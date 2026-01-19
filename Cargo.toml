@@ -1,0 +1,38 @@
+[package]
+name = "snare"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Bowan Foryt <bowan@valstad.com>"]
+repository = "https://github.com/valstad-shipworks/snare"
+keywords = ["network", "testing", "mock"]
+categories = ["development-tools::testing"]
+
+[dependencies]
+anymap2 = "0.13.0"
+mio = { version = "1", optional = true, features = ["os-poll", "os-ext", "net"] }
+parking_lot = "0.12.5"
+event-listener = { version = "5.4.1", features = ["std"] }
+
+[dev-dependencies]
+bincode = "2.0.1"
+
+[features]
+default = ["shim", "mio-compat"]
+mio-compat = ["mio"]
+shim = []
+
+[[test]]
+name = "cyclic"
+path = "tests/cyclic.rs"
+required-features = ["shim"]
+
+[[test]]
+name = "packet_count"
+path = "tests/packet_count.rs"
+required-features = ["shim"]
+
+[[test]]
+name = "mio_compat"
+path = "tests/mio_compat.rs"
+required-features = ["shim", "mio-compat"]
