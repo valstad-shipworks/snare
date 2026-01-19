@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Bowan Foryt <bowan@valstad.com>"]
+description = "Network communication testing library for rust"
 repository = "https://github.com/valstad-shipworks/snare"
 keywords = ["network", "testing", "mock"]
 categories = ["development-tools::testing"]
