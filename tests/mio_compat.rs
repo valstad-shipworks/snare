@@ -1,7 +1,6 @@
 use std::{
     io::{ErrorKind, Write},
     net::SocketAddr,
-    sync::{LazyLock, Mutex},
     time::{Duration, Instant},
 };
 
@@ -9,12 +8,6 @@ use snare::{
     TcpListener, TcpStream, register_test,
     mio::{Interest, Poll, Token, Waker, event::Events},
 };
-
-static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
-    TEST_LOCK.lock().unwrap()
-}
 
 fn accept_with_timeout(listener: &TcpListener, timeout: Duration) -> TcpStream {
     let deadline = Instant::now() + timeout;
@@ -34,7 +27,6 @@ fn accept_with_timeout(listener: &TcpListener, timeout: Duration) -> TcpStream {
 
 #[test]
 fn waker_emits_event() {
-    let _guard = lock_tests();
     register_test();
     let mut poll = Poll::new().unwrap();
     let waker = Waker::new(poll.registry(), Token(7)).unwrap();
@@ -50,7 +42,6 @@ fn waker_emits_event() {
 
 #[test]
 fn listener_readable_on_connect() {
-    let _guard = lock_tests();
     register_test();
     let mut poll = Poll::new().unwrap();
     let mut events = Events::with_capacity(4);
@@ -70,7 +61,6 @@ fn listener_readable_on_connect() {
 
 #[test]
 fn stream_readable_after_peer_write() {
-    let _guard = lock_tests();
     register_test();
     let mut poll = Poll::new().unwrap();
     let mut events = Events::with_capacity(4);

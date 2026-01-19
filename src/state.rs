@@ -49,8 +49,8 @@ pub fn register_test() {
     let thread_id = std::thread::current().id();
     let mut map = TEST_THREAD_HIERARCHY.lock();
     map.insert(thread_id, thread_id);
+    drop(map);
     let test_thread_id = TestThreadId(thread_id);
-    TEST_STATE.lock().borrow_mut().remove(&test_thread_id);
     TEST_STATE.lock().borrow_mut().insert(test_thread_id, AnyMap::new());
 }
 
@@ -177,9 +177,23 @@ pub(crate) fn trigger_event() {
 }
 
 pub(crate) fn wait_for_event(timeout: Option<Duration>) -> bool {
-    state!(new_data_event = NewDataEvent ? Arc::new(Event::new()));
-    let listener = new_data_event.listen();
+    let guard = TEST_STATE.lock();
+    let mut borrow = guard.borrow_mut();
+    let any_map = borrow
+        .get_mut(&TestThreadId::current())
+        .expect("Not a valid test thread");
+    if !any_map.contains::<Mutex<NewDataEvent>>() {
+        any_map.insert::<Mutex<NewDataEvent>>(Mutex::new(Arc::new(Event::new())));
+    }
+    #[allow(unused)]
+    let mut new_data_event = any_map
+        .get::<Mutex<NewDataEvent>>()
+        .expect("Failed to get state")
+        .lock();
+    let listener = new_data_event.clone().listen();
     drop(new_data_event);
+    drop(borrow);
+    drop(guard);
     if let Some(dur) = timeout {
         listener.wait_timeout(dur).is_some()
     } else {
