@@ -59,6 +59,11 @@ pub fn register_child_thread(child_thread_id: ThreadId) {
     TEST_THREAD_HIERARCHY.lock().insert(child_thread_id, test_thread_id.0);
 }
 
+pub fn register_thread_child_of(parent_thread_id: ThreadId) {
+    let child_thread_id = std::thread::current().id();
+    TEST_THREAD_HIERARCHY.lock().insert(child_thread_id, parent_thread_id);
+}
+
 macro_rules! state {
     ( $( $var:ident = $idx:ident $(? $default:expr)? );* $(;)? ) => {
         let mut __guard = TEST_STATE.lock();

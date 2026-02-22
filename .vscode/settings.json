@@ -1,0 +1,5 @@
+{
+    "rust-analyzer.cargo.features": ["shim", "mio-compat"],
+    // "rust-analyzer.check.command": "clippy",
+    "rust-analyzer.cfg.setTest": true
+}

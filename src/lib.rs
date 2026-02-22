@@ -17,7 +17,7 @@ pub use shim_std_tcp::{ShimStdTcpListener as TcpListener, ShimStdTcpStream as Tc
 pub use std::net::{TcpListener, TcpStream};
 
 #[cfg(feature = "shim")]
-pub use state::{add_ip_addr, register_child_thread, register_test};
+pub use state::{add_ip_addr, register_child_thread, register_thread_child_of, register_test};
 #[cfg(feature = "shim")]
 pub use framework::*;
 
@@ -27,6 +27,10 @@ pub mod mio;
 #[cfg(not(feature = "shim"))]
 #[inline(always)]
 pub fn register_child_thread(_child_thread_id: std::thread::ThreadId) {}
+
+#[cfg(not(feature = "shim"))]
+#[inline(always)]
+pub fn register_thread_child_of(_parent_thread_id: std::thread::ThreadId) {}
 
 pub trait ThreadExt {
     fn register_as_child(self) -> Self;
