@@ -625,6 +625,14 @@ pub(crate) fn udp_socket_status(addr: SocketAddr) -> Option<UdpSocketStatus> {
     })
 }
 
+pub(crate) fn tcp_connection_peer_addr(local_addr: SocketAddr) -> Option<SocketAddr> {
+    state!(tcp_connections = TcpConnections ? HashMap::new());
+    tcp_connections
+        .values()
+        .find(|conn| conn.local_addr == local_addr)
+        .map(|conn| conn.peer_addr)
+}
+
 pub(crate) fn peek_tcp_stream_data(addr: SocketAddr) -> Vec<u8> {
     state!(tcp_connections = TcpConnections ? HashMap::new());
     let connection = tcp_connections

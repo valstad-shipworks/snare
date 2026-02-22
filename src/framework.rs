@@ -787,7 +787,9 @@ pub fn _run_testers(mut testers: Vec<&mut dyn NetTesterInterface>) {
                     if data.is_empty() {
                         break;
                     }
-                    match tester.test(&data, tester.get_addr()) {
+                    let src_addr = state::tcp_connection_peer_addr(tester.get_addr())
+                        .unwrap_or(tester.get_addr());
+                    match tester.test(&data, src_addr) {
                         Some(used) if used > 0 => {
                             state::consume_tcp_stream_data(tester.get_addr(), used);
                             did_work = true;

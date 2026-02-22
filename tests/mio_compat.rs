@@ -9,11 +9,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use std::io::Read;
+
 use snare::{
     TcpListener, TcpStream, UdpSocket, register_test,
-    mio::{Interest, Poll, Token, Waker, event::Events, net::UdpSocket as MioUdpSocket},
-    Packetable, SocketType, TesterAction, TimerState, ThreadExt,
-    connect_tester, run_testers,
+    mio::{Interest, Poll, Token, Waker, event::Events, net::UdpSocket as MioUdpSocket, net::TcpStream as MioTcpStream},
+    Packetable, SocketType, TesterAction, TimerState, ThreadExt, connect_tester, run_testers,
 };
 
 fn accept_with_timeout(listener: &TcpListener, timeout: Duration) -> TcpStream {
@@ -192,5 +193,143 @@ fn udp_cyclic_send_recv_count() {
     assert_eq!(
         actual, expected,
         "Expected {expected} packets received, got {actual}"
+    );
+}
+
+/// Length-prefixed TCP packet for echo testing.
+#[derive(Clone, Debug)]
+struct TcpEchoPacket(Vec<u8>);
+
+impl Packetable for TcpEchoPacket {
+    const CAN_BE_FLATTENED: bool = false;
+    const SOCKET_TYPE: SocketType = SocketType::Tcp;
+
+    fn encode(&self) -> Vec<u8> {
+        let len = self.0.len() as u32;
+        let mut buf = len.to_le_bytes().to_vec();
+        buf.extend_from_slice(&self.0);
+        buf
+    }
+
+    fn decode(data: &[u8]) -> Option<(Self, usize)> {
+        if data.len() < 4 {
+            return None;
+        }
+        let len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+        if data.len() < 4 + len {
+            return None;
+        }
+        Some((TcpEchoPacket(data[4..4 + len].to_vec()), 4 + len))
+    }
+}
+
+const TCP_ECHO_TESTER: SocketAddr = SocketAddr::new(
+    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+    22000,
+);
+
+#[derive(Default)]
+struct EchoCount {
+    echoed: usize,
+}
+
+fn echo_back(
+    state: &mut EchoCount,
+    pkt: TcpEchoPacket,
+    src: SocketAddr,
+) -> TesterAction<TcpEchoPacket> {
+    state.echoed += 1;
+    TesterAction::Send(src, pkt)
+}
+
+#[test]
+fn tcp_echo_with_mio_poll() {
+    register_test();
+
+    const PACKET_COUNT: usize = 5;
+    let recv_count = Arc::new(AtomicI32::new(0));
+    let recv_count_clone = recv_count.clone();
+
+    // Spawn a thread that connects via TcpStream, wraps it in mio, and sends 5 packets
+    let _handle = std::thread::spawn(move || {
+        let std_stream = TcpStream::connect(TCP_ECHO_TESTER).unwrap();
+        let mut stream = MioTcpStream::from_std(std_stream.try_clone().unwrap());
+        let mut poll = Poll::new().unwrap();
+        let mut events = Events::with_capacity(16);
+
+        poll.registry()
+            .register(&mut stream, Token(1), Interest::READABLE | Interest::WRITABLE)
+            .unwrap();
+
+        // Send 5 packets
+        for i in 0..PACKET_COUNT {
+            let pkt = TcpEchoPacket(vec![i as u8; i + 1]);
+            let encoded = pkt.encode();
+            stream.write_all(&encoded).unwrap();
+        }
+
+        // Poll for echoed responses
+        let mut buf = [0u8; 256];
+        let mut recv_buf = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        while recv_count_clone.load(Ordering::Relaxed) < PACKET_COUNT as i32 {
+            if Instant::now() >= deadline {
+                panic!(
+                    "timeout waiting for echoes, got {} of {}",
+                    recv_count_clone.load(Ordering::Relaxed),
+                    PACKET_COUNT
+                );
+            }
+
+            poll.poll(&mut events, Some(Duration::from_millis(50)))
+                .unwrap();
+
+            for event in events.iter() {
+                if event.token() == Token(1) && event.is_readable() {
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                recv_buf.extend_from_slice(&buf[..n]);
+                                while let Some((_, consumed)) = TcpEchoPacket::decode(&recv_buf) {
+                                    recv_count_clone.fetch_add(1, Ordering::Relaxed);
+                                    recv_buf.drain(..consumed);
+                                }
+                            }
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                            Err(e) => panic!("read error: {e}"),
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .register_as_child();
+
+    // Main thread: TCP echo tester that sends back whatever it receives
+    let mut tester = connect_tester::<TcpEchoPacket>(TCP_ECHO_TESTER)
+        .then_stateful_action(echo_back)
+        .until_stateful_condition::<EchoCount>(|state| state.echoed >= PACKET_COUNT)
+        .until_stateful_condition::<TimerState>(|t| t.poll_elapsed() >= Duration::from_secs(5));
+
+    run_testers!(tester);
+
+    // Wait for the client thread to finish receiving all echoes
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while recv_count.load(Ordering::Relaxed) < PACKET_COUNT as i32 {
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let echoed = tester.peek_state::<EchoCount>().echoed;
+    assert_eq!(echoed, PACKET_COUNT, "Tester should have echoed {PACKET_COUNT} packets, got {echoed}");
+
+    let received = recv_count.load(Ordering::Relaxed);
+    assert_eq!(
+        received, PACKET_COUNT as i32,
+        "Client should have received {PACKET_COUNT} echoes via mio poll, got {received}"
     );
 }
