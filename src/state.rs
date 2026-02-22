@@ -633,7 +633,7 @@ pub(crate) fn peek_tcp_stream_data(addr: SocketAddr) -> Vec<u8> {
     if let Some(conn) = connection {
         conn.incoming.iter().copied().collect()
     } else {
-        panic!("No TCP connection found for address: {}", addr);
+        return Vec::new();
     }
 }
 
@@ -647,6 +647,6 @@ pub(crate) fn consume_tcp_stream_data(addr: SocketAddr, amount: usize) {
             conn.incoming.pop_front();
         }
     } else {
-        panic!("No TCP connection found for address: {}", addr);
+        return;
     }
 }
