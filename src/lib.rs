@@ -40,6 +40,22 @@ impl ThreadExt for std::thread::ThreadId {
     }
 }
 
+impl <T> ThreadExt for std::thread::JoinHandle<T> {
+    #[inline(always)]
+    fn register_as_child(self) -> std::thread::JoinHandle<T> {
+        register_child_thread(self.thread().id());
+        self
+    }
+}
+
+impl ThreadExt for std::thread::Thread {
+    #[inline(always)]
+    fn register_as_child(self) -> std::thread::Thread {
+        register_child_thread(self.id());
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SocketType {
     Udp,

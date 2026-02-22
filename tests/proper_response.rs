@@ -4,7 +4,7 @@ use std::{
 };
 
 use snare::{
-    NetTesterInterface, Packetable, SocketType, TesterAction, ThreadExt, TimerState, UdpSocket, connect_tester, register_test, run_testers,
+    Packetable, SocketType, TesterAction, ThreadExt, TimerState, UdpSocket, connect_tester, register_test, run_testers,
 };
 
 #[derive(Clone, Debug)]

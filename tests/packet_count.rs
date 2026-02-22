@@ -3,7 +3,7 @@ use std::{
 };
 
 use snare::{
-    NetTesterInterface, Packetable, SocketType, TcpListener, TcpStream, ThreadExt, TimerState, UdpSocket, connect_tester, register_test, run_testers
+    Packetable, SocketType, TcpListener, TcpStream, ThreadExt, TimerState, UdpSocket, connect_tester, register_test, run_testers
 };
 use bincode::{Encode, Decode};
 

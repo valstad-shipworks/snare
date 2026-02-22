@@ -1,6 +1,6 @@
 [package]
 name = "snare"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Bowan Foryt <bowan@valstad.com>"]
@@ -37,3 +37,13 @@ required-features = ["shim"]
 name = "mio_compat"
 path = "tests/mio_compat.rs"
 required-features = ["shim", "mio-compat"]
+
+[[test]]
+name = "proper_response"
+path = "tests/proper_response.rs"
+required-features = ["shim"]
+
+[[test]]
+name = "thread_tracking"
+path = "tests/thread_tracking.rs"
+required-features = ["shim"]
