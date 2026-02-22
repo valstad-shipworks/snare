@@ -1,6 +1,6 @@
 [package]
 name = "snare"
-version = "0.1.1"
+version = "1.0.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Bowan Foryt <bowan@valstad.com>"]
@@ -19,7 +19,7 @@ event-listener = { version = "5.4.1", features = ["std"] }
 bincode = "2.0.1"
 
 [features]
-default = ["shim", "mio-compat"]
+default = []
 mio-compat = ["mio"]
 shim = []
 
