@@ -384,6 +384,7 @@ pub mod net {
 
     impl TcpListener {
         pub fn from_std(listener: TcpListener) -> TcpListener {
+            let _ = listener.set_nonblocking(true);
             listener
         }
     }
@@ -420,6 +421,7 @@ pub mod net {
 
     impl TcpStream {
         pub fn from_std(stream: TcpStream) -> TcpStream {
+            let _ = stream.set_nonblocking(true);
             stream
         }
     }
@@ -456,6 +458,7 @@ pub mod net {
 
     impl UdpSocket {
         pub fn from_std(socket: UdpSocket) -> UdpSocket {
+            let _ = socket.set_nonblocking(true);
             socket
         }
     }
