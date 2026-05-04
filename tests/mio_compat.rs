@@ -250,7 +250,11 @@ fn tcp_echo_with_mio_poll() {
     let recv_count = Arc::new(AtomicI32::new(0));
     let recv_count_clone = recv_count.clone();
 
-    // Spawn a thread that connects via TcpStream, wraps it in mio, and sends 5 packets
+    // Bind the tester's listener BEFORE spawning the SUT, so the SUT's
+    // `TcpStream::connect` can't race ahead and hit ConnectionRefused under
+    // contention from parallel test runs.
+    let tester = connect_tester::<TcpEchoPacket>(TCP_ECHO_TESTER).then_stateful_action(echo_back);
+
     let _handle = std::thread::spawn(move || {
         let std_stream = TcpStream::connect(TCP_ECHO_TESTER).unwrap();
         let mut stream = MioTcpStream::from_std(std_stream.try_clone().unwrap());
@@ -307,9 +311,7 @@ fn tcp_echo_with_mio_poll() {
     })
     .register_as_child();
 
-    // Main thread: TCP echo tester that sends back whatever it receives
-    let mut tester = connect_tester::<TcpEchoPacket>(TCP_ECHO_TESTER)
-        .then_stateful_action(echo_back)
+    let mut tester = tester
         .until_stateful_condition::<EchoCount>(|state| state.echoed >= PACKET_COUNT)
         .until_stateful_condition::<TimerState>(|t| t.poll_elapsed() >= Duration::from_secs(5));
 
@@ -332,4 +334,77 @@ fn tcp_echo_with_mio_poll() {
         received, PACKET_COUNT as i32,
         "Client should have received {PACKET_COUNT} echoes via mio poll, got {received}"
     );
+}
+
+// ---- API-surface parity with real mio ----
+//
+// These compile-only tests exercise the surface that used to differ between
+// the snare shim and real mio. They don't need to do useful work; if they
+// build and pass it means the shim accepts the same syntax real mio does.
+
+#[test]
+fn events_into_iterator_for_ref_works() {
+    register_test();
+    let mut poll = Poll::new().unwrap();
+    let mut events = Events::with_capacity(4);
+    poll.poll(&mut events, Some(Duration::from_millis(1))).unwrap();
+    // `for ev in &events` — was broken in the shim before the parity fix
+    // (only impl'd `IntoIterator for Events`, not `&Events`).
+    let mut count = 0;
+    for _ev in &events {
+        count += 1;
+    }
+    assert_eq!(count, 0);
+    let _ = count; // silence unused
+}
+
+#[test]
+fn events_iter_returns_named_iter_type() {
+    register_test();
+    let events = Events::with_capacity(4);
+    // snare::mio::event::Iter must exist as a named type matching real mio.
+    let it: snare::mio::event::Iter<'_> = events.iter();
+    assert_eq!(it.count(), 0);
+}
+
+#[test]
+fn source_trait_requires_explicit_reregister() {
+    // The Source trait must NOT supply a default body for `reregister` —
+    // real mio doesn't, and a custom user impl missing it would silently
+    // compile against the old shim. Verify by manually impl'ing Source on
+    // a stub and using it with Registry::reregister.
+    register_test();
+
+    struct Stub;
+    impl snare::mio::event::Source for Stub {
+        fn register(
+            &mut self,
+            _r: &snare::mio::Registry,
+            _t: snare::mio::Token,
+            _i: snare::mio::Interest,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn reregister(
+            &mut self,
+            _r: &snare::mio::Registry,
+            _t: snare::mio::Token,
+            _i: snare::mio::Interest,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn deregister(&mut self, _r: &snare::mio::Registry) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let poll = Poll::new().unwrap();
+    let mut s = Stub;
+    poll.registry()
+        .register(&mut s, Token(99), Interest::READABLE)
+        .unwrap();
+    poll.registry()
+        .reregister(&mut s, Token(99), Interest::WRITABLE)
+        .unwrap();
+    poll.registry().deregister(&mut s).unwrap();
 }

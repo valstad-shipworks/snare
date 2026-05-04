@@ -347,3 +347,93 @@ fn high_volume_concurrent_sends() {
         "expected {total_expected} packets from high-volume sends, got {count}"
     );
 }
+
+// ---- snare::thread auto-registration ----
+
+/// Confirms `snare::thread::spawn` attaches the spawned thread to the test's
+/// state slot before user code runs — touching shim state inside the closure
+/// must not panic.
+#[test]
+fn snare_thread_spawn_auto_registers_child() {
+    register_test();
+    let listener: SocketAddr = "127.0.0.1:5800".parse().unwrap();
+    let _tester = connect_tester::<SimplePacket>(listener);
+
+    // The closure does NOT call register_thread_child_of itself — yet the
+    // shim TcpListener::bind / TcpStream::connect both touch state and would
+    // panic ("Thread not registered as test thread or child thread") without
+    // the wrapper.
+    let h = snare::thread::spawn(move || {
+        let socket = UdpSocket::bind("127.0.0.1:5801".parse::<SocketAddr>().unwrap()).unwrap();
+        socket.send_to(&[1u8], listener).unwrap();
+    });
+
+    let mut tester = connect_tester::<SimplePacket>(listener)
+        .with_state::<usize>(|_| {})
+        .then_stateful_test::<usize>(|n, pkt, _| {
+            *n += 1;
+            Some(pkt)
+        })
+        .until_stateful_condition::<TimerState>(|t| t.poll_elapsed() >= Duration::from_secs(2));
+    run_testers!(tester);
+    h.join().unwrap();
+
+    assert_eq!(*tester.peek_state::<usize>(), 1);
+}
+
+#[test]
+fn snare_thread_builder_spawn_auto_registers_child() {
+    register_test();
+    let listener: SocketAddr = "127.0.0.1:5802".parse().unwrap();
+    let _tester = connect_tester::<SimplePacket>(listener);
+
+    let h = snare::thread::Builder::new()
+        .name("snare-thread-test".to_string())
+        .spawn(move || {
+            let socket = UdpSocket::bind("127.0.0.1:5803".parse::<SocketAddr>().unwrap()).unwrap();
+            socket.send_to(&[2u8], listener).unwrap();
+        })
+        .unwrap();
+
+    let mut tester = connect_tester::<SimplePacket>(listener)
+        .with_state::<usize>(|_| {})
+        .then_stateful_test::<usize>(|n, pkt, _| {
+            *n += 1;
+            Some(pkt)
+        })
+        .until_stateful_condition::<TimerState>(|t| t.poll_elapsed() >= Duration::from_secs(2));
+    run_testers!(tester);
+    h.join().unwrap();
+
+    assert_eq!(*tester.peek_state::<usize>(), 1);
+}
+
+/// Nested spawn: thread A → thread B. B is registered as a child of A, which
+/// is itself a child of the test thread, so B can transitively touch shim
+/// state without manual registration.
+#[test]
+fn snare_thread_nested_spawn_chains_registration() {
+    register_test();
+    let listener: SocketAddr = "127.0.0.1:5804".parse().unwrap();
+    let _tester = connect_tester::<SimplePacket>(listener);
+
+    let outer = snare::thread::spawn(move || {
+        let inner = snare::thread::spawn(move || {
+            let socket = UdpSocket::bind("127.0.0.1:5805".parse::<SocketAddr>().unwrap()).unwrap();
+            socket.send_to(&[3u8], listener).unwrap();
+        });
+        inner.join().unwrap();
+    });
+
+    let mut tester = connect_tester::<SimplePacket>(listener)
+        .with_state::<usize>(|_| {})
+        .then_stateful_test::<usize>(|n, pkt, _| {
+            *n += 1;
+            Some(pkt)
+        })
+        .until_stateful_condition::<TimerState>(|t| t.poll_elapsed() >= Duration::from_secs(2));
+    run_testers!(tester);
+    outer.join().unwrap();
+
+    assert_eq!(*tester.peek_state::<usize>(), 1);
+}

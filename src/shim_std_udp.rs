@@ -120,6 +120,8 @@ impl ShimStdUdpSocket {
         let first_addr = addr.to_socket_addrs()?.next().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "could not resolve to any addresses")
         })?;
+        // Pre-check destruction; the policy-aware enqueue does the rest
+        // (MTU rejection, send-queue cap, etc).
         with_udp_connection(self.bound_addr, |conn| {
             if conn.is_destroyed {
                 return Err(io::Error::new(
@@ -127,14 +129,17 @@ impl ShimStdUdpSocket {
                     "connection destroyed",
                 ));
             }
-            let packet = Packet {
+            Ok(())
+        })?;
+        crate::state::enqueue_udp_outbound(
+            self.bound_addr,
+            Packet {
                 data: buf.to_vec(),
                 dest: first_addr,
                 source: self.bound_addr,
-            };
-            conn.from_local.push_back(packet);
-            Ok(buf.len())
-        })
+            },
+        )?;
+        Ok(buf.len())
     }
 
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {

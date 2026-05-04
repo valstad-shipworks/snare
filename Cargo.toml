@@ -1,6 +1,6 @@
 [package]
 name = "snare"
-version = "1.1.3"
+version = "1.2.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Bowan Foryt <bowan@valstad.com>"]
@@ -47,3 +47,24 @@ required-features = ["shim"]
 name = "thread_tracking"
 path = "tests/thread_tracking.rs"
 required-features = ["shim"]
+
+[[test]]
+name = "quiesce"
+path = "tests/quiesce.rs"
+required-features = ["shim", "mio-compat"]
+
+[[test]]
+name = "policy"
+path = "tests/policy.rs"
+required-features = ["shim", "mio-compat"]
+
+# Parity test compiles against `snare::net` / `snare::thread` once with shim
+# on (verifies the shim API matches std) and once with shim off (transparent
+# re-export test).
+[[test]]
+name = "std_parity_shim"
+path = "tests/std_parity_shim.rs"
+required-features = ["shim"]
+[[test]]
+name = "std_parity_real"
+path = "tests/std_parity_real.rs"

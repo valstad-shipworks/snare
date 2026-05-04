@@ -44,15 +44,16 @@ impl ShimStdTcpStream {
         }))
     }
 
-    #[doc(alias = "std::net::TcpStream::connect_timeout")]
-    pub fn connect_timeout<A: ToSocketAddrs>(addr: A, timeout: Duration) -> io::Result<Self> {
+    /// Mirrors [`std::net::TcpStream::connect_timeout`] — takes `&SocketAddr`
+    /// (not the generic `ToSocketAddrs`) for strict signature parity.
+    pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<Self> {
         if timeout == Duration::from_secs(0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "timeout duration must be non-zero",
             ));
         }
-        Self::connect(addr)
+        Self::connect(*addr)
     }
 
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
@@ -221,7 +222,17 @@ impl ShimStdTcpStream {
     }
 
     fn try_read(&self, len: usize, consume: bool) -> io::Result<TcpReadStatus> {
+        // Lift any latency-released bytes into incoming before inspecting.
+        let local_addr = self.with_conn(|conn| Ok(conn.local_addr))?;
+        crate::state::release_pending_for_tcp(local_addr);
         self.with_conn(|conn| {
+            if conn.reset_pending {
+                conn.reset_pending = false;
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "connection reset by peer",
+                ));
+            }
             if conn.is_destroyed {
                 return Err(io::Error::new(
                     io::ErrorKind::NotConnected,
@@ -257,6 +268,27 @@ impl ShimStdTcpStream {
         timeout: Option<Duration>,
         deadline: &mut Option<Instant>,
     ) -> io::Result<()> {
+        Self::wait_with_deadline(timeout, deadline)
+    }
+
+    fn wait_for_write_ready(
+        &self,
+        timeout: Option<Duration>,
+        deadline: &mut Option<Instant>,
+    ) -> io::Result<()> {
+        Self::wait_with_deadline(timeout, deadline)
+    }
+
+    fn wait_with_deadline(
+        timeout: Option<Duration>,
+        deadline: &mut Option<Instant>,
+    ) -> io::Result<()> {
+        // Cap the wait at the earliest pending-release deadline across all
+        // shim-managed conns. Without this, latency-delayed bytes would never
+        // wake a blocked reader: nothing in the test thread fires `notify`
+        // when the deadline elapses on its own.
+        let pending_release = crate::state::earliest_pending_release();
+
         if let Some(duration) = timeout {
             let now = Instant::now();
             let target = match deadline {
@@ -273,8 +305,14 @@ impl ShimStdTcpStream {
                     "operation timed out",
                 ));
             }
-            let remaining = target - now;
-            if !wait_for_event(Some(remaining)) {
+            let mut remaining = target - now;
+            if let Some(release) = pending_release {
+                let until_release = release.saturating_duration_since(now);
+                if until_release < remaining {
+                    remaining = until_release;
+                }
+            }
+            if !wait_for_event(Some(remaining)) && Instant::now() >= target {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "operation timed out",
@@ -282,7 +320,22 @@ impl ShimStdTcpStream {
             }
         } else {
             *deadline = None;
-            wait_for_event(None);
+            // No user timeout, but if there's a pending-release deadline we
+            // must still wake at it; otherwise we'd block forever despite
+            // having buffered bytes ready to surface.
+            match pending_release {
+                Some(release) => {
+                    let now = Instant::now();
+                    let dur = release.saturating_duration_since(now);
+                    if dur.is_zero() {
+                        return Ok(());
+                    }
+                    wait_for_event(Some(dur));
+                }
+                None => {
+                    wait_for_event(None);
+                }
+            }
         }
         Ok(())
     }
@@ -297,6 +350,29 @@ impl ShimStdTcpStream {
         let listener_addr = find_tcp_listener(target).ok_or_else(|| {
             io::Error::new(io::ErrorKind::ConnectionRefused, "no listener available")
         })?;
+        match crate::state::listener_behavior(listener_addr) {
+            crate::state::ListenerBehavior::Accepting => {}
+            crate::state::ListenerBehavior::Refusing => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "listener configured to refuse",
+                ));
+            }
+            crate::state::ListenerBehavior::DelayingUntil(deadline) => {
+                let now = Instant::now();
+                if deadline > now {
+                    // Block until the deadline (or this thread is otherwise
+                    // woken) — matches "SYN dropped, retry until backoff".
+                    wait_for_event(Some(deadline - now));
+                    if Instant::now() < deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "listener delaying accept",
+                        ));
+                    }
+                }
+            }
+        }
         let client_ip = preferred_client_ip(&target);
         let local_addr = reserve_ephemeral_addr(client_ip);
         let server_ip = if listener_addr.ip().is_unspecified() {
@@ -329,38 +405,109 @@ impl ShimStdTcpStream {
     }
 }
 
-impl Read for ShimStdTcpStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.read_internal(buf, true)
-    }
-}
-
-impl Write for ShimStdTcpStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+impl ShimStdTcpStream {
+    /// Internal write that takes `&self` so we can implement `Write` for both
+    /// `ShimStdTcpStream` and `&ShimStdTcpStream` (matching `std::net::TcpStream`).
+    fn write_internal(&self, buf: &[u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
-        let peer_id = self.with_conn(|conn| {
+        let (peer_id, nonblocking, write_timeout) = self.with_conn(|conn| {
+            if conn.reset_pending {
+                conn.reset_pending = false;
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "connection reset by peer",
+                ));
+            }
             if conn.write_shutdown {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "write half closed",
                 ));
             }
-            conn.peer_stream_id.ok_or_else(|| {
+            let peer = conn.peer_stream_id.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "no peer connected")
-            })
+            })?;
+            Ok((peer, conn.nonblocking, conn.write_timeout))
         })?;
-        with_tcp_connection(peer_id, |peer| {
-            if peer.read_shutdown {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "peer closed the read half",
-                ));
+
+        // Apply outbound latency by routing the write into the peer's
+        // pending_inbound queue with a release deadline. Recv-window also
+        // applies on the peer side so the writer back-pressures naturally.
+        let peer_local_addr =
+            with_tcp_connection(peer_id, |peer| io::Result::Ok(peer.local_addr))?;
+        let peer_policy = crate::state::tcp_policy(peer_local_addr);
+
+        let mut deadline: Option<Instant> = None;
+        loop {
+            let result = with_tcp_connection(peer_id, |peer| {
+                if peer.read_shutdown {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "peer closed the read half",
+                    ));
+                }
+                if let Some(window) = peer_policy.recv_window {
+                    let queued = peer.incoming.len()
+                        + peer.pending_inbound.iter().map(|(_, b)| b.len()).sum::<usize>();
+                    if queued + buf.len() > window {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "peer recv window full",
+                        ));
+                    }
+                }
+                if peer_policy.inbound_latency.is_zero() {
+                    peer.incoming.extend(buf.iter().copied());
+                } else {
+                    peer.pending_inbound.push_back((
+                        Instant::now() + peer_policy.inbound_latency,
+                        buf.to_vec(),
+                    ));
+                }
+                Ok(buf.len())
+            });
+
+            match result {
+                Ok(n) => return Ok(n),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if nonblocking {
+                        return Err(e);
+                    }
+                    self.wait_for_write_ready(write_timeout, &mut deadline)?;
+                }
+                Err(e) => return Err(e),
             }
-            peer.incoming.extend(buf.iter().copied());
-            Ok(buf.len())
-        })
+        }
+    }
+}
+
+impl Read for ShimStdTcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.read_internal(buf, true)
+    }
+}
+
+impl Read for &ShimStdTcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        (**self).read_internal(buf, true)
+    }
+}
+
+impl Write for ShimStdTcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_internal(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Write for &ShimStdTcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (**self).write_internal(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -370,6 +517,33 @@ impl Write for ShimStdTcpStream {
 
 impl Drop for ShimStdTcpStream {
     fn drop(&mut self) {
+        // Honor SO_LINGER: if a non-None linger duration is set and there are
+        // still bytes pending in the peer's incoming buffer (or in flight via
+        // pending_inbound), block here until either the peer drains them or
+        // the linger timeout elapses. Matches std behavior where a non-zero
+        // linger forces close() to wait for the send buffer to flush.
+        let (peer_id_opt, linger) = with_tcp_connection(self.stream_id, |conn| {
+            (conn.peer_stream_id, conn.linger)
+        });
+
+        if let (Some(peer_id), Some(linger_dur)) = (peer_id_opt, linger) {
+            let deadline = Instant::now() + linger_dur;
+            loop {
+                let pending_bytes = with_tcp_connection(peer_id, |peer| {
+                    peer.incoming.len()
+                        + peer.pending_inbound.iter().map(|(_, b)| b.len()).sum::<usize>()
+                });
+                if pending_bytes == 0 {
+                    break;
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                wait_for_event(Some(deadline - now));
+            }
+        }
+
         if let Some(peer_id) = release_stream(self.stream_id) {
             notify_peer_dropped(peer_id);
         }
@@ -461,6 +635,30 @@ impl ShimStdTcpListener {
         Ok(Self {
             bound_addr: self.bound_addr,
         })
+    }
+
+    /// Returns an iterator over the connections being received on this listener.
+    /// Mirrors [`std::net::TcpListener::incoming`].
+    pub fn incoming(&self) -> Incoming<'_> {
+        Incoming { listener: self }
+    }
+
+    // `std::net::TcpListener::into_incoming` is still unstable (rust issue
+    // #88373) so we don't expose it on the shim either — keeping the snare
+    // surface to what's stable on std.
+}
+
+/// Iterator over connections being received on a [`ShimStdTcpListener`].
+/// Mirrors [`std::net::Incoming`].
+#[derive(Debug)]
+pub struct Incoming<'a> {
+    listener: &'a ShimStdTcpListener,
+}
+
+impl<'a> Iterator for Incoming<'a> {
+    type Item = io::Result<ShimStdTcpStream>;
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(self.listener.accept().map(|(s, _)| s))
     }
 }
 
