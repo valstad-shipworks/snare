@@ -8,9 +8,9 @@ use std::{
 use crate::state::{
     add_tcp_connection, add_tcp_listener_state, assign_tcp_stream_to_listener,
     clone_tcp_listener_state, find_tcp_listener, is_ip_addr_valid, is_port_available,
-    mark_peer_read_shutdown, notify_peer_dropped, release_stream, remove_tcp_connection,
-    remove_tcp_listener_state, reserve_ephemeral_addr, wait_for_event, with_tcp_connection,
-    with_tcp_listener_state,
+    mark_peer_read_shutdown, notify_peer_dropped, pcap_tcp_data, pcap_tcp_fin, pcap_tcp_open,
+    release_stream, remove_tcp_connection, remove_tcp_listener_state, reserve_ephemeral_addr,
+    wait_for_event, with_tcp_connection, with_tcp_listener_state,
 };
 
 #[derive(Debug)]
@@ -392,6 +392,7 @@ impl ShimStdTcpStream {
             Ok(())
         })?;
         assign_tcp_stream_to_listener(listener_addr, server_stream);
+        pcap_tcp_open(local_addr, server_addr);
         Ok(Self {
             stream_id: client_stream,
         })
@@ -412,7 +413,7 @@ impl ShimStdTcpStream {
         if buf.is_empty() {
             return Ok(0);
         }
-        let (peer_id, nonblocking, write_timeout) = self.with_conn(|conn| {
+        let (peer_id, nonblocking, write_timeout, local_addr) = self.with_conn(|conn| {
             if conn.reset_pending {
                 conn.reset_pending = false;
                 return Err(io::Error::new(
@@ -429,7 +430,7 @@ impl ShimStdTcpStream {
             let peer = conn.peer_stream_id.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "no peer connected")
             })?;
-            Ok((peer, conn.nonblocking, conn.write_timeout))
+            Ok((peer, conn.nonblocking, conn.write_timeout, conn.local_addr))
         })?;
 
         // Apply outbound latency by routing the write into the peer's
@@ -470,7 +471,10 @@ impl ShimStdTcpStream {
             });
 
             match result {
-                Ok(n) => return Ok(n),
+                Ok(n) => {
+                    pcap_tcp_data(local_addr, peer_local_addr, &buf[..n]);
+                    return Ok(n);
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     if nonblocking {
                         return Err(e);
@@ -544,8 +548,17 @@ impl Drop for ShimStdTcpStream {
             }
         }
 
+        // Capture addrs before release_stream may drop the connection out from
+        // under us, so we can emit a synthetic FIN to the pcap log.
+        let addrs = with_tcp_connection(self.stream_id, |conn| -> io::Result<(std::net::SocketAddr, std::net::SocketAddr)> {
+            Ok((conn.local_addr, conn.peer_addr))
+        })
+        .ok();
         if let Some(peer_id) = release_stream(self.stream_id) {
             notify_peer_dropped(peer_id);
+            if let Some((local, peer)) = addrs {
+                pcap_tcp_fin(local, peer);
+            }
         }
     }
 }

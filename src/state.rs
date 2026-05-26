@@ -9,6 +9,7 @@ use event_listener::{Event, Listener};
 use parking_lot::{Mutex, ReentrantMutex};
 
 use crate::SocketType;
+use crate::pcapng::PcapWriter;
 
 /// Maps every test/child thread to its oldest known test-thread ancestor.
 static TEST_THREAD_HIERARCHY: LazyLock<Mutex<HashMap<ThreadId, ThreadId>>> =
@@ -73,11 +74,15 @@ impl TestThreadId {
 /// at the top of every `#[test]` that uses snare.
 pub fn register_test() {
     let thread_id = std::thread::current().id();
+    let thread_name = std::thread::current().name().map(String::from);
     let mut map = TEST_THREAD_HIERARCHY.lock();
     map.insert(thread_id, thread_id);
     drop(map);
     let test_thread_id = TestThreadId(thread_id);
     TEST_STATE.lock().borrow_mut().insert(test_thread_id, AnyMap::new());
+
+    // pcap init is in a helper defined after the `state!` macro.
+    pcap_init_for_test(thread_name);
 }
 
 /// Attach a spawned thread to the current test's state slot. Call from the
@@ -92,6 +97,12 @@ pub fn register_child_thread(child_thread_id: ThreadId) {
 pub fn register_thread_child_of(parent_thread_id: ThreadId) {
     let child_thread_id = std::thread::current().id();
     TEST_THREAD_HIERARCHY.lock().insert(child_thread_id, parent_thread_id);
+}
+
+/// Begin pcapng capture for the current test. No-op unless `SNARE_PCAPNG_DIR`
+/// is set in the environment. Already-enabled tests are unaffected.
+pub fn enable_pcapng() {
+    pcap_enable_for_current_test();
 }
 
 macro_rules! state {
@@ -137,6 +148,69 @@ type UdpPolicies = HashMap<SocketAddr, UdpPolicy>;
 type ListenerBehaviors = HashMap<SocketAddr, ListenerBehavior>;
 type RecordedEvents = Vec<RecordedEntry>;
 type RngState = u64;
+
+pub(crate) struct PcapState {
+    pub writer: Option<PcapWriter>,
+    pub test_name: Option<String>,
+}
+
+impl Default for PcapState {
+    fn default() -> Self {
+        Self { writer: None, test_name: None }
+    }
+}
+
+fn pcap_init_for_test(thread_name: Option<String>) {
+    state!(pcap = PcapState ? PcapState::default());
+    pcap.test_name = thread_name.clone();
+    if let Some(name) = thread_name.as_deref() {
+        if crate::pcapng::env_force_match(name) {
+            pcap.writer = crate::pcapng::open_writer(name);
+        }
+    }
+}
+
+fn pcap_enable_for_current_test() {
+    state!(pcap = PcapState ? PcapState::default());
+    if pcap.writer.is_some() {
+        return;
+    }
+    let name = pcap
+        .test_name
+        .clone()
+        .or_else(|| std::thread::current().name().map(String::from));
+    if let Some(name) = name {
+        pcap.writer = crate::pcapng::open_writer(&name);
+    }
+}
+
+#[inline]
+fn with_pcap<F: FnOnce(&mut PcapWriter)>(f: F) {
+    state!(pcap = PcapState ? PcapState::default());
+    if let Some(w) = pcap.writer.as_mut() {
+        f(w);
+    }
+}
+
+pub(crate) fn pcap_tcp_open(client: SocketAddr, server: SocketAddr) {
+    with_pcap(|w| w.tcp_open(client, server));
+}
+
+pub(crate) fn pcap_tcp_data(src: SocketAddr, dst: SocketAddr, data: &[u8]) {
+    with_pcap(|w| w.tcp_data(src, dst, data));
+}
+
+pub(crate) fn pcap_tcp_fin(src: SocketAddr, dst: SocketAddr) {
+    with_pcap(|w| w.tcp_fin(src, dst));
+}
+
+pub(crate) fn pcap_tcp_rst(src: SocketAddr, dst: SocketAddr) {
+    with_pcap(|w| w.tcp_rst(src, dst));
+}
+
+pub(crate) fn pcap_udp(src: SocketAddr, dst: SocketAddr, data: &[u8]) {
+    with_pcap(|w| w.udp_datagram(src, dst, data));
+}
 
 /// Which direction(s) a Quiesce window suppresses readiness in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -728,6 +802,7 @@ pub(crate) fn notify_peer_dropped(peer_id: usize) {
 pub(crate) fn send_udp_from_test(from_addr: SocketAddr, to_addr: SocketAddr, data: Vec<u8>) {
     let policy = udp_policy(to_addr);
     let len = data.len();
+    let data_for_pcap = data.clone();
 
     // MTU rejection: oversize datagram is silently dropped on the wire.
     if let Some(mtu) = policy.mtu {
@@ -806,6 +881,10 @@ pub(crate) fn send_udp_from_test(from_addr: SocketAddr, to_addr: SocketAddr, dat
             dropped: false,
             duplicated,
         });
+        pcap_udp(from_addr, to_addr, &data_for_pcap);
+        if duplicated {
+            pcap_udp(from_addr, to_addr, &data_for_pcap);
+        }
     }
 }
 
@@ -820,6 +899,9 @@ pub(crate) fn send_tcp_from_test(from_addr: SocketAddr, to_addr: SocketAddr, dat
     let policy = tcp_policy(to_addr);
     let len = data.len();
     let total_delay = policy.inbound_latency;
+    // Pcap path is opt-in; clone once up front (cheap vs. the I/O cost of
+    // tests, only used by the pcap tap below).
+    let data_for_pcap = data.clone();
 
     let outcome: Result<bool, ()> = {
         state!(
@@ -865,6 +947,7 @@ pub(crate) fn send_tcp_from_test(from_addr: SocketAddr, to_addr: SocketAddr, dat
     match outcome {
         Ok(true) => {
             record(RecordedEvent::TcpSendFromTest { from: from_addr, to: to_addr, len });
+            pcap_tcp_data(from_addr, to_addr, &data_for_pcap);
         }
         Ok(false) => {}
         Err(()) => {
@@ -955,7 +1038,7 @@ pub fn reset_tcp(addr: SocketAddr) {
 
 /// Mark a TCP connection as RST (matched by SUT-side local addr).
 pub(crate) fn reset_tcp_from_test(addr: SocketAddr) {
-    let found = {
+    let peer = {
         state!(
             tcp_connections = TcpConnections ? HashMap::new();
             new_data_event = NewDataEvent ? Arc::new(Event::new());
@@ -970,13 +1053,16 @@ pub(crate) fn reset_tcp_from_test(addr: SocketAddr) {
                 "connection reset by peer",
             ));
             new_data_event.notify(u32::MAX);
-            true
+            Some(conn.peer_addr)
         } else {
-            false
+            None
         }
     };
-    if found {
+    if let Some(peer_addr) = peer {
         record(RecordedEvent::TcpResetFromTest { addr });
+        // RST is sourced from the test-side peer, since `reset_tcp_from_test`
+        // is the "the remote side just sent a RST" path.
+        pcap_tcp_rst(peer_addr, addr);
     }
 }
 
@@ -1067,26 +1153,30 @@ pub(crate) fn enqueue_udp_outbound(
             ));
         }
     }
-    state!(
-        udp_connections = UdpConnections ? Vec::new();
-        new_data_event = NewDataEvent ? Arc::new(Event::new());
-    );
-    let conn = udp_connections
-        .iter_mut()
-        .find(|c| c.bound_addr == bound_addr)
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "no such UDP socket")
-        })?;
-    if let Some(cap) = policy.send_queue_depth {
-        if conn.from_local.len() >= cap {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "UDP send queue full",
-            ));
+    let pcap_capture = (pkt.source, pkt.dest, pkt.data.clone());
+    {
+        state!(
+            udp_connections = UdpConnections ? Vec::new();
+            new_data_event = NewDataEvent ? Arc::new(Event::new());
+        );
+        let conn = udp_connections
+            .iter_mut()
+            .find(|c| c.bound_addr == bound_addr)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "no such UDP socket")
+            })?;
+        if let Some(cap) = policy.send_queue_depth {
+            if conn.from_local.len() >= cap {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "UDP send queue full",
+                ));
+            }
         }
+        conn.from_local.push_back(pkt);
+        new_data_event.notify(u32::MAX);
     }
-    conn.from_local.push_back(pkt);
-    new_data_event.notify(u32::MAX);
+    pcap_udp(pcap_capture.0, pcap_capture.1, &pcap_capture.2);
     Ok(())
 }
 
