@@ -1,6 +1,9 @@
 use std::{
     net::SocketAddr,
-    sync::{atomic::{AtomicUsize, Ordering}, LazyLock, Mutex},
+    sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -27,10 +30,8 @@ struct CyclicState {
     last_fire: Option<Instant>,
 }
 
-static FIRING_DELTAS: LazyLock<Mutex<Vec<Duration>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
-static CYCLE_COUNT: LazyLock<AtomicUsize> =
-    LazyLock::new(|| AtomicUsize::new(0));
+static FIRING_DELTAS: LazyLock<Mutex<Vec<Duration>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static CYCLE_COUNT: LazyLock<AtomicUsize> = LazyLock::new(|| AtomicUsize::new(0));
 
 fn record_cycle(state: &mut CyclicState) -> Option<TesterAction<DummyPacket>> {
     let now = Instant::now();
@@ -62,7 +63,11 @@ fn send_packet_every_8_ms() {
         });
     run_testers!(tester);
     let deltas = FIRING_DELTAS.lock().unwrap().clone();
-    assert!(deltas.len() >= 3, "expected multiple cycles, got {}", deltas.len());
+    assert!(
+        deltas.len() >= 3,
+        "expected multiple cycles, got {}",
+        deltas.len()
+    );
     for delta in deltas {
         assert!(delta > Duration::from_millis(0));
         assert!(delta <= Duration::from_millis(80));

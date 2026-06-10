@@ -1,11 +1,14 @@
 use std::{
-    io::{ErrorKind, Write}, net::SocketAddr, time::Duration
+    io::{ErrorKind, Write},
+    net::SocketAddr,
+    time::Duration,
 };
 
+use bincode::{Decode, Encode};
 use snare::{
-    Packetable, SocketType, TcpListener, TcpStream, ThreadExt, TimerState, UdpSocket, connect_tester, register_test, run_testers
+    Packetable, SocketType, TcpListener, TcpStream, ThreadExt, TimerState, UdpSocket,
+    connect_tester, register_test, run_testers,
 };
-use bincode::{Encode, Decode};
 
 #[derive(Clone, Debug, Encode, Decode)]
 struct TcpTestPacket {
@@ -57,7 +60,6 @@ struct UdpTestPacket {
     data: Vec<u8>,
 }
 
-
 impl UdpTestPacket {
     fn new(data: &'static [u8]) -> Self {
         Self {
@@ -101,9 +103,10 @@ struct PacketCountStatec {
     packet_count: usize,
 }
 
-
 fn send_packets<T: Packetable>(addr: SocketAddr, packets: Vec<T>) {
-    if packets.is_empty() { panic!("not enough packets") }
+    if packets.is_empty() {
+        panic!("not enough packets")
+    }
     if T::SOCKET_TYPE == SocketType::Tcp {
         let mut stream = TcpStream::connect(addr).unwrap();
         for packet in packets {
@@ -116,7 +119,6 @@ fn send_packets<T: Packetable>(addr: SocketAddr, packets: Vec<T>) {
             let encoded = Packetable::encode(&packet);
             socket.send_to(&encoded, addr).unwrap();
         }
-
     }
 }
 
@@ -129,8 +131,7 @@ fn test_tcp_packet_count() {
         Some(packet)
     }
     let addr = SocketAddr::from(([127, 0, 0, 1], 4000));
-    let mut tester = connect_tester::<Packet>(addr)
-        .then_stateful_test(incr_cnt);
+    let mut tester = connect_tester::<Packet>(addr).then_stateful_test(incr_cnt);
     let packets_to_send = vec![
         Packet::new(&[1, 2, 3]),
         Packet::new(&[4, 5, 6, 7]),
@@ -146,7 +147,10 @@ fn test_tcp_packet_count() {
     let expected_packet_count = packets_to_send.len();
     std::thread::spawn(move || {
         send_packets(addr, packets_to_send);
-    }).thread().id().register_as_child();
+    })
+    .thread()
+    .id()
+    .register_as_child();
     run_testers!(tester);
     let rx_cnt = tester.peek_state::<PacketCountStatec>().packet_count;
     assert_eq!(rx_cnt, expected_packet_count);
@@ -181,7 +185,10 @@ fn test_udp_packet_count() {
     let expected_packet_count = packets_to_send.len();
     std::thread::spawn(move || {
         send_packets(addr, packets_to_send);
-    }).thread().id().register_as_child();
+    })
+    .thread()
+    .id()
+    .register_as_child();
     run_testers!(tester);
     let rx_cnt = tester.peek_state::<PacketCountStatec>().packet_count;
     assert_eq!(rx_cnt, expected_packet_count);

@@ -5,8 +5,7 @@ use std::{
 };
 
 use snare::{
-    Packetable, SocketType, TcpStream, TesterAction, ThreadExt, TimerState,
-    connect_tester,
+    Packetable, SocketType, TcpStream, TesterAction, ThreadExt, TimerState, connect_tester,
     mio::{Interest, Poll, Token, event::Events, net::TcpStream as MioTcpStream},
     register_test, run_testers,
 };
@@ -57,11 +56,14 @@ fn quiesce_suppresses_mio_readiness() {
             .unwrap();
 
         // Phase 1: baseline — send "probe" and confirm we see the ack within 200ms.
-        stream.write_all(&EchoPacket(b"probe".to_vec()).encode()).unwrap();
+        stream
+            .write_all(&EchoPacket(b"probe".to_vec()).encode())
+            .unwrap();
         let deadline = Instant::now() + Duration::from_millis(500);
         let mut got_ack = false;
         while Instant::now() < deadline && !got_ack {
-            poll.poll(&mut events, Some(Duration::from_millis(50))).unwrap();
+            poll.poll(&mut events, Some(Duration::from_millis(50)))
+                .unwrap();
             for evt in events.iter() {
                 if evt.token() == Token(1) && evt.is_readable() {
                     let mut buf = [0u8; 64];
@@ -75,7 +77,9 @@ fn quiesce_suppresses_mio_readiness() {
         // Phase 2: trigger quiesce. Tester will Send("during") + Quiesce(self, 400ms).
         // The Send buffers bytes into our incoming queue; quiesce immediately
         // takes effect, so Poll must NOT surface the readable event.
-        stream.write_all(&EchoPacket(b"trigger".to_vec()).encode()).unwrap();
+        stream
+            .write_all(&EchoPacket(b"trigger".to_vec()).encode())
+            .unwrap();
 
         // Give the tester loop a moment to process the trigger and apply the
         // quiesce + queued bytes.
@@ -85,7 +89,8 @@ fn quiesce_suppresses_mio_readiness() {
         let quiesce_check_end = Instant::now() + Duration::from_millis(250);
         let mut events_during_quiesce = 0;
         while Instant::now() < quiesce_check_end {
-            poll.poll(&mut events, Some(Duration::from_millis(40))).unwrap();
+            poll.poll(&mut events, Some(Duration::from_millis(40)))
+                .unwrap();
             events_during_quiesce += events.iter().count();
         }
         assert_eq!(
@@ -98,7 +103,8 @@ fn quiesce_suppresses_mio_readiness() {
         let post_deadline = Instant::now() + QUIESCE_WINDOW + Duration::from_millis(200);
         let mut got_post = false;
         while Instant::now() < post_deadline && !got_post {
-            poll.poll(&mut events, Some(Duration::from_millis(50))).unwrap();
+            poll.poll(&mut events, Some(Duration::from_millis(50)))
+                .unwrap();
             for evt in events.iter() {
                 if evt.token() == Token(1) && evt.is_readable() {
                     let mut buf = [0u8; 64];

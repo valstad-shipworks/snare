@@ -1,5 +1,10 @@
-
-use std::{sync::{Arc, atomic::{AtomicI8, AtomicUsize, Ordering}}, time::{Duration, Instant}};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicI8, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use std::io;
 
@@ -7,21 +12,23 @@ use parking_lot::Mutex;
 
 use crate::{
     TcpListener, TcpStream, UdpSocket,
-    state::{trigger_event, wait_for_event, tcp_listener_status, tcp_stream_status, udp_socket_status}
+    state::{
+        tcp_listener_status, tcp_stream_status, trigger_event, udp_socket_status, wait_for_event,
+    },
 };
 
 pub use mio::{Interest, Token, features, guide};
 
 #[derive(Debug)]
 pub struct Poll {
-    registry: Registry
+    registry: Registry,
 }
 
 impl Poll {
     pub fn new() -> io::Result<Poll> {
-        Ok(
-            Self { registry: Registry::new() }
-        )
+        Ok(Self {
+            registry: Registry::new(),
+        })
     }
 
     pub fn registry(&self) -> &Registry {
@@ -32,7 +39,7 @@ impl Poll {
         events.clear();
         let deadline = match timeout {
             Some(dur) => Instant::now() + dur,
-            None => Instant::now() + Duration::from_secs(60_000)
+            None => Instant::now() + Duration::from_secs(60_000),
         };
 
         loop {
@@ -42,19 +49,17 @@ impl Poll {
 
             if self.registry.waker_state.swap(-1, Ordering::SeqCst) == 1 {
                 let token = self.registry.waker_token.load(Ordering::SeqCst);
-                events.inner.push(
-                    event::Event {
-                        token: Token(token),
-                        is_readable: true,
-                        is_writable: true,
-                        is_error: false,
-                        is_read_closed: false,
-                        is_write_closed: false,
-                        is_priority: false,
-                        is_aio: false,
-                        is_lio: false
-                    }
-                );
+                events.inner.push(event::Event {
+                    token: Token(token),
+                    is_readable: true,
+                    is_writable: true,
+                    is_error: false,
+                    is_read_closed: false,
+                    is_write_closed: false,
+                    is_priority: false,
+                    is_aio: false,
+                    is_lio: false,
+                });
             }
 
             let reg_data = self.registry.data.lock();
@@ -145,21 +150,21 @@ impl Poll {
 struct RegistryEntry<S> {
     src: S,
     token: Token,
-    interest: Interest
+    interest: Interest,
 }
 
 #[derive(Debug)]
 struct RegistryData {
     listeners: Vec<RegistryEntry<TcpListener>>,
     streams: Vec<RegistryEntry<TcpStream>>,
-    sockets: Vec<RegistryEntry<UdpSocket>>
+    sockets: Vec<RegistryEntry<UdpSocket>>,
 }
 
 #[derive(Debug)]
 pub struct Registry {
     waker_state: Arc<AtomicI8>,
     waker_token: Arc<AtomicUsize>,
-    data: Arc<Mutex<RegistryData>>
+    data: Arc<Mutex<RegistryData>>,
 }
 
 impl Registry {
@@ -167,13 +172,11 @@ impl Registry {
         Registry {
             waker_state: Arc::new(AtomicI8::new(0)),
             waker_token: Arc::new(AtomicUsize::new(0)),
-            data: Arc::new(Mutex::new(
-                RegistryData {
-                    listeners: Vec::new(),
-                    streams: Vec::new(),
-                    sockets: Vec::new()
-                }
-            ))
+            data: Arc::new(Mutex::new(RegistryData {
+                listeners: Vec::new(),
+                streams: Vec::new(),
+                sockets: Vec::new(),
+            })),
         }
     }
 
@@ -202,14 +205,14 @@ impl Registry {
         Ok(Registry {
             waker_state: self.waker_state.clone(),
             waker_token: self.waker_token.clone(),
-            data: self.data.clone()
+            data: self.data.clone(),
         })
     }
 }
 
 #[derive(Debug)]
 pub struct Waker {
-    waker_state: Arc<AtomicI8>
+    waker_state: Arc<AtomicI8>,
 }
 
 impl Waker {
@@ -219,9 +222,7 @@ impl Waker {
             panic!("Only a single waker is allowed per registry")
         }
         registry.waker_token.store(token.0, Ordering::SeqCst);
-        Ok(Self {
-            waker_state
-        })
+        Ok(Self { waker_state })
     }
 
     pub fn wake(&self) -> io::Result<()> {
@@ -289,13 +290,13 @@ pub mod event {
     }
 
     pub struct Events {
-        pub(crate) inner: Vec<Event>
+        pub(crate) inner: Vec<Event>,
     }
 
     impl Events {
         pub fn with_capacity(capacity: usize) -> Events {
             Events {
-                inner: Vec::with_capacity(capacity)
+                inner: Vec::with_capacity(capacity),
             }
         }
 
@@ -312,7 +313,10 @@ pub mod event {
         }
 
         pub fn iter(&self) -> Iter<'_> {
-            Iter { inner: self, pos: 0 }
+            Iter {
+                inner: self,
+                pos: 0,
+            }
         }
     }
 
@@ -436,13 +440,11 @@ pub mod net {
             interests: Interest,
         ) -> io::Result<()> {
             let mut reg_data = registry.data.lock();
-            reg_data.listeners.push(
-                RegistryEntry {
-                    src: self.try_clone()?,
-                    token: token,
-                    interest: interests
-                }
-            );
+            reg_data.listeners.push(RegistryEntry {
+                src: self.try_clone()?,
+                token: token,
+                interest: interests,
+            });
             Ok(())
         }
 
@@ -459,7 +461,9 @@ pub mod net {
         fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
             let mut reg_data = registry.data.lock();
             let bound_attr = self.local_addr()?;
-            let pos = reg_data.listeners.iter()
+            let pos = reg_data
+                .listeners
+                .iter()
                 .position(|listener| listener.src.local_addr().unwrap() == bound_attr);
             if let Some(idx) = pos {
                 reg_data.listeners.remove(idx);
@@ -483,13 +487,11 @@ pub mod net {
             interests: Interest,
         ) -> io::Result<()> {
             let mut reg_data = registry.data.lock();
-            reg_data.streams.push(
-                RegistryEntry {
-                    src: self.try_clone()?,
-                    token: token,
-                    interest: interests
-                }
-            );
+            reg_data.streams.push(RegistryEntry {
+                src: self.try_clone()?,
+                token: token,
+                interest: interests,
+            });
             Ok(())
         }
 
@@ -506,7 +508,9 @@ pub mod net {
         fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
             let mut reg_data = registry.data.lock();
             let bound_attr = self.local_addr()?;
-            let pos = reg_data.streams.iter()
+            let pos = reg_data
+                .streams
+                .iter()
                 .position(|listener| listener.src.local_addr().unwrap() == bound_attr);
             if let Some(idx) = pos {
                 reg_data.streams.remove(idx);
@@ -530,13 +534,11 @@ pub mod net {
             interests: Interest,
         ) -> io::Result<()> {
             let mut reg_data = registry.data.lock();
-            reg_data.sockets.push(
-                RegistryEntry {
-                    src: self.try_clone()?,
-                    token: token,
-                    interest: interests
-                }
-            );
+            reg_data.sockets.push(RegistryEntry {
+                src: self.try_clone()?,
+                token: token,
+                interest: interests,
+            });
             Ok(())
         }
 
@@ -553,7 +555,9 @@ pub mod net {
         fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
             let mut reg_data = registry.data.lock();
             let bound_attr = self.local_addr()?;
-            let pos = reg_data.sockets.iter()
+            let pos = reg_data
+                .sockets
+                .iter()
                 .position(|socket| socket.src.local_addr().unwrap() == bound_attr);
             if let Some(idx) = pos {
                 reg_data.sockets.remove(idx);

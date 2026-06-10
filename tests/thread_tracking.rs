@@ -1,15 +1,15 @@
 use std::{
     net::SocketAddr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use snare::{
-    Packetable, SocketType, ThreadExt, TimerState, UdpSocket,
-    connect_tester, register_test, run_testers,
+    Packetable, SocketType, ThreadExt, TimerState, UdpSocket, connect_tester, register_test,
+    run_testers,
 };
 
 #[derive(Clone)]
@@ -59,8 +59,7 @@ fn many_concurrent_child_threads_sending_udp() {
         let bar = barrier.clone();
         let h = std::thread::spawn(move || {
             bar.wait(); // all threads start sending simultaneously
-            let client_addr: SocketAddr =
-                SocketAddr::from(([127, 0, 0, 1], 5100 + i as u16));
+            let client_addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 5100 + i as u16));
             let socket = UdpSocket::bind(client_addr).unwrap();
             for j in 0..packets_per_thread {
                 let data = vec![i as u8, j as u8];
@@ -191,8 +190,7 @@ fn concurrent_registration_contention() {
         let ok = success_count.clone();
         let h = std::thread::spawn(move || {
             bar.wait(); // synchronize all registrations + sends
-            let client_addr: SocketAddr =
-                SocketAddr::from(([127, 0, 0, 1], 5500 + i as u16));
+            let client_addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 5500 + i as u16));
             let socket = UdpSocket::bind(client_addr).unwrap();
             socket.send_to(&[i as u8], tester_addr).unwrap();
             ok.fetch_add(1, Ordering::SeqCst);
@@ -321,14 +319,11 @@ fn high_volume_concurrent_sends() {
     for i in 0..thread_count {
         let bar = barrier.clone();
         let h = std::thread::spawn(move || {
-            let client_addr: SocketAddr =
-                SocketAddr::from(([127, 0, 0, 1], 5900 + i as u16));
+            let client_addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 5900 + i as u16));
             let socket = UdpSocket::bind(client_addr).unwrap();
             bar.wait();
             for j in 0..packets_per_thread {
-                socket
-                    .send_to(&[i as u8, j as u8], tester_addr)
-                    .unwrap();
+                socket.send_to(&[i as u8, j as u8], tester_addr).unwrap();
             }
         })
         .register_as_child();

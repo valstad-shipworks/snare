@@ -14,7 +14,9 @@
 //! dependency).
 
 #[cfg(feature = "shim")]
-pub use crate::mio_shim::{Events, Interest, Poll, Registry, Token, Waker, event, features, guide, net};
+pub use crate::mio_shim::{
+    Events, Interest, Poll, Registry, Token, Waker, event, features, guide, net,
+};
 
 #[cfg(not(feature = "shim"))]
 pub use ::mio::{Events, Interest, Poll, Registry, Token, Waker, event, features, guide, net};

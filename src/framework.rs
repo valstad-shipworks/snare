@@ -1,8 +1,17 @@
-use std::{cell::RefCell, io, marker::PhantomData, net::SocketAddr, time::{Duration, Instant}};
+use std::{
+    cell::RefCell,
+    io,
+    marker::PhantomData,
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use anymap2::AnyMap;
 
-use crate::{SocketType, state::{self, wait_for_event}};
+use crate::{
+    SocketType,
+    state::{self, wait_for_event},
+};
 
 /// A type that can be encoded to / decoded from network bytes. See
 /// [`tests/`](https://github.com/valstad-shipworks/snare/tree/main/tests)
@@ -118,7 +127,7 @@ pub struct NetTester<P: Packetable> {
 }
 
 impl<P: Packetable> NetTester<P> {
-    fn enact_action(& mut self, action: TesterAction<P>) {
+    fn enact_action(&mut self, action: TesterAction<P>) {
         match action {
             TesterAction::Send(addr, pkt) => {
                 if P::SOCKET_TYPE == SocketType::Udp {
@@ -126,17 +135,17 @@ impl<P: Packetable> NetTester<P> {
                 } else {
                     state::send_tcp_from_test(self.addr, addr, pkt.encode());
                 }
-            },
+            }
             TesterAction::RaiseSocketError(addr, e) => {
                 if P::SOCKET_TYPE == SocketType::Udp {
                     state::raise_udp_socket_error_from_test(addr, e);
                 } else {
                     state::raise_tcp_socket_error_from_test(addr, e);
                 }
-            },
+            }
             TesterAction::CloseSocket(addr) => {
                 state::close_socket_from_test(addr, P::SOCKET_TYPE);
-            },
+            }
             TesterAction::Multiple(actions) => {
                 for act in actions {
                     self.enact_action(act);
@@ -166,7 +175,7 @@ impl<P: Packetable> NetTester<P> {
         }
     }
 
-    pub(crate) fn duration_till_soonest_cycle(& self) -> Option<Duration> {
+    pub(crate) fn duration_till_soonest_cycle(&self) -> Option<Duration> {
         let now = Instant::now();
         let mut min_delta: Option<Duration> = None;
         for (delta, last_run_cell, _) in &self.cycles {
@@ -185,7 +194,7 @@ impl<P: Packetable> NetTester<P> {
         min_delta
     }
 
-    pub(crate) fn run_due_cycles(& mut self) {
+    pub(crate) fn run_due_cycles(&mut self) {
         let now = Instant::now();
         let mut cycles = std::mem::take(&mut self.cycles);
         for (delta, last_run_cell, action) in cycles.iter_mut() {
@@ -202,7 +211,10 @@ impl<P: Packetable> NetTester<P> {
     /// Adds a packet handler with access to typed state `S`. State is lazily
     /// `Default`-initialized. Return `Some(pkt)` to forward to the next handler,
     /// `None` to stop the chain for this packet.
-    pub fn then_stateful_test<S: StateKey>(mut self, tester: fn(&mut S, P, SocketAddr) -> Option<P>) -> NetTester<P> {
+    pub fn then_stateful_test<S: StateKey>(
+        mut self,
+        tester: fn(&mut S, P, SocketAddr) -> Option<P>,
+    ) -> NetTester<P> {
         let storable = move |slf: &mut Self, pkt: P, addr: SocketAddr| {
             let state = slf.state.entry::<S>().or_insert_with(Default::default);
             tester(state, pkt, addr)
@@ -220,10 +232,7 @@ impl<P: Packetable> NetTester<P> {
 
     /// Mutates state `S` per packet without inspecting it; the packet is always
     /// forwarded unchanged.
-    pub fn then_edit_state<S: StateKey>(
-        mut self,
-        editor: fn(&mut S, SocketAddr),
-    ) -> NetTester<P> {
+    pub fn then_edit_state<S: StateKey>(mut self, editor: fn(&mut S, SocketAddr)) -> NetTester<P> {
         let stateful = move |slf: &mut Self, pkt: P, addr: SocketAddr| {
             let state = slf.state.entry::<S>().or_insert_with(Default::default);
             editor(state, addr);
@@ -250,10 +259,7 @@ impl<P: Packetable> NetTester<P> {
     }
 
     /// Stateless variant of [`then_stateful_action`](Self::then_stateful_action).
-    pub fn then_action(
-        mut self,
-        actor: fn(P, SocketAddr) -> TesterAction<P>,
-    ) -> NetTester<P> {
+    pub fn then_action(mut self, actor: fn(P, SocketAddr) -> TesterAction<P>) -> NetTester<P> {
         let stateless = move |slf: &mut Self, pkt: P, addr: SocketAddr| {
             let action = actor(pkt.clone(), addr);
             slf.enact_action(action);
@@ -276,7 +282,8 @@ impl<P: Packetable> NetTester<P> {
                 slf.enact_action(action);
             }
         };
-        self.cycles.push((delta, RefCell::new(Instant::now()), Box::new(stateful)));
+        self.cycles
+            .push((delta, RefCell::new(Instant::now()), Box::new(stateful)));
         self
     }
 
@@ -291,15 +298,13 @@ impl<P: Packetable> NetTester<P> {
                 slf.enact_action(action);
             }
         };
-        self.cycles.push((delta, RefCell::new(Instant::now()), Box::new(stateless)));
+        self.cycles
+            .push((delta, RefCell::new(Instant::now()), Box::new(stateless)));
         self
     }
 
     /// Eagerly initializes state `S` then runs `initializer` to configure it.
-    pub fn with_state<S: StateKey>(
-        mut self,
-        initializer: fn(&mut S),
-    ) -> NetTester<P> {
+    pub fn with_state<S: StateKey>(mut self, initializer: fn(&mut S)) -> NetTester<P> {
         let stateful = move |slf: &mut Self| {
             let state = slf.state.entry::<S>().or_insert_with(Default::default);
             initializer(state);
@@ -310,10 +315,7 @@ impl<P: Packetable> NetTester<P> {
 
     /// Stateless finish condition. Multiple conditions OR together — the tester
     /// exits when any returns `true`.
-    pub fn until_condition(
-        mut self,
-        condition: fn() -> bool,
-    ) -> NetTester<P> {
+    pub fn until_condition(mut self, condition: fn() -> bool) -> NetTester<P> {
         let cond_box = Box::new(move |_: &mut Self| condition());
         self.finish_conditions.push(cond_box);
         self
@@ -338,11 +340,8 @@ impl<P: Packetable> NetTester<P> {
     ///
     /// # Panics
     /// If no `S` was ever initialized.
-    pub fn peek_state<'a, S: StateKey>(
-        &'a self
-    ) -> &'a S {
-        self.state.get::<S>()
-            .expect("State for type was not found")
+    pub fn peek_state<'a, S: StateKey>(&'a self) -> &'a S {
+        self.state.get::<S>().expect("State for type was not found")
     }
 }
 
@@ -365,7 +364,7 @@ pub fn connect_tester<P: Packetable>(addr: SocketAddr) -> NetTester<P> {
     ret
 }
 
-impl <P: Packetable> NetTesterInterface for NetTester<P> {
+impl<P: Packetable> NetTesterInterface for NetTester<P> {
     fn test(&mut self, data: &[u8], src_addr: SocketAddr) -> Option<usize> {
         if P::SOCKET_TYPE == SocketType::Udp {
             let opt_pkt = P::decode(data).and_then(|(pkt, _)| Some(pkt));
@@ -426,7 +425,7 @@ impl <P: Packetable> NetTesterInterface for NetTester<P> {
         for condition in finish_conditions_taken.iter_mut() {
             if condition(self) {
                 self.finish_conditions = finish_conditions_taken;
-                return true
+                return true;
             }
         }
         self.finish_conditions = finish_conditions_taken;
@@ -450,8 +449,8 @@ pub fn _run_testers(mut testers: Vec<&mut dyn NetTesterInterface>) {
                 continue;
             }
             assert!(
-                tester.get_addr() != other_tester.get_addr() ||
-                tester.get_socket_type() != other_tester.get_socket_type(),
+                tester.get_addr() != other_tester.get_addr()
+                    || tester.get_socket_type() != other_tester.get_socket_type(),
                 "Overlapping testers detected for addr: {} and socket type: {:?}",
                 tester.get_addr(),
                 tester.get_socket_type()
@@ -505,7 +504,9 @@ pub fn _run_testers(mut testers: Vec<&mut dyn NetTesterInterface>) {
         for tester in testers.iter() {
             let tester_duration = tester.duration_till_soonest_cycle();
             min_duration = match (min_duration, tester_duration) {
-                (Some(current_min), Some(tester_dur)) => Some(std::cmp::min(current_min, tester_dur)),
+                (Some(current_min), Some(tester_dur)) => {
+                    Some(std::cmp::min(current_min, tester_dur))
+                }
                 (None, Some(tester_dur)) => Some(tester_dur),
                 (min, None) => min,
             };

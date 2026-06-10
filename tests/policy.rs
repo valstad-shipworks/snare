@@ -6,8 +6,8 @@
 use std::{
     io::{ErrorKind, Read, Write},
     net::SocketAddr,
-    sync::atomic::AtomicI32,
     sync::Arc,
+    sync::atomic::AtomicI32,
     time::{Duration, Instant},
 };
 
@@ -136,7 +136,10 @@ fn refusing_listener_returns_econnrefused() {
     // Flip back to accepting and confirm the connect now succeeds.
     set_listener_behavior(REFUSE_ADDR, ListenerBehavior::Accepting);
     let res = TcpStream::connect(REFUSE_ADDR);
-    assert!(res.is_ok(), "expected success after re-enabling; got {res:?}");
+    assert!(
+        res.is_ok(),
+        "expected success after re-enabling; got {res:?}"
+    );
 }
 
 // ---- Per-direction Quiesce ----
@@ -175,7 +178,10 @@ fn outbound_only_quiesce_blocks_writes_but_not_reads() {
 
         // Read should still surface the next ack — quiesce is OUTBOUND only.
         let n2 = stream.read(&mut buf);
-        assert!(matches!(n2, Ok(_)), "inbound read should not be blocked: {n2:?}");
+        assert!(
+            matches!(n2, Ok(_)),
+            "inbound read should not be blocked: {n2:?}"
+        );
         outbound_quiesced_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     })
     .register_as_child();
@@ -184,7 +190,10 @@ fn outbound_only_quiesce_blocks_writes_but_not_reads() {
         .until_stateful_condition::<TimerState>(|t| t.poll_elapsed() >= Duration::from_millis(900));
     run_testers!(tester);
     client.join().unwrap();
-    assert_eq!(outbound_quiesced.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        outbound_quiesced.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
 }
 
 // ---- TCP inbound latency ----
@@ -312,7 +321,10 @@ fn udp_policy_drops_packets_at_configured_rate() {
         let dropped = log
             .iter()
             .filter(|e| {
-                matches!(e.event, RecordedEvent::UdpSendFromTest { dropped: true, .. })
+                matches!(
+                    e.event,
+                    RecordedEvent::UdpSendFromTest { dropped: true, .. }
+                )
             })
             .count();
         assert!(
@@ -451,7 +463,11 @@ fn inbound_only_quiesce_lets_writes_drain() {
         let mut poll = Poll::new().unwrap();
         let mut events = Events::with_capacity(8);
         poll.registry()
-            .register(&mut stream, Token(1), Interest::READABLE | Interest::WRITABLE)
+            .register(
+                &mut stream,
+                Token(1),
+                Interest::READABLE | Interest::WRITABLE,
+            )
             .unwrap();
 
         let local = stream.local_addr().unwrap();
@@ -468,7 +484,8 @@ fn inbound_only_quiesce_lets_writes_drain() {
         let mut saw_readable = false;
         let until = Instant::now() + Duration::from_millis(200);
         while Instant::now() < until {
-            poll.poll(&mut events, Some(Duration::from_millis(40))).unwrap();
+            poll.poll(&mut events, Some(Duration::from_millis(40)))
+                .unwrap();
             for evt in events.iter() {
                 if evt.is_writable() {
                     saw_writable = true;
@@ -478,7 +495,10 @@ fn inbound_only_quiesce_lets_writes_drain() {
                 }
             }
         }
-        assert!(saw_writable, "SUT should see WRITABLE during InboundOnly quiesce");
+        assert!(
+            saw_writable,
+            "SUT should see WRITABLE during InboundOnly quiesce"
+        );
         assert!(
             !saw_readable,
             "SUT must NOT see READABLE during InboundOnly quiesce"

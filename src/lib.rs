@@ -1,22 +1,22 @@
 #![doc = include_str!("../README.md")]
 
-pub mod net;
-pub mod thread;
 #[cfg(feature = "mio-compat")]
 pub mod mio;
+pub mod net;
+pub mod thread;
 
 #[cfg(feature = "shim")]
-pub(crate) mod state;
+mod framework;
+#[cfg(all(feature = "shim", feature = "mio-compat"))]
+mod mio_shim;
+#[cfg(feature = "shim")]
+pub(crate) mod pcapng;
 #[cfg(feature = "shim")]
 mod shim_std_tcp;
 #[cfg(feature = "shim")]
 mod shim_std_udp;
 #[cfg(feature = "shim")]
-mod framework;
-#[cfg(feature = "shim")]
-pub(crate) mod pcapng;
-#[cfg(all(feature = "shim", feature = "mio-compat"))]
-mod mio_shim;
+pub(crate) mod state;
 
 // Top-level type aliases — kept for back-compat with the original snare API.
 // New code should prefer `snare::net::TcpStream` etc. for parity with `std::net`.
@@ -26,9 +26,9 @@ pub use net::{TcpListener, TcpStream, UdpSocket};
 pub use state::{
     ListenerBehavior, QuiesceMode, RecordedEntry, RecordedEvent, UdpPolicy, add_ip_addr,
     clear_recorded_events, enable_pcapng, inject_tcp_from_test, peek_local_addr_for_peer, quiesce,
-    quiesce_with_mode, recorded_events, register_child_thread, register_thread_child_of,
-    register_test, reset_tcp, seed_rng, set_listener_behavior,
-    set_tcp_inbound_latency, set_tcp_recv_window, set_udp_policy,
+    quiesce_with_mode, recorded_events, register_child_thread, register_test,
+    register_thread_child_of, reset_tcp, seed_rng, set_listener_behavior, set_tcp_inbound_latency,
+    set_tcp_recv_window, set_udp_policy,
 };
 
 /// No-op when the `shim` feature is disabled — kept for API parity so call
@@ -62,7 +62,7 @@ impl ThreadExt for std::thread::ThreadId {
     }
 }
 
-impl <T> ThreadExt for std::thread::JoinHandle<T> {
+impl<T> ThreadExt for std::thread::JoinHandle<T> {
     #[inline(always)]
     fn register_as_child(self) -> std::thread::JoinHandle<T> {
         register_child_thread(self.thread().id());

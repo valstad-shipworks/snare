@@ -6,8 +6,8 @@ use std::{
 };
 
 use crate::state::{
-    add_udp_connection, is_ip_addr_valid, is_port_available, wait_for_event, with_udp_connection,
-    Packet,
+    Packet, add_udp_connection, is_ip_addr_valid, is_port_available, wait_for_event,
+    with_udp_connection,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -38,9 +38,7 @@ impl ShimStdUdpSocket {
 
     fn del_option(&self, config_type: UdpConfigs) {
         let mut configs = self.configs.lock().unwrap();
-        configs.retain(|c| {
-            std::mem::discriminant(c) != std::mem::discriminant(&config_type)
-        });
+        configs.retain(|c| std::mem::discriminant(c) != std::mem::discriminant(&config_type));
     }
 
     fn get_option(&self, config_type: UdpConfigs) -> Option<UdpConfigs> {
@@ -55,7 +53,7 @@ impl ShimStdUdpSocket {
 
     #[doc(alias = "std::net::UdpSocket::bind")]
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
-        for a in  addr.to_socket_addrs()? {
+        for a in addr.to_socket_addrs()? {
             if !is_ip_addr_valid(a.ip()) {
                 continue;
             }
@@ -118,7 +116,10 @@ impl ShimStdUdpSocket {
             unimplemented!("partial writes of massive buffers");
         }
         let first_addr = addr.to_socket_addrs()?.next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "could not resolve to any addresses")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "could not resolve to any addresses",
+            )
         })?;
         // Pre-check destruction; the policy-aware enqueue does the rest
         // (MTU rejection, send-queue cap, etc).
@@ -144,9 +145,8 @@ impl ShimStdUdpSocket {
 
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         let remote_addr = self.remote_addr.lock().unwrap();
-        remote_addr.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "no remote address set")
-        })
+        remote_addr
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no remote address set"))
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -192,7 +192,9 @@ impl ShimStdUdpSocket {
     }
 
     pub fn read_timeout(&self) -> io::Result<Option<Duration>> {
-        if let Some(UdpConfigs::ReadTimeout(dur)) = self.get_option(UdpConfigs::ReadTimeout(Duration::from_secs(0))) {
+        if let Some(UdpConfigs::ReadTimeout(dur)) =
+            self.get_option(UdpConfigs::ReadTimeout(Duration::from_secs(0)))
+        {
             Ok(Some(dur))
         } else {
             Ok(None)
@@ -200,7 +202,9 @@ impl ShimStdUdpSocket {
     }
 
     pub fn write_timeout(&self) -> io::Result<Option<Duration>> {
-        if let Some(UdpConfigs::WriteTimeout(dur)) = self.get_option(UdpConfigs::WriteTimeout(Duration::from_secs(0))) {
+        if let Some(UdpConfigs::WriteTimeout(dur)) =
+            self.get_option(UdpConfigs::WriteTimeout(Duration::from_secs(0)))
+        {
             Ok(Some(dur))
         } else {
             Ok(None)
@@ -247,7 +251,9 @@ impl ShimStdUdpSocket {
     }
 
     pub fn multicast_ttl_v4(&self) -> io::Result<u32> {
-        if let Some(UdpConfigs::IpMulticastTtl(ttl)) = self.get_option(UdpConfigs::IpMulticastTtl(0)) {
+        if let Some(UdpConfigs::IpMulticastTtl(ttl)) =
+            self.get_option(UdpConfigs::IpMulticastTtl(0))
+        {
             Ok(ttl)
         } else {
             Ok(1)
@@ -284,34 +290,48 @@ impl ShimStdUdpSocket {
         }
     }
 
-    pub fn join_multicast_v4(&self, _multiaddr: &std::net::Ipv4Addr, _interface: &std::net::Ipv4Addr) -> io::Result<()> {
+    pub fn join_multicast_v4(
+        &self,
+        _multiaddr: &std::net::Ipv4Addr,
+        _interface: &std::net::Ipv4Addr,
+    ) -> io::Result<()> {
         unimplemented!("join_multicast_v4 is not implemented in ShimStdUdpSocket");
     }
 
-    pub fn leave_multicast_v4(&self, _multiaddr: &std::net::Ipv4Addr, _interface: &std::net::Ipv4Addr) -> io::Result<()> {
+    pub fn leave_multicast_v4(
+        &self,
+        _multiaddr: &std::net::Ipv4Addr,
+        _interface: &std::net::Ipv4Addr,
+    ) -> io::Result<()> {
         unimplemented!("leave_multicast_v4 is not implemented in ShimStdUdpSocket");
     }
 
-    pub fn join_multicast_v6(&self, _multiaddr: &std::net::Ipv6Addr, _interface: u32) -> io::Result<()> {
+    pub fn join_multicast_v6(
+        &self,
+        _multiaddr: &std::net::Ipv6Addr,
+        _interface: u32,
+    ) -> io::Result<()> {
         unimplemented!("join_multicast_v6 is not implemented in ShimStdUdpSocket");
     }
 
-    pub fn leave_multicast_v6(&self, _multiaddr: &std::net::Ipv6Addr, _interface: u32) -> io::Result<()> {
+    pub fn leave_multicast_v6(
+        &self,
+        _multiaddr: &std::net::Ipv6Addr,
+        _interface: u32,
+    ) -> io::Result<()> {
         unimplemented!("leave_multicast_v6 is not implemented in ShimStdUdpSocket");
     }
 
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-        with_udp_connection(
-            self.bound_addr,
-            |conn| {
-                Ok(conn.external_error.take())
-            },
-        )
+        with_udp_connection(self.bound_addr, |conn| Ok(conn.external_error.take()))
     }
 
     pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
         let first_addr = addr.to_socket_addrs()?.next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "could not resolve to any addresses")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "could not resolve to any addresses",
+            )
         })?;
         let mut remote_addr = self.remote_addr.lock().unwrap();
         *remote_addr = Some(first_addr);
@@ -320,17 +340,15 @@ impl ShimStdUdpSocket {
 
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
         let remote_addr = self.remote_addr.lock().unwrap();
-        let addr = remote_addr.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "no remote address set")
-        })?;
+        let addr = remote_addr
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no remote address set"))?;
         self.send_to(buf, addr)
     }
 
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let remote_addr = self.remote_addr.lock().unwrap();
-        let addr = remote_addr.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "no remote address set")
-        })?;
+        let addr = remote_addr
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no remote address set"))?;
         let nonblocking = self.is_nonblocking();
         let mut deadline = None;
         loop {
@@ -351,9 +369,8 @@ impl ShimStdUdpSocket {
 
     pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         let remote_addr = self.remote_addr.lock().unwrap();
-        let addr = remote_addr.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "no remote address set")
-        })?;
+        let addr = remote_addr
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no remote address set"))?;
         let nonblocking = self.is_nonblocking();
         let mut deadline = None;
         loop {

@@ -117,7 +117,11 @@ pub fn open_writer(test_name: &str) -> Option<PcapWriter> {
     let dir = std::env::var(ENV_DIR).ok()?;
     let dir = PathBuf::from(dir);
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("snare: pcapng: failed to create dir {}: {}", dir.display(), e);
+        eprintln!(
+            "snare: pcapng: failed to create dir {}: {}",
+            dir.display(),
+            e
+        );
         return None;
     }
     let path = dir.join(format!("{}.pcapng", sanitize_name(test_name)));
@@ -282,10 +286,7 @@ impl PcapWriter {
             return;
         }
         let key = FlowKey::new(src, dst);
-        let needs_open = self
-            .flows
-            .get(&key)
-            .map_or(true, |f| !f.handshake_done);
+        let needs_open = self.flows.get(&key).map_or(true, |f| !f.handshake_done);
         if needs_open {
             // Use `src` as the initiator — best effort when we missed the actual
             // connect (e.g. data injected via `inject_tcp_from_test`).
@@ -353,7 +354,11 @@ impl PcapWriter {
             }
             None => (0, 0),
         };
-        let flags = if peer_ack == 0 { TCP_RST } else { TCP_RST | TCP_ACK };
+        let flags = if peer_ack == 0 {
+            TCP_RST
+        } else {
+            TCP_RST | TCP_ACK
+        };
         let _ = self.emit_tcp(src, dst, src_seq, peer_ack, flags, &[]);
     }
 

@@ -3,8 +3,8 @@ use std::{
     io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, AtomicI32, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicI32, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -12,9 +12,13 @@ use std::{
 use std::io::Read;
 
 use snare::{
-    TcpListener, TcpStream, UdpSocket, register_test,
-    mio::{Interest, Poll, Token, Waker, event::Events, net::UdpSocket as MioUdpSocket, net::TcpStream as MioTcpStream},
-    Packetable, SocketType, TesterAction, TimerState, ThreadExt, connect_tester, run_testers,
+    Packetable, SocketType, TcpListener, TcpStream, TesterAction, ThreadExt, TimerState, UdpSocket,
+    connect_tester,
+    mio::{
+        Interest, Poll, Token, Waker, event::Events, net::TcpStream as MioTcpStream,
+        net::UdpSocket as MioUdpSocket,
+    },
+    register_test, run_testers,
 };
 
 fn accept_with_timeout(listener: &TcpListener, timeout: Duration) -> TcpStream {
@@ -41,10 +45,13 @@ fn waker_emits_event() {
     let mut events = Events::with_capacity(4);
 
     waker.wake().unwrap();
-    poll.poll(&mut events, Some(Duration::from_millis(10))).unwrap();
+    poll.poll(&mut events, Some(Duration::from_millis(10)))
+        .unwrap();
 
     assert!(
-        events.iter().any(|evt| evt.token() == Token(7) && evt.is_readable() && evt.is_writable())
+        events
+            .iter()
+            .any(|evt| evt.token() == Token(7) && evt.is_readable() && evt.is_writable())
     );
 }
 
@@ -60,8 +67,13 @@ fn listener_readable_on_connect() {
         .unwrap();
 
     let _client = TcpStream::connect(addr).unwrap();
-    poll.poll(&mut events, Some(Duration::from_secs(1))).unwrap();
-    assert!(events.iter().any(|evt| evt.token() == Token(1) && evt.is_readable()));
+    poll.poll(&mut events, Some(Duration::from_secs(1)))
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|evt| evt.token() == Token(1) && evt.is_readable())
+    );
 
     listener.set_nonblocking(true).unwrap();
     let _ = accept_with_timeout(&listener, Duration::from_secs(1));
@@ -83,19 +95,19 @@ fn stream_readable_after_peer_write() {
         .unwrap();
 
     client_stream.write_all(b"ping").unwrap();
-    poll.poll(&mut events, Some(Duration::from_secs(1))).unwrap();
-    assert!(events.iter().any(|evt| evt.token() == Token(2) && evt.is_readable()));
+    poll.poll(&mut events, Some(Duration::from_secs(1)))
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|evt| evt.token() == Token(2) && evt.is_readable())
+    );
 }
 
-const UDP_TEST_LISTENER: SocketAddr = SocketAddr::new(
-    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-    21000,
-);
+const UDP_TEST_LISTENER: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 21000);
 
-const UDP_TEST_TESTER: SocketAddr = SocketAddr::new(
-    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-    21001,
-);
+const UDP_TEST_TESTER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 21001);
 
 #[derive(Clone)]
 struct Ping;
@@ -223,10 +235,7 @@ impl Packetable for TcpEchoPacket {
     }
 }
 
-const TCP_ECHO_TESTER: SocketAddr = SocketAddr::new(
-    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-    22000,
-);
+const TCP_ECHO_TESTER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 22000);
 
 #[derive(Default)]
 struct EchoCount {
@@ -262,7 +271,11 @@ fn tcp_echo_with_mio_poll() {
         let mut events = Events::with_capacity(16);
 
         poll.registry()
-            .register(&mut stream, Token(1), Interest::READABLE | Interest::WRITABLE)
+            .register(
+                &mut stream,
+                Token(1),
+                Interest::READABLE | Interest::WRITABLE,
+            )
             .unwrap();
 
         // Send 5 packets
@@ -327,7 +340,10 @@ fn tcp_echo_with_mio_poll() {
     }
 
     let echoed = tester.peek_state::<EchoCount>().echoed;
-    assert_eq!(echoed, PACKET_COUNT, "Tester should have echoed {PACKET_COUNT} packets, got {echoed}");
+    assert_eq!(
+        echoed, PACKET_COUNT,
+        "Tester should have echoed {PACKET_COUNT} packets, got {echoed}"
+    );
 
     let received = recv_count.load(Ordering::Relaxed);
     assert_eq!(
@@ -347,7 +363,8 @@ fn events_into_iterator_for_ref_works() {
     register_test();
     let mut poll = Poll::new().unwrap();
     let mut events = Events::with_capacity(4);
-    poll.poll(&mut events, Some(Duration::from_millis(1))).unwrap();
+    poll.poll(&mut events, Some(Duration::from_millis(1)))
+        .unwrap();
     // `for ev in &events` — was broken in the shim before the parity fix
     // (only impl'd `IntoIterator for Events`, not `&Events`).
     let mut count = 0;

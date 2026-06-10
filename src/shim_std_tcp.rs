@@ -26,7 +26,10 @@ pub struct ShimStdTcpListener {
 enum TcpReadStatus {
     Data(Vec<u8>),
     Eof,
-    Pending { nonblocking: bool, timeout: Option<Duration> },
+    Pending {
+        nonblocking: bool,
+        timeout: Option<Duration>,
+    },
 }
 
 impl ShimStdTcpStream {
@@ -40,7 +43,10 @@ impl ShimStdTcpStream {
             }
         }
         Err(last_err.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "could not resolve to any addresses")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "could not resolve to any addresses",
+            )
         }))
     }
 
@@ -208,7 +214,10 @@ impl ShimStdTcpStream {
                     return Ok(len);
                 }
                 TcpReadStatus::Eof => return Ok(0),
-                TcpReadStatus::Pending { nonblocking, timeout } => {
+                TcpReadStatus::Pending {
+                    nonblocking,
+                    timeout,
+                } => {
                     if nonblocking {
                         return Err(io::Error::new(
                             io::ErrorKind::WouldBlock,
@@ -427,17 +436,16 @@ impl ShimStdTcpStream {
                     "write half closed",
                 ));
             }
-            let peer = conn.peer_stream_id.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotConnected, "no peer connected")
-            })?;
+            let peer = conn
+                .peer_stream_id
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no peer connected"))?;
             Ok((peer, conn.nonblocking, conn.write_timeout, conn.local_addr))
         })?;
 
         // Apply outbound latency by routing the write into the peer's
         // pending_inbound queue with a release deadline. Recv-window also
         // applies on the peer side so the writer back-pressures naturally.
-        let peer_local_addr =
-            with_tcp_connection(peer_id, |peer| io::Result::Ok(peer.local_addr))?;
+        let peer_local_addr = with_tcp_connection(peer_id, |peer| io::Result::Ok(peer.local_addr))?;
         let peer_policy = crate::state::tcp_policy(peer_local_addr);
 
         let mut deadline: Option<Instant> = None;
@@ -451,7 +459,11 @@ impl ShimStdTcpStream {
                 }
                 if let Some(window) = peer_policy.recv_window {
                     let queued = peer.incoming.len()
-                        + peer.pending_inbound.iter().map(|(_, b)| b.len()).sum::<usize>();
+                        + peer
+                            .pending_inbound
+                            .iter()
+                            .map(|(_, b)| b.len())
+                            .sum::<usize>();
                     if queued + buf.len() > window {
                         return Err(io::Error::new(
                             io::ErrorKind::WouldBlock,
@@ -462,10 +474,8 @@ impl ShimStdTcpStream {
                 if peer_policy.inbound_latency.is_zero() {
                     peer.incoming.extend(buf.iter().copied());
                 } else {
-                    peer.pending_inbound.push_back((
-                        Instant::now() + peer_policy.inbound_latency,
-                        buf.to_vec(),
-                    ));
+                    peer.pending_inbound
+                        .push_back((Instant::now() + peer_policy.inbound_latency, buf.to_vec()));
                 }
                 Ok(buf.len())
             });
@@ -526,16 +536,19 @@ impl Drop for ShimStdTcpStream {
         // pending_inbound), block here until either the peer drains them or
         // the linger timeout elapses. Matches std behavior where a non-zero
         // linger forces close() to wait for the send buffer to flush.
-        let (peer_id_opt, linger) = with_tcp_connection(self.stream_id, |conn| {
-            (conn.peer_stream_id, conn.linger)
-        });
+        let (peer_id_opt, linger) =
+            with_tcp_connection(self.stream_id, |conn| (conn.peer_stream_id, conn.linger));
 
         if let (Some(peer_id), Some(linger_dur)) = (peer_id_opt, linger) {
             let deadline = Instant::now() + linger_dur;
             loop {
                 let pending_bytes = with_tcp_connection(peer_id, |peer| {
                     peer.incoming.len()
-                        + peer.pending_inbound.iter().map(|(_, b)| b.len()).sum::<usize>()
+                        + peer
+                            .pending_inbound
+                            .iter()
+                            .map(|(_, b)| b.len())
+                            .sum::<usize>()
                 });
                 if pending_bytes == 0 {
                     break;
@@ -550,9 +563,12 @@ impl Drop for ShimStdTcpStream {
 
         // Capture addrs before release_stream may drop the connection out from
         // under us, so we can emit a synthetic FIN to the pcap log.
-        let addrs = with_tcp_connection(self.stream_id, |conn| -> io::Result<(std::net::SocketAddr, std::net::SocketAddr)> {
-            Ok((conn.local_addr, conn.peer_addr))
-        })
+        let addrs = with_tcp_connection(
+            self.stream_id,
+            |conn| -> io::Result<(std::net::SocketAddr, std::net::SocketAddr)> {
+                Ok((conn.local_addr, conn.peer_addr))
+            },
+        )
         .ok();
         if let Some(peer_id) = release_stream(self.stream_id) {
             notify_peer_dropped(peer_id);

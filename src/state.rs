@@ -1,7 +1,14 @@
 #![allow(dead_code)]
 
 use std::{
-    cell::RefCell, collections::{HashMap, HashSet, VecDeque}, io, net::{IpAddr, SocketAddr}, sync::{Arc, LazyLock}, thread::ThreadId, time::{Duration, Instant}, u32
+    cell::RefCell,
+    collections::{HashMap, HashSet, VecDeque},
+    io,
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, LazyLock},
+    thread::ThreadId,
+    time::{Duration, Instant},
+    u32,
 };
 
 use anymap2::SendSyncAnyMap as AnyMap;
@@ -16,7 +23,8 @@ static TEST_THREAD_HIERARCHY: LazyLock<Mutex<HashMap<ThreadId, ThreadId>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Per-test state slots, keyed by the root test thread.
-static TEST_STATE: LazyLock<ReentrantMutex<RefCell<HashMap<TestThreadId, AnyMap>>>> = LazyLock::new(|| ReentrantMutex::new(RefCell::new(HashMap::new())));
+static TEST_STATE: LazyLock<ReentrantMutex<RefCell<HashMap<TestThreadId, AnyMap>>>> =
+    LazyLock::new(|| ReentrantMutex::new(RefCell::new(HashMap::new())));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct TestThreadId(ThreadId);
@@ -52,7 +60,11 @@ impl TestThreadId {
     }
 
     fn resolve_from(
-        hierarchy: &parking_lot::lock_api::MutexGuard<'_, parking_lot::RawMutex, HashMap<ThreadId, ThreadId>>,
+        hierarchy: &parking_lot::lock_api::MutexGuard<
+            '_,
+            parking_lot::RawMutex,
+            HashMap<ThreadId, ThreadId>,
+        >,
         id: ThreadId,
     ) -> Self {
         let mut current_id = id;
@@ -79,7 +91,10 @@ pub fn register_test() {
     map.insert(thread_id, thread_id);
     drop(map);
     let test_thread_id = TestThreadId(thread_id);
-    TEST_STATE.lock().borrow_mut().insert(test_thread_id, AnyMap::new());
+    TEST_STATE
+        .lock()
+        .borrow_mut()
+        .insert(test_thread_id, AnyMap::new());
 
     // pcap init is in a helper defined after the `state!` macro.
     pcap_init_for_test(thread_name);
@@ -89,14 +104,18 @@ pub fn register_test() {
 /// parent right after `std::thread::spawn(...)` (or use [`ThreadExt::register_as_child`](crate::ThreadExt::register_as_child)).
 pub fn register_child_thread(child_thread_id: ThreadId) {
     let test_thread_id = TestThreadId::current();
-    TEST_THREAD_HIERARCHY.lock().insert(child_thread_id, test_thread_id.0);
+    TEST_THREAD_HIERARCHY
+        .lock()
+        .insert(child_thread_id, test_thread_id.0);
 }
 
 /// Variant of [`register_child_thread`] called from inside the spawned thread,
 /// naming its parent's `ThreadId`.
 pub fn register_thread_child_of(parent_thread_id: ThreadId) {
     let child_thread_id = std::thread::current().id();
-    TEST_THREAD_HIERARCHY.lock().insert(child_thread_id, parent_thread_id);
+    TEST_THREAD_HIERARCHY
+        .lock()
+        .insert(child_thread_id, parent_thread_id);
 }
 
 /// Begin pcapng capture for the current test. No-op unless `SNARE_PCAPNG_DIR`
@@ -156,7 +175,10 @@ pub(crate) struct PcapState {
 
 impl Default for PcapState {
     fn default() -> Self {
-        Self { writer: None, test_name: None }
+        Self {
+            writer: None,
+            test_name: None,
+        }
     }
 }
 
@@ -269,13 +291,36 @@ pub enum ListenerBehavior {
 /// An event captured by the per-test recording log. See [`recorded_events`].
 #[derive(Debug, Clone)]
 pub enum RecordedEvent {
-    TcpSendFromTest { from: SocketAddr, to: SocketAddr, len: usize },
-    TcpResetFromTest { addr: SocketAddr },
-    TcpCloseFromTest { addr: SocketAddr },
-    UdpSendFromTest { from: SocketAddr, to: SocketAddr, len: usize, dropped: bool, duplicated: bool },
-    UdpCloseFromTest { addr: SocketAddr },
-    Quiesce { addr: SocketAddr, dur: Duration, mode: QuiesceMode },
-    SocketErrorFromTest { addr: SocketAddr, kind: io::ErrorKind },
+    TcpSendFromTest {
+        from: SocketAddr,
+        to: SocketAddr,
+        len: usize,
+    },
+    TcpResetFromTest {
+        addr: SocketAddr,
+    },
+    TcpCloseFromTest {
+        addr: SocketAddr,
+    },
+    UdpSendFromTest {
+        from: SocketAddr,
+        to: SocketAddr,
+        len: usize,
+        dropped: bool,
+        duplicated: bool,
+    },
+    UdpCloseFromTest {
+        addr: SocketAddr,
+    },
+    Quiesce {
+        addr: SocketAddr,
+        dur: Duration,
+        mode: QuiesceMode,
+    },
+    SocketErrorFromTest {
+        addr: SocketAddr,
+        kind: io::ErrorKind,
+    },
 }
 
 /// A timestamped [`RecordedEvent`].
@@ -293,7 +338,7 @@ static DEFAULT_VALID_IP_ADDRS: LazyLock<HashSet<IpAddr>> = LazyLock::new(|| {
     valid_ip_addrs.insert("::".parse().unwrap());
     valid_ip_addrs
 });
-static  DEFAULT_NEXT: (usize, u16) = (0, 40_000);
+static DEFAULT_NEXT: (usize, u16) = (0, 40_000);
 
 #[derive(Debug)]
 pub(crate) struct Packet {
@@ -407,14 +452,20 @@ pub(crate) fn quiesce_entry(addr: SocketAddr) -> Option<QuiesceEntry> {
 pub(crate) fn is_quiesced_inbound(addr: SocketAddr) -> bool {
     matches!(
         quiesce_entry(addr),
-        Some(QuiesceEntry { mode: QuiesceMode::Both | QuiesceMode::InboundOnly, .. })
+        Some(QuiesceEntry {
+            mode: QuiesceMode::Both | QuiesceMode::InboundOnly,
+            ..
+        })
     )
 }
 
 pub(crate) fn is_quiesced_outbound(addr: SocketAddr) -> bool {
     matches!(
         quiesce_entry(addr),
-        Some(QuiesceEntry { mode: QuiesceMode::Both | QuiesceMode::OutboundOnly, .. })
+        Some(QuiesceEntry {
+            mode: QuiesceMode::Both | QuiesceMode::OutboundOnly,
+            ..
+        })
     )
 }
 
@@ -458,7 +509,10 @@ pub fn set_listener_behavior(addr: SocketAddr, behavior: ListenerBehavior) {
 
 pub(crate) fn listener_behavior(addr: SocketAddr) -> ListenerBehavior {
     state!(behaviors = ListenerBehaviors ? HashMap::new());
-    behaviors.get(&addr).copied().unwrap_or(ListenerBehavior::Accepting)
+    behaviors
+        .get(&addr)
+        .copied()
+        .unwrap_or(ListenerBehavior::Accepting)
 }
 
 // ----- Port introspection -----
@@ -525,7 +579,11 @@ fn rand_unit() -> f32 {
 /// deterministic policy tests.
 pub fn seed_rng(seed: u64) {
     state!(rng = RngState ? 0);
-    let s = if seed == 0 { 0xa5a5_a5a5_a5a5_a5a5 } else { seed };
+    let s = if seed == 0 {
+        0xa5a5_a5a5_a5a5_a5a5
+    } else {
+        seed
+    };
     *rng = s;
 }
 
@@ -794,8 +852,10 @@ pub(crate) fn notify_peer_dropped(peer_id: usize) {
     with_tcp_connection(peer_id, |peer| {
         peer.peer_stream_id = None;
         peer.read_shutdown = true;
-        peer.external_error =
-            Some(io::Error::new(io::ErrorKind::ConnectionReset, "peer disconnected"));
+        peer.external_error = Some(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "peer disconnected",
+        ));
     });
 }
 
@@ -861,7 +921,8 @@ pub(crate) fn send_udp_from_test(from_addr: SocketAddr, to_addr: SocketAddr, dat
                 }
             } else {
                 let release_at = Instant::now() + total_delay;
-                conn.pending_inbound.push_back((release_at, pkt(data.clone())));
+                conn.pending_inbound
+                    .push_back((release_at, pkt(data.clone())));
                 if duplicated {
                     conn.pending_inbound.push_back((release_at, pkt(data)));
                 }
@@ -915,7 +976,11 @@ pub(crate) fn send_tcp_from_test(from_addr: SocketAddr, to_addr: SocketAddr, dat
             Some(conn) => {
                 if let Some(window) = policy.recv_window {
                     let queued = conn.incoming.len()
-                        + conn.pending_inbound.iter().map(|(_, b)| b.len()).sum::<usize>();
+                        + conn
+                            .pending_inbound
+                            .iter()
+                            .map(|(_, b)| b.len())
+                            .sum::<usize>();
                     if queued + data.len() > window {
                         // Soft-drop on a stalled receive window. Test code
                         // that cares can inspect the recv-window via policy.
@@ -946,7 +1011,11 @@ pub(crate) fn send_tcp_from_test(from_addr: SocketAddr, to_addr: SocketAddr, dat
     };
     match outcome {
         Ok(true) => {
-            record(RecordedEvent::TcpSendFromTest { from: from_addr, to: to_addr, len });
+            record(RecordedEvent::TcpSendFromTest {
+                from: from_addr,
+                to: to_addr,
+                len,
+            });
             pcap_tcp_data(from_addr, to_addr, &data_for_pcap);
         }
         Ok(false) => {}
@@ -1043,9 +1112,7 @@ pub(crate) fn reset_tcp_from_test(addr: SocketAddr) {
             tcp_connections = TcpConnections ? HashMap::new();
             new_data_event = NewDataEvent ? Arc::new(Event::new());
         );
-        if let Some(conn) =
-            tcp_connections.values_mut().find(|c| c.local_addr == addr)
-        {
+        if let Some(conn) = tcp_connections.values_mut().find(|c| c.local_addr == addr) {
             conn.reset_pending = true;
             conn.read_shutdown = true;
             conn.external_error = Some(io::Error::new(
@@ -1071,8 +1138,9 @@ pub(crate) fn raise_udp_socket_error_from_test(addr: SocketAddr, err: io::Error)
         udp_connections = UdpConnections ? Vec::new();
         new_data_event = NewDataEvent ? Arc::new(Event::new());
     );
-    if let Some(conn) =
-        udp_connections.iter_mut().find(|conn| conn.bound_addr == addr)
+    if let Some(conn) = udp_connections
+        .iter_mut()
+        .find(|conn| conn.bound_addr == addr)
     {
         conn.external_error = Some(err);
         new_data_event.notify(u32::MAX);
@@ -1085,8 +1153,9 @@ pub(crate) fn raise_tcp_socket_error_from_test(addr: SocketAddr, err: io::Error)
         tcp_connections = TcpConnections ? HashMap::new();
         new_data_event = NewDataEvent ? Arc::new(Event::new());
     );
-    if let Some(conn) =
-        tcp_connections.values_mut().find(|conn| conn.local_addr == addr)
+    if let Some(conn) = tcp_connections
+        .values_mut()
+        .find(|conn| conn.local_addr == addr)
     {
         conn.external_error = Some(err);
         new_data_event.notify(u32::MAX);
@@ -1103,9 +1172,7 @@ pub(crate) fn close_socket_from_test(addr: SocketAddr, socket_type: SocketType) 
                     udp_connections = UdpConnections ? Vec::new();
                     new_data_event = NewDataEvent ? Arc::new(Event::new());
                 );
-                if let Some(conn) =
-                    udp_connections.iter_mut().find(|c| c.bound_addr == addr)
-                {
+                if let Some(conn) = udp_connections.iter_mut().find(|c| c.bound_addr == addr) {
                     conn.is_destroyed = true;
                     new_data_event.notify(u32::MAX);
                     found = true;
@@ -1122,9 +1189,7 @@ pub(crate) fn close_socket_from_test(addr: SocketAddr, socket_type: SocketType) 
                     tcp_connections = TcpConnections ? HashMap::new();
                     new_data_event = NewDataEvent ? Arc::new(Event::new());
                 );
-                if let Some(conn) =
-                    tcp_connections.values_mut().find(|c| c.local_addr == addr)
-                {
+                if let Some(conn) = tcp_connections.values_mut().find(|c| c.local_addr == addr) {
                     conn.is_destroyed = true;
                     new_data_event.notify(u32::MAX);
                     found = true;
@@ -1140,10 +1205,7 @@ pub(crate) fn close_socket_from_test(addr: SocketAddr, socket_type: SocketType) 
 
 /// SUT-outbound UDP send. Returns `WouldBlock` on a full send queue and
 /// `InvalidInput` over MTU; otherwise enqueues into `from_local`.
-pub(crate) fn enqueue_udp_outbound(
-    bound_addr: SocketAddr,
-    pkt: Packet,
-) -> io::Result<()> {
+pub(crate) fn enqueue_udp_outbound(bound_addr: SocketAddr, pkt: Packet) -> io::Result<()> {
     let policy = udp_policy(bound_addr);
     if let Some(mtu) = policy.mtu {
         if pkt.data.len() > mtu {
@@ -1162,9 +1224,7 @@ pub(crate) fn enqueue_udp_outbound(
         let conn = udp_connections
             .iter_mut()
             .find(|c| c.bound_addr == bound_addr)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotConnected, "no such UDP socket")
-            })?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no such UDP socket"))?;
         if let Some(cap) = policy.send_queue_depth {
             if conn.from_local.len() >= cap {
                 return Err(io::Error::new(
@@ -1242,7 +1302,9 @@ pub(crate) fn tcp_stream_status(addr: SocketAddr) -> Option<TcpStreamStatus> {
     let inbound_quiesced = is_quiesced_inbound(addr);
     let outbound_quiesced = is_quiesced_outbound(addr);
     state!(tcp_connections = TcpConnections ? HashMap::new());
-    let conn = tcp_connections.values().find(|conn| conn.local_addr == addr)?;
+    let conn = tcp_connections
+        .values()
+        .find(|conn| conn.local_addr == addr)?;
     let read_closed = conn.read_shutdown || conn.peer_stream_id.is_none() || conn.is_destroyed;
     let write_closed = conn.write_shutdown || conn.is_destroyed;
     let raw_readable = !conn.incoming.is_empty();
@@ -1261,7 +1323,9 @@ pub(crate) fn udp_socket_status(addr: SocketAddr) -> Option<UdpSocketStatus> {
     let inbound_quiesced = is_quiesced_inbound(addr);
     let outbound_quiesced = is_quiesced_outbound(addr);
     state!(udp_connections = UdpConnections ? Vec::new());
-    let conn = udp_connections.iter().find(|conn| conn.bound_addr == addr)?;
+    let conn = udp_connections
+        .iter()
+        .find(|conn| conn.bound_addr == addr)?;
     let closed = conn.is_destroyed;
     Some(UdpSocketStatus {
         readable: !conn.to_local.is_empty() && !inbound_quiesced,

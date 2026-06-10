@@ -1,10 +1,8 @@
-use std::{
-    net::SocketAddr,
-    time::Duration,
-};
+use std::{net::SocketAddr, time::Duration};
 
 use snare::{
-    Packetable, SocketType, TesterAction, ThreadExt, TimerState, UdpSocket, connect_tester, register_test, run_testers,
+    Packetable, SocketType, TesterAction, ThreadExt, TimerState, UdpSocket, connect_tester,
+    register_test, run_testers,
 };
 
 #[derive(Clone, Debug)]
@@ -50,14 +48,21 @@ fn respond_by_first_byte(
     TesterAction::Send(src, BytePacket(response))
 }
 
-fn run_response_in_thread(request: Vec<u8>, expected: Vec<u8>, tester_addr: SocketAddr, client_addr: SocketAddr) {
+fn run_response_in_thread(
+    request: Vec<u8>,
+    expected: Vec<u8>,
+    tester_addr: SocketAddr,
+    client_addr: SocketAddr,
+) {
     let handle = std::thread::spawn(move || {
         register_test();
         let mut tester = connect_tester::<BytePacket>(tester_addr)
             .with_state::<ResponseState>(|state| state.expected = 1)
             .then_stateful_action(respond_by_first_byte)
             .until_stateful_condition::<ResponseState>(|state| state.sent >= state.expected)
-            .until_stateful_condition::<TimerState>(|state| state.poll_elapsed() >= Duration::from_secs(5));
+            .until_stateful_condition::<TimerState>(|state| {
+                state.poll_elapsed() >= Duration::from_secs(5)
+            });
 
         let (start_tx, start_rx) = std::sync::mpsc::channel();
         let client_handle = std::thread::spawn(move || {

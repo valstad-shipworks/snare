@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use snare::net::{TcpListener as ShimListener, TcpStream as ShimStream, UdpSocket as ShimUdp};
-use snare::{register_test, enable_pcapng, ThreadExt};
+use snare::{ThreadExt, enable_pcapng, register_test};
 
 const BLOCK_SHB: u32 = 0x0A0D_0D0A;
 const BLOCK_IDB: u32 = 0x0000_0001;
@@ -77,8 +77,15 @@ fn pcapng_capture_writes_valid_file_with_packets() {
 
     // Drop the writer (held in per-test state) by ending the test. But the
     // file is flushed on every write_epb, so we can read it now.
-    let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(Result::ok).collect();
-    assert_eq!(entries.len(), 1, "expected exactly one pcapng file in {dir:?}");
+    let entries: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected exactly one pcapng file in {dir:?}"
+    );
     let path = entries[0].path();
     assert!(
         path.extension().and_then(|s| s.to_str()) == Some("pcapng"),
