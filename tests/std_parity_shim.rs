@@ -57,6 +57,9 @@ fn tcp_stream_full_surface() {
     let _: usize = (&mut shared_r).read(&mut buf).unwrap();
     let mut shared_w = r;
     let _: usize = (&mut shared_w).write(b"hi").unwrap();
+
+    #[cfg(unix)]
+    let _: std::os::fd::RawFd = std::os::fd::AsRawFd::as_raw_fd(&s);
 }
 
 #[test]
@@ -83,6 +86,9 @@ fn tcp_listener_full_surface() {
     l.set_ttl(64).unwrap();
     let _: u32 = l.ttl().unwrap();
     let _: Option<std::io::Error> = l.take_error().unwrap();
+
+    #[cfg(unix)]
+    let _: std::os::fd::RawFd = std::os::fd::AsRawFd::as_raw_fd(&l);
 }
 
 #[test]
@@ -138,6 +144,9 @@ fn udp_socket_full_surface() {
     let v6 = std::net::Ipv6Addr::LOCALHOST;
     s.join_multicast_v6(&v6, 0).unwrap();
     s.leave_multicast_v6(&v6, 0).unwrap();
+
+    #[cfg(unix)]
+    let _: std::os::fd::RawFd = std::os::fd::AsRawFd::as_raw_fd(&s);
 }
 
 // ---- snare::thread ----

@@ -29,6 +29,18 @@ pub struct ShimStdUdpSocket {
     configs: Arc<Mutex<Vec<UdpConfigs>>>,
 }
 
+/// Returns `-1`: there is no kernel socket behind the shim. Raw syscalls on
+/// it fail with `EBADF`, so a SUT probing socket capabilities through the fd
+/// falls back to the portable std API, which the shim does implement. A real
+/// dummy fd would be worse — option probes would succeed and the SUT would
+/// then read from an empty kernel socket instead of the virtual network.
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for ShimStdUdpSocket {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        -1
+    }
+}
+
 impl ShimStdUdpSocket {
     fn set_option(&self, config: UdpConfigs) {
         self.del_option(config);

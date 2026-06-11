@@ -24,6 +24,17 @@ pub struct Poll {
     registry: Registry,
 }
 
+/// Returns `-1`: there is no kernel poller behind the shim. Real mio exposes
+/// the epoll/kqueue fd here; anything that tries to use this one (e.g.
+/// nesting the poller in an outer event loop) fails with `EBADF` instead of
+/// silently polling the wrong thing.
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for Poll {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        -1
+    }
+}
+
 impl Poll {
     pub fn new() -> io::Result<Poll> {
         Ok(Self {
@@ -165,6 +176,14 @@ pub struct Registry {
     waker_state: Arc<AtomicI8>,
     waker_token: Arc<AtomicUsize>,
     data: Arc<Mutex<RegistryData>>,
+}
+
+/// Returns `-1`; same rationale as [`Poll`]'s impl.
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for Registry {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        -1
+    }
 }
 
 impl Registry {

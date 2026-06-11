@@ -425,3 +425,12 @@ fn source_trait_requires_explicit_reregister() {
         .unwrap();
     poll.registry().deregister(&mut s).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn poll_and_registry_expose_raw_fd() {
+    use std::os::fd::AsRawFd;
+    let poll = Poll::new().unwrap();
+    assert_eq!(poll.as_raw_fd(), -1);
+    assert_eq!(poll.registry().as_raw_fd(), -1);
+}
