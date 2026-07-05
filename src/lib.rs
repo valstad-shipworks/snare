@@ -4,6 +4,7 @@
 pub mod mio;
 pub mod net;
 pub mod thread;
+pub mod time;
 
 #[cfg(feature = "shim")]
 mod framework;
@@ -25,10 +26,11 @@ pub use net::{TcpListener, TcpStream, UdpSocket};
 #[cfg(feature = "shim")]
 pub use state::{
     ListenerBehavior, QuiesceMode, RecordedEntry, RecordedEvent, UdpPolicy, add_ip_addr,
-    clear_recorded_events, enable_pcapng, inject_tcp_from_test, peek_local_addr_for_peer, quiesce,
-    quiesce_with_mode, recorded_events, register_child_thread, register_test,
-    register_thread_child_of, reset_tcp, seed_rng, set_listener_behavior, set_tcp_inbound_latency,
-    set_tcp_recv_window, set_udp_policy,
+    advance_time, clear_recorded_events, enable_pcapng, inject_tcp_from_test, pause_time,
+    peek_local_addr_for_peer, quiesce, quiesce_with_mode, recorded_events, register_child_thread,
+    register_test, register_thread_child_of, reset_tcp, resume_time, seed_rng,
+    set_listener_behavior, set_tcp_inbound_latency, set_tcp_recv_window, set_time_rate,
+    set_time_value, set_udp_policy, time_rate, time_value,
 };
 
 /// No-op when the `shim` feature is disabled — kept for API parity so call

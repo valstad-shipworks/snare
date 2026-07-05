@@ -10,7 +10,7 @@ use crate::state::{
     clone_tcp_listener_state, find_tcp_listener, is_ip_addr_valid, is_port_available,
     mark_peer_read_shutdown, notify_peer_dropped, pcap_tcp_data, pcap_tcp_fin, pcap_tcp_open,
     release_stream, remove_tcp_connection, remove_tcp_listener_state, reserve_ephemeral_addr,
-    wait_for_event, with_tcp_connection, with_tcp_listener_state,
+    try_with_tcp_connection, wait_for_event, with_tcp_connection, with_tcp_listener_state,
 };
 
 #[derive(Debug)]
@@ -411,7 +411,12 @@ impl ShimStdTcpStream {
     where
         F: FnOnce(&mut crate::state::TcpConnection) -> io::Result<T>,
     {
-        with_tcp_connection(self.stream_id, func)
+        try_with_tcp_connection(self.stream_id, func).unwrap_or_else(|| {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            ))
+        })
     }
 }
 
@@ -445,12 +450,13 @@ impl ShimStdTcpStream {
         // Apply outbound latency by routing the write into the peer's
         // pending_inbound queue with a release deadline. Recv-window also
         // applies on the peer side so the writer back-pressures naturally.
-        let peer_local_addr = with_tcp_connection(peer_id, |peer| io::Result::Ok(peer.local_addr))?;
+        let peer_local_addr = try_with_tcp_connection(peer_id, |peer| peer.local_addr)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "peer connection closed"))?;
         let peer_policy = crate::state::tcp_policy(peer_local_addr);
 
         let mut deadline: Option<Instant> = None;
         loop {
-            let result = with_tcp_connection(peer_id, |peer| {
+            let result = try_with_tcp_connection(peer_id, |peer| {
                 if peer.read_shutdown {
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
@@ -478,6 +484,12 @@ impl ShimStdTcpStream {
                         .push_back((Instant::now() + peer_policy.inbound_latency, buf.to_vec()));
                 }
                 Ok(buf.len())
+            })
+            .unwrap_or_else(|| {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "peer connection closed",
+                ))
             });
 
             match result {
@@ -548,20 +560,26 @@ impl Drop for ShimStdTcpStream {
         // pending_inbound), block here until either the peer drains them or
         // the linger timeout elapses. Matches std behavior where a non-zero
         // linger forces close() to wait for the send buffer to flush.
-        let (peer_id_opt, linger) =
-            with_tcp_connection(self.stream_id, |conn| (conn.peer_stream_id, conn.linger));
+        let Some((peer_id_opt, linger)) =
+            try_with_tcp_connection(self.stream_id, |conn| (conn.peer_stream_id, conn.linger))
+        else {
+            // Connection already removed (e.g. peer reset and released it) —
+            // nothing left to tear down.
+            return;
+        };
 
         if let (Some(peer_id), Some(linger_dur)) = (peer_id_opt, linger) {
             let deadline = Instant::now() + linger_dur;
             loop {
-                let pending_bytes = with_tcp_connection(peer_id, |peer| {
+                let pending_bytes = try_with_tcp_connection(peer_id, |peer| {
                     peer.incoming.len()
                         + peer
                             .pending_inbound
                             .iter()
                             .map(|(_, b)| b.len())
                             .sum::<usize>()
-                });
+                })
+                .unwrap_or(0);
                 if pending_bytes == 0 {
                     break;
                 }
@@ -575,13 +593,8 @@ impl Drop for ShimStdTcpStream {
 
         // Capture addrs before release_stream may drop the connection out from
         // under us, so we can emit a synthetic FIN to the pcap log.
-        let addrs = with_tcp_connection(
-            self.stream_id,
-            |conn| -> io::Result<(std::net::SocketAddr, std::net::SocketAddr)> {
-                Ok((conn.local_addr, conn.peer_addr))
-            },
-        )
-        .ok();
+        let addrs =
+            try_with_tcp_connection(self.stream_id, |conn| (conn.local_addr, conn.peer_addr));
         if let Some(peer_id) = release_stream(self.stream_id) {
             notify_peer_dropped(peer_id);
             if let Some((local, peer)) = addrs {
@@ -652,9 +665,13 @@ impl ShimStdTcpListener {
                 ));
             }
             if let Some(stream_id) = stream_id {
-                let peer_addr = with_tcp_connection(stream_id, |conn| -> io::Result<SocketAddr> {
-                    Ok(conn.peer_addr)
-                })?;
+                let peer_addr = try_with_tcp_connection(stream_id, |conn| conn.peer_addr)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "accepted connection gone",
+                        )
+                    })?;
                 return Ok((ShimStdTcpStream { stream_id }, peer_addr));
             }
             if nonblocking {

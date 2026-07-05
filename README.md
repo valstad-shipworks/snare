@@ -56,6 +56,7 @@ In your code, replace these imports project-wide:
 | ------------------------------------------------- | --------------- |
 | `std::net::{TcpListener, TcpStream, UdpSocket}`   | `snare::net`    |
 | `std::thread`                                     | `snare::thread` |
+| `std::time::{Instant, SystemTime}`                | `snare::time`   |
 | `mio::{Poll, Waker, Token, Interest, event, net}` | `snare::mio`    |
 
 The release build resolves these to the real things; tests resolve them
@@ -170,6 +171,51 @@ that runs before `run_testers!`:
   Useful for "did we hit the retry path?" style assertions.
   `clear_recorded_events()` scopes the log to one phase.
 
+## Virtual clock
+
+`snare::time` is a drop-in for `std::time`. Point your SUT at
+`snare::time::Instant` / `snare::time::SystemTime` (`Duration` is untouched)
+and, under the shim, both read from a per-test virtual clock instead of the OS.
+Off the shim it re-exports `std::time`, so release builds see the real clock
+with zero overhead.
+
+The clock has two knobs:
+
+- **`value`** — what the clock reads right now.
+  `set_time_value(dur)` sets it (the elapsed reported by `Instant::now()` since
+  the virtual epoch, and the offset into `SystemTime::now()`); `time_value()`
+  reads it; `advance_time(dur)` jumps it forward, even while paused.
+- **`rate`** — how fast `value` advances relative to real time.
+  `set_time_rate(1.0)` tracks the real clock (the default), `0.0` pauses it so
+  `now()` stops advancing, `>1.0` runs fast. `pause_time()` / `resume_time()`
+  are shorthands for rate `0.0` / `1.0`. The rate can't go negative —
+  `set_time_rate` panics on a negative or non-finite value, since a backwards
+  clock would break the monotonicity of `Instant::now()`.
+
+```rust,ignore
+snare::register_test();
+snare::pause_time();                              // freeze time
+let t0 = snare::time::Instant::now();
+snare::advance_time(Duration::from_secs(30));     // 30s "passes" instantly
+assert_eq!(t0.elapsed(), Duration::from_secs(30));
+
+snare::set_time_rate(60.0);                        // now 1 real sec = 1 virtual min
+```
+
+The clock resolves through the same thread-chain hierarchy as the network
+shims — every thread the test owns shares one clock — and collapses to a single
+process-wide clock under `--cfg snare_global`, just like the rest of the shim
+state.
+
+`snare::thread::sleep` is tied to this clock too: it blocks until virtual time
+has advanced by its duration. So a paused clock parks the sleeper until you
+`advance_time` (or `resume_time`) it from another thread, and a fast clock wakes
+it after proportionally less real time. When a test needs to wait in real
+wall-clock time regardless of the rate — polling real I/O, an OS background
+thread — use `snare::thread::real_sleep`, which is a straight alias for
+`std::thread::sleep` (and is available off the shim too). The tester loop itself
+still runs in real time.
+
 ## Thread tracking
 
 Every shim call resolves a per-thread "which test owns me?" lookup. The
@@ -190,12 +236,45 @@ Unregistered threads that touch the shim hit a 2s grace-period poll
 before panicking, so a late `.register_as_child()` still works under CI
 contention. Don't rely on that for normal code paths.
 
+### Global mode: one shared network for the whole process
+
+Per-test isolation is the right model for `#[test]`s, but it's the wrong
+model for a long-running **single-process simulation** — e.g. driving real
+device drivers against an in-process emulator, where conductor threads,
+driver worker threads, and the emulator all need to see one shared virtual
+network and there is no "test" to scope them to.
+
+Build with `--cfg snare_global` and every thread in the process funnels to
+one shared state slot instead of a per-test one. In this mode:
+
+- `register_test()`, `register_child_thread()`, and
+  `register_thread_child_of()` are optional no-ops.
+- Plain `std::thread::spawn` works — no `.register_as_child()`, no grace
+  poll, no "not a valid test thread" panic. Every thread shares the same
+  sockets, listeners, valid-IP set, and RNG.
+- The slot auto-vivifies on first access.
+
+Set it for the whole build (it must compile `snare` once with the cfg), e.g.
+in the sim binary's `.cargo/config.toml`:
+
+```toml
+[build]
+rustflags = ["--cfg", "snare_global"]
+```
+
+or `RUSTFLAGS='--cfg snare_global' cargo build`. Leave it off for ordinary
+test builds, which want isolation. The cfg only matters when `shim` is on.
+
 ## Features
 
 - `shim` — turn on the in-process mock. Off by default so production
   builds re-export the real types.
 - `mio-compat` — expose `snare::mio`. Required if your SUT uses `mio`
   directly; otherwise leave it off.
+
+`snare::time` and its clock controls (`set_time_rate`, `pause_time`, ...) also
+live behind `shim` — off the feature, `snare::time` is a plain `std::time`
+re-export and the controls aren't compiled.
 
 ## pcapng capture
 

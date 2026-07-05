@@ -9,6 +9,9 @@ repository = "https://github.com/valstad-shipworks/snare"
 keywords = ["network", "testing", "mock"]
 categories = ["development-tools::testing"]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(snare_global)'] }
+
 [dependencies]
 anymap2 = "0.13.0"
 mio = { version = "1", optional = true, features = ["os-poll", "os-ext", "net"] }
@@ -61,6 +64,11 @@ required-features = ["shim", "mio-compat"]
 [[test]]
 name = "pcapng"
 path = "tests/pcapng.rs"
+required-features = ["shim"]
+
+[[test]]
+name = "time_shim"
+path = "tests/time_shim.rs"
 required-features = ["shim"]
 
 [[test]]
