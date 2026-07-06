@@ -6,8 +6,8 @@ use std::{
 };
 
 use crate::state::{
-    Packet, add_udp_connection, is_ip_addr_valid, is_port_available, wait_for_event,
-    with_udp_connection,
+    Packet, add_udp_connection, is_ip_addr_valid, is_port_available, reserve_ephemeral_addr,
+    wait_for_event, with_udp_connection,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -69,12 +69,26 @@ impl ShimStdUdpSocket {
             if !is_ip_addr_valid(a.ip()) {
                 continue;
             }
-            if !is_port_available(a.port()) {
+            // Port 0 means "any port" — reserve a concrete ephemeral one so the
+            // source port on outgoing datagrams routes replies back (a GVCP/GVSP
+            // camera client binds `0.0.0.0:0`). A fixed local port chosen against
+            // the real OS (e.g. openport for a Fanuc STMO client) is blind to the
+            // single global network, so two in-process wildcard clients can pick
+            // the same port; a wildcard client bind is free to move, so fall back
+            // to an ephemeral port rather than failing. Device servers bind a
+            // concrete IP and are unaffected.
+            let bound = if a.port() == 0 {
+                reserve_ephemeral_addr(a.ip())
+            } else if is_port_available(a) {
+                a
+            } else if a.ip().is_unspecified() {
+                reserve_ephemeral_addr(a.ip())
+            } else {
                 continue;
-            }
-            add_udp_connection(a);
+            };
+            add_udp_connection(bound);
             return Ok(ShimStdUdpSocket {
-                bound_addr: a,
+                bound_addr: bound,
                 remote_addr: Arc::new(Mutex::new(None)),
                 configs: Arc::new(Mutex::new(Vec::new())),
             });

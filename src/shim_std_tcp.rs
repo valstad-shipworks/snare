@@ -621,7 +621,7 @@ impl ShimStdTcpListener {
             }
             let actual_addr = if address.port() == 0 {
                 reserve_ephemeral_addr(address.ip())
-            } else if is_port_available(address.port()) {
+            } else if is_port_available(address) {
                 address
             } else {
                 continue;

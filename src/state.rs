@@ -211,7 +211,7 @@ macro_rules! state {
 type TcpConnections = HashMap<usize, TcpConnection>;
 type TcpListeners = HashMap<SocketAddr, TcpListenerState>;
 type UdpConnections = Vec<UdpConnection>;
-type LocalPortsUsed = HashSet<u16>;
+type LocalPortsUsed = HashSet<SocketAddr>;
 type ValidIpAddrs = HashSet<IpAddr>;
 type Next = (usize, u16);
 type NewDataEvent = Arc<Event>;
@@ -449,9 +449,9 @@ pub(crate) struct TcpListenerState {
     pub ref_count: usize,
 }
 
-pub(crate) fn is_port_available(port: u16) -> bool {
+pub(crate) fn is_port_available(addr: SocketAddr) -> bool {
     state!(local_ports_used = LocalPortsUsed ? HashSet::new());
-    !local_ports_used.contains(&port)
+    !local_ports_used.contains(&addr)
 }
 
 /// Whitelist `ip` as a bindable address for this test. The default whitelist
@@ -867,7 +867,7 @@ pub(crate) fn add_tcp_connection(
         new_data_event = NewDataEvent ? Arc::new(Event::new());
     );
     if owns_port {
-        local_ports_used.insert(local_addr.port());
+        local_ports_used.insert(local_addr);
     }
     let stream_id = next.0;
     next.0 += 1;
@@ -907,7 +907,7 @@ pub(crate) fn add_udp_connection(bound_addr: SocketAddr) {
         new_data_event = NewDataEvent ? Arc::new(Event::new());
     );
 
-    local_ports_used.insert(bound_addr.port());
+    local_ports_used.insert(bound_addr);
     udp_connections.push(UdpConnection {
         bound_addr,
         from_local: VecDeque::new(),
@@ -965,7 +965,7 @@ pub(crate) fn remove_tcp_connection(stream_id: usize) -> Option<TcpConnection> {
     );
     if let Some(conn) = tcp_connections.remove(&stream_id) {
         if conn.owns_port {
-            local_ports_used.remove(&conn.local_addr.port());
+            local_ports_used.remove(&conn.local_addr);
         }
         Some(conn)
     } else {
@@ -978,7 +978,7 @@ pub(crate) fn add_tcp_listener_state(addr: SocketAddr) {
         tcp_listeners = TcpListeners ? HashMap::new();
         local_ports_used = LocalPortsUsed ? HashSet::new();
     );
-    local_ports_used.insert(addr.port());
+    local_ports_used.insert(addr);
     tcp_listeners.insert(
         addr,
         TcpListenerState {
@@ -1007,7 +1007,7 @@ pub(crate) fn remove_tcp_listener_state(addr: SocketAddr) -> Option<TcpListenerS
     }
     let state = tcp_listeners.remove(&addr);
     if state.is_some() {
-        local_ports_used.remove(&addr.port());
+        local_ports_used.remove(&addr);
     }
     state
 }
@@ -1061,9 +1061,10 @@ pub(crate) fn reserve_ephemeral_addr(ip: IpAddr) -> SocketAddr {
         if port == 0 {
             port = 40_000;
         }
-        if local_ports_used.insert(port) {
+        let addr = SocketAddr::new(ip, port);
+        if local_ports_used.insert(addr) {
             next.1 = port.wrapping_add(1);
-            break SocketAddr::new(ip, port);
+            break addr;
         }
         next.1 = port.wrapping_add(1);
     }
