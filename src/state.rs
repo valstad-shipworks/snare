@@ -26,6 +26,17 @@ static TEST_THREAD_HIERARCHY: LazyLock<Mutex<HashMap<ThreadId, ThreadId>>> =
 static TEST_STATE: LazyLock<ReentrantMutex<RefCell<HashMap<TestThreadId, AnyMap>>>> =
     LazyLock::new(|| ReentrantMutex::new(RefCell::new(HashMap::new())));
 
+/// Under `--cfg snare_global` every thread in the process funnels to this one
+/// state slot instead of a per-test slot, so the whole process shares a single
+/// in-memory network with no `register_test` / child-thread registration. The
+/// slot is keyed by whichever thread resolves it first; the id is arbitrary —
+/// the point is that every thread maps to the same key. For a long-running
+/// single-process sim (driving real drivers against an in-process emulator),
+/// not for isolated `#[test]`s, which want per-test isolation.
+#[cfg(snare_global)]
+static GLOBAL_SLOT_KEY: LazyLock<TestThreadId> =
+    LazyLock::new(|| TestThreadId(std::thread::current().id()));
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct TestThreadId(ThreadId);
 
@@ -77,24 +88,38 @@ impl TestThreadId {
         TestThreadId(current_id)
     }
 
+    #[cfg(not(snare_global))]
     fn current() -> Self {
         Self::of(std::thread::current().id())
+    }
+
+    #[cfg(snare_global)]
+    fn current() -> Self {
+        *GLOBAL_SLOT_KEY
     }
 }
 
 /// Mark the current thread as the root of a fresh per-test state slot. Call
 /// at the top of every `#[test]` that uses snare.
 pub fn register_test() {
-    let thread_id = std::thread::current().id();
     let thread_name = std::thread::current().name().map(String::from);
-    let mut map = TEST_THREAD_HIERARCHY.lock();
-    map.insert(thread_id, thread_id);
-    drop(map);
-    let test_thread_id = TestThreadId(thread_id);
-    TEST_STATE
-        .lock()
-        .borrow_mut()
-        .insert(test_thread_id, AnyMap::new());
+
+    #[cfg(not(snare_global))]
+    {
+        let thread_id = std::thread::current().id();
+        let mut map = TEST_THREAD_HIERARCHY.lock();
+        map.insert(thread_id, thread_id);
+        drop(map);
+        let test_thread_id = TestThreadId(thread_id);
+        TEST_STATE
+            .lock()
+            .borrow_mut()
+            .insert(test_thread_id, AnyMap::new());
+    }
+
+    // Under `snare_global` there is one shared slot that auto-vivifies on first
+    // access, so calling `register_test` is optional; just run pcap init, which
+    // attaches to that shared slot via the `state!` macro.
 
     // pcap init is in a helper defined after the `state!` macro.
     pcap_init_for_test(thread_name);
@@ -103,19 +128,29 @@ pub fn register_test() {
 /// Attach a spawned thread to the current test's state slot. Call from the
 /// parent right after `std::thread::spawn(...)` (or use [`ThreadExt::register_as_child`](crate::ThreadExt::register_as_child)).
 pub fn register_child_thread(child_thread_id: ThreadId) {
-    let test_thread_id = TestThreadId::current();
-    TEST_THREAD_HIERARCHY
-        .lock()
-        .insert(child_thread_id, test_thread_id.0);
+    #[cfg(snare_global)]
+    let _ = child_thread_id;
+    #[cfg(not(snare_global))]
+    {
+        let test_thread_id = TestThreadId::current();
+        TEST_THREAD_HIERARCHY
+            .lock()
+            .insert(child_thread_id, test_thread_id.0);
+    }
 }
 
 /// Variant of [`register_child_thread`] called from inside the spawned thread,
 /// naming its parent's `ThreadId`.
 pub fn register_thread_child_of(parent_thread_id: ThreadId) {
-    let child_thread_id = std::thread::current().id();
-    TEST_THREAD_HIERARCHY
-        .lock()
-        .insert(child_thread_id, parent_thread_id);
+    #[cfg(snare_global)]
+    let _ = parent_thread_id;
+    #[cfg(not(snare_global))]
+    {
+        let child_thread_id = std::thread::current().id();
+        TEST_THREAD_HIERARCHY
+            .lock()
+            .insert(child_thread_id, parent_thread_id);
+    }
 }
 
 /// Begin pcapng capture for the current test. No-op unless `SNARE_PCAPNG_DIR`
@@ -124,12 +159,31 @@ pub fn enable_pcapng() {
     pcap_enable_for_current_test();
 }
 
+/// Resolve the current thread's state slot from a `&mut` borrow of the
+/// `TEST_STATE` map. In isolated mode an unregistered thread is a hard error;
+/// under `snare_global` every thread shares one slot that is created on demand.
+#[cfg(not(snare_global))]
+macro_rules! slot {
+    ($borrow:ident) => {
+        $borrow
+            .get_mut(&TestThreadId::current())
+            .expect("Not a valid test thread")
+    };
+}
+#[cfg(snare_global)]
+macro_rules! slot {
+    ($borrow:ident) => {
+        $borrow
+            .entry(TestThreadId::current())
+            .or_insert_with(AnyMap::new)
+    };
+}
+
 macro_rules! state {
     ( $( $var:ident = $idx:ident $(? $default:expr)? );* $(;)? ) => {
         let mut __guard = TEST_STATE.lock();
         let mut __borrow = __guard.borrow_mut();
-        let mut __any_map = __borrow.get_mut(&TestThreadId::current())
-            .expect("Not a valid test thread");
+        let mut __any_map = slot!(__borrow);
         $(
             $(
                 if !__any_map.contains::<Mutex<$idx>>() {
@@ -157,7 +211,7 @@ macro_rules! state {
 type TcpConnections = HashMap<usize, TcpConnection>;
 type TcpListeners = HashMap<SocketAddr, TcpListenerState>;
 type UdpConnections = Vec<UdpConnection>;
-type LocalPortsUsed = HashSet<u16>;
+type LocalPortsUsed = HashSet<SocketAddr>;
 type ValidIpAddrs = HashSet<IpAddr>;
 type Next = (usize, u16);
 type NewDataEvent = Arc<Event>;
@@ -395,9 +449,9 @@ pub(crate) struct TcpListenerState {
     pub ref_count: usize,
 }
 
-pub(crate) fn is_port_available(port: u16) -> bool {
+pub(crate) fn is_port_available(addr: SocketAddr) -> bool {
     state!(local_ports_used = LocalPortsUsed ? HashSet::new());
-    !local_ports_used.contains(&port)
+    !local_ports_used.contains(&addr)
 }
 
 /// Whitelist `ip` as a bindable address for this test. The default whitelist
@@ -587,12 +641,200 @@ pub fn seed_rng(seed: u64) {
     *rng = s;
 }
 
+// ----- Virtual clock (time-source shim) -----
+
+/// Backing store for the [`snare::time`](crate::time) shim. One virtual clock
+/// per state slot drives both `Instant` and `SystemTime`, so it resolves
+/// through the same thread-chain hierarchy — and honours `--cfg snare_global`
+/// — as every other piece of shim state.
+///
+/// The reading is `value = value_anchor + real_elapsed_since_anchor * rate`.
+/// `Instant::now()` returns `value` (measured from the virtual epoch);
+/// `SystemTime::now()` returns `wall_base + value`. `rate` is a non-negative
+/// multiplier: `0` freezes the clock (paused), `1` tracks real time, `>1` runs
+/// fast. A negative rate is rejected — it would let `now()` move backwards.
+struct VirtualClock {
+    real_anchor: Instant,
+    value_anchor_nanos: u128,
+    wall_base_nanos: u128,
+    rate: f64,
+}
+
+impl VirtualClock {
+    fn new() -> Self {
+        let wall_base_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        Self {
+            real_anchor: Instant::now(),
+            value_anchor_nanos: 0,
+            wall_base_nanos,
+            rate: 1.0,
+        }
+    }
+
+    fn value_nanos(&self) -> u128 {
+        let real = self.real_anchor.elapsed().as_nanos();
+        // float->int casts saturate rather than wrap/UB, so a huge rate is safe.
+        let scaled = (real as f64 * self.rate) as u128;
+        self.value_anchor_nanos.saturating_add(scaled)
+    }
+
+    fn wall_nanos(&self) -> u128 {
+        self.wall_base_nanos.saturating_add(self.value_nanos())
+    }
+
+    fn reanchor(&mut self) {
+        self.value_anchor_nanos = self.value_nanos();
+        self.real_anchor = Instant::now();
+    }
+
+    fn set_rate(&mut self, rate: f64) {
+        assert!(
+            rate.is_finite() && rate >= 0.0,
+            "time rate must be finite and non-negative (got {rate}); a negative \
+             rate would break the monotonicity of Instant::now()"
+        );
+        self.reanchor();
+        self.rate = rate;
+    }
+
+    fn set_value_nanos(&mut self, nanos: u128) {
+        self.reanchor();
+        self.value_anchor_nanos = nanos;
+    }
+}
+
+/// Per-slot notifier woken whenever the virtual clock is mutated (`rate` or
+/// `value` change). Threads blocked in [`virtual_sleep`] listen on it so a
+/// paused clock can be un-paused or advanced from another thread. A distinct
+/// newtype rather than a reuse of [`NewDataEvent`] so socket traffic and clock
+/// edits don't wake each other's waiters.
+struct ClockEvent(Arc<Event>);
+
+fn nanos_to_duration(nanos: u128) -> Duration {
+    Duration::new(
+        (nanos / 1_000_000_000) as u64,
+        (nanos % 1_000_000_000) as u32,
+    )
+}
+
+pub(crate) fn clock_mono_now() -> Duration {
+    state!(clock = VirtualClock ? VirtualClock::new());
+    nanos_to_duration(clock.value_nanos())
+}
+
+pub(crate) fn clock_wall_now() -> Duration {
+    state!(clock = VirtualClock ? VirtualClock::new());
+    nanos_to_duration(clock.wall_nanos())
+}
+
+/// Set how fast virtual time advances relative to real time: `1.0` tracks the
+/// real clock, `0.0` pauses it (`Instant::now()` / `SystemTime::now()` stop
+/// advancing), `>1.0` runs fast. Panics on a negative or non-finite rate — a
+/// negative rate would violate the monotonicity of `Instant::now()`.
+pub fn set_time_rate(rate: f64) {
+    {
+        state!(clock = VirtualClock ? VirtualClock::new());
+        clock.set_rate(rate);
+    }
+    notify_clock_change();
+}
+
+/// The current virtual-time advance rate. See [`set_time_rate`].
+pub fn time_rate() -> f64 {
+    state!(clock = VirtualClock ? VirtualClock::new());
+    clock.rate
+}
+
+/// Freeze virtual time. Equivalent to `set_time_rate(0.0)`.
+pub fn pause_time() {
+    set_time_rate(0.0);
+}
+
+/// Resume virtual time at real-time speed. Equivalent to `set_time_rate(1.0)`.
+pub fn resume_time() {
+    set_time_rate(1.0);
+}
+
+/// Set the clock's current value: the reading of `snare::time::Instant::now()`
+/// measured from the virtual epoch, and the offset added to the wall base for
+/// `SystemTime::now()`. Moving the value backwards breaks `Instant`
+/// monotonicity, so only do it while the SUT holds no live `Instant`s.
+pub fn set_time_value(value: Duration) {
+    {
+        state!(clock = VirtualClock ? VirtualClock::new());
+        clock.set_value_nanos(value.as_nanos());
+    }
+    notify_clock_change();
+}
+
+/// The clock's current value — the elapsed virtual time reported by
+/// `snare::time::Instant::now()` since the virtual epoch.
+pub fn time_value() -> Duration {
+    clock_mono_now()
+}
+
+/// Jump virtual time forward by `by`. Works regardless of rate, so it advances
+/// the clock even while paused.
+pub fn advance_time(by: Duration) {
+    {
+        state!(clock = VirtualClock ? VirtualClock::new());
+        let advanced = clock.value_nanos().saturating_add(by.as_nanos());
+        clock.set_value_nanos(advanced);
+    }
+    notify_clock_change();
+}
+
+fn clock_event() -> Arc<Event> {
+    state!(clock_event = ClockEvent ? ClockEvent(Arc::new(Event::new())));
+    clock_event.0.clone()
+}
+
+fn notify_clock_change() {
+    clock_event().notify(u32::MAX);
+}
+
+/// Block the calling thread until the virtual clock advances by `dur`. Unlike
+/// [`std::thread::sleep`] this honours the shim's time source: while the clock
+/// is paused (`rate == 0`) the thread stays parked until another thread
+/// advances it, and a fast clock (`rate > 1`) returns after proportionally less
+/// real time. Each iteration re-registers on [`ClockEvent`] *before* reading
+/// the clock, so a rate/value change from another thread can never be missed.
+pub(crate) fn virtual_sleep(dur: Duration) {
+    if dur.is_zero() {
+        return;
+    }
+    let deadline = clock_mono_now()
+        .as_nanos()
+        .saturating_add(dur.as_nanos());
+    loop {
+        let listener = clock_event().listen();
+        let now = clock_mono_now().as_nanos();
+        if now >= deadline {
+            return;
+        }
+        let remaining_nanos = deadline - now;
+        let rate = time_rate();
+        if rate > 0.0 {
+            let real_secs = (remaining_nanos as f64 / 1_000_000_000.0) / rate;
+            let real_remaining = if real_secs.is_finite() && real_secs < 3600.0 {
+                Duration::from_secs_f64(real_secs)
+            } else {
+                Duration::from_secs(3600)
+            };
+            listener.wait_timeout(real_remaining);
+        } else {
+            listener.wait();
+        }
+    }
+}
+
 pub(crate) fn wait_for_event(timeout: Option<Duration>) -> bool {
     let guard = TEST_STATE.lock();
     let mut borrow = guard.borrow_mut();
-    let any_map = borrow
-        .get_mut(&TestThreadId::current())
-        .expect("Not a valid test thread");
+    let any_map = slot!(borrow);
     if !any_map.contains::<Mutex<NewDataEvent>>() {
         any_map.insert::<Mutex<NewDataEvent>>(Mutex::new(Arc::new(Event::new())));
     }
@@ -625,7 +867,7 @@ pub(crate) fn add_tcp_connection(
         new_data_event = NewDataEvent ? Arc::new(Event::new());
     );
     if owns_port {
-        local_ports_used.insert(local_addr.port());
+        local_ports_used.insert(local_addr);
     }
     let stream_id = next.0;
     next.0 += 1;
@@ -665,7 +907,7 @@ pub(crate) fn add_udp_connection(bound_addr: SocketAddr) {
         new_data_event = NewDataEvent ? Arc::new(Event::new());
     );
 
-    local_ports_used.insert(bound_addr.port());
+    local_ports_used.insert(bound_addr);
     udp_connections.push(UdpConnection {
         bound_addr,
         from_local: VecDeque::new(),
@@ -696,6 +938,26 @@ pub(crate) fn with_tcp_connection<T, F: FnOnce(&mut TcpConnection) -> T>(
     }
 }
 
+/// Like [`with_tcp_connection`] but returns `None` when the connection has already
+/// been removed instead of panicking. Callers on the hot path (socket read/write)
+/// use this so a peer that closed/dropped its end surfaces as a graceful
+/// `ConnectionReset`, matching a real socket, rather than panicking a driver's
+/// I/O thread.
+pub(crate) fn try_with_tcp_connection<T, F: FnOnce(&mut TcpConnection) -> T>(
+    stream_id: usize,
+    func: F,
+) -> Option<T> {
+    state!(
+        tcp_connections = TcpConnections ? HashMap::new();
+        new_data_event = NewDataEvent ? Arc::new(Event::new());
+    );
+    tcp_connections.get_mut(&stream_id).map(|conn| {
+        let ret = func(conn);
+        new_data_event.notify(u32::MAX);
+        ret
+    })
+}
+
 pub(crate) fn remove_tcp_connection(stream_id: usize) -> Option<TcpConnection> {
     state!(
         tcp_connections = TcpConnections ? HashMap::new();
@@ -703,7 +965,7 @@ pub(crate) fn remove_tcp_connection(stream_id: usize) -> Option<TcpConnection> {
     );
     if let Some(conn) = tcp_connections.remove(&stream_id) {
         if conn.owns_port {
-            local_ports_used.remove(&conn.local_addr.port());
+            local_ports_used.remove(&conn.local_addr);
         }
         Some(conn)
     } else {
@@ -716,7 +978,7 @@ pub(crate) fn add_tcp_listener_state(addr: SocketAddr) {
         tcp_listeners = TcpListeners ? HashMap::new();
         local_ports_used = LocalPortsUsed ? HashSet::new();
     );
-    local_ports_used.insert(addr.port());
+    local_ports_used.insert(addr);
     tcp_listeners.insert(
         addr,
         TcpListenerState {
@@ -745,7 +1007,7 @@ pub(crate) fn remove_tcp_listener_state(addr: SocketAddr) -> Option<TcpListenerS
     }
     let state = tcp_listeners.remove(&addr);
     if state.is_some() {
-        local_ports_used.remove(&addr.port());
+        local_ports_used.remove(&addr);
     }
     state
 }
@@ -799,9 +1061,10 @@ pub(crate) fn reserve_ephemeral_addr(ip: IpAddr) -> SocketAddr {
         if port == 0 {
             port = 40_000;
         }
-        if local_ports_used.insert(port) {
+        let addr = SocketAddr::new(ip, port);
+        if local_ports_used.insert(addr) {
             next.1 = port.wrapping_add(1);
-            break SocketAddr::new(ip, port);
+            break addr;
         }
         next.1 = port.wrapping_add(1);
     }
@@ -1221,19 +1484,29 @@ pub(crate) fn enqueue_udp_outbound(bound_addr: SocketAddr, pkt: Packet) -> io::R
             udp_connections = UdpConnections ? Vec::new();
             new_data_event = NewDataEvent ? Arc::new(Event::new());
         );
-        let conn = udp_connections
-            .iter_mut()
-            .find(|c| c.bound_addr == bound_addr)
+        let sender_idx = udp_connections
+            .iter()
+            .position(|c| c.bound_addr == bound_addr)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no such UDP socket"))?;
         if let Some(cap) = policy.send_queue_depth {
-            if conn.from_local.len() >= cap {
+            if udp_connections[sender_idx].from_local.len() >= cap {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "UDP send queue full",
                 ));
             }
         }
-        conn.from_local.push_back(pkt);
+        // If a socket is bound at the destination, deliver straight into its
+        // inbound queue — this is what lets two real in-process sockets (e.g. a
+        // driver and a raw emulated device under `snare_global`) exchange
+        // datagrams without the tester framework pumping `from_local`. Virtual
+        // testers don't bind a UDP socket, so they fall through to `from_local`
+        // and are still served by `pop_latest_packet`.
+        if let Some(dest_idx) = udp_connections.iter().position(|c| c.bound_addr == pkt.dest) {
+            udp_connections[dest_idx].to_local.push_back(pkt);
+        } else {
+            udp_connections[sender_idx].from_local.push_back(pkt);
+        }
         new_data_event.notify(u32::MAX);
     }
     pcap_udp(pcap_capture.0, pcap_capture.1, &pcap_capture.2);

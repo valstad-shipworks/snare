@@ -505,6 +505,12 @@ pub mod net {
             token: Token,
             interests: Interest,
         ) -> io::Result<()> {
+            // mio only ever drives non-blocking sockets; real `mio::TcpStream`
+            // is created non-blocking. The shim's `net::TcpStream` reuses the
+            // std-shim's blocking `connect`, so enforce the invariant here —
+            // otherwise a registered stream blocks in `read`/`write` inside the
+            // poll loop instead of returning `WouldBlock`.
+            self.set_nonblocking(true)?;
             let mut reg_data = registry.data.lock();
             reg_data.streams.push(RegistryEntry {
                 src: self.try_clone()?,
@@ -552,6 +558,7 @@ pub mod net {
             token: Token,
             interests: Interest,
         ) -> io::Result<()> {
+            self.set_nonblocking(true)?;
             let mut reg_data = registry.data.lock();
             reg_data.sockets.push(RegistryEntry {
                 src: self.try_clone()?,

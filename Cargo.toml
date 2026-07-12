@@ -1,6 +1,6 @@
 [package]
 name = "snare"
-version = "1.3.1"
+version = "1.4.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Bowan Foryt <bowan@valstad.com>"]
@@ -8,6 +8,9 @@ description = "Network communication testing library for rust"
 repository = "https://github.com/valstad-shipworks/snare"
 keywords = ["network", "testing", "mock"]
 categories = ["development-tools::testing"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(snare_global)'] }
 
 [dependencies]
 anymap2 = "0.13.0"
@@ -61,6 +64,11 @@ required-features = ["shim", "mio-compat"]
 [[test]]
 name = "pcapng"
 path = "tests/pcapng.rs"
+required-features = ["shim"]
+
+[[test]]
+name = "time_shim"
+path = "tests/time_shim.rs"
 required-features = ["shim"]
 
 [[test]]
