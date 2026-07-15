@@ -247,7 +247,7 @@ impl ShimStdUdpSocket {
     }
 
     pub fn broadcast(&self) -> io::Result<bool> {
-        if let Some(_) = self.get_option(UdpConfigs::Broadcast) {
+        if self.get_option(UdpConfigs::Broadcast).is_some() {
             Ok(true)
         } else {
             Ok(false)
@@ -264,7 +264,7 @@ impl ShimStdUdpSocket {
     }
 
     pub fn multicast_loop_v4(&self) -> io::Result<bool> {
-        if let Some(_) = self.get_option(UdpConfigs::Ipv4MulticastLoop) {
+        if self.get_option(UdpConfigs::Ipv4MulticastLoop).is_some() {
             Ok(true)
         } else {
             Ok(false)
@@ -296,7 +296,7 @@ impl ShimStdUdpSocket {
     }
 
     pub fn multicast_loop_v6(&self) -> io::Result<bool> {
-        if let Some(_) = self.get_option(UdpConfigs::Ipv6MulticastLoop) {
+        if self.get_option(UdpConfigs::Ipv6MulticastLoop).is_some() {
             Ok(true)
         } else {
             Ok(false)

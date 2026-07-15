@@ -85,11 +85,9 @@ impl Packetable for UdpPkt {
 // ---- TCP RST ----
 
 fn rst_cycle(sent: &mut bool) -> Option<TesterAction<EchoPkt>> {
-    if !*sent {
-        if let Some(peer) = peek_local_addr_for_peer(RST_ADDR) {
-            *sent = true;
-            return Some(TesterAction::ResetTcp(peer));
-        }
+    if !*sent && let Some(peer) = peek_local_addr_for_peer(RST_ADDR) {
+        *sent = true;
+        return Some(TesterAction::ResetTcp(peer));
     }
     None
 }
@@ -145,14 +143,12 @@ fn refusing_listener_returns_econnrefused() {
 // ---- Per-direction Quiesce ----
 
 fn outbound_tick(t: &mut TimerState) -> Option<TesterAction<EchoPkt>> {
-    if let Some(peer) = peek_local_addr_for_peer(OUTBOUND_QUIESCE_ADDR) {
-        Some(TesterAction::Send(
+    peek_local_addr_for_peer(OUTBOUND_QUIESCE_ADDR).map(|peer| {
+        TesterAction::Send(
             peer,
             EchoPkt(format!("tick{}", t.poll_elapsed().as_millis()).into_bytes()),
-        ))
-    } else {
-        None
-    }
+        )
+    })
 }
 
 #[test]
@@ -178,10 +174,7 @@ fn outbound_only_quiesce_blocks_writes_but_not_reads() {
 
         // Read should still surface the next ack — quiesce is OUTBOUND only.
         let n2 = stream.read(&mut buf);
-        assert!(
-            matches!(n2, Ok(_)),
-            "inbound read should not be blocked: {n2:?}"
-        );
+        assert!(n2.is_ok(), "inbound read should not be blocked: {n2:?}");
         outbound_quiesced_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     })
     .register_as_child();

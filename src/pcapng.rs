@@ -286,7 +286,7 @@ impl PcapWriter {
             return;
         }
         let key = FlowKey::new(src, dst);
-        let needs_open = self.flows.get(&key).map_or(true, |f| !f.handshake_done);
+        let needs_open = self.flows.get(&key).is_none_or(|f| !f.handshake_done);
         if needs_open {
             // Use `src` as the initiator — best effort when we missed the actual
             // connect (e.g. data injected via `inject_tcp_from_test`).

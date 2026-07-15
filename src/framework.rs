@@ -117,13 +117,17 @@ pub trait NetTesterInterface {
 /// - **Finish conditions**: `until_condition`, `until_stateful_condition`. Tester
 ///   exits when any returns `true`. With no conditions, the tester exits when no
 ///   pending packets/data remain.
+type TestFn<P> = Box<dyn Fn(&mut NetTester<P>, P, SocketAddr) -> Option<P>>;
+type CycleEntry<P> = (Duration, RefCell<Instant>, Box<dyn Fn(&mut NetTester<P>)>);
+type FinishFn<P> = Box<dyn Fn(&mut NetTester<P>) -> bool>;
+
 pub struct NetTester<P: Packetable> {
     phantom: PhantomData<P>,
     addr: SocketAddr,
     state: AnyMap,
-    tests: Vec<Box<dyn Fn(&mut Self, P, SocketAddr) -> Option<P>>>,
-    cycles: Vec<(Duration, RefCell<Instant>, Box<dyn Fn(&mut Self)>)>,
-    finish_conditions: Vec<Box<dyn Fn(&mut Self) -> bool>>,
+    tests: Vec<TestFn<P>>,
+    cycles: Vec<CycleEntry<P>>,
+    finish_conditions: Vec<FinishFn<P>>,
 }
 
 impl<P: Packetable> NetTester<P> {
@@ -216,7 +220,7 @@ impl<P: Packetable> NetTester<P> {
         tester: fn(&mut S, P, SocketAddr) -> Option<P>,
     ) -> NetTester<P> {
         let storable = move |slf: &mut Self, pkt: P, addr: SocketAddr| {
-            let state = slf.state.entry::<S>().or_insert_with(Default::default);
+            let state = slf.state.entry::<S>().or_default();
             tester(state, pkt, addr)
         };
         self.tests.push(Box::new(storable));
@@ -234,7 +238,7 @@ impl<P: Packetable> NetTester<P> {
     /// forwarded unchanged.
     pub fn then_edit_state<S: StateKey>(mut self, editor: fn(&mut S, SocketAddr)) -> NetTester<P> {
         let stateful = move |slf: &mut Self, pkt: P, addr: SocketAddr| {
-            let state = slf.state.entry::<S>().or_insert_with(Default::default);
+            let state = slf.state.entry::<S>().or_default();
             editor(state, addr);
             Some(pkt)
         };
@@ -249,7 +253,7 @@ impl<P: Packetable> NetTester<P> {
         actor: fn(&mut S, P, SocketAddr) -> TesterAction<P>,
     ) -> NetTester<P> {
         let stateful = move |slf: &mut Self, pkt: P, addr: SocketAddr| {
-            let state = slf.state.entry::<S>().or_insert_with(Default::default);
+            let state = slf.state.entry::<S>().or_default();
             let action = actor(state, pkt.clone(), addr);
             slf.enact_action(action);
             Some(pkt)
@@ -277,7 +281,7 @@ impl<P: Packetable> NetTester<P> {
         actor: fn(&mut S) -> Option<TesterAction<P>>,
     ) -> NetTester<P> {
         let stateful = move |slf: &mut Self| {
-            let state = slf.state.entry::<S>().or_insert_with(Default::default);
+            let state = slf.state.entry::<S>().or_default();
             if let Some(action) = actor(state) {
                 slf.enact_action(action);
             }
@@ -306,7 +310,7 @@ impl<P: Packetable> NetTester<P> {
     /// Eagerly initializes state `S` then runs `initializer` to configure it.
     pub fn with_state<S: StateKey>(mut self, initializer: fn(&mut S)) -> NetTester<P> {
         let stateful = move |slf: &mut Self| {
-            let state = slf.state.entry::<S>().or_insert_with(Default::default);
+            let state = slf.state.entry::<S>().or_default();
             initializer(state);
         };
         stateful(&mut self);
@@ -328,7 +332,7 @@ impl<P: Packetable> NetTester<P> {
         condition: fn(&mut S) -> bool,
     ) -> NetTester<P> {
         let cond_box = Box::new(move |slf: &mut Self| {
-            let state = slf.state.entry::<S>().or_insert_with(Default::default);
+            let state = slf.state.entry::<S>().or_default();
             condition(state)
         });
         self.finish_conditions.push(cond_box);
@@ -340,7 +344,7 @@ impl<P: Packetable> NetTester<P> {
     ///
     /// # Panics
     /// If no `S` was ever initialized.
-    pub fn peek_state<'a, S: StateKey>(&'a self) -> &'a S {
+    pub fn peek_state<S: StateKey>(&self) -> &S {
         self.state.get::<S>().expect("State for type was not found")
     }
 }
@@ -367,7 +371,7 @@ pub fn connect_tester<P: Packetable>(addr: SocketAddr) -> NetTester<P> {
 impl<P: Packetable> NetTesterInterface for NetTester<P> {
     fn test(&mut self, data: &[u8], src_addr: SocketAddr) -> Option<usize> {
         if P::SOCKET_TYPE == SocketType::Udp {
-            let opt_pkt = P::decode(data).and_then(|(pkt, _)| Some(pkt));
+            let opt_pkt = P::decode(data).map(|(pkt, _)| pkt);
             if let Some(mut pkt) = opt_pkt {
                 let mut tests = std::mem::take(&mut self.tests);
                 for test in tests.iter_mut() {
@@ -380,7 +384,7 @@ impl<P: Packetable> NetTesterInterface for NetTester<P> {
                 self.tests = tests;
                 self.run_due_cycles();
             }
-            return None;
+            None
         } else {
             let mut offset = 0;
             while offset < data.len() {
@@ -400,7 +404,7 @@ impl<P: Packetable> NetTesterInterface for NetTester<P> {
                     break;
                 }
             }
-            return Some(offset);
+            Some(offset)
         }
     }
 

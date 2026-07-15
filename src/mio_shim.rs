@@ -54,7 +54,7 @@ impl Poll {
         };
 
         loop {
-            if Instant::now() >= deadline || events.inner.len() > 0 {
+            if Instant::now() >= deadline || !events.inner.is_empty() {
                 break;
             }
 
@@ -461,7 +461,7 @@ pub mod net {
             let mut reg_data = registry.data.lock();
             reg_data.listeners.push(RegistryEntry {
                 src: self.try_clone()?,
-                token: token,
+                token,
                 interest: interests,
             });
             Ok(())
@@ -514,7 +514,7 @@ pub mod net {
             let mut reg_data = registry.data.lock();
             reg_data.streams.push(RegistryEntry {
                 src: self.try_clone()?,
-                token: token,
+                token,
                 interest: interests,
             });
             Ok(())
@@ -562,7 +562,7 @@ pub mod net {
             let mut reg_data = registry.data.lock();
             reg_data.sockets.push(RegistryEntry {
                 src: self.try_clone()?,
-                token: token,
+                token,
                 interest: interests,
             });
             Ok(())

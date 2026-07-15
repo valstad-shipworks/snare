@@ -16,9 +16,9 @@
 //! [`std::thread::sleep`].
 
 #[cfg(not(feature = "shim"))]
-pub use std::thread::*;
-#[cfg(not(feature = "shim"))]
 pub use std::thread::sleep as real_sleep;
+#[cfg(not(feature = "shim"))]
+pub use std::thread::*;
 
 #[cfg(feature = "shim")]
 pub use std::thread::{

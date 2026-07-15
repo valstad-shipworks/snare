@@ -8,7 +8,6 @@ use std::{
     sync::{Arc, LazyLock},
     thread::ThreadId,
     time::{Duration, Instant},
-    u32,
 };
 
 use anymap2::SendSyncAnyMap as AnyMap;
@@ -222,27 +221,19 @@ type ListenerBehaviors = HashMap<SocketAddr, ListenerBehavior>;
 type RecordedEvents = Vec<RecordedEntry>;
 type RngState = u64;
 
+#[derive(Default)]
 pub(crate) struct PcapState {
     pub writer: Option<PcapWriter>,
     pub test_name: Option<String>,
 }
 
-impl Default for PcapState {
-    fn default() -> Self {
-        Self {
-            writer: None,
-            test_name: None,
-        }
-    }
-}
-
 fn pcap_init_for_test(thread_name: Option<String>) {
     state!(pcap = PcapState ? PcapState::default());
     pcap.test_name = thread_name.clone();
-    if let Some(name) = thread_name.as_deref() {
-        if crate::pcapng::env_force_match(name) {
-            pcap.writer = crate::pcapng::open_writer(name);
-        }
+    if let Some(name) = thread_name.as_deref()
+        && crate::pcapng::env_force_match(name)
+    {
+        pcap.writer = crate::pcapng::open_writer(name);
     }
 }
 
@@ -806,9 +797,7 @@ pub(crate) fn virtual_sleep(dur: Duration) {
     if dur.is_zero() {
         return;
     }
-    let deadline = clock_mono_now()
-        .as_nanos()
-        .saturating_add(dur.as_nanos());
+    let deadline = clock_mono_now().as_nanos().saturating_add(dur.as_nanos());
     loop {
         let listener = clock_event().listen();
         let now = clock_mono_now().as_nanos();
@@ -1090,20 +1079,30 @@ pub(crate) fn with_udp_connection<T, F: FnOnce(&mut UdpConnection) -> T>(
     }
 }
 
+/// Mark the peer's read side closed, if the peer is still around.
+///
+/// A peer that has already gone needs no telling: telling the other end about a
+/// close is only meaningful while there *is* another end. See
+/// [`notify_peer_dropped`] for why that absence must not panic.
 pub(crate) fn mark_peer_read_shutdown(peer_id: usize) {
-    with_tcp_connection(peer_id, |peer_state| {
+    try_with_tcp_connection(peer_id, |peer_state| {
         peer_state.read_shutdown = true;
     });
 }
 
+/// Drop one reference to `stream_id`, returning its peer's id if that was the
+/// last one. `None` when the stream is already gone — a listener dropping
+/// unaccepted streams ([`crate::shim_std_tcp`]'s `cleanup_unaccepted_stream`)
+/// can remove a connection out from under an owner that still holds a handle to
+/// it, and that owner's eventual drop is not a bug.
 pub(crate) fn release_stream(stream_id: usize) -> Option<usize> {
-    with_tcp_connection(stream_id, |conn| {
+    try_with_tcp_connection(stream_id, |conn| {
         if conn.ref_count > 1 {
             conn.ref_count -= 1;
             return None;
         }
         Some(())
-    })?;
+    })??;
     if let Some(conn) = remove_tcp_connection(stream_id) {
         conn.peer_stream_id
     } else {
@@ -1111,8 +1110,16 @@ pub(crate) fn release_stream(stream_id: usize) -> Option<usize> {
     }
 }
 
+/// Tell the peer its other end went away, if the peer is still there.
+///
+/// Must not panic on a missing peer: this runs from `ShimStdTcpStream::drop`,
+/// and when both ends of a connection drop at once — a driver hanging up on a
+/// handshake socket exactly as the server hangs up its own end, which is the
+/// shape of every real reconnect — each end finds the other already gone. That
+/// is the normal outcome of a symmetric close, and panicking on it takes out
+/// whichever thread happened to run its destructor second.
 pub(crate) fn notify_peer_dropped(peer_id: usize) {
-    with_tcp_connection(peer_id, |peer| {
+    try_with_tcp_connection(peer_id, |peer| {
         peer.peer_stream_id = None;
         peer.read_shutdown = true;
         peer.external_error = Some(io::Error::new(
@@ -1128,17 +1135,17 @@ pub(crate) fn send_udp_from_test(from_addr: SocketAddr, to_addr: SocketAddr, dat
     let data_for_pcap = data.clone();
 
     // MTU rejection: oversize datagram is silently dropped on the wire.
-    if let Some(mtu) = policy.mtu {
-        if data.len() > mtu {
-            record(RecordedEvent::UdpSendFromTest {
-                from: from_addr,
-                to: to_addr,
-                len,
-                dropped: true,
-                duplicated: false,
-            });
-            return;
-        }
+    if let Some(mtu) = policy.mtu
+        && data.len() > mtu
+    {
+        record(RecordedEvent::UdpSendFromTest {
+            from: from_addr,
+            to: to_addr,
+            len,
+            dropped: true,
+            duplicated: false,
+        });
+        return;
     }
 
     let dropped = policy.loss_rate > 0.0 && rand_unit() < policy.loss_rate;
@@ -1470,13 +1477,13 @@ pub(crate) fn close_socket_from_test(addr: SocketAddr, socket_type: SocketType) 
 /// `InvalidInput` over MTU; otherwise enqueues into `from_local`.
 pub(crate) fn enqueue_udp_outbound(bound_addr: SocketAddr, pkt: Packet) -> io::Result<()> {
     let policy = udp_policy(bound_addr);
-    if let Some(mtu) = policy.mtu {
-        if pkt.data.len() > mtu {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "datagram exceeds configured MTU",
-            ));
-        }
+    if let Some(mtu) = policy.mtu
+        && pkt.data.len() > mtu
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "datagram exceeds configured MTU",
+        ));
     }
     let pcap_capture = (pkt.source, pkt.dest, pkt.data.clone());
     {
@@ -1488,13 +1495,13 @@ pub(crate) fn enqueue_udp_outbound(bound_addr: SocketAddr, pkt: Packet) -> io::R
             .iter()
             .position(|c| c.bound_addr == bound_addr)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no such UDP socket"))?;
-        if let Some(cap) = policy.send_queue_depth {
-            if udp_connections[sender_idx].from_local.len() >= cap {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "UDP send queue full",
-                ));
-            }
+        if let Some(cap) = policy.send_queue_depth
+            && udp_connections[sender_idx].from_local.len() >= cap
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "UDP send queue full",
+            ));
         }
         // If a socket is bound at the destination, deliver straight into its
         // inbound queue — this is what lets two real in-process sockets (e.g. a
@@ -1502,7 +1509,10 @@ pub(crate) fn enqueue_udp_outbound(bound_addr: SocketAddr, pkt: Packet) -> io::R
         // datagrams without the tester framework pumping `from_local`. Virtual
         // testers don't bind a UDP socket, so they fall through to `from_local`
         // and are still served by `pop_latest_packet`.
-        if let Some(dest_idx) = udp_connections.iter().position(|c| c.bound_addr == pkt.dest) {
+        if let Some(dest_idx) = udp_connections
+            .iter()
+            .position(|c| c.bound_addr == pkt.dest)
+        {
             udp_connections[dest_idx].to_local.push_back(pkt);
         } else {
             udp_connections[sender_idx].from_local.push_back(pkt);
@@ -1624,7 +1634,7 @@ pub(crate) fn peek_tcp_stream_data(addr: SocketAddr) -> Vec<u8> {
     if let Some(conn) = connection {
         conn.incoming.iter().copied().collect()
     } else {
-        return Vec::new();
+        Vec::new()
     }
 }
 
@@ -1637,7 +1647,5 @@ pub(crate) fn consume_tcp_stream_data(addr: SocketAddr, amount: usize) {
         for _ in 0..amount {
             conn.incoming.pop_front();
         }
-    } else {
-        return;
     }
 }

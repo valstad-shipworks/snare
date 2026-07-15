@@ -100,13 +100,13 @@ impl ShimStdTcpStream {
     }
 
     pub fn set_linger(&self, linger: Option<Duration>) -> io::Result<()> {
-        if let Some(dur) = linger {
-            if dur == Duration::from_secs(0) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "linger duration must be non-zero",
-                ));
-            }
+        if let Some(dur) = linger
+            && dur == Duration::from_secs(0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "linger duration must be non-zero",
+            ));
         }
         self.with_conn(|conn| {
             conn.linger = linger;
@@ -119,13 +119,13 @@ impl ShimStdTcpStream {
     }
 
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        if let Some(d) = timeout {
-            if d == Duration::from_secs(0) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "timeout duration must be non-zero",
-                ));
-            }
+        if let Some(d) = timeout
+            && d == Duration::from_secs(0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "timeout duration must be non-zero",
+            ));
         }
         self.with_conn(|conn| {
             conn.read_timeout = timeout;
@@ -138,13 +138,13 @@ impl ShimStdTcpStream {
     }
 
     pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        if let Some(d) = timeout {
-            if d == Duration::from_secs(0) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "timeout duration must be non-zero",
-                ));
-            }
+        if let Some(d) = timeout
+            && d == Duration::from_secs(0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "timeout duration must be non-zero",
+            ));
         }
         self.with_conn(|conn| {
             conn.write_timeout = timeout;
@@ -187,10 +187,10 @@ impl ShimStdTcpStream {
             }
             Ok(conn.peer_stream_id)
         })?;
-        if let Shutdown::Write | Shutdown::Both = how {
-            if let Some(peer_id) = peer {
-                mark_peer_read_shutdown(peer_id);
-            }
+        if let Shutdown::Write | Shutdown::Both = how
+            && let Some(peer_id) = peer
+        {
+            mark_peer_read_shutdown(peer_id);
         }
         Ok(())
     }
@@ -667,10 +667,7 @@ impl ShimStdTcpListener {
             if let Some(stream_id) = stream_id {
                 let peer_addr = try_with_tcp_connection(stream_id, |conn| conn.peer_addr)
                     .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::ConnectionAborted,
-                            "accepted connection gone",
-                        )
+                        io::Error::new(io::ErrorKind::ConnectionAborted, "accepted connection gone")
                     })?;
                 return Ok((ShimStdTcpStream { stream_id }, peer_addr));
             }
@@ -739,10 +736,10 @@ impl Drop for ShimStdTcpListener {
 }
 
 fn cleanup_unaccepted_stream(stream_id: usize) {
-    if let Some(conn) = remove_tcp_connection(stream_id) {
-        if let Some(peer_id) = conn.peer_stream_id {
-            notify_peer_dropped(peer_id);
-        }
+    if let Some(conn) = remove_tcp_connection(stream_id)
+        && let Some(peer_id) = conn.peer_stream_id
+    {
+        notify_peer_dropped(peer_id);
     }
 }
 
