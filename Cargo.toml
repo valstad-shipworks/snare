@@ -1,0 +1,9 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["shims"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Bowan Foryt <bowan@valstad.com>"]

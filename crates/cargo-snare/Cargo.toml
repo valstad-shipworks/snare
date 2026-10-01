@@ -1,0 +1,14 @@
+[package]
+name = "cargo-snare"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Cargo subcommand that runs a crate's #[cfg(snare)] tests under the snare interposer with the syscall shims patched in"
+
+[[bin]]
+name = "cargo-snare"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
