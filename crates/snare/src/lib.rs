@@ -175,7 +175,7 @@ pub use tester::{RunTester as __RunTester, run_testers as __run_testers};
 #[cfg(windows)]
 pub use win_adapter::{Adapter, AdapterKey, AdvancedProperty, RegValue};
 #[cfg(windows)]
-pub use win_host::{Sim, SimBuilder, WinHost, WorkingSet};
+pub use win_host::{MmcssTask, PowerThrottling, Sim, SimBuilder, WinHost, WorkingSet};
 
 /// The file plane `fs` with, on Linux, the sim's `/proc/net/snmp` and `/proc/net/snmp6` in front
 /// of it ([`procnet`]).

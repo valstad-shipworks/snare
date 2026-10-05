@@ -272,6 +272,9 @@ pub(crate) struct DgramOpts {
     /// Linux `IPV6_MULTICAST_ALL`, the same for IPv6 groups, also on by default
     /// (net/ipv6/af_inet6.c `inet6_create` sets `MC6_ALL`).
     pub(crate) mc6_all: bool,
+    /// Windows `SIO_CPU_AFFINITY`: the processor whose receive queue the socket is tied to.
+    #[cfg(windows)]
+    pub(crate) cpu_affinity: Option<u16>,
 }
 
 impl Default for DgramOpts {
@@ -281,6 +284,8 @@ impl Default for DgramOpts {
             connreset: true,
             mc_all: true,
             mc6_all: true,
+            #[cfg(windows)]
+            cpu_affinity: None,
         }
     }
 }
@@ -1393,6 +1398,12 @@ impl SocketTable {
             .iter()
             .find(|e| e.id == id)
             .cloned()
+    }
+
+    /// The `SIO_CPU_AFFINITY` processor of open socket `id`.
+    #[cfg(windows)]
+    pub(crate) fn cpu_affinity(&self, id: SocketId) -> Option<u16> {
+        self.lookup(id)?.state().dgram.cpu_affinity
     }
 
     /// Snapshots of the open sockets, oldest first. The records are copied out before any is

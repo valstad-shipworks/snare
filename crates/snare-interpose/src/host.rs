@@ -374,6 +374,136 @@ pub trait Host: Send + Sync + 'static {
         None
     }
 
+    /// avrt `AvSetMmThreadCharacteristicsW(task, task_index)`: registers the calling thread with
+    /// the MMCSS task named `task` (UTF-16, without its terminator). `Ok` is the task handle the
+    /// hook returns; `Err(e)` returns NULL with `SetLastError(e)`
+    /// ([Microsoft Learn: AvSetMmThreadCharacteristicsW](https://learn.microsoft.com/en-us/windows/win32/api/avrt/nf-avrt-avsetmmthreadcharacteristicsw)).
+    ///
+    /// # Safety
+    /// `task_index` is null or a readable and writable `DWORD`.
+    unsafe fn av_set_mm_thread_characteristics(
+        &self,
+        task: &[u16],
+        task_index: *mut u32,
+    ) -> Option<HostResult> {
+        None
+    }
+    /// avrt `AvSetMmThreadPriority(task, priority)`, an `AVRT_PRIORITY`; returns a `BOOL`
+    /// ([Microsoft Learn: AvSetMmThreadPriority](https://learn.microsoft.com/en-us/windows/win32/api/avrt/nf-avrt-avsetmmthreadpriority)).
+    fn av_set_mm_thread_priority(&self, task: u64, priority: c_int) -> Option<HostResult> {
+        None
+    }
+    /// avrt `AvRevertMmThreadCharacteristics(task)`; returns a `BOOL`
+    /// ([Microsoft Learn: AvRevertMmThreadCharacteristics](https://learn.microsoft.com/en-us/windows/win32/api/avrt/nf-avrt-avrevertmmthreadcharacteristics)).
+    fn av_revert_mm_thread_characteristics(&self, task: u64) -> Option<HostResult> {
+        None
+    }
+
+    /// Windows `SetProcessInformation(process, class, info, size)`, a `PROCESS_INFORMATION_CLASS`;
+    /// returns a `BOOL`. A host declines the classes it does not model
+    /// ([Microsoft Learn: SetProcessInformation](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setprocessinformation)).
+    ///
+    /// # Safety
+    /// `info` is valid for `size` bytes.
+    unsafe fn set_process_information(
+        &self,
+        process: u64,
+        class: c_int,
+        info: *const u8,
+        size: u32,
+    ) -> Option<HostResult> {
+        None
+    }
+    /// Windows `GetProcessInformation(process, class, info, size)`; returns a `BOOL`.
+    ///
+    /// # Safety
+    /// `info` is valid for `size` bytes.
+    unsafe fn get_process_information(
+        &self,
+        process: u64,
+        class: c_int,
+        info: *mut u8,
+        size: u32,
+    ) -> Option<HostResult> {
+        None
+    }
+    /// Windows `SetThreadInformation(thread, class, info, size)`, a `THREAD_INFORMATION_CLASS`;
+    /// returns a `BOOL`. A host declines the classes it does not model
+    /// ([Microsoft Learn: SetThreadInformation](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreadinformation)).
+    ///
+    /// # Safety
+    /// `info` is valid for `size` bytes.
+    unsafe fn set_thread_information(
+        &self,
+        thread: u64,
+        class: c_int,
+        info: *const u8,
+        size: u32,
+    ) -> Option<HostResult> {
+        None
+    }
+    /// Windows `GetThreadInformation(thread, class, info, size)`; returns a `BOOL`.
+    ///
+    /// # Safety
+    /// `info` is valid for `size` bytes.
+    unsafe fn get_thread_information(
+        &self,
+        thread: u64,
+        class: c_int,
+        info: *mut u8,
+        size: u32,
+    ) -> Option<HostResult> {
+        None
+    }
+
+    /// Windows `GetSystemCpuSetInformation(info, len, returned, process, flags)`: the
+    /// `SYSTEM_CPU_SET_INFORMATION` records of the machine's CPU sets; returns a `BOOL`
+    /// ([Microsoft Learn: GetSystemCpuSetInformation](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getsystemcpusetinformation)).
+    ///
+    /// # Safety
+    /// `info` is null or valid for `len` bytes; `returned` is null or writable.
+    unsafe fn system_cpu_set_information(
+        &self,
+        info: *mut u8,
+        len: u32,
+        returned: *mut u32,
+        process: u64,
+        flags: u32,
+    ) -> Option<HostResult> {
+        None
+    }
+    /// Windows `SetProcessDefaultCpuSets(process, ids, count)` (`thread` false) or
+    /// `SetThreadSelectedCpuSets(thread, ids, count)` (`thread` true); returns a `BOOL`
+    /// ([Microsoft Learn: SetProcessDefaultCpuSets](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setprocessdefaultcpusets)).
+    ///
+    /// # Safety
+    /// `ids` is null or holds `count` ids.
+    unsafe fn set_cpu_sets(
+        &self,
+        thread: bool,
+        handle: u64,
+        ids: *const u32,
+        count: u32,
+    ) -> Option<HostResult> {
+        None
+    }
+    /// Windows `GetProcessDefaultCpuSets` (`thread` false) or `GetThreadSelectedCpuSets`
+    /// (`thread` true) `(handle, ids, count, required)`; returns a `BOOL`
+    /// ([Microsoft Learn: GetProcessDefaultCpuSets](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocessdefaultcpusets)).
+    ///
+    /// # Safety
+    /// `ids` is null or has room for `count` ids; `required` is writable.
+    unsafe fn get_cpu_sets(
+        &self,
+        thread: bool,
+        handle: u64,
+        ids: *mut u32,
+        count: u32,
+        required: *mut u32,
+    ) -> Option<HostResult> {
+        None
+    }
+
     /// A device-installation or registry call on a handle, device instance or device class the
     /// host may own (see [`DevCall`] for each call's return convention). `None` passes the call
     /// to the real `setupapi`, `cfgmgr32` or `advapi32` export.

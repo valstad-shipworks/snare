@@ -21,6 +21,11 @@ rg -n 'ignore = "bug' crates
 
 ## Host planes
 
+- **Host name** (`simhost_uname.rs`): `uname` reports `HostProfile::nodename`, but `gethostname`
+  is not modelled and still returns the real name (glibc builds it from the `uname` syscall
+  inside libc, macOS from `sysctl` `kern.hostname`), and neither are the macOS `kern.ostype`,
+  `kern.osrelease`, `kern.version` and `kern.hostname` sysctls.
+
 - **Environment** (`edge_host_env.rs`): on Linux, `std::env::vars` in an isolated sim lists the
   real process environment. It accesses the process-global `environ` variable directly, outside
   function interposition. Swapping `environ` would expose simulated values to concurrent sims and
@@ -56,6 +61,12 @@ can change which reports fit and drop:
   report grouping.
 
 ## Network model boundaries
+
+- `recvmmsg` (Linux) receives each message through the backend's `recvmsg`. An error after the
+  first message ends the batch and is dropped, where the kernel keeps it as the socket's pending
+  error for the next call (`do_recvmmsg`, net/socket.c).
+- On a plain sim (no `SimHost`), `sendmsg` with any control message fails with `EOPNOTSUPP`:
+  `IP_PKTINFO`, `IP_TOS`, `SCM_TXTIME` and the rest are modelled only for a `SimHost`'s sockets.
 
 - Completed TCP accept queues enforce the configured backlog, with host comparisons on macOS,
   Linux and Windows. Separate incomplete-handshake queues and simultaneous SYN/ACK completion
@@ -102,6 +113,22 @@ cases on that host, not every Winsock hook or supported Windows release.
   Process/thread background transitions, inherited threads, overlaps and class changes have
   host comparisons. Granted realtime-class thread/background behavior has a priority-range
   mismatch described below; earlier requests reported `HIGH_PRIORITY_CLASS` instead.
+- MMCSS registrations (`AvSetMmThreadCharacteristicsW`, `AvSetMmThreadPriority`,
+  `AvRevertMmThreadCharacteristics`) are kept apart from the thread's priority: on Windows 11
+  `GetThreadPriority` reads 15 once a thread joins "Pro Audio", 17 and 18 after
+  `AVRT_PRIORITY_HIGH`/`CRITICAL`, and 0 after the revert, while the sim keeps reporting the
+  priority `SetThreadPriority` last set. A successful revert also leaves `ERROR_INVALID_HANDLE`
+  (6) as the thread's last error on the host, which the sim does not. Task indices count from 1
+  per host rather than following the system-wide counter, and only the task names of a stock
+  Windows 11 installation are known.
+- Power throttling covers `ProcessPowerThrottling` and `ThreadPowerThrottling`; the other
+  `SetProcessInformation`/`SetThreadInformation` classes (memory priority, app memory, dynamic
+  code policy, ...) still reach the real process. `GetThreadInformation`'s rules for a short or
+  long buffer and a version of 0 are assumed to be the setter's, and are unmeasured.
+- CPU sets: `GetSystemCpuSetInformation` reports one core per logical processor, last-level
+  cache 0 and no flags (`Parked`, `Allocated`, `RealTime`, efficiency classes), whatever the
+  real machine's topology; its `Process` and `Flags` arguments are ignored. Selected CPU sets do
+  not interact with `SetThreadAffinityMask` as they do on Windows.
 - Timers created through `CreateWaitableTimerW/A` and `CreateWaitableTimerExW/A` support unnamed
   relative/absolute deadlines, periodic auto/manual-reset signals, same-process handle aliases,
   cancellation,

@@ -87,6 +87,18 @@ static SET_PROCESS_WORKING_SET_SIZE_EX: AtomicUsize = AtomicUsize::new(0);
 static GET_PROCESS_WORKING_SET_SIZE_EX: AtomicUsize = AtomicUsize::new(0);
 static TIME_BEGIN_PERIOD: AtomicUsize = AtomicUsize::new(0);
 static TIME_END_PERIOD: AtomicUsize = AtomicUsize::new(0);
+static AV_SET_MM_THREAD_CHARACTERISTICS_W: AtomicUsize = AtomicUsize::new(0);
+static AV_SET_MM_THREAD_PRIORITY: AtomicUsize = AtomicUsize::new(0);
+static AV_REVERT_MM_THREAD_CHARACTERISTICS: AtomicUsize = AtomicUsize::new(0);
+static SET_PROCESS_INFORMATION: AtomicUsize = AtomicUsize::new(0);
+static GET_PROCESS_INFORMATION: AtomicUsize = AtomicUsize::new(0);
+static SET_THREAD_INFORMATION: AtomicUsize = AtomicUsize::new(0);
+static GET_THREAD_INFORMATION: AtomicUsize = AtomicUsize::new(0);
+static GET_SYSTEM_CPU_SET_INFORMATION: AtomicUsize = AtomicUsize::new(0);
+static SET_PROCESS_DEFAULT_CPU_SETS: AtomicUsize = AtomicUsize::new(0);
+static GET_PROCESS_DEFAULT_CPU_SETS: AtomicUsize = AtomicUsize::new(0);
+static SET_THREAD_SELECTED_CPU_SETS: AtomicUsize = AtomicUsize::new(0);
+static GET_THREAD_SELECTED_CPU_SETS: AtomicUsize = AtomicUsize::new(0);
 static WAIT_FOR_SINGLE_OBJECT: AtomicUsize = AtomicUsize::new(0);
 static WAIT_ON_ADDRESS: AtomicUsize = AtomicUsize::new(0);
 static SWITCH_TO_THREAD: AtomicUsize = AtomicUsize::new(0);
@@ -277,6 +289,78 @@ pub(crate) fn hooks() -> Vec<Hook> {
             "winmm.dll",
             time_end_period,
             TIME_END_PERIOD
+        ),
+        hook!(
+            "AvSetMmThreadCharacteristicsW",
+            "avrt.dll",
+            av_set_mm_thread_characteristics_w,
+            AV_SET_MM_THREAD_CHARACTERISTICS_W
+        ),
+        hook!(
+            "AvSetMmThreadPriority",
+            "avrt.dll",
+            av_set_mm_thread_priority,
+            AV_SET_MM_THREAD_PRIORITY
+        ),
+        hook!(
+            "AvRevertMmThreadCharacteristics",
+            "avrt.dll",
+            av_revert_mm_thread_characteristics,
+            AV_REVERT_MM_THREAD_CHARACTERISTICS
+        ),
+        hook!(
+            "SetProcessInformation",
+            "kernel32.dll",
+            set_process_information,
+            SET_PROCESS_INFORMATION
+        ),
+        hook!(
+            "GetProcessInformation",
+            "kernel32.dll",
+            get_process_information,
+            GET_PROCESS_INFORMATION
+        ),
+        hook!(
+            "SetThreadInformation",
+            "kernel32.dll",
+            set_thread_information,
+            SET_THREAD_INFORMATION
+        ),
+        hook!(
+            "GetThreadInformation",
+            "kernel32.dll",
+            get_thread_information,
+            GET_THREAD_INFORMATION
+        ),
+        hook!(
+            "GetSystemCpuSetInformation",
+            "kernel32.dll",
+            get_system_cpu_set_information,
+            GET_SYSTEM_CPU_SET_INFORMATION
+        ),
+        hook!(
+            "SetProcessDefaultCpuSets",
+            "kernel32.dll",
+            set_process_default_cpu_sets,
+            SET_PROCESS_DEFAULT_CPU_SETS
+        ),
+        hook!(
+            "GetProcessDefaultCpuSets",
+            "kernel32.dll",
+            get_process_default_cpu_sets,
+            GET_PROCESS_DEFAULT_CPU_SETS
+        ),
+        hook!(
+            "SetThreadSelectedCpuSets",
+            "kernel32.dll",
+            set_thread_selected_cpu_sets,
+            SET_THREAD_SELECTED_CPU_SETS
+        ),
+        hook!(
+            "GetThreadSelectedCpuSets",
+            "kernel32.dll",
+            get_thread_selected_cpu_sets,
+            GET_THREAD_SELECTED_CPU_SETS
         ),
         hook!("pcap_create", "wpcap.dll", pcap_create, PCAP_CREATE),
         hook!(
@@ -1242,6 +1326,253 @@ unsafe extern "system" fn time_end_period(period: u32) -> u32 {
     }
     // SAFETY: TIME_END_PERIOD holds winmm's timeEndPeriod.
     unsafe { original::<unsafe extern "system" fn(u32) -> u32>(&TIME_END_PERIOD)(period) }
+}
+
+/// `AvSetMmThreadCharacteristicsW` (avrt): registers the calling thread with the MMCSS task
+/// `task`, returning the task handle, or NULL with the last error set
+/// ([Microsoft Learn: AvSetMmThreadCharacteristicsW](https://learn.microsoft.com/en-us/windows/win32/api/avrt/nf-avrt-avsetmmthreadcharacteristicsw)).
+unsafe extern "system" fn av_set_mm_thread_characteristics_w(
+    task: *const u16,
+    task_index: *mut u32,
+) -> HANDLE {
+    // SAFETY: `task` is the caller's NUL-terminated task name.
+    let name = unsafe { wide_str(task) };
+    if let Some(r) =
+        dispatch_host(|h| unsafe { h.av_set_mm_thread_characteristics(name, task_index) })
+    {
+        if r < 0 {
+            // SAFETY: setting the calling thread's last-error.
+            unsafe { SetLastError((-r) as u32) };
+            return std::ptr::null_mut();
+        }
+        return r as usize as HANDLE;
+    }
+    // SAFETY: AV_SET_MM_THREAD_CHARACTERISTICS_W holds avrt's AvSetMmThreadCharacteristicsW.
+    unsafe {
+        original::<unsafe extern "system" fn(*const u16, *mut u32) -> HANDLE>(
+            &AV_SET_MM_THREAD_CHARACTERISTICS_W,
+        )(task, task_index)
+    }
+}
+
+/// The UTF-16 string at `text` without its terminator; empty for a null pointer.
+///
+/// # Safety
+/// `text` is null or NUL-terminated.
+unsafe fn wide_str<'a>(text: *const u16) -> &'a [u16] {
+    if text.is_null() {
+        return &[];
+    }
+    let mut len = 0;
+    // SAFETY: the string is NUL-terminated.
+    while unsafe { *text.add(len) } != 0 {
+        len += 1;
+    }
+    // SAFETY: `len` units precede the terminator.
+    unsafe { std::slice::from_raw_parts(text, len) }
+}
+
+/// `AvSetMmThreadPriority` (avrt): an `AVRT_PRIORITY` for a registered task; returns a `BOOL`
+/// ([Microsoft Learn: AvSetMmThreadPriority](https://learn.microsoft.com/en-us/windows/win32/api/avrt/nf-avrt-avsetmmthreadpriority)).
+unsafe extern "system" fn av_set_mm_thread_priority(task: HANDLE, priority: i32) -> i32 {
+    if let Some(r) = dispatch_host(|h| h.av_set_mm_thread_priority(task as u64, priority)) {
+        return finish_bool(r);
+    }
+    // SAFETY: AV_SET_MM_THREAD_PRIORITY holds avrt's AvSetMmThreadPriority.
+    unsafe {
+        original::<unsafe extern "system" fn(HANDLE, i32) -> i32>(&AV_SET_MM_THREAD_PRIORITY)(
+            task, priority,
+        )
+    }
+}
+
+/// `AvRevertMmThreadCharacteristics` (avrt): ends a task registration; returns a `BOOL`
+/// ([Microsoft Learn: AvRevertMmThreadCharacteristics](https://learn.microsoft.com/en-us/windows/win32/api/avrt/nf-avrt-avrevertmmthreadcharacteristics)).
+unsafe extern "system" fn av_revert_mm_thread_characteristics(task: HANDLE) -> i32 {
+    if let Some(r) = dispatch_host(|h| h.av_revert_mm_thread_characteristics(task as u64)) {
+        return finish_bool(r);
+    }
+    // SAFETY: AV_REVERT_MM_THREAD_CHARACTERISTICS holds avrt's AvRevertMmThreadCharacteristics.
+    unsafe {
+        original::<unsafe extern "system" fn(HANDLE) -> i32>(&AV_REVERT_MM_THREAD_CHARACTERISTICS)(
+            task,
+        )
+    }
+}
+
+/// The signature of `SetProcessInformation`, `GetProcessInformation` and their thread
+/// counterparts: handle, information class, buffer, buffer size.
+type InformationFn = unsafe extern "system" fn(HANDLE, i32, *mut c_void, u32) -> i32;
+
+/// `SetProcessInformation`; returns a `BOOL`
+/// ([Microsoft Learn: SetProcessInformation](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setprocessinformation)).
+unsafe extern "system" fn set_process_information(
+    process: HANDLE,
+    class: i32,
+    info: *mut c_void,
+    size: u32,
+) -> i32 {
+    // SAFETY: `info` is the caller's buffer of `size` bytes.
+    if let Some(r) = dispatch_host(|h| unsafe {
+        h.set_process_information(process as u64, class, info.cast(), size)
+    }) {
+        return finish_bool(r);
+    }
+    // SAFETY: SET_PROCESS_INFORMATION holds kernel32's SetProcessInformation.
+    unsafe { original::<InformationFn>(&SET_PROCESS_INFORMATION)(process, class, info, size) }
+}
+
+/// `GetProcessInformation`; returns a `BOOL`
+/// ([Microsoft Learn: GetProcessInformation](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocessinformation)).
+unsafe extern "system" fn get_process_information(
+    process: HANDLE,
+    class: i32,
+    info: *mut c_void,
+    size: u32,
+) -> i32 {
+    // SAFETY: `info` is the caller's buffer of `size` bytes.
+    if let Some(r) = dispatch_host(|h| unsafe {
+        h.get_process_information(process as u64, class, info.cast(), size)
+    }) {
+        return finish_bool(r);
+    }
+    // SAFETY: GET_PROCESS_INFORMATION holds kernel32's GetProcessInformation.
+    unsafe { original::<InformationFn>(&GET_PROCESS_INFORMATION)(process, class, info, size) }
+}
+
+/// `SetThreadInformation`; returns a `BOOL`
+/// ([Microsoft Learn: SetThreadInformation](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreadinformation)).
+unsafe extern "system" fn set_thread_information(
+    thread: HANDLE,
+    class: i32,
+    info: *mut c_void,
+    size: u32,
+) -> i32 {
+    // SAFETY: `info` is the caller's buffer of `size` bytes.
+    if let Some(r) = dispatch_host(|h| unsafe {
+        h.set_thread_information(thread as u64, class, info.cast(), size)
+    }) {
+        return finish_bool(r);
+    }
+    // SAFETY: SET_THREAD_INFORMATION holds kernel32's SetThreadInformation.
+    unsafe { original::<InformationFn>(&SET_THREAD_INFORMATION)(thread, class, info, size) }
+}
+
+/// `GetThreadInformation`; returns a `BOOL`
+/// ([Microsoft Learn: GetThreadInformation](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getthreadinformation)).
+unsafe extern "system" fn get_thread_information(
+    thread: HANDLE,
+    class: i32,
+    info: *mut c_void,
+    size: u32,
+) -> i32 {
+    // SAFETY: `info` is the caller's buffer of `size` bytes.
+    if let Some(r) = dispatch_host(|h| unsafe {
+        h.get_thread_information(thread as u64, class, info.cast(), size)
+    }) {
+        return finish_bool(r);
+    }
+    // SAFETY: GET_THREAD_INFORMATION holds kernel32's GetThreadInformation.
+    unsafe { original::<InformationFn>(&GET_THREAD_INFORMATION)(thread, class, info, size) }
+}
+
+/// `GetSystemCpuSetInformation`; returns a `BOOL`
+/// ([Microsoft Learn: GetSystemCpuSetInformation](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getsystemcpusetinformation)).
+unsafe extern "system" fn get_system_cpu_set_information(
+    info: *mut c_void,
+    len: u32,
+    returned: *mut u32,
+    process: HANDLE,
+    flags: u32,
+) -> i32 {
+    // SAFETY: `info` holds `len` bytes and `returned` is writable, the caller's.
+    if let Some(r) = dispatch_host(|h| unsafe {
+        h.system_cpu_set_information(info.cast(), len, returned, process as u64, flags)
+    }) {
+        return finish_bool(r);
+    }
+    type CpuSetInformationFn = unsafe extern "system" fn(*mut c_void, u32, *mut u32, HANDLE, u32) -> i32;
+    // SAFETY: GET_SYSTEM_CPU_SET_INFORMATION holds kernel32's GetSystemCpuSetInformation.
+    unsafe {
+        original::<CpuSetInformationFn>(&GET_SYSTEM_CPU_SET_INFORMATION)(
+            info, len, returned, process, flags,
+        )
+    }
+}
+
+/// The signature of `SetProcessDefaultCpuSets` and `SetThreadSelectedCpuSets`.
+type SetCpuSetsFn = unsafe extern "system" fn(HANDLE, *const u32, u32) -> i32;
+/// The signature of `GetProcessDefaultCpuSets` and `GetThreadSelectedCpuSets`.
+type GetCpuSetsFn = unsafe extern "system" fn(HANDLE, *mut u32, u32, *mut u32) -> i32;
+
+/// `SetProcessDefaultCpuSets`; returns a `BOOL`
+/// ([Microsoft Learn: SetProcessDefaultCpuSets](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setprocessdefaultcpusets)).
+unsafe extern "system" fn set_process_default_cpu_sets(
+    process: HANDLE,
+    ids: *const u32,
+    count: u32,
+) -> i32 {
+    // SAFETY: `ids` holds `count` ids, the caller's.
+    if let Some(r) = dispatch_host(|h| unsafe { h.set_cpu_sets(false, process as u64, ids, count) })
+    {
+        return finish_bool(r);
+    }
+    // SAFETY: SET_PROCESS_DEFAULT_CPU_SETS holds kernel32's SetProcessDefaultCpuSets.
+    unsafe { original::<SetCpuSetsFn>(&SET_PROCESS_DEFAULT_CPU_SETS)(process, ids, count) }
+}
+
+/// `GetProcessDefaultCpuSets`; returns a `BOOL`
+/// ([Microsoft Learn: GetProcessDefaultCpuSets](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocessdefaultcpusets)).
+unsafe extern "system" fn get_process_default_cpu_sets(
+    process: HANDLE,
+    ids: *mut u32,
+    count: u32,
+    required: *mut u32,
+) -> i32 {
+    // SAFETY: `ids` has room for `count` ids and `required` is writable, the caller's.
+    if let Some(r) = dispatch_host(|h| unsafe {
+        h.get_cpu_sets(false, process as u64, ids, count, required)
+    }) {
+        return finish_bool(r);
+    }
+    // SAFETY: GET_PROCESS_DEFAULT_CPU_SETS holds kernel32's GetProcessDefaultCpuSets.
+    unsafe {
+        original::<GetCpuSetsFn>(&GET_PROCESS_DEFAULT_CPU_SETS)(process, ids, count, required)
+    }
+}
+
+/// `SetThreadSelectedCpuSets`; returns a `BOOL`
+/// ([Microsoft Learn: SetThreadSelectedCpuSets](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreadselectedcpusets)).
+unsafe extern "system" fn set_thread_selected_cpu_sets(
+    thread: HANDLE,
+    ids: *const u32,
+    count: u32,
+) -> i32 {
+    // SAFETY: `ids` holds `count` ids, the caller's.
+    if let Some(r) = dispatch_host(|h| unsafe { h.set_cpu_sets(true, thread as u64, ids, count) })
+    {
+        return finish_bool(r);
+    }
+    // SAFETY: SET_THREAD_SELECTED_CPU_SETS holds kernel32's SetThreadSelectedCpuSets.
+    unsafe { original::<SetCpuSetsFn>(&SET_THREAD_SELECTED_CPU_SETS)(thread, ids, count) }
+}
+
+/// `GetThreadSelectedCpuSets`; returns a `BOOL`
+/// ([Microsoft Learn: GetThreadSelectedCpuSets](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getthreadselectedcpusets)).
+unsafe extern "system" fn get_thread_selected_cpu_sets(
+    thread: HANDLE,
+    ids: *mut u32,
+    count: u32,
+    required: *mut u32,
+) -> i32 {
+    // SAFETY: `ids` has room for `count` ids and `required` is writable, the caller's.
+    if let Some(r) =
+        dispatch_host(|h| unsafe { h.get_cpu_sets(true, thread as u64, ids, count, required) })
+    {
+        return finish_bool(r);
+    }
+    // SAFETY: GET_THREAD_SELECTED_CPU_SETS holds kernel32's GetThreadSelectedCpuSets.
+    unsafe { original::<GetCpuSetsFn>(&GET_THREAD_SELECTED_CPU_SETS)(thread, ids, count, required) }
 }
 
 /// A host `time_period` result as the `MMRESULT` the caller reads: the code itself, or
