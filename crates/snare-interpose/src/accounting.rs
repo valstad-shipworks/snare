@@ -873,9 +873,10 @@ impl Held {
         {
             Some(slot) => slot.store(0, Ordering::SeqCst),
             None => {
+                #[allow(deprecated)]
                 let _ = self
                     .spilled
-                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
             }
         }
     }

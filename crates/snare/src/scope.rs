@@ -194,10 +194,11 @@ impl SimShared {
     /// The next ephemeral TCP port of this sim, for an unbound connect or a bind to port 0,
     /// cycling through 49152..=65535 ([`EPHEMERAL_FIRST`]). Sequential rather than randomised, so
     /// runs replay.
+    #[allow(deprecated)]
     pub(crate) fn ephemeral_port(&self) -> u16 {
         let next = |port: u16| Some(port.checked_add(1).unwrap_or(EPHEMERAL_FIRST));
         self.next_ephemeral
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, next)
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, next)
             .unwrap_or(EPHEMERAL_FIRST)
     }
 
