@@ -102,7 +102,7 @@ simulation automatically. Only managed threads are interposed; the test's own bo
 | **Time** | `clock_gettime` (`CLOCK_MONOTONIC`/`REALTIME`/`TAI`), `gettimeofday`, `QueryPerformanceCounter`, `GetTickCount64`, `mach_absolute_time` — a discrete-event virtual clock at a fixed epoch (the default, with or without a `SimHost`; `wall_clock()` opts out). Time jumps to the next pending sleep or timeout once every thread is blocked, and each call that returns without blocking costs a microsecond, so busy-polls still let time move. It can also run scaled to real time (`time_rate`), be set forward (`set_time_value`), and be paused, which holds every sleep and timed wait until time is moved from outside — see [Controlling time](#controlling-time). |
 | **Entropy** | `getrandom`/`getentropy`/`arc4random`/`ProcessPrng` — seeded, so `HashMap` order etc. is repeatable. |
 | **TCP** | `std::net::TcpStream`/`TcpListener` against scripted `connect_tester` peers, or against each other: the code under test can `bind`/`listen`/`accept` (`accept4` flags on Linux) and connect to its own listeners, with `shutdown(2)` (`SHUT_RD`/`SHUT_WR`/`SHUT_RDWR`) and bind conflicts (`EADDRINUSE`, `SO_REUSEADDR`) as the host OS has them. |
-| **UDP** | `std::net::UdpSocket` serviced from memory on every platform: `bind`/`connect`/`sendto`/`recvfrom`, blocking cross-thread receive, broadcast (`SO_BROADCAST`), multicast (`IP_ADD_MEMBERSHIP`, Linux `IP_MULTICAST_ALL`), Linux `IP_RECVERR` ICMP reports on `MSG_ERRQUEUE`, and several addresses sharing a port. Under a `SimHost` it adds `SCM_TXTIME` launch deadlines, and its sockets work with `poll` and `epoll`. TCP and UDP run together in one `Sim`. |
+| **UDP** | `std::net::UdpSocket` serviced from memory on every platform: `bind`/`connect`/`sendto`/`recvfrom`/`sendmsg`/`recvmsg` (and Linux `sendmmsg`/`recvmmsg`), blocking cross-thread receive, broadcast (`SO_BROADCAST`), multicast (`IP_ADD_MEMBERSHIP`, Linux `IP_MULTICAST_ALL`), Linux `IP_RECVERR` ICMP reports on `MSG_ERRQUEUE`, and several addresses sharing a port. Under a `SimHost` it adds `SCM_TXTIME` launch deadlines, and its sockets work with `poll` and `epoll`. TCP and UDP run together in one `Sim`. |
 | **Packet timestamps** | Kernel receive and transmit stamps from the sim's clock on the plain `Sim` and under a `SimHost`: Linux `SO_TIMESTAMP`/`SO_TIMESTAMPNS`/`SO_TIMESTAMPING` (`SCM_TIMESTAMP*`, UDP and TCP) and `MSG_ERRQUEUE` transmit stamps (`OPT_ID`, `OPT_TSONLY`, `TX_SCHED`/`TX_ACK`); macOS `SO_TIMESTAMP`/`SO_TIMESTAMP_MONOTONIC`/`SO_TIMESTAMP_CONTINUOUS`; Windows `SIO_TIMESTAMPING` on UDP (`WSARecvMsg`'s `SO_TIMESTAMP`, `SIO_GET_TX_TIMESTAMP` by `SO_TIMESTAMP_ID`). A packet is stamped when it reaches the socket, after its link delay. See [Packet timestamps](#packet-timestamps). |
 | **Raw L2** | Linux `AF_PACKET`/`SOCK_RAW` + `bind(sockaddr_ll)`; macOS `/dev/bpf*` (`BIOCSETIF`/`bpf_hdr`). What EtherCAT masters (ethercrab) use. Interfaces come from the sim's topology (`add_nic`), and frames respect their link state and MTU. |
 | **Interfaces and routing** | One topology per sim (`NicSpec`, `Route`, `add_nic`, `set_link`, `schedule_link`, `route_lookup`) that every backend routes real traffic through: longest-prefix routes, source selection, carrier and admin flaps that stall TCP and drop datagrams, per-interface latency/jitter/loss (`NicPolicy`) and counters, and bind-to-device (`SO_BINDTODEVICE`, `IP_BOUND_IF`, `IP_UNICAST_IF`, or `set_socket_device` from the test) with the host OS's errors. See [Interfaces and routing](#interfaces-and-routing). |
@@ -111,9 +111,10 @@ simulation automatically. Only managed threads are interposed; the test's own bo
 | **Socket faults and back-pressure** | Raised socket errors (`raise_socket_error`), ICMP port unreachables (injected, from a tester, and sent back automatically after the round trip for a datagram no socket takes), one-way link stalls that hold traffic in flight (`quiesce`), TCP send and receive buffers (`SO_SNDBUF`/`SO_RCVBUF`) and a receive window (`TcpPolicy::recv_window`) that block sends with `SO_SNDTIMEO` and host-OS writable thresholds, and `SO_LINGER` aborts and waiting closes — each with the host OS's codes and call order. See [Socket faults and back-pressure](#socket-faults-and-back-pressure). |
 | **Connect faults** | A listening address refuses (`ListenerBehavior::Refusing`) or drops SYNs until an instant (`DelayingUntil`), and an address nobody answers at makes a connect wait out the host OS's SYN retransmission plan — Linux 131 s (`tcp_syn_retries`, `tcp_syn_linear_timeouts`, `TCP_SYNCNT`), macOS 75 s (`TCP_CONNECTIONTIMEOUT`), Windows 21 s (`TCP_MAXRT`) — in virtual time. Nonblocking connects report `EINPROGRESS`/`WSAEWOULDBLOCK`, then `poll`/`epoll`/`kqueue`/`select` and `SO_ERROR`, so `connect_timeout` and `mio` behave as on the real OS. See [Connect faults](#connect-faults). |
 | **Protocol counters** | The host's UDP and TCP counters, driven by the sim's traffic: Linux `/proc/net/snmp` and `/proc/net/snmp6`, macOS `sysctl` `net.inet.udp.stats`, Windows `GetUdpStatistics(Ex/Ex2)` and `GetTcpStatistics(Ex/Ex2)`, and `proto_counters()` for the test. See [Protocol counters](#protocol-counters). |
-| **Netlink** | `AF_NETLINK` rtnetlink `RTM_GETLINK`/`IFLA_STATS64`, genetlink `CTRL_CMD_GETFAMILY`, `RTM_GETQDISC`/ETF. |
-| **Files** | `VirtualFs`: an in-memory tree behind open, sequential/positional IO, truncate, sync, stat and directory-stream calls, with glob passthrough to real paths. `SimHost` also renders `/sys`, `/proc`, `/dev/ptp*`, `/dev/cpu_dma_latency`. Raw directory syscalls and path mutation are incomplete. |
+| **Netlink** | `AF_NETLINK` rtnetlink `RTM_GETLINK`/`IFLA_STATS64` (a dump, or one link by index or name), genetlink `CTRL_CMD_GETFAMILY`, `RTM_GETQDISC`/ETF. |
+| **Files** | `VirtualFs`: an in-memory tree behind open, sequential/positional IO, truncate, sync, stat and directory-stream calls, with glob passthrough to real paths. `SimHost` also renders `/sys`, `/proc`, `/dev/ptp*`, `/dev/cpu_dma_latency` (the request held open reads back through `SimHost::cpu_dma_latency`). Raw directory syscalls and path mutation are incomplete. |
 | **Host tuning** | Scheduling (`sched_setscheduler`/affinity/priority, `mlock`/`mlockall`), resource limits (`RLIMIT_RTPRIO`/`NICE`/`MEMLOCK`), NIC config (`ethtool` rings/coalescing/channels/pause/EEE/flags/flow rules/stats, `SIOC[GS]HWTSTAMP`, qdiscs and ETF offload, threaded NAPI, queues/IRQs), PTP, capability gating — all modeled, never touching the real scheduler or NIC. |
+| **Kernel identity** | Under a `SimHost`, `uname` (and Linux `SYS_uname`) reports the profile's `sysname`/`nodename`/`kernel_release`/`kernel_version`/`machine`: a fixed kernel by default, whose Linux version string carries `PREEMPT_RT` when the profile does, or the build machine's own with `real_uname()`. `gethostname` still reads the real name. |
 | **Tester stages** | A tester's message chain: `then_test` / `then_stateful_test` drop or rewrite a message before later stages, `then_edit_state` updates state, `then_action` / `then_stateful_action` answer — run in the order added. |
 | **Thread classes** | Every thread in a `Sim` is a participant unless marked (`snare::sched::mark_background`, `mark_helper`, `mark_driver_thread`, `spawn_as`): only participants hold up quiescence and the deterministic schedule. `busy()` / `setup_scope()` leases hold time still; thread names from `pthread_setname_np` / `SetThreadDescription` label each thread. `SimBuilder::stuck_after` fails a run a spinning participant has frozen. See [Stuck runs](#stuck-runs). |
 | **Cooperative primitives** | `snare::sched::park` / `current_unparker`, `block_on` / `block_on_until` / `block_on_timeout`, the `Sleep` future (`sleep_until`), `WakerSet` and `is_driven`: in a sim they wait on its clock and schedule — counted toward quiescence, their deadlines virtual timers, their wakes held at an executive's gate — and off one on real time. See [Cooperative primitives](#cooperative-primitives). |
@@ -125,7 +126,7 @@ simulation automatically. Only managed threads are interposed; the test's own bo
 | **Recorded events** | A sim-wide log (`recorded_events()`, `Sim::recorded_events`) of what crossed each tester's boundary, what link policies did to datagrams, policy changes, injected faults and delivered signals, stamped on the sim's clock. |
 | **Packet capture** | `SimBuilder::pcapng(path)` (or `SNARE_PCAPNG_DIR` for every sim, `SNARE_PCAPNG_TESTS` for chosen tests) writes what crosses the sim's network to a pcapng file Wireshark opens: fabricated Ethernet/IP headers around each TCP connection (handshake, segments, ACKs at arrival, FINs, resets, SYN retransmissions), each datagram once at its sender, ICMP port unreachables and raw L2 frames verbatim, stamped on the sim's clock per interface, optionally commented with real wall time. See [Packet capture](#packet-capture). |
 | **Environment** | `getenv`/`setenv`/`unsetenv` lookups and mutations are isolated (opt-in). macOS enumeration uses the simulated snapshot; Linux `vars`/`vars_os` still read the real process environment. |
-| **Windows** | The thread-scheduling plane (`SetThreadPriority`/affinity/priority-class/`timeBeginPeriod`) runs against a `WinHost`, and `std::net::TcpStream`/`TcpListener`/`UdpSocket` are serviced from memory by a Winsock fabric (`socket`/`bind`/`listen`/`accept`/`connect`/`send`/`recv`/`sendto`/`recvfrom` with `MSG_PEEK`/`MSG_WAITALL` and `WSAEMSGSIZE` truncation, the synchronous `WSASend`/`WSARecv`/`WSASendTo`/`WSARecvFrom`/`WSASendMsg` and the `WSARecvMsg` extension, blocking recv/accept, UDP broadcast/multicast/multi-IP, don't-fragment, `WSAIoctl`). `WSAPoll` and `select` readiness and `WSADuplicateSocket` (`try_clone`) are modelled, IOCP is planned; a sim socket never reaches Winsock — overlapped calls and event/window-message notification on one fail with `WSAEOPNOTSUPP`. A pcap/npcap interposer is in place structurally. |
+| **Windows** | The thread-scheduling plane (`SetThreadPriority`/affinity/priority-class/`timeBeginPeriod`, MMCSS `AvSetMmThreadCharacteristicsW`/`AvSetMmThreadPriority`/`AvRevertMmThreadCharacteristics`, power throttling through `Set/GetProcessInformation` and `Set/GetThreadInformation`, CPU sets) runs against a `WinHost`, read back with `Sim::time_periods`, `mmcss_tasks`, `process_power_throttling`, `thread_power_throttling`, `process_default_cpu_sets` and `thread_selected_cpu_sets`, and `std::net::TcpStream`/`TcpListener`/`UdpSocket` are serviced from memory by a Winsock fabric (`socket`/`bind`/`listen`/`accept`/`connect`/`send`/`recv`/`sendto`/`recvfrom` with `MSG_PEEK`/`MSG_WAITALL` and `WSAEMSGSIZE` truncation, the synchronous `WSASend`/`WSARecv`/`WSASendTo`/`WSARecvFrom`/`WSASendMsg` and the `WSARecvMsg` extension, blocking recv/accept, UDP broadcast/multicast/multi-IP, don't-fragment, `WSAIoctl` including `SIO_CPU_AFFINITY`, read back with `Sim::socket_cpu_affinity`). `WSAPoll` and `select` readiness and `WSADuplicateSocket` (`try_clone`) are modelled, IOCP is planned; a sim socket never reaches Winsock — overlapped calls and event/window-message notification on one fail with `WSAEOPNOTSUPP`. A pcap/npcap interposer is in place structurally. |
 
 Registered hooks record unsupported calls in `Domain::unmodelled()`. An empty report is a useful
 check, but does not prove full simulation: unhooked functions, direct process-global reads and CPU
@@ -155,12 +156,18 @@ let host = HostProfile::new()
         .queues(4, 4)
         .link_stats(LinkStats { rx_packets: 1000, ..Default::default() }))
     .env("RUNTIME_ENV", "sim")            // isolates + sets the environment
+    .kernel_release("6.6.30-rt30")        // uname -r; also sysname, nodename, kernel_version, machine
     .build();
 
 Sim::builder().host(host).build().run(|| {
     // sched_setscheduler(SCHED_FIFO), ethtool, /sys reads, SO_TIMESTAMPING, getenv — all served here.
 });
 ```
+
+`uname` reports a host named `snare` running a fixed kernel (Linux `6.12.0`, `#1 SMP PREEMPT_DYNAMIC`,
+or `#1 SMP PREEMPT_RT` with `preempt_rt(true)`; macOS `Darwin` `25.0.0`) on the build target's machine
+type. `HostProfile::real_uname()` copies all five fields from the machine running the test instead,
+and works inside a sim.
 
 `EasyBuilder` gives batteries-included presets when you just want a working machine:
 
@@ -1241,7 +1248,7 @@ gate follow the build host's kernel:
 | OS | Rule |
 |---|---|
 | Linux | `sched_setscheduler`/`sched_setparam`/`pthread_setschedparam` (and the raw syscalls): `EINVAL` for a bad policy or priority, then without `CAP_SYS_NICE` `EPERM` to enter a real-time policy with `RLIMIT_RTPRIO` 0 or to raise the priority above both the current one and the limit (kernel/sched/syscalls.c). `setpriority`: the value is clamped to −20..19 and lowering it needs `CAP_SYS_NICE` or `20 − nice <= RLIMIT_NICE` (`EACCES`). `mlock`: `EPERM` with `RLIMIT_MEMLOCK` 0, `ENOMEM` past it (locks do not nest); `mlockall(MCL_CURRENT)`: `ENOMEM` when the process's mapped size exceeds it; `CAP_IPC_LOCK` lifts both (mm/mlock.c). |
-| macOS | `mlock` wires pages counted against `RLIMIT_MEMLOCK` whatever the privileges (`EAGAIN` past it); wiring nests per page, so a page is released after as many `munlock`s. `mlockall` is `ENOSYS`, as on the real system. |
+| macOS | `mlock` wires pages counted against `RLIMIT_MEMLOCK` whatever the privileges (`EAGAIN` past it); wiring nests per page, so a page is released after as many `munlock`s. `mlockall` is `ENOSYS`, as on the real system. A successful `pthread_setschedparam`, any policy, opts the thread out of QoS for good: later `pthread_set_qos_class_self_np` calls fail with `EPERM` (`<pthread/qos.h>`; `tests/macos_qos_os_truth.rs` checks it against the host). |
 
 A `SimHost` applies these to its own simulated threads and never reaches the real scheduler or lock
 memory. A plain sim gates the same calls on its privileges and then lets an allowed one through to the
@@ -1418,6 +1425,19 @@ using it in the other mode panics rather than silently mixing an emulated ring w
 | NIC tuning / PTP | ✅ (`ethtool`, qdiscs, sysfs) | partial (`sysctl`) | adapter properties + restart (SetupAPI/registry/`CM_*`) |
 | Process limits | ✅ (`RLIMIT_RTPRIO`/`NICE`/`MEMLOCK`, `mlock`) | ✅ (`RLIMIT_MEMLOCK`, `mlock`) | priority class, working set (`WinHost`) |
 | Names / signals | ✅ | ✅ | ✅ (`GetAddrInfoW`, console control events) |
+
+Linux means glibc (`target_env = "gnu"`). Every other target — musl, 32-bit x86 and ARM, Android,
+the BSDs, illumos, Redox — stops at a single `compile_error!` naming the supported targets. A crate
+that also builds for those targets gates the dev-dependency:
+
+```toml
+[target.'cfg(any(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")), target_os = "macos", windows))'.dev-dependencies]
+snare = "2"
+```
+
+and puts its sim tests behind the same `cfg`.
+
+The minimum supported Rust version is 1.88.
 
 ## Repository layout
 

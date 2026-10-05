@@ -231,6 +231,8 @@ const SIO_KEEPALIVE_VALS: u32 = 0x9800_0004;
 const SIO_UDP_NETRESET: u32 = 0x9800_000F;
 /// `SIO_LOOPBACK_FAST_PATH`, `_WSAIOW(IOC_VENDOR, 16)`.
 const SIO_LOOPBACK_FAST_PATH: u32 = 0x9800_0010;
+/// `SIO_CPU_AFFINITY`, `_WSAIOW(IOC_VENDOR, 21)`.
+const SIO_CPU_AFFINITY: u32 = 0x9800_0015;
 /// `SIO_GET_TX_TIMESTAMP`, `_WSAIOW(IOC_VENDOR, 234)`.
 const SIO_GET_TX_TIMESTAMP: u32 = 0x9800_00EA;
 /// `SIO_TIMESTAMPING`, `_WSAIOW(IOC_VENDOR, 235)`.
@@ -1006,7 +1008,7 @@ impl WinNet {
                 .unreachable_port(&rec, &sender, src, dest, &data, station);
         }
         rec.note_tx_nic(sender.egress_name());
-        rec.count_udp_sent(dest);
+        rec.count_udp_sent(dest, &sender);
         if rec.has_error_reports() {
             self.regs.shared.bump_keys(&[rec.wake_key()]);
         }
@@ -2874,6 +2876,11 @@ impl Net for WinNet {
     /// - `SIO_LOOPBACK_FAST_PATH` is accepted on a TCP socket and changes nothing, the sim's
     ///   loopback having no slow path; on a datagram socket ("can be used only with TCP sockets")
     ///   it is `WSAEOPNOTSUPP`, snare's choice.
+    /// - `SIO_CPU_AFFINITY` ties an unbound UDP socket to the processor in its `USHORT` input,
+    ///   which is kept (see [`Sim::socket_cpu_affinity`](crate::Sim::socket_cpu_affinity)) and not
+    ///   checked against the machine's processors. As measured on Windows 11: a TCP socket is
+    ///   `WSAEOPNOTSUPP`, an input shorter than a `USHORT` `WSAEFAULT`, and a bound socket
+    ///   `WSAEINVAL`.
     /// - `SIO_TIMESTAMPING` and `SIO_GET_TX_TIMESTAMP` on a datagram socket, as `win_sockopt`
     ///   models Winsock timestamping; "Valid only for datagram sockets", so on TCP the first is
     ///   `WSAEINVAL` and the second `WSAEOPNOTSUPP`, as on a socket that never enabled stamps.
@@ -2965,6 +2972,21 @@ impl Net for WinNet {
                 if input_dword().is_none() {
                     return err(WSAEFAULT);
                 }
+                set_returned(0);
+                ok(0)
+            }
+            SIO_CPU_AFFINITY => {
+                if kind.stream {
+                    return err(WSAEOPNOTSUPP);
+                }
+                if input.is_null() || (input_len as usize) < size_of::<u16>() {
+                    return err(WSAEFAULT);
+                }
+                let mut state = rec.state();
+                if state.local.is_some() {
+                    return err(WSAEINVAL);
+                }
+                state.dgram.cpu_affinity = Some(unsafe { input.cast::<u16>().read_unaligned() });
                 set_returned(0);
                 ok(0)
             }

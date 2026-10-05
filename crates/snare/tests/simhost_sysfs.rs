@@ -57,12 +57,19 @@ fn realtime_flag_present_only_under_preempt_rt() {
 fn cpu_dma_latency_request_is_held_then_released() {
     use std::io::Write;
     let host = HostProfile::new().cpus(2).build();
-    Sim::builder().host(host).build().run(|| {
+    assert_eq!(host.cpu_dma_latency(), None);
+    Sim::builder().host(host.clone()).build().run(|| {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .open("/dev/cpu_dma_latency")
             .unwrap();
+        assert_eq!(host.cpu_dma_latency(), Some(2_000_000_000));
         f.write_all(&0i32.to_ne_bytes()).unwrap();
+        assert_eq!(host.cpu_dma_latency(), Some(0));
+        let alias = f.try_clone().unwrap();
         drop(f);
+        assert_eq!(host.cpu_dma_latency(), Some(0));
+        drop(alias);
+        assert_eq!(host.cpu_dma_latency(), None);
     });
 }

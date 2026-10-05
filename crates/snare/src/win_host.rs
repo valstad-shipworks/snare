@@ -41,13 +41,13 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Threading::{
     ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess,
-    GetCurrentProcessId, GetCurrentThread, GetProcessIdOfThread, HIGH_PRIORITY_CLASS,
-    IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_MODE_BACKGROUND_BEGIN,
+    GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId, GetProcessIdOfThread, GetThreadId,
+    HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_MODE_BACKGROUND_BEGIN,
     PROCESS_MODE_BACKGROUND_END, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA, REALTIME_PRIORITY_CLASS,
-    THREAD_MODE_BACKGROUND_BEGIN, THREAD_MODE_BACKGROUND_END, THREAD_PRIORITY_NORMAL,
-    THREAD_QUERY_INFORMATION, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SET_INFORMATION,
-    THREAD_SET_LIMITED_INFORMATION,
+    PROCESS_SET_INFORMATION, PROCESS_SET_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
+    REALTIME_PRIORITY_CLASS, THREAD_MODE_BACKGROUND_BEGIN, THREAD_MODE_BACKGROUND_END,
+    THREAD_PRIORITY_NORMAL, THREAD_QUERY_INFORMATION, THREAD_QUERY_LIMITED_INFORMATION,
+    THREAD_SET_INFORMATION, THREAD_SET_LIMITED_INFORMATION,
 };
 
 /// Per-thread scheduling state. `priority` is the `SetThreadPriority` view; `affinity` the explicit
@@ -59,6 +59,9 @@ struct ThreadState {
     priority: i32,
     affinity: Option<u64>,
     background_priority: Option<i32>,
+    power_throttling: PowerThrottling,
+    /// The `SetThreadSelectedCpuSets` ids, ascending and without repeats.
+    cpu_sets: Vec<u32>,
 }
 
 impl Default for ThreadState {
@@ -67,9 +70,89 @@ impl Default for ThreadState {
             priority: THREAD_PRIORITY_NORMAL,
             affinity: None,
             background_priority: None,
+            power_throttling: PowerThrottling::default(),
+            cpu_sets: Vec::new(),
         }
     }
 }
+
+/// A process's or thread's power-throttling policy, as `SetProcessInformation` /
+/// `SetThreadInformation` with `ProcessPowerThrottling` / `ThreadPowerThrottling` set it: the
+/// `PROCESS_POWER_THROTTLING_*` / `THREAD_POWER_THROTTLING_*` bits the system leaves to the
+/// program (`control_mask`) and, of those, the ones turned on (`state_mask`). Both are 0, the
+/// system's own policy, until set
+/// ([Microsoft Learn: SetProcessInformation](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setprocessinformation)).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PowerThrottling {
+    /// The policies under the program's control.
+    pub control_mask: u32,
+    /// The controlled policies that are on.
+    pub state_mask: u32,
+}
+
+/// A live MMCSS registration made with `AvSetMmThreadCharacteristicsW`
+/// ([Microsoft Learn: Multimedia Class Scheduler Service](https://learn.microsoft.com/en-us/windows/win32/procthread/multimedia-class-scheduler-service)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MmcssTask {
+    /// The registered thread's id.
+    pub thread_id: u32,
+    /// The task name as the caller spelled it.
+    pub task: String,
+    /// The task index, shared by the threads registered under it.
+    pub index: u32,
+    /// The `AVRT_PRIORITY` last set, `AVRT_PRIORITY_NORMAL` (0) at first.
+    pub priority: i32,
+}
+
+/// The MMCSS tasks a Windows 11 installation defines under `HKLM\SOFTWARE\Microsoft\Windows
+/// NT\CurrentVersion\Multimedia\SystemProfile\Tasks` (read on the test VM); names match
+/// without regard to case, as registry key names do.
+const MMCSS_TASKS: [&str; 8] = [
+    "Audio",
+    "Capture",
+    "DisplayPostProcessing",
+    "Distribution",
+    "Games",
+    "Playback",
+    "Pro Audio",
+    "Window Manager",
+];
+
+/// `ERROR_INVALID_TASK_NAME`, `ERROR_INVALID_TASK_INDEX` and `ERROR_THREAD_ALREADY_IN_TASK`
+/// (winerror.h), the failures of `AvSetMmThreadCharacteristicsW`.
+const ERROR_INVALID_TASK_NAME: u32 = 1550;
+const ERROR_INVALID_TASK_INDEX: u32 = 1551;
+const ERROR_THREAD_ALREADY_IN_TASK: u32 = 1552;
+
+/// The error `SetProcessDefaultCpuSets` and `SetThreadSelectedCpuSets` fail with for an id that
+/// names no CPU set, measured on Windows 11.
+const ERROR_INVALID_CPU_SET: u32 = 813;
+
+/// `ERROR_BAD_LENGTH` and `ERROR_INSUFFICIENT_BUFFER` (winerror.h).
+const ERROR_BAD_LENGTH: u32 = 24;
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+/// `ProcessPowerThrottling` and `ThreadPowerThrottling`, the information classes of
+/// `PROCESS_INFORMATION_CLASS` and `THREAD_INFORMATION_CLASS` (processthreadsapi.h).
+const PROCESS_POWER_THROTTLING: c_int = 4;
+const THREAD_POWER_THROTTLING: c_int = 3;
+
+/// The policy bits `SetProcessInformation` accepts (`EXECUTION_SPEED`, 2, and
+/// `IGNORE_TIMER_RESOLUTION`) and the one `SetThreadInformation` accepts (`EXECUTION_SPEED`),
+/// measured on Windows 11; anything else is `ERROR_INVALID_PARAMETER`.
+const PROCESS_THROTTLING_BITS: u32 = 0b111;
+const THREAD_THROTTLING_BITS: u32 = 0b1;
+
+/// The size of a `PROCESS_POWER_THROTTLING_STATE` / `THREAD_POWER_THROTTLING_STATE`: `Version`,
+/// `ControlMask`, `StateMask`, each a `ULONG`. `Version` must be 1, the `_CURRENT_VERSION`.
+const THROTTLING_STATE_SIZE: u32 = 12;
+
+/// The id of the first CPU set; the rest follow one per logical processor, as Windows numbers
+/// them (`SYSTEM_CPU_SET_INFORMATION.CpuSet.Id`, measured on Windows 11).
+const FIRST_CPU_SET: u32 = 0x100;
+
+/// The size of one `SYSTEM_CPU_SET_INFORMATION` record of type `CpuSetInformation`.
+const CPU_SET_RECORD: usize = 32;
 
 /// Keeps object identity intact when a caller closes or reuses its handle.
 struct NativeHandle(usize);
@@ -218,6 +301,8 @@ const PHYSICAL_MEMORY: usize = 16 << 30;
 struct HostState {
     /// One bit per simulated logical CPU, low bits first; fixed at build.
     process_affinity: u64,
+    /// How many consecutive logical CPUs share a core; fixed at build.
+    threads_per_core: u32,
     /// The `*_PRIORITY_CLASS` value `GetPriorityClass` reports; starts `NORMAL_PRIORITY_CLASS`,
     /// the Windows default ([Microsoft Learn: Scheduling Priorities, Priority Class](https://learn.microsoft.com/en-us/windows/win32/procthread/scheduling-priorities)).
     priority_class: u32,
@@ -227,9 +312,32 @@ struct HostState {
     time_periods: HashMap<u32, u64>,
     /// The working-set bounds `SetProcessWorkingSetSizeEx` last set.
     working_set: WorkingSet,
+    /// Live MMCSS registrations, by the task handle handed out.
+    mmcss: Vec<(u64, MmcssTask)>,
+    /// The task handle the next registration gets.
+    next_mmcss_handle: u64,
+    /// The task indices handed out, with the task (lowercased) each belongs to.
+    mmcss_indices: Vec<(u32, String)>,
+    process_power_throttling: PowerThrottling,
+    /// The `SetProcessDefaultCpuSets` ids, ascending and without repeats.
+    process_cpu_sets: Vec<u32>,
 }
 
 impl HostState {
+    /// The state of the thread whose id is `id`, if it has any.
+    fn thread_by_id(&self, id: u32) -> Option<&ThreadState> {
+        let _error = PreservedLastError::new();
+        self.threads
+            .iter()
+            .find(|(handle, _)| unsafe { GetThreadId(handle.0 as HANDLE) } == id)
+            .map(|(_, state)| state)
+    }
+
+    /// The number of logical CPUs the host has.
+    fn cpus(&self) -> u32 {
+        self.process_affinity.count_ones()
+    }
+
     /// Resolves a Win32 thread handle to the key its state lives under, ensuring an entry exists.
     fn resolve(&mut self, handle: u64) -> Result<usize, u32> {
         let _error = PreservedLastError::new();
@@ -320,8 +428,9 @@ impl WinHost {
     /// and covers one processor group, "a static set of up to 64 logical processors"
     /// ([Microsoft Learn: Processor Groups](https://learn.microsoft.com/en-us/windows/win32/procthread/processor-groups)).
     /// 64 is special-cased because `1 << 64` overflows.
-    fn new(cpus: usize) -> Self {
+    fn new(cpus: usize, threads_per_core: usize) -> Self {
         let cpus = cpus.clamp(1, 64);
+        let threads_per_core = threads_per_core.clamp(1, cpus) as u32;
         let process_affinity = if cpus == 64 {
             u64::MAX
         } else {
@@ -330,11 +439,17 @@ impl WinHost {
         WinHost {
             state: Mutex::new(HostState {
                 process_affinity,
+                threads_per_core,
                 priority_class: NORMAL_PRIORITY_CLASS,
                 process_background: false,
                 threads: Vec::new(),
                 time_periods: HashMap::new(),
                 working_set: WorkingSet::INITIAL,
+                mmcss: Vec::new(),
+                next_mmcss_handle: 0x4d4d_0004,
+                mmcss_indices: Vec::new(),
+                process_power_throttling: PowerThrottling::default(),
+                process_cpu_sets: Vec::new(),
             }),
             shared: std::sync::OnceLock::new(),
             adapters: crate::win_adapter::Adapters::default(),
@@ -648,6 +763,355 @@ impl Host for WinHost {
         ))
     }
 
+    /// Registers the calling thread with an MMCSS task, in the order Windows 11 checks, as
+    /// measured: a name outside [`MMCSS_TASKS`] is `ERROR_INVALID_TASK_NAME`, a nonzero
+    /// `*task_index` other than one handed out for this task `ERROR_INVALID_TASK_INDEX`, and a
+    /// thread already registered `ERROR_THREAD_ALREADY_IN_TASK`. A zero index gets the next one,
+    /// counting from 1 (Windows hands out its own system-wide numbers). The registration does
+    /// not change what `GetThreadPriority` reports. A null `task_index`, which avrt dereferences,
+    /// is `ERROR_INVALID_PARAMETER`.
+    unsafe fn av_set_mm_thread_characteristics(
+        &self,
+        task: &[u16],
+        task_index: *mut u32,
+    ) -> Option<HostResult> {
+        let name = String::from_utf16_lossy(task);
+        let key = name.to_lowercase();
+        if !MMCSS_TASKS.iter().any(|t| t.to_lowercase() == key) {
+            return Some(HostResult::Err(ERROR_INVALID_TASK_NAME as c_int));
+        }
+        if task_index.is_null() {
+            return Some(HostResult::Err(ERROR_INVALID_PARAMETER as c_int));
+        }
+        let mut state = self.state.lock().unwrap();
+        // SAFETY: a non-null `task_index` is the caller's DWORD.
+        let requested = unsafe { task_index.read_unaligned() };
+        if requested != 0
+            && !state
+                .mmcss_indices
+                .iter()
+                .any(|(index, task)| *index == requested && *task == key)
+        {
+            return Some(HostResult::Err(ERROR_INVALID_TASK_INDEX as c_int));
+        }
+        let thread_id = unsafe { GetCurrentThreadId() };
+        if state.mmcss.iter().any(|(_, t)| t.thread_id == thread_id) {
+            return Some(HostResult::Err(ERROR_THREAD_ALREADY_IN_TASK as c_int));
+        }
+        let index = if requested == 0 {
+            let index = state.mmcss_indices.len() as u32 + 1;
+            state.mmcss_indices.push((index, key));
+            index
+        } else {
+            requested
+        };
+        // SAFETY: as above.
+        unsafe { task_index.write_unaligned(index) };
+        let handle = state.next_mmcss_handle;
+        state.next_mmcss_handle += 4;
+        state.mmcss.push((
+            handle,
+            MmcssTask {
+                thread_id,
+                task: name,
+                index,
+                priority: 0,
+            },
+        ));
+        Some(HostResult::Ok(handle as i64))
+    }
+
+    /// Sets a registration's `AVRT_PRIORITY`, from any thread: an unknown handle is
+    /// `ERROR_INVALID_HANDLE` and a priority outside `AVRT_PRIORITY_VERYLOW..=AVRT_PRIORITY_CRITICAL`
+    /// (-2..=2) `ERROR_INVALID_PARAMETER`, as measured on Windows 11.
+    fn av_set_mm_thread_priority(&self, task: u64, priority: c_int) -> Option<HostResult> {
+        let mut state = self.state.lock().unwrap();
+        let Some((_, registration)) = state.mmcss.iter_mut().find(|(h, _)| *h == task) else {
+            return Some(HostResult::Err(ERROR_INVALID_HANDLE as c_int));
+        };
+        if !(-2..=2).contains(&priority) {
+            return Some(HostResult::Err(ERROR_INVALID_PARAMETER as c_int));
+        }
+        registration.priority = priority;
+        Some(HostResult::Ok(1))
+    }
+
+    /// Ends a registration, from any thread; an unknown or already reverted handle is
+    /// `ERROR_INVALID_HANDLE`.
+    fn av_revert_mm_thread_characteristics(&self, task: u64) -> Option<HostResult> {
+        let mut state = self.state.lock().unwrap();
+        let Some(at) = state.mmcss.iter().position(|(h, _)| *h == task) else {
+            return Some(HostResult::Err(ERROR_INVALID_HANDLE as c_int));
+        };
+        state.mmcss.remove(at);
+        Some(HostResult::Ok(1))
+    }
+
+    /// `ProcessPowerThrottling` on the current process; other classes are declined. As
+    /// measured on Windows 11: a size other than a `PROCESS_POWER_THROTTLING_STATE`'s is
+    /// `ERROR_BAD_LENGTH`; a version other than 1, a control bit outside
+    /// [`PROCESS_THROTTLING_BITS`] or a state bit outside the control mask is
+    /// `ERROR_INVALID_PARAMETER`.
+    unsafe fn set_process_information(
+        &self,
+        process: u64,
+        class: c_int,
+        info: *const u8,
+        size: u32,
+    ) -> Option<HostResult> {
+        if class != PROCESS_POWER_THROTTLING {
+            return None;
+        }
+        if let Err(error) = current_process(process, PROCESS_SET_INFORMATION) {
+            return Some(HostResult::Err(error as c_int));
+        }
+        if size != THROTTLING_STATE_SIZE || info.is_null() {
+            return Some(HostResult::Err(ERROR_BAD_LENGTH as c_int));
+        }
+        // SAFETY: `info` holds the three ULONGs `size` says.
+        let throttling = match unsafe { read_throttling(info, 1..=1, PROCESS_THROTTLING_BITS) } {
+            Ok(t) => t,
+            Err(error) => return Some(HostResult::Err(error as c_int)),
+        };
+        self.state.lock().unwrap().process_power_throttling = throttling;
+        Some(HostResult::Ok(1))
+    }
+
+    /// Reads back `ProcessPowerThrottling`; other classes are declined. The buffer's `Version`
+    /// must be 1 and its size a `PROCESS_POWER_THROTTLING_STATE`'s, failing as the setter does.
+    unsafe fn get_process_information(
+        &self,
+        process: u64,
+        class: c_int,
+        info: *mut u8,
+        size: u32,
+    ) -> Option<HostResult> {
+        if class != PROCESS_POWER_THROTTLING {
+            return None;
+        }
+        if let Err(error) = current_process(
+            process,
+            PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+        ) {
+            return Some(HostResult::Err(error as c_int));
+        }
+        if size != THROTTLING_STATE_SIZE || info.is_null() {
+            return Some(HostResult::Err(ERROR_BAD_LENGTH as c_int));
+        }
+        let throttling = self.state.lock().unwrap().process_power_throttling;
+        // SAFETY: `info` holds the three ULONGs `size` says.
+        Some(match unsafe { write_throttling(info, throttling) } {
+            Ok(()) => HostResult::Ok(1),
+            Err(error) => HostResult::Err(error as c_int),
+        })
+    }
+
+    /// `ThreadPowerThrottling` on a thread of this process; other classes are declined. Laxer
+    /// than the process class, as measured on Windows 11: a buffer longer than a
+    /// `THREAD_POWER_THROTTLING_STATE` and a version of 0 are accepted; a shorter buffer, a
+    /// version above 1, a bit other than `THREAD_POWER_THROTTLING_EXECUTION_SPEED` or a state bit
+    /// outside the control mask is `ERROR_INVALID_PARAMETER`.
+    unsafe fn set_thread_information(
+        &self,
+        thread: u64,
+        class: c_int,
+        info: *const u8,
+        size: u32,
+    ) -> Option<HostResult> {
+        if class != THREAD_POWER_THROTTLING {
+            return None;
+        }
+        if let Err(error) = require_access(thread, "Thread", &[THREAD_SET_INFORMATION]) {
+            return Some(HostResult::Err(error as c_int));
+        }
+        if size < THROTTLING_STATE_SIZE || info.is_null() {
+            return Some(HostResult::Err(ERROR_INVALID_PARAMETER as c_int));
+        }
+        // SAFETY: `info` holds at least the three ULONGs.
+        let throttling = match unsafe { read_throttling(info, 0..=1, THREAD_THROTTLING_BITS) } {
+            Ok(t) => t,
+            Err(error) => return Some(HostResult::Err(error as c_int)),
+        };
+        let mut state = self.state.lock().unwrap();
+        let key = match state.resolve(thread) {
+            Ok(key) => key,
+            Err(error) => return Some(HostResult::Err(error as c_int)),
+        };
+        state.threads[key].1.power_throttling = throttling;
+        Some(HostResult::Ok(1))
+    }
+
+    /// Reads back `ThreadPowerThrottling`; other classes are declined.
+    unsafe fn get_thread_information(
+        &self,
+        thread: u64,
+        class: c_int,
+        info: *mut u8,
+        size: u32,
+    ) -> Option<HostResult> {
+        if class != THREAD_POWER_THROTTLING {
+            return None;
+        }
+        if let Err(error) = require_access(
+            thread,
+            "Thread",
+            &[THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION],
+        ) {
+            return Some(HostResult::Err(error as c_int));
+        }
+        if size != THROTTLING_STATE_SIZE || info.is_null() {
+            return Some(HostResult::Err(ERROR_INVALID_PARAMETER as c_int));
+        }
+        let mut state = self.state.lock().unwrap();
+        let key = match state.resolve(thread) {
+            Ok(key) => key,
+            Err(error) => return Some(HostResult::Err(error as c_int)),
+        };
+        let throttling = state.threads[key].1.power_throttling;
+        // SAFETY: `info` holds the three ULONGs `size` says.
+        Some(match unsafe { write_throttling(info, throttling) } {
+            Ok(()) => HostResult::Ok(1),
+            Err(error) => HostResult::Err(error as c_int),
+        })
+    }
+
+    /// One `CpuSetInformation` record per simulated logical processor, ids from
+    /// [`FIRST_CPU_SET`], in group 0 and NUMA node 0, efficiency class 0, sharing last-level
+    /// cache 0, no flags set. Each run of `threads_per_core` logical processors is one core, whose
+    /// `CoreIndex` is its first logical processor's index, as Windows reports SMT siblings
+    /// (measured on Windows Server 2025, 2 cores of 2 threads each). A buffer too small for all of them fails with
+    /// `ERROR_INSUFFICIENT_BUFFER` and `*returned` the size needed.
+    unsafe fn system_cpu_set_information(
+        &self,
+        info: *mut u8,
+        len: u32,
+        returned: *mut u32,
+        _process: u64,
+        _flags: u32,
+    ) -> Option<HostResult> {
+        let (cpus, threads_per_core) = {
+            let state = self.state.lock().unwrap();
+            (state.cpus(), state.threads_per_core)
+        };
+        let need = cpus as usize * CPU_SET_RECORD;
+        if !returned.is_null() {
+            // SAFETY: the caller's out-pointer.
+            unsafe { returned.write_unaligned(need as u32) };
+        }
+        if info.is_null() || (len as usize) < need {
+            return Some(HostResult::Err(ERROR_INSUFFICIENT_BUFFER as c_int));
+        }
+        for cpu in 0..cpus {
+            let mut record = [0u8; CPU_SET_RECORD];
+            record[0..4].copy_from_slice(&(CPU_SET_RECORD as u32).to_ne_bytes());
+            record[8..12].copy_from_slice(&(FIRST_CPU_SET + cpu).to_ne_bytes());
+            record[14] = cpu as u8;
+            record[15] = (cpu - cpu % threads_per_core) as u8;
+            // SAFETY: `need` bytes fit in the caller's `len`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    record.as_ptr(),
+                    info.add(cpu as usize * CPU_SET_RECORD),
+                    CPU_SET_RECORD,
+                )
+            };
+        }
+        Some(HostResult::Ok(1))
+    }
+
+    /// Sets the current process's default CPU sets (`thread` false) or a thread's selected
+    /// ones; an empty list clears them. An id naming no simulated CPU set fails with
+    /// [`ERROR_INVALID_CPU_SET`]; repeated ids count once. A null `ids` with a nonzero count,
+    /// which Windows dereferences, is `ERROR_INVALID_PARAMETER`.
+    unsafe fn set_cpu_sets(
+        &self,
+        thread: bool,
+        handle: u64,
+        ids: *const u32,
+        count: u32,
+    ) -> Option<HostResult> {
+        let access = if thread {
+            require_access(handle, "Thread", &[THREAD_SET_LIMITED_INFORMATION])
+        } else {
+            current_process(handle, PROCESS_SET_LIMITED_INFORMATION)
+        };
+        if let Err(error) = access {
+            return Some(HostResult::Err(error as c_int));
+        }
+        if ids.is_null() && count != 0 {
+            return Some(HostResult::Err(ERROR_INVALID_PARAMETER as c_int));
+        }
+        let requested = if count == 0 {
+            &[][..]
+        } else {
+            // SAFETY: `ids` holds `count` ids.
+            unsafe { std::slice::from_raw_parts(ids, count as usize) }
+        };
+        let mut state = self.state.lock().unwrap();
+        let sets = FIRST_CPU_SET..FIRST_CPU_SET + state.cpus();
+        if requested.iter().any(|id| !sets.contains(id)) {
+            return Some(HostResult::Err(ERROR_INVALID_CPU_SET as c_int));
+        }
+        let mut chosen = requested.to_vec();
+        chosen.sort_unstable();
+        chosen.dedup();
+        if thread {
+            let key = match state.resolve(handle) {
+                Ok(key) => key,
+                Err(error) => return Some(HostResult::Err(error as c_int)),
+            };
+            state.threads[key].1.cpu_sets = chosen;
+        } else {
+            state.process_cpu_sets = chosen;
+        }
+        Some(HostResult::Ok(1))
+    }
+
+    /// Reads back the CPU sets [`set_cpu_sets`](Self::set_cpu_sets) chose: `*required` is their
+    /// number, and a `count` below it fails with `ERROR_INSUFFICIENT_BUFFER` after filling the
+    /// `count` ids that fit, as Windows 11 does.
+    unsafe fn get_cpu_sets(
+        &self,
+        thread: bool,
+        handle: u64,
+        ids: *mut u32,
+        count: u32,
+        required: *mut u32,
+    ) -> Option<HostResult> {
+        let access = if thread {
+            require_access(handle, "Thread", &[THREAD_QUERY_LIMITED_INFORMATION])
+        } else {
+            current_process(handle, PROCESS_QUERY_LIMITED_INFORMATION)
+        };
+        if let Err(error) = access {
+            return Some(HostResult::Err(error as c_int));
+        }
+        let mut state = self.state.lock().unwrap();
+        let chosen = if thread {
+            let key = match state.resolve(handle) {
+                Ok(key) => key,
+                Err(error) => return Some(HostResult::Err(error as c_int)),
+            };
+            state.threads[key].1.cpu_sets.clone()
+        } else {
+            state.process_cpu_sets.clone()
+        };
+        drop(state);
+        if !required.is_null() {
+            // SAFETY: the caller's out-pointer.
+            unsafe { required.write_unaligned(chosen.len() as u32) };
+        }
+        let fits = chosen.len().min(count as usize);
+        if !ids.is_null() {
+            // SAFETY: `ids` has room for `count` ids.
+            unsafe { std::ptr::copy_nonoverlapping(chosen.as_ptr(), ids, fits) };
+        }
+        if fits < chosen.len() {
+            return Some(HostResult::Err(ERROR_INSUFFICIENT_BUFFER as c_int));
+        }
+        Some(HostResult::Ok(1))
+    }
+
     /// Timer-resolution requests are paired by period. They do not change the virtual clock's
     /// resolution. Winmm accepts positive periods above `timeGetDevCaps`' reported maximum.
     fn time_period(&self, begin: bool, period: u32) -> Option<HostResult> {
@@ -669,6 +1133,45 @@ impl Host for WinHost {
         }
         Some(HostResult::Ok(0))
     }
+}
+
+/// Reads a `*_POWER_THROTTLING_STATE` at `info`: a version in `versions`, control bits within
+/// `valid`, state bits within the control mask, else `ERROR_INVALID_PARAMETER`.
+///
+/// # Safety
+/// `info` holds three `ULONG`s.
+unsafe fn read_throttling(
+    info: *const u8,
+    versions: std::ops::RangeInclusive<u32>,
+    valid: u32,
+) -> Result<PowerThrottling, u32> {
+    let word = |at: usize| unsafe { info.add(at * 4).cast::<u32>().read_unaligned() };
+    let (version, control_mask, state_mask) = (word(0), word(1), word(2));
+    if !versions.contains(&version) || control_mask & !valid != 0 || state_mask & !control_mask != 0
+    {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+    Ok(PowerThrottling {
+        control_mask,
+        state_mask,
+    })
+}
+
+/// Fills the `*_POWER_THROTTLING_STATE` at `info`, whose `Version` the caller set to 1, else
+/// `ERROR_INVALID_PARAMETER`.
+///
+/// # Safety
+/// `info` holds three `ULONG`s.
+unsafe fn write_throttling(info: *mut u8, throttling: PowerThrottling) -> Result<(), u32> {
+    let words = info.cast::<u32>();
+    if unsafe { words.read_unaligned() } != 1 {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+    unsafe {
+        words.add(1).write_unaligned(throttling.control_mask);
+        words.add(2).write_unaligned(throttling.state_mask);
+    }
+    Ok(())
 }
 
 /// A running Windows simulation: a [`Domain`] whose managed threads' Win32 scheduling calls are
@@ -827,6 +1330,64 @@ impl Sim {
     /// The working-set bounds the code under test last set with `SetProcessWorkingSetSizeEx`.
     pub fn working_set(&self) -> WorkingSet {
         self._host.state.lock().unwrap().working_set
+    }
+
+    /// The outstanding `timeBeginPeriod` requests the code under test holds, as (period in ms,
+    /// count) by ascending period. The effective timer resolution is the first period.
+    pub fn time_periods(&self) -> Vec<(u32, u64)> {
+        let mut periods: Vec<_> = self
+            ._host
+            .state
+            .lock()
+            .unwrap()
+            .time_periods
+            .iter()
+            .map(|(&period, &count)| (period, count))
+            .collect();
+        periods.sort_unstable();
+        periods
+    }
+
+    /// The live MMCSS registrations (`AvSetMmThreadCharacteristicsW`), oldest first.
+    pub fn mmcss_tasks(&self) -> Vec<MmcssTask> {
+        let state = self._host.state.lock().unwrap();
+        state.mmcss.iter().map(|(_, task)| task.clone()).collect()
+    }
+
+    /// The process's power-throttling policy (`SetProcessInformation` with
+    /// `ProcessPowerThrottling`).
+    pub fn process_power_throttling(&self) -> PowerThrottling {
+        self._host.state.lock().unwrap().process_power_throttling
+    }
+
+    /// The power-throttling policy of the thread whose id is `thread_id`
+    /// (`SetThreadInformation` with `ThreadPowerThrottling`), or `None` for a thread the host
+    /// has not seen.
+    pub fn thread_power_throttling(&self, thread_id: u32) -> Option<PowerThrottling> {
+        let state = self._host.state.lock().unwrap();
+        state.thread_by_id(thread_id).map(|t| t.power_throttling)
+    }
+
+    /// The process's default CPU sets (`SetProcessDefaultCpuSets`), ascending; empty when none
+    /// are set.
+    pub fn process_default_cpu_sets(&self) -> Vec<u32> {
+        self._host.state.lock().unwrap().process_cpu_sets.clone()
+    }
+
+    /// The CPU sets selected for the thread whose id is `thread_id`
+    /// (`SetThreadSelectedCpuSets`), ascending; empty when none are, or for a thread the host has
+    /// not seen.
+    pub fn thread_selected_cpu_sets(&self, thread_id: u32) -> Vec<u32> {
+        let state = self._host.state.lock().unwrap();
+        state
+            .thread_by_id(thread_id)
+            .map(|t| t.cpu_sets.clone())
+            .unwrap_or_default()
+    }
+
+    /// The processor `SIO_CPU_AFFINITY` tied open socket `id` to, if it was.
+    pub fn socket_cpu_affinity(&self, id: crate::SocketId) -> Option<u16> {
+        snare_interpose::real(|| self.shared.sockets.cpu_affinity(id))
     }
 
     /// Describes the adapter of interface `nic` from now on (see [`SimBuilder::adapter`]),
@@ -1110,6 +1671,8 @@ impl Sim {
 pub struct SimBuilder {
     /// `None` means the default of 8.
     cpus: Option<usize>,
+    /// `None` means the default of 1.
+    threads_per_core: Option<usize>,
     /// Set by [`wall_clock`](Self::wall_clock); overridden by `time_rate` and cleared by
     /// `deterministic`.
     wall_clock: bool,
@@ -1177,6 +1740,14 @@ impl SimBuilder {
     /// threads apart.
     pub fn cpus(mut self, count: usize) -> Self {
         self.cpus = Some(count);
+        self
+    }
+
+    /// How many hardware threads each core runs (default 1, clamped to 1..=[`cpus`](Self::cpus)):
+    /// consecutive logical CPUs are grouped into cores of this many, which
+    /// `GetSystemCpuSetInformation` reports as sharing a `CoreIndex`.
+    pub fn threads_per_core(mut self, count: usize) -> Self {
+        self.threads_per_core = Some(count);
         self
     }
 
@@ -1325,7 +1896,10 @@ impl SimBuilder {
         if let Some(limits) = self.sys_limits {
             shared.sys.set_limits(|l| *l = limits);
         }
-        let host = Arc::new(WinHost::new(self.cpus.unwrap_or(8)));
+        let host = Arc::new(WinHost::new(
+            self.cpus.unwrap_or(8),
+            self.threads_per_core.unwrap_or(1),
+        ));
         for (nic, adapter) in self.adapters {
             host.adapters.configure(&shared, &nic, adapter);
         }

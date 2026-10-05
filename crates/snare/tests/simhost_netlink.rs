@@ -282,3 +282,142 @@ fn duplicated_netlink_descriptors_share_flags_and_replies_os_truth() {
     let host = HostProfile::new().build();
     assert_eq!(Sim::builder().host(host).build().run(probe), real);
 }
+
+/// Sends an `RTM_GETLINK` with `flags` for `index`, naming `name` in an `IFLA_IFNAME`, and returns
+/// every message of the reply as (type, flags, body).
+fn getlink(fd: i32, flags: u16, index: i32, name: Option<&str>) -> Vec<(u16, u16, Vec<u8>)> {
+    let mut req = Vec::new();
+    req.extend_from_slice(&0u32.to_ne_bytes());
+    req.extend_from_slice(&RTM_GETLINK.to_ne_bytes());
+    req.extend_from_slice(&(NLM_F_REQUEST | flags).to_ne_bytes());
+    req.extend_from_slice(&7u32.to_ne_bytes());
+    req.extend_from_slice(&0u32.to_ne_bytes());
+    req.extend_from_slice(&[0, 0, 0, 0]);
+    req.extend_from_slice(&index.to_ne_bytes());
+    req.extend_from_slice(&[0; 8]);
+    if let Some(name) = name {
+        let len = 4 + name.len() + 1;
+        req.extend_from_slice(&(len as u16).to_ne_bytes());
+        req.extend_from_slice(&IFLA_IFNAME.to_ne_bytes());
+        req.extend_from_slice(name.as_bytes());
+        req.push(0);
+        req.resize(align4(req.len()), 0);
+    }
+    let len = req.len() as u32;
+    req[..4].copy_from_slice(&len.to_ne_bytes());
+    let sent = unsafe { libc::send(fd, req.as_ptr().cast(), req.len(), 0) };
+    assert_eq!(sent, req.len() as isize);
+
+    let mut buf = vec![0u8; 65536];
+    let got = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
+    assert!(got > 0, "recv the reply");
+    let buf = &buf[..got as usize];
+    let mut out = Vec::new();
+    let mut off = 0;
+    while off + 16 <= buf.len() {
+        let msg_len = u32at(buf, off) as usize;
+        out.push((
+            u16at(buf, off + 4),
+            u16at(buf, off + 6),
+            buf[off + 16..off + msg_len].to_vec(),
+        ));
+        off += align4(msg_len);
+    }
+    out
+}
+
+/// The (ifname, rx_packets, tx_bytes) of one `RTM_NEWLINK` body.
+fn link_of(body: &[u8]) -> (String, u64, u64) {
+    let mut msg = vec![0u8; 16];
+    msg[..4].copy_from_slice(&((16 + body.len()) as u32).to_ne_bytes());
+    msg[4..6].copy_from_slice(&RTM_NEWLINK.to_ne_bytes());
+    msg.extend_from_slice(body);
+    parse_links(&msg).remove(0)
+}
+
+/// What a non-dump `RTM_GETLINK` returns, reduced to what the sim and the kernel share: the
+/// message types, whether any is part of a multipart reply, the interface name and index of an
+/// `RTM_NEWLINK`, and the errno of an `NLMSG_ERROR`.
+#[derive(Debug, PartialEq, Eq)]
+enum Reply {
+    Link {
+        name: String,
+        index: i32,
+        multi: bool,
+    },
+    Error(i32),
+    Other(Vec<u16>),
+}
+
+fn getlink_one(index: i32, name: Option<&str>) -> Reply {
+    const NLMSG_ERROR: u16 = 2;
+    const NLM_F_MULTI: u16 = 2;
+    let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, NETLINK_ROUTE) };
+    assert!(fd >= 0);
+    let reply = getlink(fd, 0, index, name);
+    unsafe { libc::close(fd) };
+    match reply.as_slice() {
+        [(RTM_NEWLINK, flags, body)] => {
+            let link = link_of(body);
+            Reply::Link {
+                name: link.0,
+                index: i32::from_ne_bytes(body[4..8].try_into().unwrap()),
+                multi: flags & NLM_F_MULTI != 0,
+            }
+        }
+        [(NLMSG_ERROR, _, body)] => {
+            Reply::Error(-i32::from_ne_bytes(body[..4].try_into().unwrap()))
+        }
+        other => Reply::Other(other.iter().map(|m| m.0).collect()),
+    }
+}
+
+#[test]
+fn rtm_getlink_without_dump_answers_one_link() {
+    let host = HostProfile::new()
+        .nic(Nic::new("eth0", 2).link_stats(LinkStats {
+            rx_packets: 1000,
+            ..Default::default()
+        }))
+        .nic(Nic::new("eth1", 3).link_stats(LinkStats {
+            rx_packets: 7,
+            tx_bytes: 42,
+            ..Default::default()
+        }))
+        .build();
+    Sim::builder().host(host).build().run(|| {
+        let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, NETLINK_ROUTE) };
+        let by_index = getlink(fd, 0, 3, None);
+        let by_name = getlink(fd, 0, 0, Some("eth0"));
+        unsafe { libc::close(fd) };
+        assert_eq!(by_index.len(), 1, "no NLMSG_DONE after a single link");
+        assert_eq!(link_of(&by_index[0].2), ("eth1".to_string(), 7, 42));
+        assert_eq!(by_name.len(), 1);
+        assert!(matches!(
+            getlink_one(0, Some("eth0")),
+            Reply::Link { ref name, index: 2, multi: false } if name == "eth0"
+        ));
+        assert_eq!(getlink_one(99, None), Reply::Error(libc::ENODEV));
+        assert_eq!(getlink_one(0, Some("nope0")), Reply::Error(libc::ENODEV));
+        assert_eq!(getlink_one(0, None), Reply::Error(libc::EINVAL));
+    });
+}
+
+#[test]
+fn rtm_getlink_without_dump_matches_the_host_os_truth() {
+    let probe = || {
+        [
+            getlink_one(1, None),
+            getlink_one(0, Some("lo")),
+            getlink_one(9999, None),
+            getlink_one(0, Some("nope0")),
+            getlink_one(0, None),
+        ]
+    };
+    let real = probe();
+    let simulated = Sim::builder()
+        .host(HostProfile::new().build())
+        .build()
+        .run(probe);
+    assert_eq!(simulated, real);
+}

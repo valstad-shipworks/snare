@@ -1917,7 +1917,7 @@ impl Fabric {
             self.shared()
                 .unreachable_port(&rec, &sender, src, dest, data, station);
         }
-        if rec.finish_udp_send(dest, sender.egress_name()) {
+        if rec.finish_udp_send(dest, &sender) {
             self.shared().bump_keys(&[rec.wake_key()]);
         }
         ok(data.len() as i64)
@@ -3574,6 +3574,54 @@ impl Net for Fabric {
         };
         let data = unsafe { std::slice::from_raw_parts(buf, len) };
         self.udp_send(fd, endpoint, data, dest, flags)
+    }
+
+    /// Sends the payload `msg`'s iovecs gather (man 2 sendmsg) as [`sendto`](Self::sendto) to
+    /// `msg_name`, or as [`send`](Self::send) to the connected peer when it is null. Control
+    /// messages are not modelled here: a message carrying any fails with `EOPNOTSUPP`.
+    unsafe fn sendmsg(&self, fd: c_int, msg: *const u8, flags: c_int) -> Option<NetResult> {
+        if !Net::owns(self, fd) {
+            return None;
+        }
+        if msg.is_null() {
+            return err(libc::EFAULT);
+        }
+        let hdr = msg as *const libc::msghdr;
+        // SAFETY: `hdr` is the caller's msghdr.
+        let (name, name_len, iov, iov_len, control_len) = unsafe {
+            (
+                (*hdr).msg_name,
+                (*hdr).msg_namelen,
+                (*hdr).msg_iov,
+                (*hdr).msg_iovlen,
+                (*hdr).msg_controllen,
+            )
+        };
+        if control_len != 0 {
+            return err(libc::EOPNOTSUPP);
+        }
+        let mut data = Vec::new();
+        if !iov.is_null() {
+            for i in 0..iov_len as _ {
+                // SAFETY: `iov` holds `iov_len` iovecs, each describing the caller's bytes.
+                let v = unsafe { &*iov.add(i) };
+                if !v.iov_base.is_null() && v.iov_len != 0 {
+                    data.extend_from_slice(unsafe {
+                        std::slice::from_raw_parts(v.iov_base as *const u8, v.iov_len)
+                    });
+                }
+            }
+        }
+        unsafe {
+            self.sendto(
+                fd,
+                data.as_ptr(),
+                data.len(),
+                flags,
+                name as *const u8,
+                name_len,
+            )
+        }
     }
 
     /// Receives one datagram, truncated to `len` (the rest is discarded, man 7 udp), and writes

@@ -21,6 +21,11 @@ rg -n 'ignore = "bug' crates
 
 ## Host planes
 
+- **Host name** (`simhost_uname.rs`): `uname` reports `HostProfile::nodename`, but `gethostname`
+  is not modelled and still returns the real name (glibc builds it from the `uname` syscall
+  inside libc, macOS from `sysctl` `kern.hostname`), and neither are the macOS `kern.ostype`,
+  `kern.osrelease`, `kern.version` and `kern.hostname` sysctls.
+
 - **Environment** (`edge_host_env.rs`): on Linux, `std::env::vars` in an isolated sim lists the
   real process environment. It accesses the process-global `environ` variable directly, outside
   function interposition. Swapping `environ` would expose simulated values to concurrent sims and
@@ -56,6 +61,12 @@ can change which reports fit and drop:
   report grouping.
 
 ## Network model boundaries
+
+- `recvmmsg` (Linux) receives each message through the backend's `recvmsg`. An error after the
+  first message ends the batch and is dropped, where the kernel keeps it as the socket's pending
+  error for the next call (`do_recvmmsg`, net/socket.c).
+- On a plain sim (no `SimHost`), `sendmsg` with any control message fails with `EOPNOTSUPP`:
+  `IP_PKTINFO`, `IP_TOS`, `SCM_TXTIME` and the rest are modelled only for a `SimHost`'s sockets.
 
 - Completed TCP accept queues enforce the configured backlog, with host comparisons on macOS,
   Linux and Windows. Separate incomplete-handshake queues and simultaneous SYN/ACK completion
@@ -102,6 +113,24 @@ cases on that host, not every Winsock hook or supported Windows release.
   Process/thread background transitions, inherited threads, overlaps and class changes have
   host comparisons. Granted realtime-class thread/background behavior has a priority-range
   mismatch described below; earlier requests reported `HIGH_PRIORITY_CLASS` instead.
+- MMCSS registrations (`AvSetMmThreadCharacteristicsW`, `AvSetMmThreadPriority`,
+  `AvRevertMmThreadCharacteristics`) are kept apart from the thread's priority: on Windows 11
+  `GetThreadPriority` reads 15 once a thread joins "Pro Audio", 17 and 18 after
+  `AVRT_PRIORITY_HIGH`/`CRITICAL`, and 0 after the revert, while the sim keeps reporting the
+  priority `SetThreadPriority` last set. A successful revert also leaves `ERROR_INVALID_HANDLE`
+  (6) as the thread's last error on the host, which the sim does not. Task indices count from 1
+  per host rather than following the system-wide counter, and only the task names of a stock
+  Windows 11 installation are known.
+- Power throttling covers `ProcessPowerThrottling` and `ThreadPowerThrottling`; the other
+  `SetProcessInformation`/`SetThreadInformation` classes (memory priority, app memory, dynamic
+  code policy, ...) still reach the real process. `GetThreadInformation`'s rules for a short or
+  long buffer and a version of 0 are assumed to be the setter's, and are unmeasured.
+- CPU sets: `GetSystemCpuSetInformation` groups logical processors into uniform cores of
+  `SimBuilder::threads_per_core`, all in NUMA node 0 and last-level cache 0 with no flags
+  (`Parked`, `Allocated`, `RealTime`) and efficiency class 0, so hybrid machines with cores of
+  different sizes or classes, several caches or nodes are not represented; its `Process` and
+  `Flags` arguments are ignored. Selected CPU sets do not interact with `SetThreadAffinityMask` as
+  they do on Windows.
 - Timers created through `CreateWaitableTimerW/A` and `CreateWaitableTimerExW/A` support unnamed
   relative/absolute deadlines, periodic auto/manual-reset signals, same-process handle aliases,
   cancellation,
@@ -111,6 +140,10 @@ cases on that host, not every Winsock hook or supported Windows release.
   contexts, cross-process aliases, alertable timer waits and blocking mixed-object waits return
   `ERROR_NOT_SUPPORTED` (50). Tolerable-delay requests use the exact deadline
   rather than modelling the host's coalescing policy.
+- A timed `WaitOnAddress` outlasts a spurious return (`TRUE` with the comparand still in place)
+  only when no `WakeByAddress*` reached its address meanwhile, tracked in a fixed table of 4096
+  hashed counters. A wake of another address sharing the slot lets the spurious return through, and
+  std's `park_timeout` then returns before its virtual timeout.
 - Rust's Windows sleep conversion discards sub-100 ns precision; finite std synchronization
   timeouts use a millisecond `WaitOnAddress` timeout. Overflowing Rust sleep durations reach the
   clock through a typed hook before conversion and saturate at the finite clock limit. Native
@@ -215,6 +248,9 @@ Supported model boundaries and unverified approximations. These do not establish
 - **Locks held outside the sim:** a wait on an ownerless lock held outside the sim can still let
   time skip. Linux futex and Windows `WaitOnAddress` waits in static data get a 1 ms real grace;
   an outside holder that keeps such a lock longer, and arbitrary heap-backed std mutexes, do not.
+  Under `deterministic()` such a wait then passes the baton, so the run's order depends on how
+  long the outside holder took (a holder descheduled on a loaded or single-CPU host exceeds the
+  grace). macOS pthread mutexes name their owner and keep the baton for an outside holder.
   std's one-time Windows Winsock startup, which holds its `Once` far longer, is run outside every
   domain before the first one is installed. macOS std `RwLock` and `Once` can park on ownerless
   semaphores. An external holder's `sim.busy()` lease prevents the incorrect skip; an

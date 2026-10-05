@@ -308,3 +308,52 @@ fn windows_statistics_report_constants_and_families() {
         assert_eq!(unsafe { GetUdpStatisticsEx(&mut u, 7) }, 50);
     });
 }
+
+/// A datagram each way between the host and a station socket across eth0: only the host's ends
+/// count.
+fn station_traffic() {
+    let host = UdpSocket::bind("10.0.0.1:0").unwrap();
+    let station = UdpSocket::bind("10.0.0.2:0").unwrap();
+    let before = proto_counters().udp4;
+    station.send_to(b"in", host.local_addr().unwrap()).unwrap();
+    let mut buf = [0u8; 8];
+    host.recv_from(&mut buf).unwrap();
+    host.send_to(b"out", station.local_addr().unwrap()).unwrap();
+    station.recv_from(&mut buf).unwrap();
+    let c = proto_counters().udp4;
+    assert_eq!(
+        (
+            c.sent - before.sent,
+            c.received - before.received,
+            c.read - before.read
+        ),
+        (1, 1, 1)
+    );
+}
+
+fn station_nic() -> snare::NicSpec {
+    snare::NicSpec::new("eth0")
+        .index(4)
+        .address("10.0.0.1/24".parse::<snare::IpNet>().unwrap())
+        .station("10.0.0.2".parse::<std::net::IpAddr>().unwrap())
+}
+
+#[test]
+fn a_stations_datagrams_are_not_the_hosts() {
+    Sim::builder()
+        .nic(station_nic())
+        .build()
+        .run(station_traffic);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stations_datagrams_are_not_the_simhosts() {
+    let nic = snare::Nic::new("eth0", 4)
+        .network("10.0.0.1/24".parse::<snare::IpNet>().unwrap())
+        .station("10.0.0.2".parse::<std::net::IpAddr>().unwrap());
+    Sim::builder()
+        .host(snare::HostProfile::new().nic(nic).build())
+        .build()
+        .run(station_traffic);
+}

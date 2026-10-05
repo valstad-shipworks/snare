@@ -873,9 +873,10 @@ impl Held {
         {
             Some(slot) => slot.store(0, Ordering::SeqCst),
             None => {
+                #[allow(deprecated)]
                 let _ = self
                     .spilled
-                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
             }
         }
     }
@@ -2206,6 +2207,7 @@ impl Accounting {
 
     #[cfg(target_os = "macos")]
     pub(crate) fn native_mutex_lineage(&self, mutex: usize) -> Option<u64> {
+        let _passthrough = Passthrough::enter();
         let owner = unsafe { crate::os::sync::native_mutex_owner(mutex) }?;
         match owner {
             crate::os::sync::NativeMutexOwner::ThreadId(id) => lock(&self.os_ids).get(&id).copied(),

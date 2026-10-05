@@ -272,6 +272,9 @@ pub(crate) struct DgramOpts {
     /// Linux `IPV6_MULTICAST_ALL`, the same for IPv6 groups, also on by default
     /// (net/ipv6/af_inet6.c `inet6_create` sets `MC6_ALL`).
     pub(crate) mc6_all: bool,
+    /// Windows `SIO_CPU_AFFINITY`: the processor whose receive queue the socket is tied to.
+    #[cfg(windows)]
+    pub(crate) cpu_affinity: Option<u16>,
 }
 
 impl Default for DgramOpts {
@@ -281,6 +284,8 @@ impl Default for DgramOpts {
             connreset: true,
             mc_all: true,
             mc6_all: true,
+            #[cfg(windows)]
+            cpu_affinity: None,
         }
     }
 }
@@ -367,6 +372,9 @@ pub(crate) struct SockState {
     /// The descriptors open on this file description; it closes when the last goes.
     fds: BTreeSet<c_int>,
     pub(crate) local: Option<SocketAddr>,
+    /// Bound at a station address: across a link from the host, so its datagrams are not the
+    /// host's to count.
+    station: bool,
     pub(crate) peer: Option<SocketAddr>,
     pub(crate) tcp_established: bool,
     #[cfg(unix)]
@@ -512,9 +520,14 @@ impl SockRec {
         self.state().kind = kind;
     }
 
-    /// Records the bound address.
+    /// Records the bound address, and whether it is a station address of the calling thread's sim.
     pub(crate) fn set_local(&self, local: SocketAddr) {
-        self.state().local = Some(local);
+        let station = snare_interpose::real(|| {
+            crate::scope::try_here().is_some_and(|shared| shared.topo().is_station_ip(local.ip()))
+        });
+        let mut state = self.state();
+        state.local = Some(local);
+        state.station = station;
     }
 
     /// Records the connected peer; `None` dissolves a datagram socket's association.
@@ -628,28 +641,31 @@ impl SockRec {
         self.state().sent += 1;
     }
 
-    /// Counts a datagram sent to `dest`, on the socket and in the host's UDP counters.
+    /// Counts a datagram sent to `dest`, on the socket and, when the host sent it rather than a
+    /// station across a link, in the host's UDP counters.
     #[cfg(any(target_os = "linux", windows))]
-    pub(crate) fn count_udp_sent(&self, dest: SocketAddr) {
+    pub(crate) fn count_udp_sent(&self, dest: SocketAddr, sender: &crate::netif::Sender) {
         self.count_sent();
-        self.stats
-            .udp(dest.ip())
-            .out
-            .fetch_add(1, Ordering::Relaxed);
+        if let crate::netif::Sender::Host(_) = sender {
+            self.stats
+                .udp(dest.ip())
+                .out
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     #[cfg(unix)]
-    pub(crate) fn finish_udp_send(&self, dest: SocketAddr, nic: Option<&str>) -> bool {
+    pub(crate) fn finish_udp_send(&self, dest: SocketAddr, sender: &crate::netif::Sender) -> bool {
         let mut state = self.state();
-        if let Some(nic) = nic {
+        if let Some(nic) = sender.egress_name() {
             Self::update_nic(&mut state.last_nic, nic);
             Self::update_nic(&mut state.last_tx_nic, nic);
+            self.stats
+                .udp(dest.ip())
+                .out
+                .fetch_add(1, Ordering::Relaxed);
         }
         state.sent += 1;
-        self.stats
-            .udp(dest.ip())
-            .out
-            .fetch_add(1, Ordering::Relaxed);
         Self::error_reports_pending(&state)
     }
 
@@ -731,7 +747,7 @@ impl SockRec {
             state.delivered += 1;
             state.delivered_bytes += len as u64;
         }
-        if state.kind == SocketKind::Udp {
+        if state.kind == SocketKind::Udp && !state.station {
             let udp = self.stats.udp(src.ip());
             match admitted {
                 Some(_) => udp.received.fetch_add(1, Ordering::Relaxed),
@@ -746,7 +762,7 @@ impl SockRec {
     pub(crate) fn consumed(&self, len: usize, charge: Charge, src: SocketAddr) {
         let mut state = self.state();
         state.buf.consumed(len, charge);
-        if state.kind == SocketKind::Udp {
+        if state.kind == SocketKind::Udp && !state.station {
             self.stats
                 .udp(src.ip())
                 .read
@@ -1238,6 +1254,7 @@ impl SocketTable {
                 kind,
                 fds: BTreeSet::from([fd]),
                 local: None,
+                station: false,
                 peer: None,
                 tcp_established: false,
                 #[cfg(unix)]
@@ -1381,6 +1398,12 @@ impl SocketTable {
             .iter()
             .find(|e| e.id == id)
             .cloned()
+    }
+
+    /// The `SIO_CPU_AFFINITY` processor of open socket `id`.
+    #[cfg(windows)]
+    pub(crate) fn cpu_affinity(&self, id: SocketId) -> Option<u16> {
+        self.lookup(id)?.state().dgram.cpu_affinity
     }
 
     /// Snapshots of the open sockets, oldest first. The records are copied out before any is

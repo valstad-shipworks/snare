@@ -48,6 +48,21 @@
 //! (from any thread) or through the calling thread's scope (from inside [`Sim::run`]); the free
 //! functions such as [`add_nic`] and [`add_host`] take the second route and panic off a sim.
 
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    all(windows, any(target_arch = "x86_64", target_arch = "aarch64"))
+)))]
+compile_error!(
+    "snare supports only x86_64/aarch64 Linux (glibc), macOS, and x86_64/aarch64 Windows; \
+     gate the dependency on `cfg(any(all(target_os = \"linux\", target_env = \"gnu\", \
+     any(target_arch = \"x86_64\", target_arch = \"aarch64\")), target_os = \"macos\", windows))`"
+);
+
 mod clock;
 mod dns;
 #[cfg(unix)]
@@ -160,7 +175,7 @@ pub use tester::{RunTester as __RunTester, run_testers as __run_testers};
 #[cfg(windows)]
 pub use win_adapter::{Adapter, AdapterKey, AdvancedProperty, RegValue};
 #[cfg(windows)]
-pub use win_host::{Sim, SimBuilder, WinHost, WorkingSet};
+pub use win_host::{MmcssTask, PowerThrottling, Sim, SimBuilder, WinHost, WorkingSet};
 
 /// The file plane `fs` with, on Linux, the sim's `/proc/net/snmp` and `/proc/net/snmp6` in front
 /// of it ([`procnet`]).

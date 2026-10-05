@@ -24,6 +24,8 @@ pub(crate) use nested::startup as thread_startup;
 mod signal_hooks;
 #[cfg(unix)]
 mod sockets;
+#[cfg(target_os = "linux")]
+pub(crate) use sockets::{recvmmsg_each, sendmmsg_each};
 #[cfg(unix)]
 pub(crate) mod sync;
 #[cfg(unix)]

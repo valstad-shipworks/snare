@@ -685,9 +685,10 @@ impl Clock {
     /// before and after. Called under `control`.
     fn step_base(&self, by: u64) -> (u64, u64) {
         let floor = self.floor.load(Ordering::Acquire);
+        #[allow(deprecated)]
         let before = self
             .monotonic_nanos
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |m| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |m| {
                 Some(m.max(floor).saturating_add(by))
             })
             .unwrap_or_else(|m| m)

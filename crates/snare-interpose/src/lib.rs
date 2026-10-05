@@ -64,66 +64,100 @@
 //!   io_uring use into a failure rather than a silent gap. liburing issues it inline on x86_64
 //!   and aarch64 (`src/syscall.h`, `src/arch/*/syscall.h`), so that use goes unseen.
 
-mod accounting;
-mod census;
-#[cfg(windows)]
-mod detour;
-mod domain;
-mod env;
-mod fs;
-mod hooks;
-mod host;
-mod layer;
-mod net;
-mod os;
-mod patch;
-mod race;
-mod resolve;
-mod sched;
-mod signals;
-mod stall;
-mod state;
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    all(windows, any(target_arch = "x86_64", target_arch = "aarch64"))
+)))]
+compile_error!(
+    "snare-interpose supports only x86_64/aarch64 Linux (glibc), macOS, and x86_64/aarch64 Windows; \
+     gate the dependency on `cfg(any(all(target_os = \"linux\", target_env = \"gnu\", \
+     any(target_arch = \"x86_64\", target_arch = \"aarch64\")), target_os = \"macos\", windows))`"
+);
 
-pub use accounting::{
-    AuditReport, BlockerKind, ClassEffect, EpochBump, LeaseId, LeaseInfo, LeaseKind, PState,
-    ParticipantInfo, Quiescence, QuiescenceViolation, ThreadClass, WaitLabel, current_wait_label,
-    note_wait_deadline, set_child_class, set_in_setup, wait_label,
-};
-pub use census::{
-    CensusThread, ServiceThread, SimId, ThreadCensus, ThreadOwner, census, current_os_thread_id,
-    service_thread,
-};
-pub use domain::{
-    Domain, DomainBuilder, Managed, WeakDomain, bump_epoch, cancel_wake, charge_latency,
-    det_active, det_block, det_block_readiness, det_wake, det_wake_readiness, domain_key, dormant,
-    end_spin, executive_attached, expire_timer, foreign_time_skip, idle_wait, in_passthrough,
-    mark_sim_waiting, mark_waiting, note_effect, now, pass_gate, quiescent, real, real_span,
-    recorded_thread_class, register_event_timer, register_timer, register_wake, set_thread_class,
-    set_thread_name, stalled, thread_class, thread_lineage, thread_name, time_skip,
-    try_leave_sim_wait, unregister_event_timer, unregister_timer, virtual_now,
-};
-#[cfg(unix)]
-pub use domain::{defer_descriptor_cleanup, descriptor_transaction};
-pub use env::Env;
-pub use fs::Fs;
-#[cfg(windows)]
-pub use host::DevCall;
-pub use host::Host;
-pub use layer::{ClockKind, Flow, Layer, SleepRequest, SpinStep, Unmodelled};
-#[cfg(windows)]
-pub use net::IpHlpCall;
-#[cfg(windows)]
-pub use net::{CompletionCall, CompletionPost, CompletionQuery};
-pub use net::{Net, NetResult};
-#[doc(hidden)]
-pub use os::joined_lists;
-#[cfg(windows)]
-pub use os::performance_count;
-pub use patch::{ImagePatches, InstallReport, install};
-#[doc(hidden)]
-pub use race::RaceCell;
-pub use resolve::{Lookup, Resolver, Reverse};
-pub use sched::{DetKey, DetWake, ReadinessKey, ReadinessWake};
-#[cfg(unix)]
-pub use signals::{Disposition, deliver_here, is_virtual};
-pub use signals::{SignalOutcome, SignalSource, Signals, simulated};
+macro_rules! on_supported_targets {
+    ($($item:item)*) => {
+        $(
+            #[cfg(any(
+                all(
+                    target_os = "linux",
+                    target_env = "gnu",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                target_os = "macos",
+                all(windows, any(target_arch = "x86_64", target_arch = "aarch64"))
+            ))]
+            $item
+        )*
+    };
+}
+
+on_supported_targets! {
+    mod accounting;
+    mod census;
+    #[cfg(windows)]
+    mod detour;
+    mod domain;
+    mod env;
+    mod fs;
+    mod hooks;
+    mod host;
+    mod layer;
+    mod net;
+    mod os;
+    mod patch;
+    mod race;
+    mod resolve;
+    mod sched;
+    mod signals;
+    mod stall;
+    mod state;
+
+    pub use accounting::{
+        AuditReport, BlockerKind, ClassEffect, EpochBump, LeaseId, LeaseInfo, LeaseKind, PState,
+        ParticipantInfo, Quiescence, QuiescenceViolation, ThreadClass, WaitLabel, current_wait_label,
+        note_wait_deadline, set_child_class, set_in_setup, wait_label,
+    };
+    pub use census::{
+        CensusThread, ServiceThread, SimId, ThreadCensus, ThreadOwner, census, current_os_thread_id,
+        service_thread,
+    };
+    pub use domain::{
+        Domain, DomainBuilder, Managed, WeakDomain, bump_epoch, cancel_wake, charge_latency,
+        det_active, det_block, det_block_readiness, det_wake, det_wake_readiness, domain_key, dormant,
+        end_spin, executive_attached, expire_timer, foreign_time_skip, idle_wait, in_passthrough,
+        mark_sim_waiting, mark_waiting, note_effect, now, pass_gate, quiescent, real, real_span,
+        recorded_thread_class, register_event_timer, register_timer, register_wake, set_thread_class,
+        set_thread_name, stalled, thread_class, thread_lineage, thread_name, time_skip,
+        try_leave_sim_wait, unregister_event_timer, unregister_timer, virtual_now,
+    };
+    #[cfg(unix)]
+    pub use domain::{defer_descriptor_cleanup, descriptor_transaction};
+    pub use env::Env;
+    pub use fs::Fs;
+    #[cfg(windows)]
+    pub use host::DevCall;
+    pub use host::Host;
+    pub use layer::{ClockKind, Flow, Layer, SleepRequest, SpinStep, Unmodelled};
+    #[cfg(windows)]
+    pub use net::IpHlpCall;
+    #[cfg(windows)]
+    pub use net::{CompletionCall, CompletionPost, CompletionQuery};
+    pub use net::{Net, NetResult};
+    #[doc(hidden)]
+    pub use os::joined_lists;
+    #[cfg(windows)]
+    pub use os::performance_count;
+    pub use patch::{ImagePatches, InstallReport, install};
+    #[doc(hidden)]
+    pub use race::RaceCell;
+    pub use resolve::{Lookup, Resolver, Reverse};
+    pub use sched::{DetKey, DetWake, ReadinessKey, ReadinessWake};
+    #[cfg(unix)]
+    pub use signals::{Disposition, deliver_here, is_virtual};
+    pub use signals::{SignalOutcome, SignalSource, Signals, simulated};
+}
