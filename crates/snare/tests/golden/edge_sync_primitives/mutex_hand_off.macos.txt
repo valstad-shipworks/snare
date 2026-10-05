@@ -1,0 +1,9 @@
+## mutex_hand_off
+           0 ns  w2 r0 acquired
+     1000001 ns  w2 r1 acquired
+     2000002 ns  w0 r0 acquired
+     3000003 ns  w0 r1 acquired
+     4000004 ns  w1 r0 acquired
+     5000005 ns  w1 r1 acquired
+     6000006 ns  w3 r0 acquired
+     7000007 ns  w3 r1 acquired

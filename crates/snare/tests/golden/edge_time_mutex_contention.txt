@@ -1,0 +1,16 @@
+           0 w2 holds 0 count 1
+           0 w4 holds 0 count 2
+        3001 w1 holds 0 count 3
+        8002 w0 holds 0 count 4
+       10003 w3 holds 0 count 5
+       11004 w2 holds 1 count 6
+       15005 w4 holds 1 count 7
+       18006 w1 holds 1 count 8
+       23007 w0 holds 1 count 9
+       25008 w3 holds 1 count 10
+       26009 w2 holds 2 count 11
+       30010 w4 holds 2 count 12
+       33011 w1 holds 2 count 13
+       38012 w0 holds 2 count 14
+       40013 w3 holds 2 count 15
+       45015 main joined

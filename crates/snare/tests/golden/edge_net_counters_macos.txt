@@ -1,0 +1,50 @@
+start
+two udp4 sockets
+  udp4 UdpCounters { sent: 0, received: 0, read: 0, rcvbuf_errors: 0, no_ports: 0, ignored_multi: 0, sockets: 2 }
+five datagrams queued
+  udp4 UdpCounters { sent: 5, received: 5, read: 0, rcvbuf_errors: 0, no_ports: 0, ignored_multi: 0, sockets: 2 }
+three read
+  udp4 UdpCounters { sent: 5, received: 5, read: 3, rcvbuf_errors: 0, no_ports: 0, ignored_multi: 0, sockets: 2 }
+a zero-length datagram
+  udp4 UdpCounters { sent: 6, received: 6, read: 3, rcvbuf_errors: 0, no_ports: 0, ignored_multi: 0, sockets: 2 }
+to a closed port
+  udp4 UdpCounters { sent: 7, received: 6, read: 3, rcvbuf_errors: 0, no_ports: 1, ignored_multi: 0, sockets: 2 }
+a broadcast nobody takes
+  udp4 UdpCounters { sent: 8, received: 6, read: 3, rcvbuf_errors: 0, no_ports: 1, ignored_multi: 1, sockets: 2 }
+a joined group on a port nobody holds
+  udp4 UdpCounters { sent: 9, received: 6, read: 3, rcvbuf_errors: 0, no_ports: 1, ignored_multi: 2, sockets: 3 }
+a group nobody joined
+  udp4 UdpCounters { sent: 10, received: 6, read: 3, rcvbuf_errors: 0, no_ports: 1, ignored_multi: 2, sockets: 3 }
+a joined group's member takes it
+  udp4 UdpCounters { sent: 11, received: 7, read: 3, rcvbuf_errors: 0, no_ports: 1, ignored_multi: 2, sockets: 3 }
+flood: delivered 0 overflowed 20 drops 20
+twenty into a minimal buffer
+  udp4 UdpCounters { sent: 31, received: 7, read: 3, rcvbuf_errors: 20, no_ports: 1, ignored_multi: 2, sockets: 4 }
+its socket closed
+  udp4 UdpCounters { sent: 31, received: 7, read: 3, rcvbuf_errors: 20, no_ports: 1, ignored_multi: 2, sockets: 3 }
+udp6: one read, one to a closed port
+  udp6 UdpCounters { sent: 2, received: 1, read: 1, rcvbuf_errors: 0, no_ports: 1, ignored_multi: 0, sockets: 2 }
+connected, not yet accepted
+  tcp4 TcpCounters { active_opens: 1, passive_opens: 1, attempt_fails: 0, estab_resets: 0, curr_estab: 1, in_segs: 0, out_segs: 0, out_rsts: 0 }
+accepted
+  tcp4 TcpCounters { active_opens: 1, passive_opens: 1, attempt_fails: 0, estab_resets: 0, curr_estab: 2, in_segs: 0, out_segs: 0, out_rsts: 0 }
+100 then 20000 bytes written
+  tcp4 TcpCounters { active_opens: 1, passive_opens: 1, attempt_fails: 0, estab_resets: 0, curr_estab: 2, in_segs: 3, out_segs: 3, out_rsts: 0 }
+read; an empty write
+refused
+  tcp4 TcpCounters { active_opens: 2, passive_opens: 1, attempt_fails: 1, estab_resets: 0, curr_estab: 2, in_segs: 3, out_segs: 3, out_rsts: 1 }
+client half-closed
+  tcp4 TcpCounters { active_opens: 2, passive_opens: 1, attempt_fails: 1, estab_resets: 0, curr_estab: 1, in_segs: 3, out_segs: 3, out_rsts: 1 }
+server aborts with linger 0
+  tcp4 TcpCounters { active_opens: 2, passive_opens: 1, attempt_fails: 1, estab_resets: 1, curr_estab: 0, in_segs: 3, out_segs: 3, out_rsts: 2 }
+client closed
+tcp6 connection, one write
+  tcp6 TcpCounters { active_opens: 1, passive_opens: 1, attempt_fails: 0, estab_resets: 0, curr_estab: 2, in_segs: 1, out_segs: 1, out_rsts: 0 }
+tcp6 closed
+  tcp6 TcpCounters { active_opens: 1, passive_opens: 1, attempt_fails: 0, estab_resets: 1, curr_estab: 0, in_segs: 1, out_segs: 1, out_rsts: 1 }
+a tester's connection, one write
+  tcp4 TcpCounters { active_opens: 3, passive_opens: 1, attempt_fails: 1, estab_resets: 1, curr_estab: 1, in_segs: 3, out_segs: 4, out_rsts: 2 }
+closed toward the tester
+  tcp4 TcpCounters { active_opens: 3, passive_opens: 1, attempt_fails: 1, estab_resets: 1, curr_estab: 0, in_segs: 3, out_segs: 4, out_rsts: 2 }
+net.inet.udp.stats (104 bytes)
+32 0 0 0 2 2 20 0 0 33 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0

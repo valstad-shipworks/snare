@@ -1,0 +1,25 @@
+[package]
+name = "snare-interpose"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0 AND BSD-2-Clause"
+authors.workspace = true
+repository.workspace = true
+keywords = ["interposition", "hooking", "testing", "simulation"]
+categories = ["development-tools::testing", "os"]
+description = "Redirects a program's calls into the operating system to pluggable layers, per thread"
+
+[dependencies]
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.186"
+
+[target."cfg(windows)".dependencies]
+region = { version = "4.0.1", default-features = false, features = ["std"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Performance", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_Security", "Win32_System_ProcessStatus", "Win32_Networking_WinSock", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Kernel", "Win32_System_Diagnostics_Debug"] }
+
+[target.'cfg(all(windows, any(target_arch = "x86", target_arch = "x86_64")))'.dependencies]
+iced-x86 = { version = "1.21", default-features = false, features = ["decoder", "block_encoder", "instr_info", "std"] }
+
+[dev-dependencies]
+libc = "0.2.186"

@@ -1,0 +1,117 @@
+name: Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+
+    runs-on: ${{ matrix.platform.os }}
+    name: ${{ matrix.platform.target }}
+
+    env:
+      # The real-time guards' budgets are calibrated on a developer machine.
+      SNARE_PERF_SCALE: 4
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform.target }}
+
+      - name: Cargo check
+        run: cargo check --workspace --all-targets --target ${{ matrix.platform.target }}
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --target ${{ matrix.platform.target }} -- -D warnings
+
+      # The module-loading test loads this cdylib from beside the test binaries' deps directory.
+      - name: Build interpose-probe
+        run: cargo build -p interpose-probe --target ${{ matrix.platform.target }}
+
+      # Each cell first gives the runner what the host-truth tests compare against; Linux and
+      # macOS then skip the comparisons whose host prerequisites a hosted runner cannot provide
+      # (see OPEN_BUGS.md for the Linux error-queue calibration).
+      # The runner starts jobs at BELOW_NORMAL_PRIORITY_CLASS, and children inherit it; the
+      # scheduling host-truth tests compare against a process started at NORMAL, as a desktop
+      # session starts it. Server 2025 fills loopback TCP differently (OPEN_BUGS.md).
+      - name: Tests (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          (Get-Process -Id $PID).PriorityClass = 'Normal'
+          $skip = @()
+          if ('${{ matrix.platform.os }}' -eq 'windows-latest') {
+            $skip = '--skip', 'unread_stream_fill_matches_real_os'
+          }
+          cargo test --workspace --no-fail-fast --target ${{ matrix.platform.target }} -- @skip
+
+      # The stub resolver also serves /etc/hosts names over DNS, so glibc would report a hosts-file
+      # name asked in the wrong family as EAI_NODATA; the uplink resolver answers NXDOMAIN, as a
+      # plain resolver does. Directory-stream tests raise RLIMIT_NOFILE past the runner's 65536.
+      - name: Tests (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+          sudo prlimit --pid $$ --nofile=1048576:1048576
+          cargo test --workspace --no-fail-fast --target ${{ matrix.platform.target }} -- \
+            --skip report_capacity_charge_and_payload_match_linux \
+            --skip ordinary_data_and_error_reports_share_the_receive_budget \
+            --skip duplicated_packet_socket_survives_original_close_os_truth
+
+      # Its real side opens AF_PACKET sockets, which need CAP_NET_RAW.
+      - name: Raw L2 host truth (Linux, root)
+        if: runner.os == 'Linux'
+        run: |
+          exe=$(cargo test -p snare --test raw_l2 --no-run --message-format=json --target ${{ matrix.platform.target }} \
+            | jq -r 'select(.target.name == "raw_l2" and .executable != null) | .executable')
+          sudo "$exe" duplicated_packet_socket_survives_original_close_os_truth
+
+      # The scale tests hold over 16k sockets against a default kern.maxfilesperproc of 10240.
+      # Multicast sends from the runner VM fail with EHOSTUNREACH, so there is no real side to
+      # compare the multicast tests with.
+      - name: Tests (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          sudo sysctl -w kern.maxfiles=1048576 kern.maxfilesperproc=1048576
+          ulimit -n 1048576
+          cargo test --workspace --no-fail-fast --target ${{ matrix.platform.target }} -- \
+            --skip multicast_all_matches_real_os \
+            --skip unicast_bound_member_matches_real_os
+
+  shims:
+    runs-on: ubuntu-latest
+    name: shims
+
+    strategy:
+      fail-fast: false
+      matrix:
+        shim: [io-uring, sc, syscalls, xsk-rs]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: shims/${{ matrix.shim }}
+
+      - name: Tests
+        run: cargo test --manifest-path shims/${{ matrix.shim }}/Cargo.toml

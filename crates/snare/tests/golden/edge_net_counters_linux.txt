@@ -1,0 +1,146 @@
+start
+two udp4 sockets
+  udp4 UdpCounters { sent: 0, received: 0, read: 0, rcvbuf_errors: 0, no_ports: 0, ignored_multi: 0, sockets: 2 }
+five datagrams queued
+  udp4 UdpCounters { sent: 5, received: 5, read: 0, rcvbuf_errors: 0, no_ports: 0, ignored_multi: 0, sockets: 2 }
+three read
+  udp4 UdpCounters { sent: 5, received: 5, read: 3, rcvbuf_errors: 0, no_ports: 0, ignored_multi: 0, sockets: 2 }
+a zero-length datagram
+  udp4 UdpCounters { sent: 6, received: 6, read: 3, rcvbuf_errors: 0, no_ports: 0, ignored_multi: 0, sockets: 2 }
+to a closed port
+  udp4 UdpCounters { sent: 7, received: 6, read: 3, rcvbuf_errors: 0, no_ports: 1, ignored_multi: 0, sockets: 2 }
+a broadcast nobody takes
+  udp4 UdpCounters { sent: 8, received: 6, read: 3, rcvbuf_errors: 0, no_ports: 1, ignored_multi: 1, sockets: 2 }
+a joined group on a port nobody holds
+  udp4 UdpCounters { sent: 9, received: 6, read: 3, rcvbuf_errors: 0, no_ports: 1, ignored_multi: 2, sockets: 3 }
+a group nobody joined
+  udp4 UdpCounters { sent: 10, received: 6, read: 3, rcvbuf_errors: 0, no_ports: 1, ignored_multi: 2, sockets: 3 }
+a joined group's member takes it
+  udp4 UdpCounters { sent: 11, received: 7, read: 3, rcvbuf_errors: 0, no_ports: 1, ignored_multi: 2, sockets: 3 }
+flood: delivered 1 overflowed 19 drops 19
+twenty into a minimal buffer
+  udp4 UdpCounters { sent: 31, received: 8, read: 3, rcvbuf_errors: 19, no_ports: 1, ignored_multi: 2, sockets: 4 }
+its socket closed
+  udp4 UdpCounters { sent: 31, received: 8, read: 3, rcvbuf_errors: 19, no_ports: 1, ignored_multi: 2, sockets: 3 }
+udp6: one read, one to a closed port
+  udp6 UdpCounters { sent: 2, received: 1, read: 1, rcvbuf_errors: 0, no_ports: 1, ignored_multi: 0, sockets: 2 }
+connected, not yet accepted
+  tcp4 TcpCounters { active_opens: 1, passive_opens: 1, attempt_fails: 0, estab_resets: 0, curr_estab: 1, in_segs: 0, out_segs: 0, out_rsts: 0 }
+accepted
+  tcp4 TcpCounters { active_opens: 1, passive_opens: 1, attempt_fails: 0, estab_resets: 0, curr_estab: 2, in_segs: 0, out_segs: 0, out_rsts: 0 }
+100 then 20000 bytes written
+  tcp4 TcpCounters { active_opens: 1, passive_opens: 1, attempt_fails: 0, estab_resets: 0, curr_estab: 2, in_segs: 2, out_segs: 2, out_rsts: 0 }
+read; an empty write
+refused
+  tcp4 TcpCounters { active_opens: 2, passive_opens: 1, attempt_fails: 1, estab_resets: 0, curr_estab: 2, in_segs: 2, out_segs: 2, out_rsts: 1 }
+client half-closed
+  tcp4 TcpCounters { active_opens: 2, passive_opens: 1, attempt_fails: 1, estab_resets: 0, curr_estab: 1, in_segs: 2, out_segs: 2, out_rsts: 1 }
+server aborts with linger 0
+  tcp4 TcpCounters { active_opens: 2, passive_opens: 1, attempt_fails: 1, estab_resets: 1, curr_estab: 0, in_segs: 2, out_segs: 2, out_rsts: 2 }
+client closed
+tcp6 connection, one write
+  tcp6 TcpCounters { active_opens: 1, passive_opens: 1, attempt_fails: 0, estab_resets: 0, curr_estab: 2, in_segs: 1, out_segs: 1, out_rsts: 0 }
+tcp6 closed
+  tcp6 TcpCounters { active_opens: 1, passive_opens: 1, attempt_fails: 0, estab_resets: 1, curr_estab: 0, in_segs: 1, out_segs: 1, out_rsts: 1 }
+a tester's connection, one write
+  tcp4 TcpCounters { active_opens: 3, passive_opens: 1, attempt_fails: 1, estab_resets: 1, curr_estab: 1, in_segs: 2, out_segs: 3, out_rsts: 2 }
+closed toward the tester
+  tcp4 TcpCounters { active_opens: 3, passive_opens: 1, attempt_fails: 1, estab_resets: 1, curr_estab: 0, in_segs: 2, out_segs: 3, out_rsts: 2 }
+/proc/net/snmp
+Ip: Forwarding DefaultTTL InReceives InHdrErrors InAddrErrors ForwDatagrams InUnknownProtos InDiscards InDelivers OutRequests OutDiscards OutNoRoutes ReasmTimeout ReasmReqds ReasmOKs ReasmFails FragOKs FragFails FragCreates OutTransmits
+Ip: 2 64 32 0 0 0 0 0 32 34 0 0 0 0 0 0 0 0 0 34
+Icmp: InMsgs InErrors InCsumErrors InDestUnreachs InTimeExcds InParmProbs InSrcQuenchs InRedirects InEchos InEchoReps InTimestamps InTimestampReps InAddrMasks InAddrMaskReps OutMsgs OutErrors OutRateLimitGlobal OutRateLimitHost OutDestUnreachs OutTimeExcds OutParmProbs OutSrcQuenchs OutRedirects OutEchos OutEchoReps OutTimestamps OutTimestampReps OutAddrMasks OutAddrMaskReps
+Icmp: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 1 0 0 0 0 0 0 0 0 0 0
+Tcp: RtoAlgorithm RtoMin RtoMax MaxConn ActiveOpens PassiveOpens AttemptFails EstabResets CurrEstab InSegs OutSegs RetransSegs InErrs OutRsts InCsumErrors
+Tcp: 1 200 120000 -1 4 2 1 2 0 3 4 0 0 3 0
+Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors
+Udp: 3 1 19 31 19 0 0 2 0
+UdpLite: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors
+UdpLite: 0 0 0 0 0 0 0 0 0
+/proc/net/snmp6
+Ip6InReceives                   	3
+Ip6InHdrErrors                  	0
+Ip6InTooBigErrors               	0
+Ip6InNoRoutes                   	0
+Ip6InAddrErrors                 	0
+Ip6InUnknownProtos              	0
+Ip6InTruncatedPkts              	0
+Ip6InDiscards                   	0
+Ip6InDelivers                   	3
+Ip6OutForwDatagrams             	0
+Ip6OutRequests                  	3
+Ip6OutDiscards                  	0
+Ip6OutNoRoutes                  	0
+Ip6ReasmTimeout                 	0
+Ip6ReasmReqds                   	0
+Ip6ReasmOKs                     	0
+Ip6ReasmFails                   	0
+Ip6FragOKs                      	0
+Ip6FragFails                    	0
+Ip6FragCreates                  	0
+Ip6InMcastPkts                  	0
+Ip6OutMcastPkts                 	0
+Ip6InOctets                     	0
+Ip6OutOctets                    	0
+Ip6InMcastOctets                	0
+Ip6OutMcastOctets               	0
+Ip6InBcastOctets                	0
+Ip6OutBcastOctets               	0
+Ip6InNoECTPkts                  	0
+Ip6InECT1Pkts                   	0
+Ip6InECT0Pkts                   	0
+Ip6InCEPkts                     	0
+Ip6OutTransmits                 	3
+Icmp6InMsgs                     	0
+Icmp6InErrors                   	0
+Icmp6OutMsgs                    	1
+Icmp6OutErrors                  	0
+Icmp6InCsumErrors               	0
+Icmp6OutRateLimitHost           	0
+Icmp6InDestUnreachs             	0
+Icmp6InPktTooBigs               	0
+Icmp6InTimeExcds                	0
+Icmp6InParmProblems             	0
+Icmp6InEchos                    	0
+Icmp6InEchoReplies              	0
+Icmp6InGroupMembQueries         	0
+Icmp6InGroupMembResponses       	0
+Icmp6InGroupMembReductions      	0
+Icmp6InRouterSolicits           	0
+Icmp6InRouterAdvertisements     	0
+Icmp6InNeighborSolicits         	0
+Icmp6InNeighborAdvertisements   	0
+Icmp6InRedirects                	0
+Icmp6InMLDv2Reports             	0
+Icmp6OutDestUnreachs            	1
+Icmp6OutPktTooBigs              	0
+Icmp6OutTimeExcds               	0
+Icmp6OutParmProblems            	0
+Icmp6OutEchos                   	0
+Icmp6OutEchoReplies             	0
+Icmp6OutGroupMembQueries        	0
+Icmp6OutGroupMembResponses      	0
+Icmp6OutGroupMembReductions     	0
+Icmp6OutRouterSolicits          	0
+Icmp6OutRouterAdvertisements    	0
+Icmp6OutNeighborSolicits        	0
+Icmp6OutNeighborAdvertisements  	0
+Icmp6OutRedirects               	0
+Icmp6OutMLDv2Reports            	0
+Udp6InDatagrams                 	1
+Udp6NoPorts                     	1
+Udp6InErrors                    	0
+Udp6OutDatagrams                	2
+Udp6RcvbufErrors                	0
+Udp6SndbufErrors                	0
+Udp6InCsumErrors                	0
+Udp6IgnoredMulti                	0
+Udp6MemErrors                   	0
+UdpLite6InDatagrams             	0
+UdpLite6NoPorts                 	0
+UdpLite6InErrors                	0
+UdpLite6OutDatagrams            	0
+UdpLite6RcvbufErrors            	0
+UdpLite6SndbufErrors            	0
+UdpLite6InCsumErrors            	0
+UdpLite6MemErrors               	0

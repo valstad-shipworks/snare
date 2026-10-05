@@ -1,0 +1,3 @@
+## condvar_timeout
+     7000001 ns  wait_timeout timed_out=true
+    10000002 ns  wait_timeout_while timed_out=true

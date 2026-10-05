@@ -1,0 +1,9 @@
+## condvar_notify_counts
+       10001 ns  all waiting
+       10001 ns  waiter 2 through ticket 1
+     1010002 ns  after notify_one: 1 wakes
+     1010002 ns  waiter 4 through ticket 1
+     1010002 ns  waiter 1 through ticket 1
+     1010002 ns  waiter 0 through ticket 1
+     1010002 ns  waiter 3 through ticket 1
+     1010002 ns  after notify_all: 5 wakes

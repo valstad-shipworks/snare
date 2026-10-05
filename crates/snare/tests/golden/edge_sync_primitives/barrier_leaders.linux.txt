@@ -1,0 +1,9 @@
+## barrier_leaders
+     4000001 ns  t3 round 0 through leader=true
+     4000001 ns  t2 round 0 through leader=false
+     4000001 ns  t1 round 0 through leader=false
+     4000001 ns  t0 round 0 through leader=false
+     8000002 ns  t3 round 1 through leader=true
+     8000002 ns  t2 round 1 through leader=false
+     8000002 ns  t1 round 1 through leader=false
+     8000002 ns  t0 round 1 through leader=false

@@ -1,0 +1,72 @@
+rx 3 @ 2517us
+rx 1 @ 3422us
+rx 4 @ 3584us
+rx 16 @ 3614us
+rx 12 @ 3645us
+rx 15 @ 3675us
+rx 17 @ 3939us
+rx 14 @ 3957us
+rx 19 @ 4419us
+rx 22 @ 4481us
+rx 25 @ 4510us
+rx 14 @ 4588us
+rx 17 @ 4612us
+rx 23 @ 4672us
+rx 10 @ 4717us
+rx 3 @ 4862us
+rx 19 @ 4959us
+rx 9 @ 5188us
+rx 31 @ 5224us
+rx 13 @ 5277us
+rx 21 @ 5516us
+rx 7 @ 5582us
+rx 33 @ 5668us
+rx 28 @ 5794us
+rx 38 @ 5894us
+rx 13 @ 5942us
+rx 29 @ 6125us
+rx 20 @ 6210us
+rx 24 @ 6227us
+rx 26 @ 6248us
+rx 29 @ 6474us
+rx 41 @ 6488us
+rx 46 @ 6768us
+rx 21 @ 6855us
+rx 33 @ 7012us
+rx 41 @ 7369us
+rx 26 @ 7424us
+rx 35 @ 7597us
+rx 31 @ 7624us
+rx 32 @ 7866us
+rx 37 @ 7885us
+rx 35 @ 8045us
+rx 39 @ 8185us
+rx 36 @ 8189us
+rx 47 @ 8396us
+rx 43 @ 8433us
+rx 40 @ 8733us
+link Lost 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 0us
+link Lost 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 200us
+link Duplicated 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 300us
+link Lost 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 500us
+link Lost 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 600us
+link Lost 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 800us
+link Lost 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 1100us
+link Duplicated 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 1300us
+link Duplicated 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 1400us
+link Duplicated 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 1700us
+link Lost 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 1800us
+link Duplicated 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 1900us
+link Duplicated 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 2100us
+link Duplicated 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 2600us
+link Lost 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 2700us
+link Duplicated 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 2900us
+link Lost 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 3000us
+link Duplicated 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 3100us
+link Duplicated 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 3300us
+link Lost 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 3400us
+link Duplicated 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 3500us
+link Duplicated 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 4100us
+link Lost 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 4200us
+link Lost 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 4400us
+link Lost 127.0.0.1:41000->127.0.0.1:41001 len 1 @ 4500us

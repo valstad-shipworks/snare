@@ -1,0 +1,9 @@
+## channels
+     1000001 ns  received 0
+     1000001 ns  sent 0
+     2000002 ns  received 1
+     2000002 ns  sent 1
+     3000003 ns  received 2
+     3000003 ns  sent 2
+     7000004 ns  recv_timeout Err(Timeout)
+    10000005 ns  recv_timeout Ok(5)
