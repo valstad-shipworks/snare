@@ -760,9 +760,19 @@ sim.run(|| {
   `Fault::Unreachable`. A loopback source leaving the host is `EINVAL` on Linux and
   `EADDRNOTAVAIL` on macOS; Windows is a strong host, so a bound address only leaves through its own
   interface (`WSAENETUNREACH`, as measured) and only receives there.
-- **Sources and delivery.** A wildcard or unbound UDP socket keeps its wildcard local address and
-  each datagram carries the route's source; a TCP client's local address is the route's source. A
-  datagram reaches the exact bind, else a wildcard bind only for the host's own addresses; a directed
+- **Sources and delivery.** An unconnected wildcard or unbound UDP socket keeps its wildcard local
+  address and each datagram carries the route's source; a TCP client's local address is the
+  route's source. A UDP `connect` from the wildcard (or unbound) takes the route's source address,
+  v4-mapped on an IPv6 socket, and the socket then receives only there, as every host does
+  (`getsockname` reports it). Connecting again keeps that address on Linux; macOS and Windows
+  dissolve the association first and pick anew. Dissolving it (`connect` to an `AF_UNSPEC`
+  address; on Windows also the all-zero address) follows the host: Linux returns to the wildcard
+  unless `bind` named an address and gives up the port unless `bind` named one (the next send or
+  connect takes a new one); macOS returns to the wildcard, keeps the port and fails with
+  `EAFNOSUPPORT` (`EINVAL` for an address shorter than the family's); Windows returns to what
+  `bind` named, keeps the port, and refuses an address shorter than the family's with
+  `WSAEFAULT`. `tests/udp_connect_source.rs` compares this with the real host. A datagram
+  reaches the exact bind, else a wildcard bind only for the host's own addresses; a directed
   broadcast reaches its subnet's stations and the host's wildcard binds; a socket bound to a device
   only receives what arrives on it. Recipients are served in (port, address) order.
 - **Multicast.** A group's datagram reaches, on its port, every socket that joined the group. On
@@ -1144,7 +1154,23 @@ the sim depends on them: `SO_KEEPALIVE` and the TCP keepalive timers (no connect
 `FIOCLEX`/`FIONCLEX` for ioctls. Windows keeps the same, read back from Windows' defaults until set
 (`IP_TTL` and `IPV6_UNICAST_HOPS` 128, the multicast hop limits 1, the TCP keepalive timers 2 hours,
 1 s and 10 probes), plus `SO_DEBUG` and `SO_DONTROUTE`, which Microsoft's providers ignore, and the
-`SIO_KEEPALIVE_VALS`, `SIO_LOOPBACK_FAST_PATH` and `SIO_UDP_NETRESET` ioctls. Everything else the sim does not model — `SO_REUSEPORT`,
+`SIO_KEEPALIVE_VALS`, `SIO_LOOPBACK_FAST_PATH` and `SIO_UDP_NETRESET` ioctls.
+
+Some options are modelled although nothing in the sim depends on them, so code that sets or reads
+them sees the host's answers. Linux `SO_BUSY_POLL`, `SO_PREFER_BUSY_POLL` and
+`SO_BUSY_POLL_BUDGET` are kept per socket with the kernel's checks (Linux 7.0, measured): any
+non-negative `SO_BUSY_POLL` (negative is `EINVAL`), `SO_PREFER_BUSY_POLL` on only with
+`CAP_NET_ADMIN`, and `SO_BUSY_POLL_BUDGET` raised above its current value only with
+`CAP_NET_ADMIN` (`EPERM`) and within `0..=65535` (`EINVAL`); the first two read back, the budget
+does not (`ENOPROTOOPT`, as `sk_getsockopt`). Nothing is polled: delivery is unchanged. Linux
+`SO_DOMAIN` and `SO_PROTOCOL` read the socket's family and the protocol the kernel resolved
+(`IPPROTO_UDP`/`IPPROTO_TCP` for protocol 0, 0 for packet and unix sockets, a netlink socket's
+own), and fail `ENOPROTOOPT` to set; macOS has neither. Windows `SO_PROTOCOL_INFOW` and
+`SO_PROTOCOL_INFOA` return the host's Winsock catalog entry for the socket's family, type and
+protocol, as Winsock does, and refuse to be set. `tests/busy_poll.rs` and
+`tests/socket_family.rs` compare them with the real host.
+
+Everything else the sim does not model — `SO_REUSEPORT`,
 `IP_MULTICAST_LOOP`, `IP_DROP_MEMBERSHIP`, `IPV6_V6ONLY`, `SO_RCVLOWAT`, `SIOCGSTAMP` and the
 rest — is unmodelled. A `SimHost` socket keeps its
 existing read-back of every option set, and records the same way. std's own socket calls on each host
@@ -1232,7 +1258,7 @@ capability, `RLIMIT_RTPRIO` 99, `RLIMIT_NICE` 40, unlimited `RLIMIT_MEMLOCK`, as
 has one, and `SimBuilder::privileges` over both; `Privileges::none()` is an ordinary user with the
 stock limits (0, 0, 8 MiB on Linux) and `Privileges::from_real_process()` copies the machine's;
 `set_privileges` / `Sim::set_privileges` change it from any thread. The host's scheduling,
-`mlockall` and `SIOCSHWTSTAMP` gates read the same model, a `SimHost` answers `geteuid`/`getuid` (0
+`mlockall`, `SIOCSHWTSTAMP` and busy-poll gates read the same model, a `SimHost` answers `geteuid`/`getuid` (0
 for root, else 1000 on Linux, 501 on macOS) and renders `CapEff`/`CapPrm`/`CapBnd` in
 `/proc/self/status`.
 

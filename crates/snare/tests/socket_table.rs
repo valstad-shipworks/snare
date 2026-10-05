@@ -72,7 +72,7 @@ fn entry_tracks_local_peer_memberships() {
     Sim::new().run(|| {
         let s = UdpSocket::bind("0.0.0.0:0").unwrap();
         let id = snare::socket_id(&s).unwrap();
-        let local = s.local_addr().unwrap();
+        let port = s.local_addr().unwrap().port();
         let group = Ipv4Addr::new(239, 1, 2, 3);
         s.join_multicast_v4(&group, &Ipv4Addr::new(127, 0, 0, 1))
             .unwrap();
@@ -80,7 +80,7 @@ fn entry_tracks_local_peer_memberships() {
 
         let e = entry_of(id);
         assert_eq!(e.kind, SocketKind::Udp);
-        assert_eq!(e.local, Some(local));
+        assert_eq!(e.local, Some(([127, 0, 0, 1], port).into()));
         assert_eq!(e.peer, Some("127.0.0.1:4000".parse().unwrap()));
         assert_eq!(e.memberships.len(), 1);
         assert_eq!(e.memberships[0].group, std::net::IpAddr::V4(group));

@@ -877,6 +877,22 @@ impl Sender {
         }
     }
 
+    /// Where a datagram socket bound at `local` stands once it connects along this route: a
+    /// wildcard bind takes the route's source address, v4-mapped on an IPv6 socket (Linux
+    /// `ip4_datagram_connect`, net/ipv4/datagram.c, and `ip6_datagram_dst_update`,
+    /// net/ipv6/datagram.c; macOS `in_pcbconnect`, bsd/netinet/in_pcb.c; and Winsock alike, as
+    /// measured by tests/udp_connect_source.rs).
+    pub(crate) fn connected_local(&self, local: SocketAddr) -> SocketAddr {
+        let src = self.source(local);
+        match (src.ip(), local) {
+            (IpAddr::V4(v4), SocketAddr::V6(_)) => {
+                SocketAddr::new(v4.to_ipv6_mapped().into(), local.port())
+            }
+            (IpAddr::V6(_), SocketAddr::V4(_)) => local,
+            _ => src,
+        }
+    }
+
     /// The interface a host datagram leaves through; `None` for a station.
     pub(crate) fn egress_name(&self) -> Option<&str> {
         match self {

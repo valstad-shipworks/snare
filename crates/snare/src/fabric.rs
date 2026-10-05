@@ -1014,6 +1014,12 @@ fn unspecified_like(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// What an unbound datagram socket still holds of the address its `bind` named: the address, at
+/// no port. Only a Linux disconnect leaves a socket so (see [`Fabric::disconnect_dgram`]).
+fn unhashed(requested: Option<SocketAddr>) -> Option<SocketAddr> {
+    requested.map(|r| SocketAddr::new(r.ip(), 0))
+}
+
 thread_local! {
     /// The registries of the `Sim` this thread runs in, set by [`enter`].
     static CURRENT: std::cell::RefCell<Option<Arc<Registries>>> = const { std::cell::RefCell::new(None) };
@@ -1242,6 +1248,8 @@ enum Sock {
         queue: Arc<DgramQueue>,
         domain: c_int,
         local: Option<SocketAddr>,
+        /// The address `bind` was given (port 0 for any): what a disconnect falls back to.
+        requested: Option<SocketAddr>,
         peer: Option<SocketAddr>,
         nonblocking: bool,
         /// `SO_BROADCAST`: whether sends to a broadcast address are allowed (man 7 socket).
@@ -1509,6 +1517,7 @@ pub struct Fabric {
 
 struct UdpSendEndpoint {
     local: Option<SocketAddr>,
+    requested: Option<SocketAddr>,
     queue: Arc<DgramQueue>,
     domain: c_int,
     broadcast: bool,
@@ -1521,6 +1530,7 @@ impl UdpSendEndpoint {
         match sock {
             Sock::Dgram {
                 local,
+                requested,
                 queue,
                 domain,
                 broadcast,
@@ -1529,6 +1539,7 @@ impl UdpSendEndpoint {
                 ..
             } => Some(Self {
                 local: *local,
+                requested: *requested,
                 queue: queue.clone(),
                 domain: *domain,
                 broadcast: *broadcast,
@@ -1841,6 +1852,7 @@ impl Fabric {
         }
         let UdpSendEndpoint {
             local,
+            requested,
             queue,
             domain,
             broadcast,
@@ -1860,14 +1872,16 @@ impl Fabric {
             return err(errno);
         }
         let station = self.regs.station_at(dest.ip());
-        let sender =
-            match self
-                .shared()
-                .route_send(&rec.view(local), dest, Op::Send, station, broadcast)
-            {
-                Ok(sender) => sender,
-                Err(errno) => return err(errno),
-            };
+        let sender = match self.shared().route_send(
+            &rec.view(local.or(unhashed(requested))),
+            dest,
+            Op::Send,
+            station,
+            broadcast,
+        ) {
+            Ok(sender) => sender,
+            Err(errno) => return err(errno),
+        };
         if let Err(errno) = crate::netif::frag::check_send(
             self.shared(),
             &rec,
@@ -1881,7 +1895,7 @@ impl Fabric {
         let local = match local {
             Some(local) => local,
             None => {
-                let ip = unspecified_like(loopback_for(domain));
+                let ip = requested.map_or(unspecified_like(loopback_for(domain)), |r| r.ip());
                 match self.autobind(fd, &queue, &rec, ip) {
                     Ok(local) => local,
                     Err(errno) => return err(errno),
@@ -1948,6 +1962,83 @@ impl Fabric {
         }
         rec.set_local(sa);
         Ok(sa)
+    }
+
+    /// Moves bound datagram socket `fd` from `from` to `to` in the delivery map, as the kernel
+    /// rehashes a socket whose local address a connect or disconnect changed. An address another
+    /// socket holds (shared through `SO_REUSEADDR`, which the map does not model) leaves it where
+    /// it is.
+    fn rehash(
+        &self,
+        fd: c_int,
+        queue: &Arc<DgramQueue>,
+        rec: &Arc<SockRec>,
+        from: SocketAddr,
+        to: SocketAddr,
+    ) {
+        if from == to {
+            return;
+        }
+        let mut regs = self.regs.udp.lock().unwrap();
+        if regs.bound.contains_key(&to) {
+            return;
+        }
+        regs.remove(&from);
+        regs.insert(to, queue.clone());
+        drop(regs);
+        if let Some(Sock::Dgram { local, .. }) = self.socks.lock().unwrap().get_mut(&fd) {
+            *local = Some(to);
+        }
+        rec.set_local(to);
+    }
+
+    /// Dissolves a datagram socket's association (`connect` with `AF_UNSPEC`, man 2 connect),
+    /// returning the socket's family; `None` when `fd` is not a datagram socket. Linux
+    /// `__udp_disconnect` (net/ipv4/udp.c) returns the local address to the wildcard unless
+    /// `bind` named one (`SOCK_BINDADDR_LOCK`) and gives up the port unless `bind` named one
+    /// (`SOCK_BINDPORT_LOCK`), so the next send or connect picks a new one. macOS
+    /// `udp_disconnect` (bsd/netinet/udp_usrreq.c) always returns the address to the wildcard and
+    /// keeps the port. Measured by tests/udp_connect_source.rs.
+    fn disconnect_dgram(&self, fd: c_int) -> Option<c_int> {
+        let mut socks = self.socks.lock().unwrap();
+        let Some(Sock::Dgram {
+            peer,
+            local,
+            requested,
+            queue,
+            rec,
+            domain,
+            ..
+        }) = socks.get_mut(&fd)
+        else {
+            return None;
+        };
+        let domain = *domain;
+        *peer = None;
+        rec.set_peer(None);
+        let Some(bound) = *local else {
+            return Some(domain);
+        };
+        let (requested, queue, rec) = (*requested, queue.clone(), rec.clone());
+        let wildcard = unspecified_like(bound.ip());
+        if cfg!(target_os = "linux") && requested.is_none_or(|r| r.port() == 0) {
+            *local = None;
+            drop(socks);
+            queue.next_port.store(
+                bound.port().checked_add(1).unwrap_or(49152) as u64,
+                Ordering::Relaxed,
+            );
+            self.regs.udp.lock().unwrap().remove(&bound);
+            rec.state().local = unhashed(requested).filter(|a| !a.ip().is_unspecified());
+            return Some(domain);
+        }
+        drop(socks);
+        let ip = requested
+            .map(|r| r.ip())
+            .filter(|ip| cfg!(target_os = "linux") && !ip.is_unspecified())
+            .unwrap_or(wildcard);
+        self.rehash(fd, &queue, &rec, bound, SocketAddr::new(ip, bound.port()));
+        Some(domain)
     }
 }
 
@@ -2778,7 +2869,7 @@ impl Net for Fabric {
     /// Opens an `AF_INET`/`AF_INET6` stream or datagram socket, or on Linux an `AF_PACKET` one;
     /// declines any other family or type (`AF_UNIX` sockets other than socketpairs, raw IP).
     /// `protocol` is not checked.
-    unsafe fn socket(&self, domain: c_int, ty: c_int, _protocol: c_int) -> Option<NetResult> {
+    unsafe fn socket(&self, domain: c_int, ty: c_int, protocol: c_int) -> Option<NetResult> {
         let base = ty & 0xff;
         let nonblocking = ty & sock_nonblock() != 0;
         // AF_PACKET gives raw L2 access: SOCK_RAW passes whole frames incl. the Ethernet header,
@@ -2793,36 +2884,60 @@ impl Net for Fabric {
             if !self.shared().sys.has_cap(crate::limits::CAP_NET_RAW) {
                 return err(libc::EPERM);
             }
-            return self.open_socket(SocketKind::Packet, ty, |rec| Sock::Raw {
-                ifindex: None,
-                rx: VecDeque::new(),
-                arrived: 0,
-                nonblocking,
-                rec,
+            return self.open_socket(SocketKind::Packet, ty, |rec| {
+                // SO_PROTOCOL reads 0 on a packet socket whatever protocol it was opened with
+                // (measured on Linux 7.0 by tests/socket_family.rs).
+                rec.set_family(domain, 0);
+                Sock::Raw {
+                    ifindex: None,
+                    rx: VecDeque::new(),
+                    arrived: 0,
+                    nonblocking,
+                    rec,
+                }
             });
         }
         if domain != libc::AF_INET && domain != libc::AF_INET6 {
             return None;
         }
+        // inet_create (net/ipv4/af_inet.c) resolves protocol 0 to the type's own, which is
+        // what SO_PROTOCOL reports.
+        #[cfg(target_os = "linux")]
+        let resolved = match (protocol, base) {
+            (0, libc::SOCK_DGRAM) => libc::IPPROTO_UDP,
+            (0, _) => libc::IPPROTO_TCP,
+            (given, _) => given,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let _ = protocol;
         if base == libc::SOCK_DGRAM {
-            return self.open_socket(SocketKind::Udp, ty, |rec| Sock::Dgram {
-                queue: DgramQueue::for_socket(&rec),
-                domain,
-                local: None,
-                peer: None,
-                nonblocking,
-                broadcast: false,
-                rec,
+            return self.open_socket(SocketKind::Udp, ty, |rec| {
+                #[cfg(target_os = "linux")]
+                rec.set_family(domain, resolved);
+                Sock::Dgram {
+                    queue: DgramQueue::for_socket(&rec),
+                    domain,
+                    local: None,
+                    requested: None,
+                    peer: None,
+                    nonblocking,
+                    broadcast: false,
+                    rec,
+                }
             });
         }
         if base != libc::SOCK_STREAM {
             return None;
         }
-        self.open_socket(SocketKind::TcpStream, ty, |rec| Sock::Fresh {
-            domain,
-            local: None,
-            nonblocking,
-            rec,
+        self.open_socket(SocketKind::TcpStream, ty, |rec| {
+            #[cfg(target_os = "linux")]
+            rec.set_family(domain, resolved);
+            Sock::Fresh {
+                domain,
+                local: None,
+                nonblocking,
+                rec,
+            }
         })
     }
 
@@ -2870,6 +2985,12 @@ impl Net for Fabric {
             self.shared().new_socket(SocketKind::Unix, a),
             self.shared().new_socket(SocketKind::Unix, b),
         );
+        // unix_create (net/unix/af_unix.c) keeps no protocol: SO_PROTOCOL reads 0 even for
+        // PF_UNIX.
+        #[cfg(target_os = "linux")]
+        for rec in [&ra, &rb] {
+            rec.set_family(libc::AF_UNIX, 0);
+        }
         let (sa, sb) = if base == libc::SOCK_STREAM {
             let conn = Arc::new(Conn {
                 a_to_b: Pipe::new(None, None, self.shared().domain_key()),
@@ -2994,6 +3115,7 @@ impl Net for Fabric {
         if let Some(errno) = self.shared().sys.bind_denied(want) {
             return err(errno);
         }
+        let asked = want;
         let (queue, rec) = (queue.clone(), rec.clone());
         let mut regs = self.regs.udp.lock().unwrap();
         if want.port() == 0 {
@@ -3011,8 +3133,12 @@ impl Net for Fabric {
         }
         regs.insert(want, queue);
         drop(regs);
-        if let Some(Sock::Dgram { local, .. }) = socks.get_mut(&fd) {
+        if let Some(Sock::Dgram {
+            local, requested, ..
+        }) = socks.get_mut(&fd)
+        {
             *local = Some(want);
+            *requested = Some(asked);
         }
         rec.set_local(want);
         ok(0)
@@ -3157,6 +3283,17 @@ impl Net for Fabric {
             rec.set_ends(conn.server, conn.client);
             rec.set_listener(lrec.id);
             rec.inherit_buffers(&lrec);
+            // sk_clone_lock (net/core/sock.c) copies the listener whole: its family, protocol
+            // and busy-poll settings carry over.
+            #[cfg(target_os = "linux")]
+            {
+                let (family, busy_poll) = {
+                    let listener = lrec.state();
+                    (listener.family, listener.opts.busy_poll)
+                };
+                rec.set_family(family.0, family.1);
+                rec.state().opts.busy_poll = busy_poll;
+            }
             rec.note_conn_nic(self.shared().hop_name(conn.hop.as_ref()).as_deref());
             conn.a_to_b.read_by(&rec);
             conn.b_to_a.write_by(&rec);
@@ -3195,34 +3332,25 @@ impl Net for Fabric {
         }
         if !addr.is_null() && len as usize >= size_of::<libc::sa_family_t>() {
             let family = unsafe { (*addr.cast::<libc::sockaddr>()).sa_family } as c_int;
-            if family == libc::AF_UNSPEC {
-                let mut socks = self.socks.lock().unwrap();
-                if let Some(Sock::Dgram {
-                    peer,
-                    local,
-                    queue,
-                    rec,
-                    ..
-                }) = socks.get_mut(&fd)
-                {
-                    *peer = None;
-                    rec.set_peer(None);
-                    if cfg!(target_os = "linux") {
-                        if let Some(bound) = local.take() {
-                            queue.next_port.store(
-                                bound.port().checked_add(1).unwrap_or(49152) as u64,
-                                Ordering::Relaxed,
-                            );
-                            self.regs.udp.lock().unwrap().remove(&bound);
-                        }
-                        rec.state().local = None;
-                    }
-                    return if cfg!(target_os = "macos") {
-                        err(libc::EAFNOSUPPORT)
-                    } else {
-                        ok(0)
-                    };
+            if family == libc::AF_UNSPEC
+                && let Some(domain) = self.disconnect_dgram(fd)
+            {
+                if cfg!(not(target_os = "macos")) {
+                    return ok(0);
                 }
+                // XNU in_pcbladdr and in6_pcbladdr (bsd/netinet/in_pcb.c, in6_pcb.c) check
+                // the address length before its family.
+                let fits = len as usize
+                    == if domain == libc::AF_INET6 {
+                        size_of::<libc::sockaddr_in6>()
+                    } else {
+                        size_of::<libc::sockaddr_in>()
+                    };
+                return err(if fits {
+                    libc::EAFNOSUPPORT
+                } else {
+                    libc::EINVAL
+                });
             }
         }
         let Some(server) = (unsafe { parse_addr(addr, len) }) else {
@@ -3235,18 +3363,26 @@ impl Net for Fabric {
         let (domain, nonblocking, bound, rec) = {
             let socks = self.socks.lock().unwrap();
             match socks.get(&fd)? {
+                // XNU soconnectlock (bsd/kern/uipc_socket.c) dissolves a datagram socket's
+                // association before connecting it again, so the source is picked anew.
+                Sock::Dgram { peer: Some(_), .. } if cfg!(target_os = "macos") => {
+                    drop(socks);
+                    self.disconnect_dgram(fd);
+                    return unsafe { self.connect(fd, addr, len) };
+                }
                 Sock::Dgram {
                     local,
+                    requested,
                     queue,
                     rec,
                     broadcast,
                     ..
                 } => {
-                    let (local, queue, rec, broadcast) =
-                        (*local, queue.clone(), rec.clone(), *broadcast);
+                    let (local, requested, queue, rec, broadcast) =
+                        (*local, *requested, queue.clone(), rec.clone(), *broadcast);
                     drop(socks);
                     let sender = match self.shared().route_send(
-                        &rec.view(local),
+                        &rec.view(local.or(unhashed(requested))),
                         server,
                         Op::Connect,
                         station,
@@ -3255,12 +3391,17 @@ impl Net for Fabric {
                         Ok(sender) => sender,
                         Err(errno) => return err(errno),
                     };
-                    if local.is_none() {
-                        let ip = sender
-                            .source(SocketAddr::new(unspecified_like(server.ip()), 0))
-                            .ip();
-                        if let Err(errno) = self.autobind(fd, &queue, &rec, ip) {
-                            return err(errno);
+                    match local {
+                        None => {
+                            let unbound = unhashed(requested)
+                                .unwrap_or(SocketAddr::new(unspecified_like(server.ip()), 0));
+                            let ip = sender.connected_local(unbound).ip();
+                            if let Err(errno) = self.autobind(fd, &queue, &rec, ip) {
+                                return err(errno);
+                            }
+                        }
+                        Some(bound) => {
+                            self.rehash(fd, &queue, &rec, bound, sender.connected_local(bound))
                         }
                     }
                     if let Some(Sock::Dgram { peer, .. }) = self.socks.lock().unwrap().get_mut(&fd)
@@ -3893,6 +4034,11 @@ impl Net for Fabric {
             Sock::UnixDgram { .. } => None,
             Sock::Stream { conn, end, .. } => Some(conn.local(*end)),
             Sock::Listener { listener, .. } => Some(listener.addr),
+            Sock::Dgram {
+                local: None,
+                requested: Some(requested),
+                ..
+            } => Some(SocketAddr::new(requested.ip(), 0)),
             Sock::Dgram { local, domain, .. }
             | Sock::Fresh { local, domain, .. }
             | Sock::Connecting { local, domain, .. } => Some(
