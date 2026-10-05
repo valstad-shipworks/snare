@@ -59,7 +59,16 @@ jobs:
           sudo prlimit --pid $$ --nofile=1048576:1048576
           cargo test --workspace --no-fail-fast --target ${{ matrix.platform.target }} -- \
             --skip report_capacity_charge_and_payload_match_linux \
-            --skip ordinary_data_and_error_reports_share_the_receive_budget
+            --skip ordinary_data_and_error_reports_share_the_receive_budget \
+            --skip duplicated_packet_socket_survives_original_close_os_truth
+
+      # Its real side opens AF_PACKET sockets, which need CAP_NET_RAW.
+      - name: Raw L2 host truth (Linux, root)
+        if: runner.os == 'Linux'
+        run: |
+          exe=$(cargo test -p snare --test raw_l2 --no-run --message-format=json --target ${{ matrix.platform.target }} \
+            | jq -r 'select(.target.name == "raw_l2" and .executable != null) | .executable')
+          sudo "$exe" duplicated_packet_socket_survives_original_close_os_truth
 
       # The scale tests hold over 16k sockets against a default kern.maxfilesperproc of 10240.
       # Multicast sends from the runner VM fail with EHOSTUNREACH, so there is no real side to
