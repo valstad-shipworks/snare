@@ -2733,6 +2733,15 @@ impl SimHost {
         self.clock.clone()
     }
 
+    /// The CPU latency cap, in microseconds, the code under test currently requests through
+    /// `/dev/cpu_dma_latency`, or `None` while no descriptor on it is open. Opening the file starts
+    /// the request at the kernel's no-constraint default of 2000 s (`PM_QOS_CPU_LATENCY_DEFAULT_VALUE`),
+    /// each write of a native-endian `s32` replaces it, and closing the last descriptor withdraws
+    /// it (Documentation/power/pm_qos_interface.rst).
+    pub fn cpu_dma_latency(&self) -> Option<i32> {
+        self.state.lock().unwrap().cpu_dma_latency
+    }
+
     /// Interface `nic`'s driver as `ethtool` sees it now: its capabilities and every ring,
     /// coalescing, channel, flow-control, EEE, feature and flow-rule setting the code under test
     /// has made, or `None` for an interface the profile did not declare.
