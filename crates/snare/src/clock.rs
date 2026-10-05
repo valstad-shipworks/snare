@@ -1455,7 +1455,14 @@ impl Clock {
     /// Moves a driven clock forward to `t`, or with `to_next` to the earliest participant timer
     /// after the reading if that comes first, raising the horizon to reach it and keeping the
     /// grant's rate. Returns the reading before and after.
-    pub(crate) fn jump_driven(&self, t: u64, to_next: bool) -> (u64, u64) {
+    ///
+    /// With `past`, the horizon reaches 1 ns beyond the landing. A landing stops the clock exactly
+    /// on a deadline, where a wait that recomputes `deadline - now` (flume's `recv_timeout`,
+    /// std's `Condvar::wait_timeout_while`) comes back with a zero timeout; the latency charged to
+    /// that call is what carries the clock past it, and only inside the horizon. Without the
+    /// nanosecond such a thread spins at its deadline as a running participant, and time never
+    /// moves again.
+    pub(crate) fn jump_driven(&self, t: u64, to_next: bool, past: bool) -> (u64, u64) {
         self.controlled(|| {
             let now = self.peek();
             if !self.is_driven() {
@@ -1466,7 +1473,8 @@ impl Clock {
                 None => t,
             };
             let to = now.max(landing);
-            let horizon = self.horizon.load(Ordering::Acquire).max(to);
+            let reach = if past { to.saturating_add(1) } else { to };
+            let horizon = self.horizon.load(Ordering::Acquire).max(reach);
             self.publish_line(
                 to,
                 real_nanos(),
