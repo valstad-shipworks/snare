@@ -1241,7 +1241,7 @@ gate follow the build host's kernel:
 | OS | Rule |
 |---|---|
 | Linux | `sched_setscheduler`/`sched_setparam`/`pthread_setschedparam` (and the raw syscalls): `EINVAL` for a bad policy or priority, then without `CAP_SYS_NICE` `EPERM` to enter a real-time policy with `RLIMIT_RTPRIO` 0 or to raise the priority above both the current one and the limit (kernel/sched/syscalls.c). `setpriority`: the value is clamped to −20..19 and lowering it needs `CAP_SYS_NICE` or `20 − nice <= RLIMIT_NICE` (`EACCES`). `mlock`: `EPERM` with `RLIMIT_MEMLOCK` 0, `ENOMEM` past it (locks do not nest); `mlockall(MCL_CURRENT)`: `ENOMEM` when the process's mapped size exceeds it; `CAP_IPC_LOCK` lifts both (mm/mlock.c). |
-| macOS | `mlock` wires pages counted against `RLIMIT_MEMLOCK` whatever the privileges (`EAGAIN` past it); wiring nests per page, so a page is released after as many `munlock`s. `mlockall` is `ENOSYS`, as on the real system. |
+| macOS | `mlock` wires pages counted against `RLIMIT_MEMLOCK` whatever the privileges (`EAGAIN` past it); wiring nests per page, so a page is released after as many `munlock`s. `mlockall` is `ENOSYS`, as on the real system. A successful `pthread_setschedparam`, any policy, opts the thread out of QoS for good: later `pthread_set_qos_class_self_np` calls fail with `EPERM` (`<pthread/qos.h>`; `tests/macos_qos_os_truth.rs` checks it against the host). |
 
 A `SimHost` applies these to its own simulated threads and never reaches the real scheduler or lock
 memory. A plain sim gates the same calls on its privileges and then lets an allowed one through to the

@@ -1493,7 +1493,7 @@ pub(crate) struct HostState {
     /// net/sched/sch_api.c starts from `8000:` and steps by one major number).
     #[cfg(target_os = "linux")]
     qdisc_auto: u32,
-    /// macOS thread scheduling, keyed by `pthread_t`: (policy, priority).
+    /// macOS thread scheduling, keyed by [`mac_thread_id`]: (policy, priority).
     #[cfg(target_os = "macos")]
     mac_threads: HashMap<u64, (c_int, c_int)>,
     /// Datagram sockets the host serves, by fd.
@@ -3989,7 +3989,8 @@ impl Host for SimHost {
     /// Records the policy and priority for `thread` (`SCHED_FIFO`, `SCHED_RR` or `SCHED_OTHER` with
     /// a `struct sched_param` priority). There is no capability gate: macOS's
     /// pthread_setschedparam(3) lists no privilege error, only `EINVAL`, `ENOTSUP` and `ESRCH`.
-    /// Policy and priority are not validated.
+    /// A policy other than those three is `EINVAL`; the priority is not validated. Setting any policy, even `SCHED_OTHER` at the default
+    /// priority, opts the thread out of QoS for good, as on macOS (see [`set_qos`](Self::set_qos)).
     #[cfg(target_os = "macos")]
     unsafe fn pthread_setschedparam(
         &self,
@@ -3997,6 +3998,9 @@ impl Host for SimHost {
         policy: c_int,
         param: *const u8,
     ) -> Option<HostResult> {
+        if ![libc::SCHED_OTHER, libc::SCHED_FIFO, libc::SCHED_RR].contains(&policy) {
+            return err(libc::EINVAL);
+        }
         let priority = if param.is_null() {
             0
         } else {
@@ -4006,7 +4010,7 @@ impl Host for SimHost {
             .lock()
             .unwrap()
             .mac_threads
-            .insert(thread, (policy, priority));
+            .insert(mac_thread_id(thread), (policy, priority));
         ok(0)
     }
 
@@ -4024,7 +4028,7 @@ impl Host for SimHost {
             .lock()
             .unwrap()
             .mac_threads
-            .get(&thread)
+            .get(&mac_thread_id(thread))
             .copied()
             .unwrap_or((0, 0)); // SCHED_OTHER, priority 0
         if !policy.is_null() {
@@ -4051,9 +4055,24 @@ impl Host for SimHost {
     }
 
     /// `pthread_set_qos_class_self_np` with a `QOS_CLASS_*` from `<pthread/qos.h>`: accepted and
-    /// not recorded.
+    /// not recorded. A class outside `QOS_CLASS_*` or a relative priority outside
+    /// `QOS_MIN_RELATIVE_PRIORITY..=0` is `EINVAL`. A thread whose scheduling policy has been set
+    /// is "permanently opted-out of the QOS class system" (`<pthread/qos.h>`) and gets `EPERM`;
+    /// macOS opts out on any successful `pthread_setschedparam`, `SCHED_OTHER` at the default
+    /// priority included, and setting the policy back does not opt the thread in again.
     #[cfg(target_os = "macos")]
-    fn set_qos(&self, _qos_class: c_int, _relative_priority: c_int) -> Option<HostResult> {
+    fn set_qos(&self, qos_class: c_int, relative_priority: c_int) -> Option<HostResult> {
+        const QOS_CLASSES: [c_int; 5] = [0x21, 0x19, 0x15, 0x11, 0x09];
+        const QOS_MIN_RELATIVE_PRIORITY: c_int = -15;
+        if !QOS_CLASSES.contains(&qos_class)
+            || !(QOS_MIN_RELATIVE_PRIORITY..=0).contains(&relative_priority)
+        {
+            return err(libc::EINVAL);
+        }
+        let me = mac_thread_id(unsafe { libc::pthread_self() } as u64);
+        if self.state.lock().unwrap().mac_threads.contains_key(&me) {
+            return err(libc::EPERM);
+        }
         ok(0)
     }
 
@@ -4212,6 +4231,18 @@ unsafe fn read_ifname(arg: i64) -> Option<String> {
         name.push(b);
     }
     String::from_utf8(name).ok()
+}
+
+/// The never-reused 64-bit id of the thread behind `pthread_t` `thread` (man 3
+/// pthread_threadid_np); a `pthread_t` is a structure address that a later thread can reuse.
+#[cfg(target_os = "macos")]
+fn mac_thread_id(thread: u64) -> u64 {
+    let mut id = 0;
+    if unsafe { libc::pthread_threadid_np(thread as libc::pthread_t, &mut id) } == 0 {
+        id
+    } else {
+        thread
+    }
 }
 
 /// The options a host datagram socket models itself, beyond the sim-wide handlers: `SO_BROADCAST`,
