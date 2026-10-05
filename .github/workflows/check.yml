@@ -1,0 +1,67 @@
+name: Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+
+    runs-on: ${{ matrix.platform.os }}
+    name: ${{ matrix.platform.target }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform.target }}
+
+      - name: Cargo check
+        run: cargo check --workspace --all-targets --target ${{ matrix.platform.target }}
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --target ${{ matrix.platform.target }} -- -D warnings
+
+      # The module-loading test loads this cdylib from beside the test binaries' deps directory.
+      - name: Build interpose-probe
+        run: cargo build -p interpose-probe --target ${{ matrix.platform.target }}
+
+      - name: Tests
+        run: cargo test --workspace --target ${{ matrix.platform.target }}
+
+  shims:
+    runs-on: ubuntu-latest
+    name: shims
+
+    strategy:
+      fail-fast: false
+      matrix:
+        shim: [io-uring, sc, syscalls, xsk-rs]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: shims/${{ matrix.shim }}
+
+      - name: Tests
+        run: cargo test --manifest-path shims/${{ matrix.shim }}/Cargo.toml

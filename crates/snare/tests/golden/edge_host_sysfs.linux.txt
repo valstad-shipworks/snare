@@ -1,0 +1,206 @@
+# explicit profile
+/sys/devices/system/cpu/online = "0-3,5\n"
+/sys/devices/system/cpu/isolated = "2-3,5\n"
+/sys/devices/system/cpu/nohz_full = "3\n"
+/sys/kernel/realtime = "1\n"
+/proc/sys/net/core/default_qdisc = "fq\n"
+/proc/sys/net/ipv4/tcp_syn_retries = "6\n"
+/proc/self/status = "Name:\tsnare\nState:\tR (running)\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nCapInh:\t0000000000000000\nCapPrm:\t0000000000001000\nCapEff:\t0000000000001000\nCapBnd:\t0000000000001000\nCapAmb:\t0000000000000000\n"
+/proc/thread-self/status = "Name:\tsnare\nState:\tR (running)\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nCapInh:\t0000000000000000\nCapPrm:\t0000000000001000\nCapEff:\t0000000000001000\nCapBnd:\t0000000000001000\nCapAmb:\t0000000000000000\n"
+/sys/devices/system/cpu/cpu0/online = "1\n"
+/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor = "schedutil\n"
+/sys/devices/system/cpu/cpu1/online = "1\n"
+/sys/devices/system/cpu/cpu1/cpufreq/scaling_governor = "schedutil\n"
+/sys/devices/system/cpu/cpu2/online = "1\n"
+/sys/devices/system/cpu/cpu2/cpufreq/scaling_governor = "schedutil\n"
+/sys/devices/system/cpu/cpu3/online = "1\n"
+/sys/devices/system/cpu/cpu3/cpufreq/scaling_governor = "schedutil\n"
+/sys/devices/system/cpu/cpu4/online = "0\n"
+/sys/devices/system/cpu/cpu4/cpufreq/scaling_governor = "schedutil\n"
+/sys/devices/system/cpu/cpu5/online = "1\n"
+/sys/devices/system/cpu/cpu5/cpufreq/scaling_governor = "schedutil\n"
+/sys/class/net/lo/mtu = "65536\n"
+/sys/class/net/lo/ifindex = "1\n"
+/sys/class/net/lo/operstate = "unknown\n"
+/sys/class/net/lo/carrier = "1\n"
+/sys/class/net/lo/flags = "0x9\n"
+/sys/class/net/lo/address = "00:00:00:00:00:00\n"
+/sys/class/net/lo/statistics/rx_packets = "0\n"
+/sys/class/net/lo/statistics/tx_packets = "0\n"
+/sys/class/net/lo/statistics/rx_bytes = "0\n"
+/sys/class/net/lo/statistics/tx_bytes = "0\n"
+/sys/class/net/lo/statistics/rx_errors = "0\n"
+/sys/class/net/lo/statistics/tx_errors = "0\n"
+/sys/class/net/lo/statistics/rx_dropped = "0\n"
+/sys/class/net/lo/statistics/tx_dropped = "0\n"
+/sys/class/net/lo/statistics/multicast = "0\n"
+/sys/class/net/lo/statistics/tx_carrier_errors = "0\n"
+/sys/class/net/lo/statistics/rx_nohandler = "0\n"
+/sys/class/net/lo/threaded = "0\n"
+/sys/class/net/lo0/mtu ! errno 2
+/sys/class/net/lo0/ifindex ! errno 2
+/sys/class/net/lo0/operstate ! errno 2
+/sys/class/net/lo0/carrier ! errno 2
+/sys/class/net/lo0/flags ! errno 2
+/sys/class/net/lo0/address ! errno 2
+/sys/class/net/lo0/statistics/rx_packets ! errno 2
+/sys/class/net/lo0/statistics/tx_packets ! errno 2
+/sys/class/net/lo0/statistics/rx_bytes ! errno 2
+/sys/class/net/lo0/statistics/tx_bytes ! errno 2
+/sys/class/net/lo0/statistics/rx_errors ! errno 2
+/sys/class/net/lo0/statistics/tx_errors ! errno 2
+/sys/class/net/lo0/statistics/rx_dropped ! errno 2
+/sys/class/net/lo0/statistics/tx_dropped ! errno 2
+/sys/class/net/lo0/statistics/multicast ! errno 2
+/sys/class/net/lo0/statistics/tx_carrier_errors ! errno 2
+/sys/class/net/lo0/statistics/rx_nohandler ! errno 2
+/sys/class/net/lo0/threaded ! errno 2
+/sys/class/net/eth0/mtu = "9000\n"
+/sys/class/net/eth0/ifindex = "2\n"
+/sys/class/net/eth0/operstate = "up\n"
+/sys/class/net/eth0/carrier = "1\n"
+/sys/class/net/eth0/flags = "0x1003\n"
+/sys/class/net/eth0/address = "02:00:00:00:00:02\n"
+/sys/class/net/eth0/statistics/rx_packets = "1000\n"
+/sys/class/net/eth0/statistics/tx_packets = "2000\n"
+/sys/class/net/eth0/statistics/rx_bytes = "64000\n"
+/sys/class/net/eth0/statistics/tx_bytes = "128000\n"
+/sys/class/net/eth0/statistics/rx_errors = "1\n"
+/sys/class/net/eth0/statistics/tx_errors = "2\n"
+/sys/class/net/eth0/statistics/rx_dropped = "3\n"
+/sys/class/net/eth0/statistics/tx_dropped = "4\n"
+/sys/class/net/eth0/statistics/multicast = "0\n"
+/sys/class/net/eth0/statistics/tx_carrier_errors = "0\n"
+/sys/class/net/eth0/statistics/rx_nohandler = "0\n"
+/sys/class/net/eth0/threaded = "1\n"
+/sys/class/net/eth1/mtu = "1500\n"
+/sys/class/net/eth1/ifindex = "3\n"
+/sys/class/net/eth1/operstate = "down\n"
+/sys/class/net/eth1/carrier = "0\n"
+/sys/class/net/eth1/flags = "0x1003\n"
+/sys/class/net/eth1/address = "02:00:00:00:00:03\n"
+/sys/class/net/eth1/statistics/rx_packets = "0\n"
+/sys/class/net/eth1/statistics/tx_packets = "0\n"
+/sys/class/net/eth1/statistics/rx_bytes = "0\n"
+/sys/class/net/eth1/statistics/tx_bytes = "0\n"
+/sys/class/net/eth1/statistics/rx_errors = "0\n"
+/sys/class/net/eth1/statistics/tx_errors = "0\n"
+/sys/class/net/eth1/statistics/rx_dropped = "0\n"
+/sys/class/net/eth1/statistics/tx_dropped = "0\n"
+/sys/class/net/eth1/statistics/multicast = "0\n"
+/sys/class/net/eth1/statistics/tx_carrier_errors = "0\n"
+/sys/class/net/eth1/statistics/rx_nohandler = "0\n"
+/sys/class/net/eth1/threaded = "0\n"
+ls /sys/class/net/eth0/queues = ["rx-0", "rx-1", "rx-2", "tx-0", "tx-1"]
+ls /sys/class/net/eth0/device/msi_irqs = ["40", "41", "42"]
+ls /sys/class/net/eth1/queues = ["rx-0", "tx-0"]
+ls /sys/class/net/eth1/device/msi_irqs = []
+write eth0/threaded "0\n" = ok
+  read = "0\n"
+write eth0/threaded "2" ! errno 95
+  read = "0\n"
+write eth0/threaded "x" ! errno 22
+  read = "0\n"
+write eth0/threaded "0x1" = ok
+  read = "1\n"
+write eth0/threaded "+0" = ok
+  read = "0\n"
+write eth0/threaded "01" = ok
+  read = "1\n"
+write eth0/threaded "1\n\n" ! errno 22
+  read = "1\n"
+write eth0/threaded "" = ok
+  read = "1\n"
+# EasyBuilder::realtime()
+/sys/devices/system/cpu/online = "0-7\n"
+/sys/devices/system/cpu/isolated = "2-7\n"
+/sys/devices/system/cpu/nohz_full = "2-7\n"
+/sys/kernel/realtime = "1\n"
+/proc/sys/net/core/default_qdisc = "fq\n"
+/proc/sys/net/ipv4/tcp_syn_retries = "6\n"
+/proc/self/status = "Name:\tsnare\nState:\tR (running)\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nCapInh:\t0000000000000000\nCapPrm:\t0000000000807400\nCapEff:\t0000000000807400\nCapBnd:\t0000000000807400\nCapAmb:\t0000000000000000\n"
+/proc/thread-self/status = "Name:\tsnare\nState:\tR (running)\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nCapInh:\t0000000000000000\nCapPrm:\t0000000000807400\nCapEff:\t0000000000807400\nCapBnd:\t0000000000807400\nCapAmb:\t0000000000000000\n"
+/sys/devices/system/cpu/cpu0/online = "1\n"
+/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor = "performance\n"
+/sys/devices/system/cpu/cpu1/online = "1\n"
+/sys/devices/system/cpu/cpu1/cpufreq/scaling_governor = "performance\n"
+/sys/devices/system/cpu/cpu2/online = "1\n"
+/sys/devices/system/cpu/cpu2/cpufreq/scaling_governor = "performance\n"
+/sys/devices/system/cpu/cpu3/online = "1\n"
+/sys/devices/system/cpu/cpu3/cpufreq/scaling_governor = "performance\n"
+/sys/devices/system/cpu/cpu4/online = "1\n"
+/sys/devices/system/cpu/cpu4/cpufreq/scaling_governor = "performance\n"
+/sys/devices/system/cpu/cpu5/online = "1\n"
+/sys/devices/system/cpu/cpu5/cpufreq/scaling_governor = "performance\n"
+/sys/class/net/lo/mtu = "65536\n"
+/sys/class/net/lo/ifindex = "1\n"
+/sys/class/net/lo/operstate = "unknown\n"
+/sys/class/net/lo/carrier = "1\n"
+/sys/class/net/lo/flags = "0x9\n"
+/sys/class/net/lo/address = "00:00:00:00:00:00\n"
+/sys/class/net/lo/statistics/rx_packets = "0\n"
+/sys/class/net/lo/statistics/tx_packets = "0\n"
+/sys/class/net/lo/statistics/rx_bytes = "0\n"
+/sys/class/net/lo/statistics/tx_bytes = "0\n"
+/sys/class/net/lo/statistics/rx_errors = "0\n"
+/sys/class/net/lo/statistics/tx_errors = "0\n"
+/sys/class/net/lo/statistics/rx_dropped = "0\n"
+/sys/class/net/lo/statistics/tx_dropped = "0\n"
+/sys/class/net/lo/statistics/multicast = "0\n"
+/sys/class/net/lo/statistics/tx_carrier_errors = "0\n"
+/sys/class/net/lo/statistics/rx_nohandler = "0\n"
+/sys/class/net/lo/threaded = "0\n"
+/sys/class/net/lo0/mtu ! errno 2
+/sys/class/net/lo0/ifindex ! errno 2
+/sys/class/net/lo0/operstate ! errno 2
+/sys/class/net/lo0/carrier ! errno 2
+/sys/class/net/lo0/flags ! errno 2
+/sys/class/net/lo0/address ! errno 2
+/sys/class/net/lo0/statistics/rx_packets ! errno 2
+/sys/class/net/lo0/statistics/tx_packets ! errno 2
+/sys/class/net/lo0/statistics/rx_bytes ! errno 2
+/sys/class/net/lo0/statistics/tx_bytes ! errno 2
+/sys/class/net/lo0/statistics/rx_errors ! errno 2
+/sys/class/net/lo0/statistics/tx_errors ! errno 2
+/sys/class/net/lo0/statistics/rx_dropped ! errno 2
+/sys/class/net/lo0/statistics/tx_dropped ! errno 2
+/sys/class/net/lo0/statistics/multicast ! errno 2
+/sys/class/net/lo0/statistics/tx_carrier_errors ! errno 2
+/sys/class/net/lo0/statistics/rx_nohandler ! errno 2
+/sys/class/net/lo0/threaded ! errno 2
+/sys/class/net/eth0/mtu = "1500\n"
+/sys/class/net/eth0/ifindex = "2\n"
+/sys/class/net/eth0/operstate = "up\n"
+/sys/class/net/eth0/carrier = "1\n"
+/sys/class/net/eth0/flags = "0x1003\n"
+/sys/class/net/eth0/address = "02:00:00:00:00:02\n"
+/sys/class/net/eth0/statistics/rx_packets = "0\n"
+/sys/class/net/eth0/statistics/tx_packets = "0\n"
+/sys/class/net/eth0/statistics/rx_bytes = "0\n"
+/sys/class/net/eth0/statistics/tx_bytes = "0\n"
+/sys/class/net/eth0/statistics/rx_errors = "0\n"
+/sys/class/net/eth0/statistics/tx_errors = "0\n"
+/sys/class/net/eth0/statistics/rx_dropped = "0\n"
+/sys/class/net/eth0/statistics/tx_dropped = "0\n"
+/sys/class/net/eth0/statistics/multicast = "0\n"
+/sys/class/net/eth0/statistics/tx_carrier_errors = "0\n"
+/sys/class/net/eth0/statistics/rx_nohandler = "0\n"
+/sys/class/net/eth0/threaded = "0\n"
+ls /sys/class/net/eth0/queues = ["rx-0", "tx-0"]
+ls /sys/class/net/eth0/device/msi_irqs = []
+write eth0/threaded "0\n" ! errno 13
+  read = "0\n"
+write eth0/threaded "2" ! errno 13
+  read = "0\n"
+write eth0/threaded "x" ! errno 13
+  read = "0\n"
+write eth0/threaded "0x1" ! errno 13
+  read = "0\n"
+write eth0/threaded "+0" ! errno 13
+  read = "0\n"
+write eth0/threaded "01" ! errno 13
+  read = "0\n"
+write eth0/threaded "1\n\n" ! errno 13
+  read = "0\n"
+write eth0/threaded "" ! errno 13
+  read = "0\n"

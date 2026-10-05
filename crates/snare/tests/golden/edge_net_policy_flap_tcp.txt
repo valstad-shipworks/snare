@@ -1,0 +1,4 @@
+read 97 @ 30000us
+read 98 @ 30000us
+read 99 @ 30000us
+read 100 @ 30000us

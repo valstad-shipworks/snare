@@ -1,0 +1,100 @@
+seed 0x0000000000000000 root lineage 0x0000000000000000
+  getentropy(16): 6f7e194d2fdd06a75e4f41f405a382b3
+  CCRandomGenerateBytes(16): 17f7abfb54911a63060964868cba0aa8
+  arc4random_buf(11): bbf0986610aeb5c9a10e42
+  arc4random(): bece8b84
+seed 0x0000000000000000 child 1 lineage 0xe220a8397b1dcdaf
+  getentropy(16): 53c50e4ffc2cf470e9b1f98fb897d82d
+  CCRandomGenerateBytes(16): 26ada83cdebe0551f512bdfbb7128d9b
+  arc4random_buf(11): b0cb039a6c6122b77cfdf4
+  arc4random(): 7d55ac62
+seed 0x0000000000000000 grandchild 1.1 lineage 0x0397ab29740681d9
+  getentropy(16): 7a4ee5f1ce9316214838390ec698eafc
+  CCRandomGenerateBytes(16): 2eb342b86ff1a04f987a4286d67d5c37
+  arc4random_buf(11): 4185b32bcb40e1939f030e
+  arc4random(): b9fe7037
+seed 0x0000000000000000 child 2 lineage 0x6e789e6aa1b965f4
+  getentropy(16): 4076cea44904a0230d78543d4c5acbee
+  CCRandomGenerateBytes(16): b65b80f9388d2a3760dc95e750d31640
+  arc4random_buf(11): 937a7449b4a8972b727b4f
+  arc4random(): 908b5f23
+seed 0x0000000000000001 root lineage 0x0000000000000000
+  getentropy(16): 1e61397408ab415eeef16c3de96c8df1
+  CCRandomGenerateBytes(16): 788d7e326df6950ba92b32931b1b06c7
+  arc4random_buf(11): 517625f9dded1738d4e330
+  arc4random(): 0b9f211a
+seed 0x0000000000000001 child 1 lineage 0xe220a8397b1dcdaf
+  getentropy(16): cd0c6033922969a8362ae131c0bb7cf5
+  CCRandomGenerateBytes(16): 842ddc5d8597db7733ea3af1a18a9bd8
+  arc4random_buf(11): b9a2c11b12c49902d2a93a
+  arc4random(): 292cbcd0
+seed 0x0000000000000001 grandchild 1.1 lineage 0x0397ab29740681d9
+  getentropy(16): d09c86a0cc69a9cf761207a019a19d96
+  CCRandomGenerateBytes(16): 992517aaea8a924d51e8d776af6d6fed
+  arc4random_buf(11): 04f161c04356f513f48c9b
+  arc4random(): 6fed10d5
+seed 0x0000000000000001 child 2 lineage 0x6e789e6aa1b965f4
+  getentropy(16): 35146f43b06d473d542d466f4639eef7
+  CCRandomGenerateBytes(16): 4e18719b6bcf846a38f383e97a2fc4eb
+  arc4random_buf(11): 424b298476e9131c904ea9
+  arc4random(): 11dd5869
+seed 0x000000000000002a root lineage 0x0000000000000000
+  getentropy(16): 04721065bafae1575540b2fe43d1abf4
+  CCRandomGenerateBytes(16): b20329c13867817ca8d88f6fec5d3e11
+  arc4random_buf(11): 3917fd6290594aadb720ea
+  arc4random(): 74bd1e34
+seed 0x000000000000002a child 1 lineage 0xe220a8397b1dcdaf
+  getentropy(16): c49362021be5bf52b1dfc8b47f5c3f30
+  CCRandomGenerateBytes(16): f9ff2f9d64a83df7e294d7fcf6be31d7
+  arc4random_buf(11): 6ebfadcd80c9406b799235
+  arc4random(): dcb1bb95
+seed 0x000000000000002a grandchild 1.1 lineage 0x0397ab29740681d9
+  getentropy(16): 4d3177eadceffed4e70c19cf2f032e6b
+  CCRandomGenerateBytes(16): 178a77e5ad3feb18fcb8c3d75f527b22
+  arc4random_buf(11): 2d07467e95e9be724704df
+  arc4random(): 3e1c36ac
+seed 0x000000000000002a child 2 lineage 0x6e789e6aa1b965f4
+  getentropy(16): 051338d7e7785551b40216dc3358e708
+  CCRandomGenerateBytes(16): ccc67745cd561dcbb7ea0a11f0c6b050
+  arc4random_buf(11): addb0165511f9669314366
+  arc4random(): 8927a287
+seed 0xdeadbeefcafef00d root lineage 0x0000000000000000
+  getentropy(16): fa131840d0187b71d2081293e9f0ce19
+  CCRandomGenerateBytes(16): 42dd43ec55dcfff0a2d30777d0c90cc2
+  arc4random_buf(11): 6553e59b2b8a68690cb663
+  arc4random(): 04a6f178
+seed 0xdeadbeefcafef00d child 1 lineage 0xe220a8397b1dcdaf
+  getentropy(16): e56a8857e1a8193942faa7fae98c5717
+  CCRandomGenerateBytes(16): f551bcb13bf2d6228bb37803f297674a
+  arc4random_buf(11): b06e1c9aa19399b2d587e4
+  arc4random(): 27ec5e3f
+seed 0xdeadbeefcafef00d grandchild 1.1 lineage 0x0397ab29740681d9
+  getentropy(16): 15db796a19e7c409c04225e38aeb3f75
+  CCRandomGenerateBytes(16): 10b3fc1350362fe53a44857b097e6aaa
+  arc4random_buf(11): a5f7f9f510f1dce601023f
+  arc4random(): 5e2d4f4a
+seed 0xdeadbeefcafef00d child 2 lineage 0x6e789e6aa1b965f4
+  getentropy(16): f001dd5b57946fc239f6ab08f263d705
+  CCRandomGenerateBytes(16): 84827dc4288e8399fa45ed9c7720e0e8
+  arc4random_buf(11): 99406039d665c35f5e3d92
+  arc4random(): ac0ceb53
+seed 0xffffffffffffffff root lineage 0x0000000000000000
+  getentropy(16): 3771a2b2a70ac25d9c04d7018a66a5bd
+  CCRandomGenerateBytes(16): 2602b8ab7632b482b459eaa6d45e4ded
+  arc4random_buf(11): 58a648d35e440683241cf4
+  arc4random(): 079d3211
+seed 0xffffffffffffffff child 1 lineage 0xe220a8397b1dcdaf
+  getentropy(16): d933595ac924278e538c0cf451cc2e7f
+  CCRandomGenerateBytes(16): 1a31884d48163f76e3c6819db91ba174
+  arc4random_buf(11): 0c9f8105b93c430ddb5cbc
+  arc4random(): b8acf52f
+seed 0xffffffffffffffff grandchild 1.1 lineage 0x0397ab29740681d9
+  getentropy(16): af041625ef3a770805a8e25f53912cff
+  CCRandomGenerateBytes(16): 55ca85af19f2f762c6f07b30d17357cb
+  arc4random_buf(11): 368de208200665b9c92b7a
+  arc4random(): d853a49b
+seed 0xffffffffffffffff child 2 lineage 0x6e789e6aa1b965f4
+  getentropy(16): 2181b74f947996739e321b0418304b94
+  CCRandomGenerateBytes(16): afdaacdc4c159475b5238a37ad394a1b
+  arc4random_buf(11): 0d13fc4783246c56ce709f
+  arc4random(): 171d6ae4

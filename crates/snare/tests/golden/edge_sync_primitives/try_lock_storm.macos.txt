@@ -1,0 +1,8 @@
+## try_lock_storm
+           0 ns  t0 won 8
+           0 ns  t1 won 8
+           0 ns  t2 won 9
+           0 ns  t3 won 8
+           0 ns  t4 won 9
+           0 ns  t5 won 8
+           0 ns  total 50

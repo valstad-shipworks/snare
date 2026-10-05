@@ -1,0 +1,20 @@
+      122214 udp-echo d4
+      122214 udp-client d4
+      122219 udp-echo d3
+      122219 udp-client d3
+      128329 udp-echo d0
+      128329 udp-client d0
+      137290 udp-echo d1
+      137290 udp-client d1
+      138146 udp-echo d5
+      138146 udp-client d5
+      148551 udp-echo d2
+      148551 udp-client d2
+      148551 tcp-server accepted
+      148551 tcp-server read 3
+      148551 tcp-client abc
+      148551 tcp-server read 5
+      148551 tcp-client defgh
+      148551 tcp-server read 2
+      148551 tcp-client ij
+      148551 tcp-server eof

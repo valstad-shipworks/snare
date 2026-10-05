@@ -1,0 +1,69 @@
+rx 4 @ 1650us
+rx 3 @ 1852us
+rx 3 @ 1905us
+rx 2 @ 2051us
+rx 1 @ 2268us
+rx 0 @ 2512us
+rx 9 @ 2752us
+rx 29 @ 3201us
+rx 5 @ 3248us
+rx 12 @ 3453us
+rx 11 @ 3456us
+rx 31 @ 3614us
+rx 16 @ 3703us
+rx 14 @ 3709us
+rx 38 @ 3710us
+rx 24 @ 3753us
+rx 37 @ 3832us
+rx 26 @ 3867us
+rx 42 @ 3904us
+rx 11 @ 3990us
+rx 20 @ 4006us
+rx 34 @ 4047us
+rx 33 @ 4087us
+rx 45 @ 4097us
+rx 34 @ 4193us
+rx 17 @ 4217us
+rx 32 @ 4233us
+rx 35 @ 4306us
+rx 32 @ 4329us
+rx 40 @ 4349us
+rx 38 @ 4355us
+rx 38 @ 4529us
+rx 17 @ 4545us
+rx 37 @ 4595us
+rx 34 @ 4691us
+rx 19 @ 4694us
+rx 28 @ 4740us
+rx 36 @ 4898us
+rx 30 @ 5172us
+rx 47 @ 5668us
+rx 43 @ 5707us
+rx 44 @ 5882us
+rx 47 @ 5935us
+eth0 tx 48 2064B rx 0 0B dropped tx 0 rx 0
+link Duplicated 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 150us
+link Lost 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 300us
+link Lost 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 350us
+link Lost 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 400us
+link Lost 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 500us
+link Duplicated 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 550us
+link Lost 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 650us
+link Lost 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 750us
+link Duplicated 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 850us
+link Lost 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 900us
+link Lost 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 1050us
+link Lost 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 1100us
+link Lost 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 1150us
+link Lost 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 1250us
+link Lost 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 1350us
+link Duplicated 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 1600us
+link Duplicated 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 1700us
+link Duplicated 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 1700us
+link Duplicated 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 1850us
+link Duplicated 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 1900us
+link Duplicated 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 1900us
+link Lost 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 1950us
+link Lost 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 2050us
+link Lost 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 2300us
+link Duplicated 10.0.0.1:42000->10.0.0.2:42001 len 1 @ 2350us

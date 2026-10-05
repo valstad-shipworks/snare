@@ -1,0 +1,8 @@
+## rwlock_order
+           0 ns  main write
+     2000001 ns  main released
+     2000001 ns  reader 2 saw 0
+     2000001 ns  reader 1 saw 0
+     2000001 ns  reader 0 saw 0
+     2000001 ns  writer 2 wrote 10
+     3000002 ns  final 10

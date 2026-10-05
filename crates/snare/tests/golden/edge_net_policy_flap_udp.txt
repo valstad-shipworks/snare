@@ -1,0 +1,2 @@
+rx 2 @ 17000us
+eth0 tx 2 86B dropped 1 carrier 1 rx 0 rx_dropped 0

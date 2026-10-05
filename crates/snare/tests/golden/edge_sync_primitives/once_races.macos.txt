@@ -1,0 +1,12 @@
+## once_races
+           0 ns  racer 2 initialises the cell
+     2000001 ns  racer 2 sees 200
+     2000001 ns  racer 2 runs the once
+     2000001 ns  racer 1 sees 200
+     2000001 ns  racer 0 sees 200
+     2000001 ns  racer 3 sees 200
+     3000002 ns  racer 2 past the once
+     3000002 ns  racer 1 past the once
+     3000002 ns  racer 0 past the once
+     3000002 ns  racer 3 past the once
+     3000002 ns  initialisers run 2

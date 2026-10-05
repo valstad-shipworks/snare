@@ -1,0 +1,10 @@
+[package]
+name = "sc"
+version = "0.2.7"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Drop-in replacement for the `sc` raw-syscall crate that routes through libc, so an interposer can observe the calls. Applied via [patch.crates-io] by the snare test harness; not for release builds."
+publish = false
+
+[dependencies]
+libc = { version = "0.2", default-features = false }

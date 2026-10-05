@@ -1,0 +1,219 @@
+//! Type-safe detours, created at runtime.
+
+use crate::detour::error::Result;
+use crate::detour::hook::Hook;
+use crate::detour::{Function, HookableWith};
+use core::marker::PhantomData;
+
+/// A type-safe detour.
+///
+/// The same prototype is enforced for the target, the detour, and when
+/// invoking the original function using [`call`](#method.call).
+///
+/// # Dropping
+///
+/// Once dropped, the detour is disabled (without suspending other threads)
+/// and its generated code is released. No other thread may execute the
+/// target's prolog, or the trampoline (e.g. via [`call`](#method.call)), at
+/// that moment. To disable a detour whilst threads are suspended, use a
+/// [`Transaction`](crate::detour::Transaction) before dropping it. If the detour
+/// cannot be disabled (e.g. its target has been modified by a third party),
+/// its generated code is leaked instead.
+///
+/// # Example
+///
+/// ```ignore
+/// # use crate::detour::Result;
+/// use crate::detour::TypedDetour;
+///
+/// #[inline(never)]
+/// fn add5(val: i32) -> i32 {
+///   val + 5
+/// }
+///
+/// #[inline(never)]
+/// fn add10(val: i32) -> i32 {
+///   val + 10
+/// }
+///
+/// # fn main() -> Result<()> {
+/// let mut hook = unsafe { TypedDetour::<fn(i32) -> i32>::new(add5, add10)? };
+///
+/// assert_eq!(add5(5), 10);
+/// assert_eq!(hook.call(5), 10);
+///
+/// unsafe { hook.enable()? };
+///
+/// assert_eq!(add5(5), 15);
+/// assert_eq!(hook.call(5), 10);
+///
+/// unsafe { hook.disable()? };
+///
+/// assert_eq!(add5(5), 10);
+/// # Ok(())
+/// # }
+/// ```
+pub struct TypedDetour<T: Function> {
+    phantom: PhantomData<T>,
+    detour: Hook,
+}
+
+impl<T: Function> TypedDetour<T> {
+    /// Rejects calls whose return address lies inside the bytes overwritten by this detour.
+    ///
+    /// Suspended thread contexts expose the current program counter, but not return addresses
+    /// retained by callees. Such addresses cannot be relocated by a transaction.
+    pub fn validate_suspended_install(&self) -> Result<()> {
+        self.detour.validate_suspended_install()
+    }
+
+    /// Create a new hook given a target function and a compatible detour
+    /// function.
+    ///
+    /// # Safety
+    ///
+    /// The target must be a function (e.g. not a Rust-ABI function that has
+    /// been inlined into all of its callers) with the declared signature. Its
+    /// callers must pass every argument the detour uses: calls to a function of
+    /// the same crate may omit arguments the target itself does not use.
+    pub unsafe fn new<D>(target: T, detour: D) -> Result<Self>
+    where
+        T: HookableWith<D>,
+        D: Function,
+    {
+        // SAFETY: The signatures are compatible, as asserted by `HookableWith`.
+        unsafe { Hook::new(target.to_ptr(), detour.to_ptr()) }.map(|detour| TypedDetour {
+            phantom: PhantomData,
+            detour,
+        })
+    }
+
+    /// Enables the detour.
+    ///
+    /// # Safety
+    ///
+    /// The target must not be executing its prolog (i.e. the patched
+    /// instructions) on another thread whilst the detour is being enabled.
+    /// To suspend other threads meanwhile, use a [`Transaction`](crate::detour::Transaction).
+    pub unsafe fn enable(&self) -> Result<()> {
+        // SAFETY: Forwarded from the caller.
+        unsafe { self.detour.enable() }
+    }
+
+    /// Disables the detour.
+    ///
+    /// # Safety
+    ///
+    /// See [`TypedDetour::enable`].
+    pub unsafe fn disable(&self) -> Result<()> {
+        // SAFETY: Forwarded from the caller.
+        unsafe { self.detour.disable() }
+    }
+
+    /// Returns whether the detour is enabled or not.
+    pub fn is_enabled(&self) -> bool {
+        self.detour.is_enabled()
+    }
+
+    /// Returns the original, undetoured function, borrowed from the detour.
+    ///
+    /// It can be called using its `call` method, regardless of whether the
+    /// detour is enabled or not. Unlike the [trampoline](Self::trampoline), it
+    /// cannot outlive the detour, so this is safe.
+    ///
+    /// ```ignore
+    /// use crate::detour::{TypedDetour, signature};
+    ///
+    /// signature! {
+    ///   struct Length(fn(&str) -> usize);
+    /// }
+    ///
+    /// #[inline(never)]
+    /// fn length(text: &str) -> usize {
+    ///   text.len()
+    /// }
+    ///
+    /// # fn main() -> crate::detour::Result<()> {
+    /// let hook = unsafe { TypedDetour::new(Length(length), Length(|_| 0))? };
+    /// unsafe { hook.enable()? };
+    ///
+    /// assert_eq!(length("abc"), 0);
+    /// assert_eq!(hook.original().call("abc"), 3);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn original(&self) -> T::Original<'_> {
+        // SAFETY: The trampoline shares the target's signature, and remains valid
+        // whilst `self` is borrowed.
+        unsafe { T::from_ptr(self.trampoline_ptr()).__original() }
+    }
+
+    /// Returns the trampoline, i.e. a function that invokes the original,
+    /// undetoured target.
+    ///
+    /// Prefer [`original`](Self::original), unless the original function must
+    /// be passed elsewhere (e.g. as a callback).
+    ///
+    /// # Safety
+    ///
+    /// The returned function must not be invoked after the detour is dropped.
+    pub unsafe fn trampoline(&self) -> T {
+        // SAFETY: The trampoline shares the target's signature.
+        unsafe { T::from_ptr(self.trampoline_ptr()) }
+    }
+
+    /// Returns a pointer to the generated trampoline.
+    pub(crate) fn trampoline_ptr(&self) -> *const () {
+        self.detour.trampoline()
+    }
+}
+
+/// The original function of a [`TypedDetour`], borrowed from it.
+///
+/// Returned by [`TypedDetour::original`] for function pointers. Its `call`
+/// method takes the same arguments as the function, and is `unsafe` if the
+/// function is.
+#[derive(Clone, Copy, Debug)]
+pub struct Original<'a, T> {
+    function: T,
+    phantom: PhantomData<&'a ()>,
+}
+
+impl<T> Original<'_, T> {
+    /// Wraps a function.
+    ///
+    /// # Safety
+    ///
+    /// The function must remain valid for the lifetime.
+    #[doc(hidden)]
+    pub unsafe fn __new(function: T) -> Self {
+        Original {
+            function,
+            phantom: PhantomData,
+        }
+    }
+
+    /// Returns the function.
+    ///
+    /// # Safety
+    ///
+    /// The function must not be used after the lifetime ends.
+    #[doc(hidden)]
+    pub unsafe fn __function(self) -> T {
+        self.function
+    }
+}
+
+impl<T: Function> core::fmt::Debug for TypedDetour<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("TypedDetour").field(&self.detour).finish()
+    }
+}
+
+impl<T: Function> crate::detour::transaction::private::Sealed for TypedDetour<T> {
+    fn hook(&self) -> Option<&Hook> {
+        Some(&self.detour)
+    }
+}
+
+impl<T: Function> crate::detour::Detour for TypedDetour<T> {}
