@@ -283,6 +283,25 @@ impl HostState {
     }
 }
 
+/// The base priorities of `REALTIME_PRIORITY_CLASS` and `NORMAL_PRIORITY_CLASS`
+/// ([Microsoft Learn: Scheduling Priorities](https://learn.microsoft.com/en-us/windows/win32/procthread/scheduling-priorities)).
+const REALTIME_BASE: i32 = 24;
+const NORMAL_BASE: i32 = 8;
+
+/// What `GetThreadPriority` reads back after `SetThreadPriority(priority)` in a realtime process,
+/// whose threads run at 16 to 31 ([Microsoft Learn: Scheduling Priorities](https://learn.microsoft.com/en-us/windows/win32/procthread/scheduling-priorities)):
+/// `THREAD_PRIORITY_IDLE` and `THREAD_PRIORITY_TIME_CRITICAL` and anything past them read back as
+/// themselves, and any other request from -16 to 16 is accepted and held to that band, -8 to 7
+/// relative to the base of 24. Measured on Windows Server 2025 x64 and Windows 11 ARM64 with the
+/// class granted.
+fn realtime_priority(priority: i32) -> i32 {
+    match priority {
+        ..=-15 => -15,
+        15.. => 15,
+        _ => priority.clamp(-8, 7),
+    }
+}
+
 /// A simulated Windows host serving the Win32 scheduling plane from in-memory state. Attach it to a
 /// [`Sim`] with [`SimBuilder`]; it never touches the real scheduler.
 pub struct WinHost {
@@ -344,9 +363,10 @@ impl Host for WinHost {
                 return Some(HostResult::Err(ERROR_INVALID_PARAMETER as c_int));
             }
         }
+        let realtime = state.priority_class == REALTIME_PRIORITY_CLASS;
         if !background
             && !matches!(priority, -16 | -15 | -2..=2 | 15 | 16)
-            && !(state.priority_class == REALTIME_PRIORITY_CLASS && (-7..=6).contains(&priority))
+            && !(realtime && (-16..=16).contains(&priority))
         {
             return Some(HostResult::Err(ERROR_INVALID_PARAMETER as c_int));
         }
@@ -385,6 +405,7 @@ impl Host for WinHost {
                 };
                 thread.priority = priority;
             }
+            _ if realtime => thread.priority = realtime_priority(priority),
             _ => thread.priority = priority.clamp(-15, 15),
         }
         Some(HostResult::Ok(1))
@@ -461,6 +482,17 @@ impl Host for WinHost {
                     ));
                 }
                 state.process_background = true;
+                // Background mode drops a realtime process to the normal class, but its threads
+                // keep their absolute priorities: measured, a thread set to 1 reads back 17.
+                if state.priority_class == REALTIME_PRIORITY_CLASS {
+                    for (_, thread) in &mut state.threads {
+                        if thread.background_priority.is_none()
+                            && (-8..=7).contains(&thread.priority)
+                        {
+                            thread.priority += REALTIME_BASE - NORMAL_BASE;
+                        }
+                    }
+                }
                 state.priority_class = NORMAL_PRIORITY_CLASS;
             } else {
                 if !state.process_background {

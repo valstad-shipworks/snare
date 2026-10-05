@@ -87,6 +87,15 @@ mod os {
     }
 }
 
+/// Makes the process's first real UDP socket on its own. On Windows, the first UDP sockets of a
+/// process created concurrently can read back `SO_RCVBUF` as 0 (measured on Windows 11 ARM64, native
+/// and x64-emulated, about one process in six with four racing threads); a socket created alone
+/// first prevents it, so this runs before either test's real measurements.
+fn first_socket_alone() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| snare::real(|| drop(UdpSocket::bind("127.0.0.1:0").unwrap())));
+}
+
 fn host_sim() -> Sim {
     Sim::builder()
         .sys_limits(SysLimits::from_real_host().unwrap())
@@ -110,6 +119,7 @@ fn sockbuf_semantics() -> Vec<(i32, i32, Result<i32, i32>)> {
 
 #[test]
 fn sockbuf_semantics_match_real_os() {
+    first_socket_alone();
     let real = snare::real(sockbuf_semantics);
     let sim = host_sim().run(sockbuf_semantics);
     assert_eq!(sim, real);
@@ -144,6 +154,7 @@ fn overflow_counts_match_real_os() {
         .flat_map(|r| [1, 10, 100, 200, 500, 1000, 1472].map(|s| (r, s)))
         .collect();
     let count = 120;
+    first_socket_alone();
     let real: Vec<usize> =
         snare::real(|| cases.iter().map(|&(r, s)| admitted(r, s, count)).collect());
     let sim: Vec<usize> =

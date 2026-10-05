@@ -387,6 +387,22 @@ pub(crate) const INVALID_SOCKET: Socket = usize::MAX;
 /// winsock2.h `SOCKET_ERROR`: what a failed `int`-returning Winsock call returns.
 pub(crate) const SOCKET_ERROR: c_int = -1;
 
+/// Runs std's one-time Winsock startup outside every domain, once per process.
+///
+/// std starts Winsock under a process-wide `Once` the first time any of its socket calls runs
+/// (std/src/sys/pal/windows/winsock.rs `startup`), and `WSAStartup` loads the provider DLLs: a
+/// critical section far longer than the [`outside_grace`] of a wait on it. A managed thread that
+/// found a thread of another domain inside it would wait on a word no thread of its own domain
+/// releases, and its domain would read as quiescent. A connect to no address runs that startup and
+/// then fails without creating a socket.
+pub(crate) fn start_std_winsock() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let _passthrough = state::Passthrough::enter();
+    STARTED.call_once(|| {
+        let _ = std::net::TcpStream::connect(&[][..] as &[std::net::SocketAddr]);
+    });
+}
+
 /// `s` as one of the calling thread's sim handles. The sim mints its handles in the `c_int`
 /// range, so a `SOCKET` beyond it is never the sim's, even when its low 32 bits equal a sim
 /// handle.
@@ -1932,12 +1948,58 @@ pub(crate) unsafe fn address_value(addr: usize, size: usize) -> u64 {
     }
 }
 
+/// Whether a `WaitOnAddress` on `addr` that returned `woke` was woken: it returned `TRUE` and the
+/// address no longer holds the comparand. A return with the comparand still in place is one of
+/// the spurious wakes the call allows ([Microsoft Learn: WaitOnAddress](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitonaddress)),
+/// which no thread caused and so is not a wake from outside the domain.
+fn woken_at(addr: usize, woke: i32) -> bool {
+    woke != 0
+        && address_wait_value(addr)
+            .is_none_or(|(size, expected)| unsafe { address_value(addr, size) } != expected)
+}
+
 struct AddressWaitValue(Option<(usize, usize, u64)>);
 
 impl Drop for AddressWaitValue {
     fn drop(&mut self) {
         let _ = ADDRESS_WAIT_VALUE.try_with(|value| value.set(self.0));
     }
+}
+
+/// winerror.h: ERROR_TIMEOUT (1460), what a timed-out WaitOnAddress leaves in GetLastError.
+const ERROR_TIMEOUT: u32 = 1460;
+
+/// How long a wait on a word in static data first waits in real time, for a holder outside the
+/// simulation, before it counts as a wait in the domain. A snare choice, as on Linux: long enough
+/// for an outside holder in a short critical section to let go, short enough not to slow a run that
+/// waits on an inside one.
+const OUTSIDE_HOLDER_GRACE_MS: u32 = 1;
+
+/// The first [`OUTSIDE_HOLDER_GRACE_MS`] of a `WaitOnAddress` on a word in static data, which may
+/// be a lock shared with threads outside the simulation (std's own statics: stdout's and stderr's
+/// locks, the `Once` around Winsock's startup), as a real wait the domain does not count. The word
+/// carries no owner, so whether a thread of the domain holds it cannot be told; a holder outside
+/// lets go in that time, and a holder inside merely delays the wait's counting by it. Returns the
+/// wait's result, with the last error as the OS left it, when it ended other than by timing out;
+/// `None` once the grace ran out.
+///
+/// # Safety
+/// As for `WaitOnAddress`.
+unsafe fn outside_grace(
+    address: *const c_void,
+    compare: *const c_void,
+    size: usize,
+) -> Option<i32> {
+    // SAFETY: WAIT_ON_ADDRESS holds the system's WaitOnAddress.
+    let wait = unsafe {
+        original::<unsafe extern "system" fn(*const c_void, *const c_void, usize, u32) -> i32>(
+            &WAIT_ON_ADDRESS,
+        )
+    };
+    // SAFETY: the caller's address and comparand, with the grace as the timeout.
+    let woke = unsafe { wait(address, compare, size, OUTSIDE_HOLDER_GRACE_MS) };
+    // SAFETY: reading this thread's last-error value.
+    (woke != 0 || unsafe { GetLastError() } != ERROR_TIMEOUT).then_some(woke)
 }
 
 /// The body of [`wait_on_address`] for a wait not nested in another on the same address.
@@ -1958,8 +2020,6 @@ unsafe fn wait_on_address_call(
     };
     // winbase.h: INFINITE.
     const INFINITE: u32 = u32::MAX;
-    // winerror.h: ERROR_TIMEOUT (1460), what a timed-out WaitOnAddress leaves in GetLastError.
-    const ERROR_TIMEOUT: u32 = 1460;
     let _label = crate::accounting::wait_label_on("WaitOnAddress", address as usize);
     let addr = address as usize;
     let _value = if domain::counts_native_waits()
@@ -2002,19 +2062,12 @@ unsafe fn wait_on_address_call(
         if differs {
             return 1;
         }
-        if domain::in_static_image(address as usize) {
-            // A word in static data may be a lock shared with threads outside the simulation: give
-            // such a holder a millisecond in real time (a snare choice: long enough for a holder
-            // outside to finish a short critical section, short enough not to stall the schedule), keeping the baton, before waiting in the
-            // schedule (a holder inside the simulation is parked and cannot release it meanwhile).
-            // SAFETY: the caller's address and comparand, with a 1ms timeout.
-            if unsafe { wait(address, compare, size, 1) } != 0 {
-                return 1;
-            }
-            // SAFETY: reading this thread's last-error value.
-            if unsafe { GetLastError() } != ERROR_TIMEOUT {
-                return 0;
-            }
+        // A holder inside the simulation is parked while this thread keeps the baton and cannot
+        // release the word meanwhile, so whether this wait yields never depends on outside timing.
+        if domain::in_static_image(addr)
+            && let Some(woke) = unsafe { outside_grace(address, compare, size) }
+        {
+            return woke;
         }
         let deadline = (millis != INFINITE)
             .then(|| domain::virtual_now().map(|now| now + Duration::from_millis(millis.into())))
@@ -2027,6 +2080,12 @@ unsafe fn wait_on_address_call(
         return 1;
     }
     if millis == INFINITE {
+        if domain::counts_native_waits()
+            && domain::in_static_image(addr)
+            && let Some(woke) = unsafe { outside_grace(address, compare, size) }
+        {
+            return woke;
+        }
         // SAFETY: forwarding the caller's arguments unchanged.
         return domain::native_wait_at_checked(
             None,
@@ -2044,7 +2103,7 @@ unsafe fn wait_on_address_call(
                     unsafe { wait(address, compare, size, millis) }
                 }
             },
-            |woke| *woke != 0,
+            |woke| woken_at(addr, *woke),
         );
     }
     let after = Duration::from_millis(u64::from(millis));
@@ -2066,7 +2125,7 @@ unsafe fn wait_on_address_call(
             let error = unsafe { GetLastError() };
             (woke != 0 || error != ERROR_TIMEOUT).then_some((woke, error))
         },
-        |(woke, _)| *woke != 0,
+        |(woke, _)| woken_at(addr, *woke),
     );
     let (woke, error) = match outcome {
         domain::TimedWait::Woken(result) => result,

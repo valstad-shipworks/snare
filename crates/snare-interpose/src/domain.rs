@@ -1245,6 +1245,8 @@ impl DomainBuilder {
     /// Builds the domain, installing the interposer first if nothing has yet.
     pub fn install(self) -> Domain {
         crate::install();
+        #[cfg(windows)]
+        crate::os::windows::start_std_winsock();
         let domain = Domain(Arc::new(Inner {
             layers: self.layers,
             net: self.net,
@@ -1613,6 +1615,8 @@ fn park_if(domain: &Inner, sim: bool, waiting: impl FnOnce() -> bool) -> Option<
         pre_released: false,
         #[cfg(target_os = "linux")]
         claimed: false,
+        #[cfg(windows)]
+        woken: false,
     };
     let mut core = domain.accounting.core();
     #[cfg(windows)]
@@ -3801,6 +3805,8 @@ fn det_block_with_timer(
             pre_released: false,
             #[cfg(target_os = "linux")]
             claimed: false,
+            #[cfg(windows)]
+            woken: false,
         };
         {
             let _passthrough = Passthrough::enter();

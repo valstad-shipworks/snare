@@ -326,9 +326,11 @@ impl SysLimits {
     ///   the `skb_*` sizes, [`from_real_host`](Self::from_real_host) picks up. `tcp_rmem` 131072
     ///   and `tcp_wmem` 16384 (the middle values), `ip_unprivileged_port_start` 1024 and
     ///   `tcp_syn_retries` 6 are the documented defaults (Documentation/networking/ip-sysctl.rst).
-    /// - Windows: 65536 for every new socket's `SO_RCVBUF`/`SO_SNDBUF`, and Winsock takes any
+    /// - Windows 11: 65536 for every new socket's `SO_RCVBUF`/`SO_SNDBUF`, and Winsock takes any
     ///   size as given; neither is documented, and tests/os_parity.rs
-    ///   `sockbuf_semantics_match_real_os` compares both with the real OS. No port is reserved.
+    ///   `sockbuf_semantics_match_real_os` compares both with the real OS. Windows Server 2025
+    ///   gives a new UDP socket 131072, which [`from_real_host`](Self::from_real_host) reads. No
+    ///   port is reserved.
     pub fn host() -> Self {
         if cfg!(target_os = "macos") {
             SysLimits {
@@ -391,8 +393,9 @@ impl SysLimits {
     }
 
     /// The machine this runs on, read from `/proc/sys` (Linux) or `sysctl` (macOS); Windows has no
-    /// such knobs and gets [`host`](Self::host). Fields with no sysctl behind them keep their
-    /// [`host`](Self::host) values. Reads bypass the sim, so it works inside one.
+    /// such knobs, so its new-socket buffer sizes are read off fresh real sockets. Fields with
+    /// nothing behind them keep their [`host`](Self::host) values. Reads bypass the sim, so it
+    /// works inside one.
     pub fn from_real_host() -> io::Result<Self> {
         snare_interpose::real(Self::read_real)
     }
@@ -491,10 +494,53 @@ impl SysLimits {
         })
     }
 
-    /// Windows has no socket-buffer sysctls: the stock values.
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    /// Windows has no socket-buffer sysctls, and the size Winsock gives a new socket's buffers
+    /// varies by edition: 65536 measured on Windows 11, 131072 for UDP on Windows Server 2025.
+    /// Reads `SO_RCVBUF`/`SO_SNDBUF` off a fresh real UDP socket and a fresh TCP one.
+    #[cfg(windows)]
     fn read_real() -> io::Result<Self> {
-        Ok(Self::host())
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            AF_INET, INVALID_SOCKET, IPPROTO_TCP, SO_RCVBUF, SO_SNDBUF, SOCK_STREAM, SOCKET,
+            SOL_SOCKET, closesocket, getsockopt, socket,
+        };
+        fn buffer(socket: SOCKET, name: i32) -> io::Result<usize> {
+            let mut value = 0i32;
+            let mut len = size_of::<i32>() as i32;
+            // SAFETY: a live socket, and an `int` with its length for the option.
+            let rc = unsafe {
+                getsockopt(
+                    socket,
+                    SOL_SOCKET,
+                    name,
+                    (&mut value as *mut i32).cast(),
+                    &mut len,
+                )
+            };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            usize::try_from(value).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
+        }
+        // std starts Winsock for the UDP socket, before the raw `socket` call below needs it.
+        let udp_socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let udp = udp_socket.as_raw_socket() as SOCKET;
+        // SAFETY: creates a socket this function closes below.
+        let tcp = unsafe { socket(AF_INET as i32, SOCK_STREAM, IPPROTO_TCP) };
+        if tcp == INVALID_SOCKET {
+            return Err(io::Error::last_os_error());
+        }
+        let tcp_buffers = buffer(tcp, SO_RCVBUF).and_then(|r| Ok((r, buffer(tcp, SO_SNDBUF)?)));
+        // SAFETY: the socket created above, closed once.
+        unsafe { closesocket(tcp) };
+        let (tcp_rmem_default, tcp_wmem_default) = tcp_buffers?;
+        Ok(SysLimits {
+            rmem_default: buffer(udp, SO_RCVBUF)?,
+            wmem_default: buffer(udp, SO_SNDBUF)?,
+            tcp_rmem_default,
+            tcp_wmem_default,
+            ..Self::host()
+        })
     }
 }
 

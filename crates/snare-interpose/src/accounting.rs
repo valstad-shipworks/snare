@@ -574,6 +574,11 @@ pub(crate) struct RowWait {
     pub(crate) pre_released: bool,
     #[cfg(target_os = "linux")]
     pub(crate) claimed: bool,
+    /// A wake on `key` that reached every waiter parked there when it was made reached this one.
+    /// Its own, unlike the per-address count, so another waiter on the same address leaving its
+    /// wait (a spurious return, a timeout) cannot take it.
+    #[cfg(windows)]
+    pub(crate) woken: bool,
 }
 
 #[cfg(windows)]
@@ -1350,6 +1355,18 @@ impl Core {
         if eligible == 0 || n == 0 {
             return;
         }
+        #[cfg(windows)]
+        if n >= eligible {
+            for row in self.rows.values_mut() {
+                if row.class == ThreadClass::Participant
+                    && let Some(wait) = row.wait.as_mut()
+                    && wait.key == Some(key)
+                    && matches(*wait)
+                {
+                    wait.woken = true;
+                }
+            }
+        }
         let pending = self.signalled.entry(key).or_default();
         let target = u32::try_from(n.min(eligible)).unwrap_or(u32::MAX);
         *pending = pending
@@ -1385,7 +1402,7 @@ impl Core {
                     #[cfg(not(target_os = "linux"))]
                     let released = self.signalled.contains_key(&key);
                     #[cfg(windows)]
-                    let released = released || self.timer_released(wait);
+                    let released = released || wait.woken || self.timer_released(wait);
                     released && !mutex.is_some_and(|m| self.held_by_other(m, lineage))
                 }
                 (None, Some(mutex)) => self.lock_unheld(mutex, lineage),
@@ -1882,7 +1899,7 @@ impl Accounting {
                 .rows
                 .get(&crate::thread_lineage())
                 .and_then(|row| row.wait)
-                .is_some_and(|wait| core.timer_released(wait));
+                .is_some_and(|wait| wait.woken || core.timer_released(wait));
         if owned
             || current_wait_label() == Some("mutex")
             || JOIN_TARGET.try_with(Cell::get).ok().flatten().is_some()
@@ -2411,6 +2428,7 @@ mod timer_release_tests {
             key: Some(key),
             mutex: None,
             token: signals.admit(),
+            woken: false,
         };
         core.rows.entry(lineage).or_insert(Row {
             class: ThreadClass::Participant,

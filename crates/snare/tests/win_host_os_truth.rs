@@ -31,6 +31,14 @@ use windows_sys::Win32::System::Threading::{
     THREAD_SET_LIMITED_INFORMATION,
 };
 
+/// Serializes the tests: the real side of each changes or reads the process's priority class, its
+/// background mode or the calling thread's priority, which another test running beside it would
+/// change under it.
+fn host_state() -> std::sync::MutexGuard<'static, ()> {
+    static HOST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    HOST.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 struct TestHandle(HANDLE);
 
 impl Drop for TestHandle {
@@ -169,6 +177,7 @@ fn scheduling_handle_matrix() -> Vec<(&'static str, i64, u32)> {
 
 #[test]
 fn scheduling_handle_access_and_errors_match_the_host() {
+    let _host = host_state();
     let real = snare::real(scheduling_handle_matrix);
     let modeled = Sim::new().run(scheduling_handle_matrix);
     for (index, (model, native)) in modeled.iter().zip(&real).enumerate() {
@@ -220,6 +229,7 @@ fn scheduling_aliases() -> Vec<i64> {
 
 #[test]
 fn duplicated_scheduling_handles_share_their_objects_state() {
+    let _host = host_state();
     let real = snare::real(scheduling_aliases);
     assert_eq!(Sim::new().run(scheduling_aliases), real);
 }
@@ -243,6 +253,7 @@ fn set_only_thread_handle() -> i32 {
 
 #[test]
 fn a_set_only_handle_can_initialize_a_threads_scheduling_state() {
+    let _host = host_state();
     assert_eq!(
         Sim::new().run(set_only_thread_handle),
         snare::real(set_only_thread_handle)
@@ -288,6 +299,7 @@ fn working_set_handle_matrix() -> Vec<(i32, u32)> {
 
 #[test]
 fn working_set_handles_and_access_match_the_host() {
+    let _host = host_state();
     let native = snare::real(working_set_handle_matrix);
     assert_eq!(Sim::new().run(working_set_handle_matrix), native);
 }
@@ -323,6 +335,7 @@ fn child_thread_scheduling_aliases() -> Vec<i32> {
 
 #[test]
 fn another_threads_handle_and_pseudo_handle_share_its_state() {
+    let _host = host_state();
     let native = snare::real(child_thread_scheduling_aliases);
     assert_eq!(Sim::new().run(child_thread_scheduling_aliases), native);
     assert_eq!(
@@ -336,6 +349,7 @@ fn another_threads_handle_and_pseudo_handle_share_its_state() {
 
 #[test]
 fn a_foreign_process_handle_does_not_change_the_simulated_current_process() {
+    let _host = host_state();
     use std::os::windows::io::AsRawHandle;
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["__foreign_handle_child__", "--exact"])
@@ -378,6 +392,7 @@ fn duplicated_current_thread_background_mode() -> Vec<(i32, u32)> {
 
 #[test]
 fn background_mode_on_a_duplicate_current_thread_matches_the_host() {
+    let _host = host_state();
     let native = snare::real(duplicated_current_thread_background_mode);
     assert_eq!(
         Sim::new().run(duplicated_current_thread_background_mode),
@@ -469,6 +484,7 @@ fn clock_invariants() -> Vec<(&'static str, bool)> {
 
 #[test]
 fn clock_invariants_hold_on_the_host_and_in_the_sim() {
+    let _host = host_state();
     let real = snare::real(clock_invariants);
     let sim = Sim::new().run(clock_invariants);
     assert!(real.iter().all(|(_, held)| *held), "host: {real:?}");
@@ -477,6 +493,7 @@ fn clock_invariants_hold_on_the_host_and_in_the_sim() {
 
 #[test]
 fn query_performance_frequency_is_the_hosts() {
+    let _host = host_state();
     let read = || {
         let mut frequency = 0;
         unsafe { QueryPerformanceFrequency(&mut frequency) };
@@ -496,6 +513,7 @@ fn period_round_trip() -> (u32, u32) {
 
 #[test]
 fn time_period_round_trip_matches_the_host() {
+    let _host = host_state();
     let real = snare::real(period_round_trip);
     assert_eq!(real, (0, 0));
     assert_eq!(Sim::new().run(period_round_trip), real);
@@ -511,6 +529,7 @@ fn period_out_of_range() -> (u32, u32) {
 
 #[test]
 fn time_period_out_of_range_matches_the_host() {
+    let _host = host_state();
     let real = snare::real(period_out_of_range);
     assert_eq!(real, (TIMERR_NOCANDO, TIMERR_NOCANDO));
     assert_eq!(Sim::new().run(period_out_of_range), real);
@@ -544,6 +563,7 @@ fn period_boundaries() -> Vec<(u32, u32, u32)> {
 
 #[test]
 fn timer_period_boundaries_match_the_host() {
+    let _host = host_state();
     let real = snare::real(period_boundaries);
     assert_eq!(Sim::new().run(period_boundaries), real);
 }
@@ -572,6 +592,7 @@ fn priority_round_trips() -> Vec<(i32, i32, i32)> {
 
 #[test]
 fn thread_priority_round_trips_match_the_host() {
+    let _host = host_state();
     let real = snare::real(priority_round_trips);
     let sim = Sim::new().run(priority_round_trips);
     assert!(
@@ -592,6 +613,7 @@ fn invalid_priority() -> (i32, u32) {
 
 #[test]
 fn invalid_thread_priority_matches_the_host() {
+    let _host = host_state();
     let real = snare::real(invalid_priority);
     assert_eq!(real, (0, 87));
     assert_eq!(Sim::new().run(invalid_priority), real);
@@ -624,6 +646,7 @@ fn background_priorities() -> Vec<(i32, u32, i32)> {
 
 #[test]
 fn background_priority_transitions_match_the_host() {
+    let _host = host_state();
     let real = snare::real(background_priorities);
     assert_eq!(Sim::new().run(background_priorities), real);
 }
@@ -673,6 +696,7 @@ fn priority_boundaries() -> Vec<(i32, i32, u32, i32)> {
 
 #[test]
 fn thread_priority_boundaries_match_the_host() {
+    let _host = host_state();
     let real = snare::real(priority_boundaries);
     assert_eq!(Sim::new().run(priority_boundaries), real);
 }
@@ -702,6 +726,7 @@ fn background_priority_levels() -> Vec<(i32, i32, i32)> {
 
 #[test]
 fn background_priority_levels_match_the_host() {
+    let _host = host_state();
     let real = snare::real(background_priority_levels);
     assert_eq!(Sim::new().run(background_priority_levels), real);
 }
@@ -746,6 +771,7 @@ fn background_priority_classes() -> Vec<(u32, i32, i32)> {
 
 #[test]
 fn background_priority_classes_match_the_host() {
+    let _host = host_state();
     let real = snare::real(background_priority_classes);
     assert_eq!(Sim::new().run(background_priority_classes), real);
 }
@@ -782,6 +808,7 @@ fn priority_class_flags() -> Vec<(i32, u32, u32)> {
 
 #[test]
 fn priority_class_flags_match_the_host() {
+    let _host = host_state();
     let real = snare::real(priority_class_flags);
     assert_eq!(Sim::new().run(priority_class_flags), real);
 }
@@ -1006,6 +1033,7 @@ fn current_process_background_matrix() -> Vec<PrioritySnapshot> {
 
 #[test]
 fn child_current_process_background_matrix() {
+    let _host = host_state();
     if std::env::var_os("SNARE_PRIORITY_MATRIX_CHILD").is_none() {
         return;
     }
@@ -1030,6 +1058,7 @@ fn child_current_process_background_matrix() {
 
 #[test]
 fn current_process_background_and_priority_classes_match_the_host() {
+    let _host = host_state();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "child_current_process_background_matrix",
