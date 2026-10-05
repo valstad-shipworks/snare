@@ -20,7 +20,7 @@
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{FILETIME, GetLastError, HANDLE, HMODULE, SetLastError};
@@ -2297,6 +2297,16 @@ impl Drop for AddressWaitValue {
     }
 }
 
+/// How many `WakeByAddressSingle`/`WakeByAddressAll` calls have reached each address, hashed into
+/// a fixed table, so a timed wait can tell whether any wake was made on its address while it
+/// waited. Two addresses sharing a slot only make a spurious return look like a wake.
+static ADDRESS_WAKES: [AtomicU64; 4096] = [const { AtomicU64::new(0) }; 4096];
+
+fn address_wakes(addr: usize) -> &'static AtomicU64 {
+    let hash = (addr as u64 >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 52;
+    &ADDRESS_WAKES[hash as usize]
+}
+
 /// winerror.h: ERROR_TIMEOUT (1460), what a timed-out WaitOnAddress leaves in GetLastError.
 const ERROR_TIMEOUT: u32 = 1460;
 
@@ -2353,6 +2363,7 @@ unsafe fn wait_on_address_call(
     const INFINITE: u32 = u32::MAX;
     let _label = crate::accounting::wait_label_on("WaitOnAddress", address as usize);
     let addr = address as usize;
+    let wakes = address_wakes(addr).load(Ordering::Acquire);
     let _value = if domain::counts_native_waits()
         && !address.is_null()
         && !compare.is_null()
@@ -2454,6 +2465,15 @@ unsafe fn wait_on_address_call(
             let woke = unsafe { wait(address, compare, size, slice_ms) };
             // SAFETY: reading this thread's last-error value.
             let error = unsafe { GetLastError() };
+            // A return with the comparand in place and no wake made on the address since the
+            // wait began is spurious, and std's `park_timeout` would end early on it rather than
+            // outlast its virtual timeout.
+            if woke != 0
+                && !woken_at(addr, woke)
+                && address_wakes(addr).load(Ordering::Acquire) == wakes
+            {
+                return None;
+            }
             (woke != 0 || error != ERROR_TIMEOUT).then_some((woke, error))
         },
         |(woke, _)| woken_at(addr, *woke),
@@ -2474,6 +2494,7 @@ unsafe fn wait_on_address_call(
 /// runs.
 unsafe extern "system" fn wake_by_address_single(address: *const c_void) {
     domain::note_hook_effect("WakeByAddressSingle");
+    address_wakes(address as usize).fetch_add(1, Ordering::Release);
     if domain::det_wakes() {
         domain::det_wake(crate::DetKey::Addr(address as usize), 1);
     }
@@ -2488,6 +2509,7 @@ unsafe extern "system" fn wake_by_address_single(address: *const c_void) {
 /// ([Microsoft Learn: WakeByAddressAll](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-wakebyaddressall)).
 unsafe extern "system" fn wake_by_address_all(address: *const c_void) {
     domain::note_hook_effect("WakeByAddressAll");
+    address_wakes(address as usize).fetch_add(1, Ordering::Release);
     if domain::det_wakes() {
         domain::det_wake(crate::DetKey::Addr(address as usize), usize::MAX);
     }
