@@ -293,6 +293,22 @@ pub(crate) fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// The earliest monotonic time past `t` at which the code under test sees the clock move: 1 ns
+/// later, or on Windows the next `QueryPerformanceCounter` tick, whose period std's `Instant`
+/// cannot see inside.
+fn creep_past(t: u64) -> u64 {
+    #[cfg(windows)]
+    {
+        nanos(snare_interpose::next_performance_count(
+            Duration::from_nanos(t),
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        t.saturating_add(1)
+    }
+}
+
 /// Real nanoseconds since the process origin, the time base of [`Line::anchor_real`].
 fn real_nanos() -> u64 {
     nanos(crate::readiness::real_now())
@@ -1455,7 +1471,14 @@ impl Clock {
     /// Moves a driven clock forward to `t`, or with `to_next` to the earliest participant timer
     /// after the reading if that comes first, raising the horizon to reach it and keeping the
     /// grant's rate. Returns the reading before and after.
-    pub(crate) fn jump_driven(&self, t: u64, to_next: bool) -> (u64, u64) {
+    ///
+    /// With `past`, the horizon reaches [`creep_past`] the landing. A landing stops the clock exactly
+    /// on a deadline, where a wait that recomputes `deadline - now` (flume's `recv_timeout`,
+    /// std's `Condvar::wait_timeout_while`) comes back with a zero timeout; the latency charged to
+    /// that call is what carries the clock past it, and only inside the horizon. Without the
+    /// creep such a thread spins at its deadline as a running participant, and time never
+    /// moves again.
+    pub(crate) fn jump_driven(&self, t: u64, to_next: bool, past: bool) -> (u64, u64) {
         self.controlled(|| {
             let now = self.peek();
             if !self.is_driven() {
@@ -1466,7 +1489,8 @@ impl Clock {
                 None => t,
             };
             let to = now.max(landing);
-            let horizon = self.horizon.load(Ordering::Acquire).max(to);
+            let reach = if past { creep_past(to) } else { to };
+            let horizon = self.horizon.load(Ordering::Acquire).max(reach);
             self.publish_line(
                 to,
                 real_nanos(),

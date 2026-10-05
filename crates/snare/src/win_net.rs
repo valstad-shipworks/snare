@@ -767,6 +767,20 @@ fn unspecified_like(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// The addresses the bound datagram sockets in `socks` claim against a new bind: the address each
+/// one's `bind` named, at the port it got, wherever a connect has since rehashed it for delivery.
+/// A socket a send or connect bound implicitly claims where that put it.
+fn dgram_claims(socks: &HashMap<c_int, Sock>) -> impl Iterator<Item = SocketAddr> + '_ {
+    socks.values().filter_map(|sock| match sock {
+        Sock::Dgram {
+            local: Some(local),
+            requested,
+            ..
+        } => Some(requested.map_or(*local, |r| SocketAddr::new(r.ip(), local.port()))),
+        _ => None,
+    })
+}
+
 /// The loopback address of socket family `domain`.
 fn loopback_for(domain: c_int) -> IpAddr {
     if domain == AF_INET6 {
@@ -2046,8 +2060,9 @@ impl Net for WinNet {
     /// `bind`. A malformed address is `WSAEFAULT`, an address the host does not have fails as
     /// `claim_address` says, a bound socket is `WSAEINVAL`
     /// ([Microsoft Learn: bind](https://learn.microsoft.com/en-us/windows/win32/api/winsock/nf-winsock-bind)).
-    /// TCP follows [`tcp_bind_addr`]; UDP refuses an exact address already bound (`WSAEADDRINUSE`)
-    /// and takes port 0 from [`Registry::alloc_port`]. Holds the handle table throughout, then the
+    /// TCP follows [`tcp_bind_addr`]; UDP refuses an exact duplicate of an address a socket was
+    /// bound to (`WSAEADDRINUSE`) — the address `bind` named, not where a connect since rehashed
+    /// it — and takes port 0 from [`Registry::alloc_port`]. Holds the handle table throughout, then the
     /// registry.
     unsafe fn bind(&self, fd: c_int, addr: *const u8, len: u32) -> Option<NetResult> {
         let Some(want) = (unsafe { parse_addr(addr, len) }) else {
@@ -2087,7 +2102,7 @@ impl Net for WinNet {
                 let mut regs = self.regs.lock();
                 if want.port() == 0 {
                     want.set_port(regs.alloc_port(want.ip()));
-                } else if regs.udp.contains_key(&want) {
+                } else if regs.udp.contains_key(&want) || dgram_claims(&socks).any(|c| c == want) {
                     return err(WSAEADDRINUSE);
                 }
                 regs.udp.insert(want, queue);

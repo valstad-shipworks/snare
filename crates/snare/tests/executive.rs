@@ -1033,3 +1033,71 @@ fn sim_time_agrees_with_the_monotonic_clock_inside_a_timestamp() {
         exec.leave_timestamp(t);
     });
 }
+
+/// A wait that recomputes `deadline - now` and waits again (std's `Condvar::wait_timeout_while`,
+/// flume's `recv_timeout`) gets a zero timeout once the clock stops exactly on its deadline; the
+/// clock reaching a nanosecond past the landing is what lets it see the deadline pass.
+fn deadline_loop(timeout: Duration) -> Duration {
+    let pair = (Mutex::new(()), Condvar::new());
+    let start = Instant::now();
+    let (_guard, result) = pair
+        .1
+        .wait_timeout_while(pair.0.lock().unwrap(), timeout, |()| true)
+        .unwrap();
+    assert!(result.timed_out());
+    start.elapsed()
+}
+
+/// The most a wait landed on by the clock runs past its deadline: 1 ns, or on Windows one
+/// `QueryPerformanceCounter` tick, at most a microsecond.
+const CREEP: Duration = if cfg!(windows) {
+    Duration::from_micros(1)
+} else {
+    Duration::from_nanos(1)
+};
+
+/// Joins `run`, failing the test if it has not finished within ten seconds of real time.
+fn join_soon<T>(run: thread::ScopedJoinHandle<'_, T>) -> T {
+    let start = real_now();
+    while !run.is_finished() {
+        assert!(
+            real_since(start) < Duration::from_secs(10),
+            "the wait is spinning at its deadline"
+        );
+        real_sleep(MS);
+    }
+    run.join().unwrap()
+}
+
+#[test]
+fn a_wait_landed_on_by_a_jump_times_out() {
+    let sim = Sim::new();
+    thread::scope(|s| {
+        let exec = sim.executive(ExecutiveConfig::default()).unwrap();
+        let run = s.spawn(|| sim.run(|| deadline_loop(30 * MS)));
+        settle_at(&exec, 30 * MS);
+        assert_eq!(jump(&exec, Duration::from_secs(1)), 1);
+        let waited = join_soon(run);
+        assert!(
+            waited >= 30 * MS && waited <= 30 * MS + CREEP,
+            "the wait timed out {waited:?} in"
+        );
+    });
+}
+
+#[test]
+fn a_wait_landed_on_by_a_timestamp_times_out() {
+    let sim = Sim::new();
+    thread::scope(|s| {
+        let exec = sim.executive(ExecutiveConfig::default()).unwrap();
+        let run = s.spawn(|| sim.run(|| deadline_loop(30 * MS)));
+        settle_at(&exec, 30 * MS);
+        enter_checked(&exec, 30 * MS);
+        exec.leave_timestamp(30 * MS);
+        let waited = join_soon(run);
+        assert!(
+            waited >= 30 * MS && waited <= 30 * MS + CREEP,
+            "the wait timed out {waited:?} in"
+        );
+    });
+}

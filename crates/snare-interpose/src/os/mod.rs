@@ -47,7 +47,7 @@ pub(crate) use unix::hooks;
 #[cfg(windows)]
 pub(crate) use windows::hooks;
 #[cfg(windows)]
-pub use windows::performance_count;
+pub use windows::{next_performance_count, performance_count};
 
 /// Whether `addr` lies inside a loaded image (a binary's or library's mapped sections, static data
 /// included) rather than the heap or a stack. Called under passthrough.

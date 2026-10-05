@@ -391,12 +391,13 @@ impl Executive {
     /// quiescent — checked in the same step as the move, so no participant starts running in
     /// between. It lands exactly on that timer, so one jump releases one timer group; returns how
     /// many participant waits, events and wakers were due there. The line re-anchors there at the
-    /// grant's rate, its horizon raised to reach it if need be, so the clock holds there unless the
-    /// grant flows on beyond. On `Err` nothing changed.
+    /// grant's rate, its horizon raised to reach just past it if need be (1 ns, or one
+    /// `QueryPerformanceCounter` tick on Windows), so the clock holds there — but for that creep,
+    /// which only a charged call can cross — unless the grant flows on beyond. On `Err` nothing changed.
     ///
     /// Landing exactly on a deadline leaves a loop such as std's `Condvar::wait_timeout_while`
-    /// re-waiting a zero timeout; that call's charged latency carries it past, but only inside a
-    /// granted horizon, so grant one beyond the deadline for such code.
+    /// re-waiting a zero timeout; that call's charged latency carries it past, so the horizon
+    /// reaches just beyond the landing for such code.
     pub fn jump_to(&self, t: Duration) -> Result<u32, NotQuiescent> {
         let target = self.at(t);
         let (fired, wakers) = readiness()
@@ -406,7 +407,7 @@ impl Executive {
                     || self.timer_blocker(None),
                     false,
                     || {
-                        let (before, landing) = self.clock.jump_driven(target, true);
+                        let (before, landing) = self.clock.jump_driven(target, true, true);
                         self.clock.fire_upto(before, landing)
                     },
                 )
@@ -431,7 +432,8 @@ impl Executive {
         self.domain.begin_timestamp();
         let target = self.at(t);
         snare_interpose::real(|| {
-            self.clock.jump_driven(target.saturating_sub(1), false);
+            self.clock
+                .jump_driven(target.saturating_sub(1), false, false);
             self.clock.set_stamp(Some(target));
         });
         clock::set_driver_time(Some(self.clock.driver_time_at(target)));
@@ -450,7 +452,8 @@ impl Executive {
                     || self.timer_blocker(Some(target)),
                     true,
                     || {
-                        self.clock.jump_driven(target.saturating_sub(1), false);
+                        self.clock
+                            .jump_driven(target.saturating_sub(1), false, false);
                         self.clock.set_stamp(Some(target));
                     },
                 )
@@ -460,8 +463,9 @@ impl Executive {
         Ok(())
     }
 
-    /// Ends the timestamp at `t`: the clock moves to `t` (and holds there unless a flowing grant
-    /// reaches past it), every timer due at `t` comes due, and the participants held since the
+    /// Ends the timestamp at `t`: the clock moves to `t` (and holds there, but for the creep a
+    /// zero-timeout wait can make past it as for [`jump_to`](Self::jump_to), unless a flowing grant
+    /// reaches further), every timer due at `t` comes due, and the participants held since the
     /// timestamp began run — under
     /// [`deterministic`](crate::SimBuilder::deterministic) in the schedule's order, with what came
     /// due at `t` released before the schedule moves on. Returns how many participant waits,
@@ -474,7 +478,7 @@ impl Executive {
         clock::set_driver_time(None);
         let target = self.at(t);
         let (fired, wakers, reached) = snare_interpose::real(|| {
-            let (before, _) = self.clock.jump_driven(target, false);
+            let (before, _) = self.clock.jump_driven(target, false, true);
             let (fired, wakers) = self.clock.fire_upto(before, target);
             self.clock.set_stamp(None);
             (fired, wakers, self.clock.wait_reached())

@@ -145,6 +145,45 @@ fn connect_source_os_truth() {
     assert_eq!(simulated, real);
 }
 
+/// A connect moves where a wildcard-bound socket receives, not the port its bind claimed: binding
+/// the wildcard at that port again is still `EADDRINUSE`.
+fn rebind_probe() -> Vec<String> {
+    let first = UdpSocket::bind("0.0.0.0:47616").unwrap();
+    let mut out = vec![format!(
+        "before {:?}",
+        code(UdpSocket::bind("0.0.0.0:47616"))
+    )];
+    first.connect("127.0.0.1:9").unwrap();
+    out.push(format!(
+        "after {:?}",
+        code(UdpSocket::bind("0.0.0.0:47616"))
+    ));
+    out
+}
+
+#[test]
+fn connected_wildcard_keeps_its_port_os_truth() {
+    let real = snare::real(rebind_probe);
+    let simulated = Sim::new().run(rebind_probe);
+    assert_eq!(simulated, real);
+}
+
+/// Through a simulated interface, where the connect rehashes the socket to the interface's
+/// address, a second wildcard bind of the port still fails, so a probe for a free port moves on.
+#[test]
+fn connected_wildcard_keeps_its_port_on_an_interface() {
+    nic_sim().run(|| {
+        let first = UdpSocket::bind("0.0.0.0:47617").unwrap();
+        first.connect("10.0.0.2:9").unwrap();
+        assert_eq!(
+            first.local_addr().unwrap().ip(),
+            IpAddr::from([10, 0, 0, 1])
+        );
+        let again = UdpSocket::bind("0.0.0.0:47617").unwrap_err();
+        assert_eq!(again.kind(), std::io::ErrorKind::AddrInUse);
+    });
+}
+
 /// Winsock also dissolves the association on a connect to the all-zero IPv4 address.
 #[cfg(windows)]
 #[test]

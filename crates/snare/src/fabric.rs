@@ -1014,6 +1014,20 @@ fn unspecified_like(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// The addresses the bound datagram sockets in `socks` claim against a new bind: the address each
+/// one's `bind` named, at the port it got, wherever a connect has since rehashed it for delivery.
+/// A socket a send or connect bound implicitly claims where that put it.
+fn dgram_claims(socks: &Sockets) -> impl Iterator<Item = SocketAddr> + '_ {
+    socks.values().filter_map(|sock| match sock {
+        Sock::Dgram {
+            local: Some(local),
+            requested,
+            ..
+        } => Some(requested.map_or(*local, |r| SocketAddr::new(r.ip(), local.port()))),
+        _ => None,
+    })
+}
+
 /// What an unbound datagram socket still holds of the address its `bind` named: the address, at
 /// no port. Only a Linux disconnect leaves a socket so (see [`Fabric::disconnect_dgram`]).
 fn unhashed(requested: Option<SocketAddr>) -> Option<SocketAddr> {
@@ -3051,7 +3065,9 @@ impl Net for Fabric {
     /// (`SimShared::claim_address`, EADDRNOTAVAIL otherwise, man 7 ip) and a port the process may
     /// take (`bind_denied`: EACCES for a privileged port without the capability, man 7 ip). TCP
     /// then applies `tcp_bind_conflict` against every socket of the sim; UDP refuses only an
-    /// exact duplicate (EADDRINUSE), as `SO_REUSEADDR` is not modelled for datagram sockets. Port 0
+    /// exact duplicate of an address a socket was bound to (EADDRINUSE) — the address `bind`
+    /// named, not where a connect since rehashed it — as `SO_REUSEADDR` is not modelled for
+    /// datagram sockets. Port 0
     /// takes an ephemeral port. A second bind of a bound socket is EINVAL (man 2 bind).
     unsafe fn bind(&self, fd: c_int, addr: *const u8, len: u32) -> Option<NetResult> {
         #[cfg(target_os = "linux")]
@@ -3128,7 +3144,7 @@ impl Net for Fabric {
                 });
             }
             want.set_port(port);
-        } else if regs.bound.contains_key(&want) {
+        } else if regs.bound.contains_key(&want) || dgram_claims(&socks).any(|c| c == want) {
             return err(libc::EADDRINUSE);
         }
         regs.insert(want, queue);
