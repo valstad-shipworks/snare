@@ -54,6 +54,11 @@ pub(crate) const IPPROTO_UDP: c_int = 17;
 /// `IPPROTO_IPV6` (`ws2def.h`).
 pub(crate) const IPPROTO_IPV6: c_int = 41;
 
+/// `SO_PROTOCOL_INFOA` (`winsock2.h`): the socket's `WSAPROTOCOL_INFOA`, read-only.
+pub(crate) const SO_PROTOCOL_INFOA: c_int = 0x2004;
+/// `SO_PROTOCOL_INFOW` (`winsock2.h`): the socket's `WSAPROTOCOL_INFOW`, read-only.
+pub(crate) const SO_PROTOCOL_INFOW: c_int = 0x2005;
+
 /// `SO_KEEPALIVE` (`ws2def.h`).
 pub(crate) const SO_KEEPALIVE: c_int = 0x0008;
 /// `SO_OOBINLINE` (`ws2def.h`).
@@ -221,8 +226,6 @@ static KNOWN: &[Known] = &[
     get_only(SOL_SOCKET, 0x2001, Dword),
     opt(SOL_SOCKET, 0x2002, Unmodelled, Dword, 0),
     get_only(SOL_SOCKET, 0x2003, Dword),
-    get_only(SOL_SOCKET, 0x2004, Bytes),
-    get_only(SOL_SOCKET, 0x2005, Bytes),
     opt(SOL_SOCKET, 0x3002, Unmodelled, Flag, 0),
     opt(SOL_SOCKET, 0x3003, Unmodelled, Flag, 0),
     opt(SOL_SOCKET, 0x3005, Unmodelled, Flag, 0),
@@ -670,4 +673,86 @@ pub(crate) fn rx_stamp(rec: &SockRec, arrived: Duration) -> Option<u64> {
         .stamping
         .rx
         .then(|| snare_interpose::performance_count(arrived))
+}
+
+/// `getsockopt` of `SO_PROTOCOL_INFOW` or `SO_PROTOCOL_INFOA`: the host's Winsock catalog entry
+/// for the socket's family, type and protocol (`IPPROTO_UDP` or `IPPROTO_TCP` whatever `socket`
+/// was given), the first `WSAEnumProtocols` lists as `WSASocket` picks it. Winsock returns the
+/// entry unchanged. The wide form stores the structure's size in `*len`; the ANSI form stores it
+/// only when the buffer is too short. A buffer shorter than the structure is `WSAEFAULT`.
+/// Measured by tests/socket_family.rs.
+///
+/// # Safety
+/// `val`/`len` are the caller's getsockopt buffer.
+pub(crate) unsafe fn get_protocol_info(
+    kind: Kind,
+    name: c_int,
+    val: *mut u8,
+    len: *mut u32,
+) -> Result<(), c_int> {
+    use windows_sys::Win32::Networking::WinSock as ws;
+    let family = if kind.v6 { ws::AF_INET6 } else { ws::AF_INET } as i32;
+    let (ty, protocol) = if kind.stream {
+        (ws::SOCK_STREAM, ws::IPPROTO_TCP)
+    } else {
+        (ws::SOCK_DGRAM, ws::IPPROTO_UDP)
+    };
+    let entry = if name == SO_PROTOCOL_INFOW {
+        catalog_entry(
+            ws::WSAEnumProtocolsW,
+            protocol,
+            |e: &ws::WSAPROTOCOL_INFOW| (e.iAddressFamily, e.iSocketType) == (family, ty),
+        )
+    } else {
+        catalog_entry(
+            ws::WSAEnumProtocolsA,
+            protocol,
+            |e: &ws::WSAPROTOCOL_INFOA| (e.iAddressFamily, e.iSocketType) == (family, ty),
+        )
+    };
+    let size = entry.as_ref().map_or(0, Vec::len);
+    if val.is_null() || len.is_null() || (unsafe { *len } as usize) < size {
+        if name == SO_PROTOCOL_INFOA && !len.is_null() {
+            unsafe { *len = size as u32 };
+        }
+        return Err(WSAEFAULT);
+    }
+    let entry = entry.ok_or(WSAENOPROTOOPT)?;
+    unsafe {
+        std::ptr::copy_nonoverlapping(entry.as_ptr(), val, size);
+        if name == SO_PROTOCOL_INFOW {
+            *len = size as u32;
+        }
+    }
+    Ok(())
+}
+
+/// The bytes of the first entry of the real Winsock catalog of `protocol` that `matches`, read
+/// with `enumerate` (`WSAEnumProtocolsW` or `WSAEnumProtocolsA`) outside the sim.
+fn catalog_entry<T>(
+    enumerate: unsafe extern "system" fn(*const i32, *mut T, *mut u32) -> i32,
+    protocol: i32,
+    matches: impl Fn(&T) -> bool,
+) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Networking::WinSock as ws;
+    snare_interpose::real(|| unsafe {
+        let mut data: ws::WSADATA = std::mem::zeroed();
+        if ws::WSAStartup(0x0202, &mut data) != 0 {
+            return None;
+        }
+        let protocols = [protocol, 0];
+        let mut bytes = 0u32;
+        enumerate(protocols.as_ptr(), std::ptr::null_mut(), &mut bytes);
+        let mut entries: Vec<T> = (0..bytes as usize / size_of::<T>() + 1)
+            .map(|_| std::mem::zeroed())
+            .collect();
+        bytes = (entries.len() * size_of::<T>()) as u32;
+        let count = enumerate(protocols.as_ptr(), entries.as_mut_ptr(), &mut bytes);
+        ws::WSACleanup();
+        let entry = entries
+            .get(..usize::try_from(count).ok()?)?
+            .iter()
+            .find(|e| matches(e))?;
+        Some(std::slice::from_raw_parts((entry as *const T).cast::<u8>(), size_of::<T>()).to_vec())
+    })
 }

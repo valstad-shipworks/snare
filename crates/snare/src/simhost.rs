@@ -1290,6 +1290,8 @@ struct UdpSocket {
     domain: c_int,
     /// The bound address; set by `bind`, or implicitly by the first `connect`/send.
     local: Option<std::net::SocketAddr>,
+    /// The address `bind` was given (port 0 for any): what a disconnect falls back to.
+    requested: Option<std::net::SocketAddr>,
     /// The connected peer, set by `connect` (man 2 connect): it fixes the default `send`
     /// destination and filters received datagrams to that source.
     peer: Option<std::net::SocketAddr>,
@@ -1645,6 +1647,51 @@ impl HostState {
         {
             self.bound.remove(&local);
         }
+    }
+
+    /// Moves bound datagram socket `fd` from `from` to `to` in `bound`, as the kernel rehashes a
+    /// socket whose local address a connect or disconnect changed; an address another socket
+    /// holds leaves it where it is.
+    #[cfg(target_os = "linux")]
+    fn rehash(&mut self, fd: c_int, from: std::net::SocketAddr, to: std::net::SocketAddr) {
+        if from == to || self.bound.contains_key(&to) {
+            return;
+        }
+        self.bound.remove(&from);
+        self.bound.insert(to, fd);
+        if let Some(sock) = self.udp.get_mut(&fd) {
+            sock.local = Some(to);
+            sock.rec.set_local(to);
+        }
+    }
+
+    /// Dissolves datagram socket `fd`'s association; see [`Net::connect`].
+    #[cfg(target_os = "linux")]
+    fn udp_disconnect(&mut self, fd: c_int) {
+        let Some(sock) = self.udp.get_mut(&fd) else {
+            return;
+        };
+        sock.peer = None;
+        sock.rec.set_peer(None);
+        let Some(bound) = sock.local else {
+            return;
+        };
+        let requested = sock.requested;
+        let ip = requested
+            .map(|r| r.ip())
+            .filter(|ip| !ip.is_unspecified())
+            .unwrap_or(match bound {
+                std::net::SocketAddr::V4(_) => std::net::Ipv4Addr::UNSPECIFIED.into(),
+                std::net::SocketAddr::V6(_) => std::net::Ipv6Addr::UNSPECIFIED.into(),
+            });
+        if requested.is_some_and(|r| r.port() != 0) {
+            self.rehash(fd, bound, std::net::SocketAddr::new(ip, bound.port()));
+            return;
+        }
+        sock.local = None;
+        sock.rec.state().local =
+            Some(std::net::SocketAddr::new(ip, 0)).filter(|a| !a.ip().is_unspecified());
+        self.bound.remove(&bound);
     }
 
     #[cfg(target_os = "linux")]
@@ -2450,6 +2497,18 @@ impl SimHost {
         regs.as_ref().map(|regs| regs.shared.clone())
     }
 
+    /// The record of the host's datagram or netlink socket on `fd`, and whether it is a netlink
+    /// one. A netlink socket answers only the socket-level options of [`crate::limits::sockopt`]
+    /// itself.
+    #[cfg(target_os = "linux")]
+    fn sockopt_rec(&self, fd: c_int) -> Option<(Arc<SockRec>, bool)> {
+        let state = self.state.lock().unwrap();
+        if let Some(netlink) = state.netlinks.get(&fd) {
+            return Some((netlink.rec.clone(), true));
+        }
+        Some((state.udp.get(&fd)?.rec.clone(), false))
+    }
+
     /// Mints a socket fd served by the host, with its record. Without an attached sim there is
     /// nothing to route through, so the socket is refused with `EAFNOSUPPORT` (a snare choice).
     #[cfg(target_os = "linux")]
@@ -2514,16 +2573,23 @@ impl SimHost {
         let regs = self.registries.lock().unwrap().clone()?;
         let shared = regs.shared.clone();
         let station = regs.station_at(dest.ip());
-        let (local, domain, broadcast, rec) = {
+        let (local, requested, domain, broadcast, rec) = {
             let state = self.state.lock().unwrap();
             let sock = state.udp.get(&fd)?;
-            (sock.local, sock.domain, sock.broadcast, sock.rec.clone())
+            (
+                sock.local,
+                sock.requested,
+                sock.domain,
+                sock.broadcast,
+                sock.rec.clone(),
+            )
         };
         rec.land();
         if let Some(errno) = rec.take_error_as(&shared, crate::sockets::Taker::Send) {
             return err(errno);
         }
-        let view = rec.view(local);
+        let unhashed = requested.map(|r| std::net::SocketAddr::new(r.ip(), 0));
+        let view = rec.view(local.or(unhashed));
         let sender =
             match shared.route_send(&view, dest, crate::netif::Op::Send, station, broadcast) {
                 Ok(sender) => sender,
@@ -2550,11 +2616,14 @@ impl SimHost {
         let local = match local {
             Some(local) => local,
             None => {
-                let ip = if domain == libc::AF_INET6 {
-                    std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
-                } else {
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-                };
+                let ip = unhashed.map_or(
+                    if domain == libc::AF_INET6 {
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+                    } else {
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+                    },
+                    |a| a.ip(),
+                );
                 let Some(port) = state.alloc_ephemeral(ip) else {
                     return err(libc::EAGAIN);
                 };
@@ -5510,12 +5579,13 @@ impl Net for SimHost {
     /// taken from the type's low byte (the kernel masks with `SOCK_TYPE_MASK` = 0xf,
     /// include/linux/net.h); `SOCK_NONBLOCK`/`SOCK_CLOEXEC` are flags OR'd above it.
     #[cfg(target_os = "linux")]
-    unsafe fn socket(&self, domain: c_int, ty: c_int, _protocol: c_int) -> Option<NetResult> {
+    unsafe fn socket(&self, domain: c_int, ty: c_int, protocol: c_int) -> Option<NetResult> {
         if domain == libc::AF_NETLINK {
             let (fd, rec) = match self.open_socket(SocketKind::Netlink) {
                 Ok(opened) => opened,
                 Err(errno) => return err(errno),
             };
+            rec.set_family(domain, protocol);
             let probe = Arc::new(NetlinkRx {
                 host: self.me.get().cloned().unwrap_or_default(),
                 id: rec.id.get(),
@@ -5549,6 +5619,14 @@ impl Net for SimHost {
             Ok(opened) => opened,
             Err(errno) => return err(errno),
         };
+        rec.set_family(
+            domain,
+            if protocol == 0 {
+                libc::IPPROTO_UDP
+            } else {
+                protocol
+            },
+        );
         let probe = Arc::new(HostRx {
             host: self.me.get().cloned().unwrap_or_default(),
             id: rec.id.get(),
@@ -5562,6 +5640,7 @@ impl Net for SimHost {
                 descriptors: std::collections::BTreeSet::from([fd]),
                 domain,
                 local: None,
+                requested: None,
                 peer: None,
                 rx: crate::limits::RxQueue::default(),
                 nonblocking,
@@ -5610,6 +5689,7 @@ impl Net for SimHost {
                 return err(errno);
             }
         }
+        let asked = sa;
         let mut state = self.state.lock().unwrap();
         if sa.port() == 0 {
             let Some(p) = state.alloc_ephemeral(sa.ip()) else {
@@ -5622,15 +5702,18 @@ impl Net for SimHost {
         state.bound.insert(sa, fd);
         let sock = state.udp.get_mut(&fd).unwrap();
         sock.local = Some(sa);
+        sock.requested = Some(asked);
         sock.rec.set_local(sa);
         ok(0)
     }
 
-    /// Sets a datagram socket's default peer after checking the route. Dissolving the
-    /// association with an `AF_UNSPEC` address (man 2 connect) is not modelled: it fails
-    /// `read_sockaddr` and returns `EINVAL`. The address is parsed before the fd's ownership is
-    /// checked, so a non-INET address on an fd the host does not own is also answered `EINVAL`
-    /// rather than declined.
+    /// Sets a datagram socket's default peer after checking the route; a socket bound to the
+    /// wildcard takes the route's source address (see [`crate::netif::Sender::connected_local`]).
+    /// An `AF_UNSPEC` address dissolves the association as `__udp_disconnect` (net/ipv4/udp.c)
+    /// does: the local address returns to the wildcard unless `bind` named one, and the port is
+    /// given up unless `bind` named one. Any other address is parsed before the fd's ownership is
+    /// checked, so a non-INET address on an fd the host does not own is answered `EINVAL` rather
+    /// than declined.
     #[cfg(target_os = "linux")]
     unsafe fn connect(&self, fd: c_int, addr: *const u8, len: u32) -> Option<NetResult> {
         if !self.state.lock().unwrap().udp.contains_key(&fd) {
@@ -5640,31 +5723,24 @@ impl Net for SimHost {
             && len as usize >= size_of::<libc::sa_family_t>()
             && unsafe { (*addr.cast::<libc::sockaddr>()).sa_family } as c_int == libc::AF_UNSPEC
         {
-            let mut state = self.state.lock().unwrap();
-            let sock = state.udp.get_mut(&fd)?;
-            sock.peer = None;
-            sock.rec.set_peer(None);
-            sock.rec.state().local = None;
-            let bound = sock.local.take();
-            if let Some(bound) = bound {
-                state.bound.remove(&bound);
-            }
+            self.state.lock().unwrap().udp_disconnect(fd);
             return ok(0);
         }
         let Some(dest) = (unsafe { read_sockaddr(addr, len) }) else {
             return err(libc::EINVAL);
         };
-        let (local, broadcast, rec) = {
+        let (local, requested, broadcast, rec) = {
             let state = self.state.lock().unwrap();
             let sock = state.udp.get(&fd)?;
-            (sock.local, sock.broadcast, sock.rec.clone())
+            (sock.local, sock.requested, sock.broadcast, sock.rec.clone())
         };
+        let unhashed = requested.map(|r| std::net::SocketAddr::new(r.ip(), 0));
         // man 2 connect on a datagram socket: fix the default peer, taking the route's source
         // address at an ephemeral port first if unbound so the peer can address a reply.
         let regs = self.registries.lock().unwrap().clone()?;
         let station = regs.station_at(dest.ip());
         let sender = match regs.shared.route_send(
-            &rec.view(local),
+            &rec.view(local.or(unhashed)),
             dest,
             crate::netif::Op::Connect,
             station,
@@ -5674,22 +5750,23 @@ impl Net for SimHost {
             Err(errno) => return err(errno),
         };
         let mut state = self.state.lock().unwrap();
-        if state.udp.get(&fd)?.local.is_none() {
-            let unspecified = if dest.is_ipv4() {
-                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-            } else {
-                std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
-            };
-            let ip = sender
-                .source(std::net::SocketAddr::new(unspecified, 0))
-                .ip();
-            if let Some(p) = state.alloc_ephemeral(ip) {
+        match state.udp.get(&fd)?.local {
+            None => {
+                let unspecified = if dest.is_ipv4() {
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+                } else {
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+                };
+                let unbound = unhashed.unwrap_or(std::net::SocketAddr::new(unspecified, 0));
+                let ip = sender.connected_local(unbound).ip();
+                let Some(p) = state.alloc_ephemeral(ip) else {
+                    return err(libc::EAGAIN);
+                };
                 let sa = std::net::SocketAddr::new(ip, p);
                 state.bound.insert(sa, fd);
                 state.udp.get_mut(&fd).unwrap().local = Some(sa);
-            } else {
-                return err(libc::EAGAIN);
             }
+            Some(bound) => state.rehash(fd, bound, sender.connected_local(bound)),
         }
         let sock = state.udp.get_mut(&fd).unwrap();
         sock.peer = Some(dest);
@@ -6148,7 +6225,16 @@ impl Net for SimHost {
         val: *const u8,
         len: u32,
     ) -> Option<NetResult> {
-        let rec = self.state.lock().unwrap().udp.get(&fd)?.rec.clone();
+        let (rec, netlink) = self.sockopt_rec(fd)?;
+        if netlink {
+            let shared = self.shared()?;
+            let result =
+                unsafe { crate::limits::sockopt::set(&shared, &rec, level, name, val, len)? };
+            return match result {
+                Ok(()) => ok(0),
+                Err(errno) => err(errno),
+            };
+        }
         if let Some(shared) = self.shared()
             && let Some(result) = unsafe {
                 crate::netif::sockopt::set(&shared, &rec, level, name, val, len)
@@ -6270,7 +6356,14 @@ impl Net for SimHost {
         val: *mut u8,
         len: *mut u32,
     ) -> Option<NetResult> {
-        let rec = self.state.lock().unwrap().udp.get(&fd)?.rec.clone();
+        let (rec, netlink) = self.sockopt_rec(fd)?;
+        if netlink {
+            let result = unsafe { crate::limits::sockopt::get(&rec, level, name, val, len)? };
+            return match result {
+                Ok(()) => ok(0),
+                Err(errno) => err(errno),
+            };
+        }
         rec.land();
         if val.is_null() || len.is_null() {
             return err(libc::EFAULT);
@@ -6371,7 +6464,8 @@ impl Net for SimHost {
         let state = self.state.lock().unwrap();
         let sock = state.udp.get(&fd)?;
         // man 2 getsockname: an unbound socket reports the wildcard address on its family.
-        let local = sock.local.unwrap_or_else(|| {
+        let unhashed = sock.requested.map(|r| std::net::SocketAddr::new(r.ip(), 0));
+        let local = sock.local.or(unhashed).unwrap_or_else(|| {
             std::net::SocketAddr::new(
                 if sock.domain == libc::AF_INET6 {
                     std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)

@@ -198,6 +198,10 @@ pub(crate) struct SockOpts {
     /// Linux `SO_MARK`.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) mark: u32,
+    /// Linux `SO_BUSY_POLL`, `SO_PREFER_BUSY_POLL` and `SO_BUSY_POLL_BUDGET`: kept and read back,
+    /// as the sim has no device queue to poll.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) busy_poll: BusyPoll,
     /// Linux `TCP_SYNCNT`; `None` uses `tcp_syn_retries`.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) syncnt: Option<u8>,
@@ -205,6 +209,16 @@ pub(crate) struct SockOpts {
     /// [`Duration::MAX`] never gives up (Windows `TCP_MAXRT` -1).
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub(crate) connect_give_up: Option<Duration>,
+}
+
+/// A socket's busy-polling settings (man 7 socket): `sk_ll_usec`, `sk_prefer_busy_poll` and
+/// `sk_busy_poll_budget`, all 0 on a new socket (`net.core.busy_read` is 0 by default).
+#[derive(Clone, Copy, Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct BusyPoll {
+    pub(crate) usecs: c_int,
+    pub(crate) prefer: bool,
+    pub(crate) budget: u16,
 }
 
 /// Where a socket's pending error came from.
@@ -369,6 +383,9 @@ pub(crate) enum ErrorReport {
 /// The mutable half of a [`SockRec`], behind its `state` lock.
 pub(crate) struct SockState {
     pub(crate) kind: SocketKind,
+    /// The family and protocol Linux `SO_DOMAIN` and `SO_PROTOCOL` report.
+    #[cfg(target_os = "linux")]
+    pub(crate) family: (c_int, c_int),
     /// The descriptors open on this file description; it closes when the last goes.
     fds: BTreeSet<c_int>,
     pub(crate) local: Option<SocketAddr>,
@@ -518,6 +535,12 @@ impl SockRec {
     /// Changes the kind, as `listen` turns a stream into a listener.
     pub(crate) fn set_kind(&self, kind: SocketKind) {
         self.state().kind = kind;
+    }
+
+    /// Records the family and protocol `SO_DOMAIN` and `SO_PROTOCOL` report.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_family(&self, family: c_int, protocol: c_int) {
+        self.state().family = (family, protocol);
     }
 
     /// Records the bound address, and whether it is a station address of the calling thread's sim.
@@ -1252,6 +1275,8 @@ impl SocketTable {
             next_data_arrival: AtomicU64::new(u64::MAX),
             state: Mutex::new(SockState {
                 kind,
+                #[cfg(target_os = "linux")]
+                family: (0, 0),
                 fds: BTreeSet::from([fd]),
                 local: None,
                 station: false,

@@ -69,7 +69,8 @@ pub struct Privileges {
     /// Effective uid 0: what macOS checks for reserved ports and BPF devices.
     pub root: bool,
     /// `CAP_NET_ADMIN`: interface configuration, `SO_RCVBUFFORCE`/`SO_SNDBUFFORCE`, `SO_MARK`,
-    /// `SO_PRIORITY` above 6 (man 7 socket).
+    /// `SO_PRIORITY` above 6 (man 7 socket), turning `SO_PREFER_BUSY_POLL` on and raising
+    /// `SO_BUSY_POLL_BUDGET` (net/core/sock.c `sk_setsockopt`).
     pub net_admin: bool,
     /// `CAP_NET_RAW`: `AF_PACKET` and raw sockets (man 7 packet), and also `SO_MARK` and a high
     /// `SO_PRIORITY` (net/core/sock.c `sk_setsockopt`).
@@ -1410,10 +1411,10 @@ pub(crate) fn sockbuf_value(
 #[cfg(target_os = "linux")]
 pub(crate) const SO_RXQ_OVFL: c_int = 40;
 
-/// The buffer, priority and introspection socket options, as the host OS answers them for a
-/// socket of the code under test on any unix backend. Each is answered from the record and never
-/// reaches the OS. The Linux numbers are those of include/uapi/asm-generic/socket.h, which every
-/// architecture snare targets uses.
+/// The buffer, priority, busy-poll and introspection socket options, as the host OS answers them
+/// for a socket of the code under test on any unix backend. Each is answered from the record and
+/// never reaches the OS. The Linux numbers are those of include/uapi/asm-generic/socket.h, which
+/// every architecture snare targets uses.
 #[cfg(unix)]
 pub(crate) mod sockopt {
     use std::ffi::c_int;
@@ -1431,6 +1432,11 @@ pub(crate) mod sockopt {
         pub(super) const SO_MARK: c_int = 36;
         pub(super) const SO_MEMINFO: c_int = 55;
         pub(super) const SO_COOKIE: c_int = 57;
+        pub(super) const SO_PROTOCOL: c_int = 38;
+        pub(super) const SO_DOMAIN: c_int = 39;
+        pub(super) const SO_BUSY_POLL: c_int = 46;
+        pub(super) const SO_PREFER_BUSY_POLL: c_int = 69;
+        pub(super) const SO_BUSY_POLL_BUDGET: c_int = 70;
     }
 
     /// The `int` an option value holds; `EINVAL` when it is shorter than an `int`, as Linux
@@ -1513,6 +1519,42 @@ pub(crate) mod sockopt {
                 super::SO_RXQ_OVFL => {
                     return Some(read_int(val, len).map(|v| rec.state().buf.rxq_ovfl = v != 0));
                 }
+                // Read-only: sk_setsockopt has no case for them.
+                name::SO_DOMAIN | name::SO_PROTOCOL => return Some(Err(libc::ENOPROTOOPT)),
+                // sk_setsockopt (net/core/sock.c, Linux 7.0, measured): any non-negative
+                // SO_BUSY_POLL, unprivileged; turning SO_PREFER_BUSY_POLL on needs CAP_NET_ADMIN;
+                // raising SO_BUSY_POLL_BUDGET above its current value needs CAP_NET_ADMIN, checked
+                // before the 0..=U16_MAX range.
+                name::SO_BUSY_POLL => {
+                    return Some(read_int(val, len).and_then(|v| {
+                        if v < 0 {
+                            return Err(libc::EINVAL);
+                        }
+                        rec.state().opts.busy_poll.usecs = v;
+                        Ok(())
+                    }));
+                }
+                name::SO_PREFER_BUSY_POLL => {
+                    return Some(read_int(val, len).and_then(|v| {
+                        if v != 0 && !shared.sys.has_cap(CAP_NET_ADMIN) {
+                            return Err(libc::EPERM);
+                        }
+                        rec.state().opts.busy_poll.prefer = v != 0;
+                        Ok(())
+                    }));
+                }
+                name::SO_BUSY_POLL_BUDGET => {
+                    return Some(read_int(val, len).and_then(|v| {
+                        let mut state = rec.state();
+                        if v > c_int::from(state.opts.busy_poll.budget)
+                            && !shared.sys.has_cap(CAP_NET_ADMIN)
+                        {
+                            return Err(libc::EPERM);
+                        }
+                        state.opts.busy_poll.budget = u16::try_from(v).map_err(|_| libc::EINVAL)?;
+                        Ok(())
+                    }));
+                }
                 _ => {}
             }
         }
@@ -1563,6 +1605,14 @@ pub(crate) mod sockopt {
         match name {
             name::SO_PRIORITY => return Some(int(rec.state().opts.priority)),
             name::SO_MARK => return Some(int(rec.state().opts.mark as c_int)),
+            name::SO_DOMAIN => return Some(int(rec.state().family.0)),
+            name::SO_PROTOCOL => return Some(int(rec.state().family.1)),
+            name::SO_BUSY_POLL => return Some(int(rec.state().opts.busy_poll.usecs)),
+            name::SO_PREFER_BUSY_POLL => {
+                return Some(int(rec.state().opts.busy_poll.prefer as c_int));
+            }
+            // sk_getsockopt has no case for it.
+            name::SO_BUSY_POLL_BUDGET => return Some(Err(libc::ENOPROTOOPT)),
             super::SO_RXQ_OVFL => return Some(int(rec.state().buf.rxq_ovfl as c_int)),
             // The record's socket id serves as the cookie: unique and never reused within a sim,
             // as sock_gen_cookie's is within a boot. A buffer shorter than a u64 fails with

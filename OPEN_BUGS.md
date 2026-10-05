@@ -67,6 +67,12 @@ can change which reports fit and drop:
   error for the next call (`do_recvmmsg`, net/socket.c).
 - On a plain sim (no `SimHost`), `sendmsg` with any control message fails with `EOPNOTSUPP`:
   `IP_PKTINFO`, `IP_TOS`, `SCM_TXTIME` and the rest are modelled only for a `SimHost`'s sockets.
+- Linux `getsockopt(SO_TYPE)` on an `AF_PACKET` socket reads `SOCK_STREAM` (1) where the kernel
+  reports the type it was opened with (`SOCK_RAW` 3 or `SOCK_DGRAM` 2).
+- A `SimHost`'s netlink sockets answer only the socket-level options of `limits::sockopt`
+  (buffers, priority, busy polling, `SO_DOMAIN`/`SO_PROTOCOL`, ...); any other `getsockopt` or
+  `setsockopt` on them, `SO_TYPE` and `SO_ERROR` included, reaches the real OS on the reserved
+  descriptor and fails with `ENOTSOCK`.
 
 - Completed TCP accept queues enforce the configured backlog, with host comparisons on macOS,
   Linux and Windows. Separate incomplete-handshake queues and simultaneous SYN/ACK completion

@@ -132,6 +132,8 @@ const SO_TIMESTAMP_ID: c_int = 0x300B;
 
 // Winsock address families and socket types (`<winsock2.h>`): AF_INET = 2, AF_INET6 = 23,
 // SOCK_STREAM = 1, SOCK_DGRAM = 2. The IPv6 family value differs from unix (10/30).
+/// `AF_UNSPEC` (`ws2def.h`).
+const AF_UNSPEC: c_int = 0;
 /// `AF_INET` (`ws2def.h`).
 const AF_INET: c_int = 2;
 /// `AF_INET6` (`ws2def.h`).
@@ -647,6 +649,8 @@ enum Sock {
         queue: Arc<DgramQueue>,
         domain: c_int,
         local: Option<SocketAddr>,
+        /// The address `bind` was given: what a disconnect returns the local address to.
+        requested: Option<SocketAddr>,
         peer: Option<SocketAddr>,
         nonblocking: bool,
         broadcast: bool,
@@ -1034,6 +1038,67 @@ impl WinNet {
         }
         rec.set_local(sa);
         sa
+    }
+
+    /// Moves the datagram socket on `queue` from `from` to `to` in the delivery map, for every
+    /// descriptor of it, when a connect or disconnect changes its local address. An address
+    /// another socket holds leaves it where it is.
+    fn rehash(
+        &self,
+        queue: &Arc<DgramQueue>,
+        rec: &Arc<SockRec>,
+        from: SocketAddr,
+        to: SocketAddr,
+    ) {
+        if from == to {
+            return;
+        }
+        let mut regs = self.regs.lock();
+        if regs.udp.contains_key(&to) {
+            return;
+        }
+        regs.udp.remove(&from);
+        regs.udp.insert(to, queue.clone());
+        drop(regs);
+        for sock in self.socks.lock().unwrap().values_mut() {
+            if let Sock::Dgram {
+                queue: q, local, ..
+            } = sock
+                && Arc::ptr_eq(q, queue)
+            {
+                *local = Some(to);
+            }
+        }
+        rec.set_local(to);
+    }
+
+    /// Dissolves a datagram socket's association on a connect to an `AF_UNSPEC` address or the
+    /// all-zero address: the peer is cleared and the local address returns to the one `bind`
+    /// named, else the wildcard, keeping its port (measured by tests/udp_connect_source.rs).
+    /// False when `fd` is not a datagram socket.
+    fn disconnect_dgram(&self, fd: c_int) -> bool {
+        let (queue, rec, local, requested) = {
+            let mut socks = self.socks.lock().unwrap();
+            let Some(Sock::Dgram {
+                queue,
+                rec,
+                local,
+                requested,
+                peer,
+                ..
+            }) = socks.get_mut(&fd)
+            else {
+                return false;
+            };
+            *peer = None;
+            (queue.clone(), rec.clone(), *local, *requested)
+        };
+        rec.set_peer(None);
+        if let Some(bound) = local {
+            let ip = requested.map_or(unspecified_like(bound.ip()), |r| r.ip());
+            self.rehash(&queue, &rec, bound, SocketAddr::new(ip, bound.port()));
+        }
+        true
     }
 
     /// The `revents` for one `WSAPOLLFD`: which of the requested `events` are satisfied now.
@@ -1962,6 +2027,7 @@ impl Net for WinNet {
                 queue: DgramQueue::for_socket(&rec),
                 domain,
                 local: None,
+                requested: None,
                 peer: None,
                 nonblocking: false,
                 broadcast: false,
@@ -2016,6 +2082,7 @@ impl Net for WinNet {
                 if let Err(code) = self.regs.shared.claim_address(want.ip()) {
                     return err(code);
                 }
+                let asked = want;
                 let mut want = want;
                 let mut regs = self.regs.lock();
                 if want.port() == 0 {
@@ -2025,8 +2092,12 @@ impl Net for WinNet {
                 }
                 regs.udp.insert(want, queue);
                 drop(regs);
-                if let Some(Sock::Dgram { local, .. }) = socks.get_mut(&fd) {
+                if let Some(Sock::Dgram {
+                    local, requested, ..
+                }) = socks.get_mut(&fd)
+                {
                     *local = Some(want);
+                    *requested = Some(asked);
                 }
                 rec.set_local(want);
                 ok(0)
@@ -2159,15 +2230,42 @@ impl Net for WinNet {
     /// `WSAEALREADY`, and after success `WSAEISCONN`. A blocking socket waits, settling the attempt
     /// as its points come due.
     unsafe fn connect(&self, fd: c_int, addr: *const u8, len: u32) -> Option<NetResult> {
+        if !addr.is_null()
+            && len >= 2
+            && unsafe { addr.cast::<u16>().read_unaligned() } == AF_UNSPEC as u16
+            && let Some(Sock::Dgram { domain, .. }) = self.socks.lock().unwrap().get(&fd)
+        {
+            // Winsock holds the address to the socket family's size first (measured).
+            let size = if *domain == AF_INET6 { 28 } else { 16 };
+            if len < size {
+                return err(WSAEFAULT);
+            }
+        }
+        if !addr.is_null()
+            && len >= 2
+            && unsafe { addr.cast::<u16>().read_unaligned() } == AF_UNSPEC as u16
+            && self.disconnect_dgram(fd)
+        {
+            return ok(0);
+        }
         let Some(dest) = (unsafe { parse_addr(addr, len) }) else {
             return err(WSAEFAULT);
         };
+        if dest.ip().is_unspecified() && dest.port() == 0 && self.disconnect_dgram(fd) {
+            return ok(0);
+        }
         // UDP connect fixes the default peer; an unbound socket takes the route's source address
-        // at an ephemeral port.
+        // at an ephemeral port. A connected socket is disconnected first, so a wildcard bind
+        // picks its source anew (measured by tests/udp_connect_source.rs).
         let station = self.regs.lock().station_at(dest.ip());
         let (nonblocking, bound, rec) = {
             let socks = self.socks.lock().unwrap();
             match socks.get(&fd)? {
+                Sock::Dgram { peer: Some(_), .. } => {
+                    drop(socks);
+                    self.disconnect_dgram(fd);
+                    return unsafe { self.connect(fd, addr, len) };
+                }
                 Sock::Dgram {
                     local,
                     queue,
@@ -2188,11 +2286,16 @@ impl Net for WinNet {
                         Ok(sender) => sender,
                         Err(code) => return err(code),
                     };
-                    if local.is_none() {
-                        let ip = sender
-                            .source(SocketAddr::new(unspecified_like(dest.ip()), 0))
-                            .ip();
-                        self.autobind(fd, &queue, &rec, ip);
+                    match local {
+                        None => {
+                            let ip = sender
+                                .connected_local(SocketAddr::new(unspecified_like(dest.ip()), 0))
+                                .ip();
+                            self.autobind(fd, &queue, &rec, ip);
+                        }
+                        Some(bound) => {
+                            self.rehash(&queue, &rec, bound, sender.connected_local(bound))
+                        }
                     }
                     if let Some(Sock::Dgram { peer, .. }) = self.socks.lock().unwrap().get_mut(&fd)
                     {
@@ -2657,6 +2760,20 @@ impl Net for WinNet {
         if let Err(code) = win_sockopt::level_applies(kind, level, name) {
             return err(code);
         }
+        // Read-only, refused as measured: WSAENOPROTOOPT, except WSAEINVAL for the wide form on
+        // a datagram socket.
+        if level == SOL_SOCKET
+            && matches!(
+                name,
+                win_sockopt::SO_PROTOCOL_INFOA | win_sockopt::SO_PROTOCOL_INFOW
+            )
+        {
+            return err(if name == win_sockopt::SO_PROTOCOL_INFOW && !kind.stream {
+                WSAEINVAL
+            } else {
+                WSAENOPROTOOPT
+            });
+        }
         if level == IPPROTO_TCP
             && let Some(result) = unsafe { crate::faults::sockopt::set(&rec, name, val, len) }
         {
@@ -2755,6 +2872,16 @@ impl Net for WinNet {
         let kind = self.kind(fd)?;
         if let Err(code) = win_sockopt::level_applies(kind, level, name) {
             return err(code);
+        }
+        if level == SOL_SOCKET
+            && matches!(
+                name,
+                win_sockopt::SO_PROTOCOL_INFOA | win_sockopt::SO_PROTOCOL_INFOW
+            )
+        {
+            return done(
+                unsafe { win_sockopt::get_protocol_info(kind, name, val, len) }.map(|()| 0),
+            );
         }
         if level == IPPROTO_TCP
             && let Some(value) = crate::faults::sockopt::get(&self.regs.shared, &rec, name)
@@ -3238,6 +3365,7 @@ impl Net for WinNet {
                 queue,
                 domain,
                 local,
+                requested,
                 peer,
                 nonblocking,
                 broadcast,
@@ -3246,6 +3374,7 @@ impl Net for WinNet {
                 queue: queue.clone(),
                 domain: *domain,
                 local: *local,
+                requested: *requested,
                 peer: *peer,
                 nonblocking: *nonblocking,
                 broadcast: *broadcast,
