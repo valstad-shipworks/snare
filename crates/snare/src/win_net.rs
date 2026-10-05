@@ -1006,7 +1006,7 @@ impl WinNet {
                 .unreachable_port(&rec, &sender, src, dest, &data, station);
         }
         rec.note_tx_nic(sender.egress_name());
-        rec.count_udp_sent(dest);
+        rec.count_udp_sent(dest, &sender);
         if rec.has_error_reports() {
             self.regs.shared.bump_keys(&[rec.wake_key()]);
         }

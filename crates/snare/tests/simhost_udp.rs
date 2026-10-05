@@ -528,3 +528,160 @@ fn a_datagram_past_the_mtu_is_charged_per_fragment() {
             );
         });
 }
+
+fn station_host(latency: std::time::Duration) -> std::sync::Arc<snare::SimHost> {
+    HostProfile::new()
+        .nic(
+            Nic::new("eth0", 2)
+                .network("10.0.0.10/24".parse::<IpNet>().unwrap())
+                .station("10.0.0.20".parse::<std::net::IpAddr>().unwrap())
+                .policy(snare::NicPolicy {
+                    latency,
+                    ..snare::NicPolicy::default()
+                }),
+        )
+        .build()
+}
+
+/// One `recvmsg` into `buf`: the byte count or the errno.
+fn recvmsg_into(fd: i32, buf: &mut [u8], flags: i32) -> Result<usize, i32> {
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    let n = unsafe { libc::recvmsg(fd, &mut msg, flags) };
+    if n < 0 {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+#[test]
+fn a_blocking_recvmsg_waits_for_a_datagram_in_flight() {
+    use std::os::fd::AsRawFd;
+    let latency = std::time::Duration::from_millis(2);
+    Sim::builder().host(station_host(latency)).build().run(|| {
+        let rx = std::net::UdpSocket::bind("10.0.0.10:7011").unwrap();
+        let sender = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let station = std::net::UdpSocket::bind("10.0.0.20:0").unwrap();
+            station.send_to(b"ping", "10.0.0.10:7011").unwrap();
+            std::time::Instant::now()
+        });
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            recvmsg_into(rx.as_raw_fd(), &mut buf, libc::MSG_DONTWAIT),
+            Err(libc::EAGAIN)
+        );
+        assert_eq!(recvmsg_into(rx.as_raw_fd(), &mut buf, 0), Ok(4));
+        let arrived = std::time::Instant::now();
+        assert_eq!(&buf[..4], b"ping");
+        assert!(arrived >= sender.join().unwrap() + latency);
+
+        rx.set_read_timeout(Some(std::time::Duration::from_millis(5)))
+            .unwrap();
+        assert_eq!(recvmsg_into(rx.as_raw_fd(), &mut buf, 0), Err(libc::EAGAIN));
+    });
+}
+
+/// `recvmmsg` into `count` 8-byte buffers: the first byte of each message received, or the errno.
+fn recvmmsg_firsts(
+    fd: i32,
+    count: usize,
+    flags: i32,
+    timeout: Option<&mut libc::timespec>,
+) -> Result<Vec<u8>, i32> {
+    let mut bufs = vec![[0u8; 8]; count];
+    let mut iovs: Vec<libc::iovec> = bufs
+        .iter_mut()
+        .map(|b| libc::iovec {
+            iov_base: b.as_mut_ptr().cast(),
+            iov_len: b.len(),
+        })
+        .collect();
+    let mut msgs: Vec<libc::mmsghdr> = iovs
+        .iter_mut()
+        .map(|iov| {
+            let mut m: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            m.msg_hdr.msg_iov = iov;
+            m.msg_hdr.msg_iovlen = 1;
+            m
+        })
+        .collect();
+    let timeout = timeout.map_or(std::ptr::null_mut(), |t| t as *mut libc::timespec);
+    let n = unsafe { libc::recvmmsg(fd, msgs.as_mut_ptr(), count as u32, flags, timeout) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error().raw_os_error().unwrap());
+    }
+    assert!(msgs[..n as usize].iter().all(|m| m.msg_len == 1));
+    Ok(bufs[..n as usize].iter().map(|b| b[0]).collect())
+}
+
+/// Three datagrams queued on a socket, read by `recvmmsg` four ways; returns each call's result.
+fn recvmmsg_rounds(rx: &std::net::UdpSocket, send: impl Fn(u8)) -> Vec<Result<Vec<u8>, i32>> {
+    use std::os::fd::AsRawFd;
+    let fd = rx.as_raw_fd();
+    let mut out = vec![recvmmsg_firsts(fd, 4, libc::MSG_DONTWAIT, None)];
+    for i in 0..3 {
+        send(i);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    out.push(recvmmsg_firsts(fd, 2, libc::MSG_WAITFORONE, None));
+    out.push(recvmmsg_firsts(fd, 4, libc::MSG_WAITFORONE, None));
+    let mut bad = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000_000,
+    };
+    out.push(recvmmsg_firsts(fd, 4, libc::MSG_DONTWAIT, Some(&mut bad)));
+    send(9);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let mut zero = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    out.push(recvmmsg_firsts(fd, 4, 0, Some(&mut zero)));
+    out
+}
+
+fn expected_recvmmsg_rounds() -> Vec<Result<Vec<u8>, i32>> {
+    vec![
+        Err(libc::EAGAIN),
+        Ok(vec![0, 1]),
+        Ok(vec![2]),
+        Err(libc::EINVAL),
+        Ok(vec![9]),
+    ]
+}
+
+#[test]
+fn recvmmsg_takes_what_is_queued_os_truth() {
+    let probe = || {
+        let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let to = rx.local_addr().unwrap();
+        recvmmsg_rounds(&rx, |i| {
+            tx.send_to(&[i], to).unwrap();
+        })
+    };
+    assert_eq!(probe(), expected_recvmmsg_rounds());
+    assert_eq!(Sim::new().run(probe), expected_recvmmsg_rounds());
+}
+
+#[test]
+fn recvmmsg_on_a_simhost_socket() {
+    Sim::builder()
+        .host(station_host(std::time::Duration::ZERO))
+        .build()
+        .run(|| {
+            let rx = std::net::UdpSocket::bind("10.0.0.10:7050").unwrap();
+            let station = std::net::UdpSocket::bind("10.0.0.20:0").unwrap();
+            let rounds = recvmmsg_rounds(&rx, |i| {
+                station.send_to(&[i], "10.0.0.10:7050").unwrap();
+            });
+            assert_eq!(rounds, expected_recvmmsg_rounds());
+        });
+}

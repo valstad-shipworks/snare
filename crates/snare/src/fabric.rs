@@ -1917,7 +1917,7 @@ impl Fabric {
             self.shared()
                 .unreachable_port(&rec, &sender, src, dest, data, station);
         }
-        if rec.finish_udp_send(dest, sender.egress_name()) {
+        if rec.finish_udp_send(dest, &sender) {
             self.shared().bump_keys(&[rec.wake_key()]);
         }
         ok(data.len() as i64)

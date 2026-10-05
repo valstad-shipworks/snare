@@ -579,6 +579,15 @@ pub trait Net: Send + Sync + 'static {
     /// Models `recvmmsg(2)` (Linux); `msgvec` is an array of `struct mmsghdr` (a `msghdr` plus a
     /// received-length field) and `timeout` a `struct timespec`.
     ///
+    /// The default receives each message with [`recvmsg`](Net::recvmsg), as `do_recvmmsg` in
+    /// net/socket.c does: up to `vlen` (at most `UIO_MAXIOV`, 1024), every one with `flags`
+    /// (which block, as the kernel's do, unless `MSG_WAITFORONE` adds `MSG_DONTWAIT` after the
+    /// first). `timeout` is checked only after a message arrives and is written back with the time
+    /// left, so it never cuts a wait short (man 2 recvmmsg, BUGS). An error ends the batch: with
+    /// no message yet it is the call's, otherwise the messages so far are returned and the error
+    /// is dropped where the kernel would keep it for the next call. Declines when `recvmsg` declines
+    /// the first message.
+    ///
     /// # Safety
     /// `msgvec` points to `vlen` `mmsghdr` slots; `timeout`, when non-null, is a `timespec`.
     unsafe fn recvmmsg(
@@ -589,8 +598,15 @@ pub trait Net: Send + Sync + 'static {
         flags: c_int,
         timeout: *mut u8,
     ) -> Option<NetResult> {
-        let _ = (fd, msgvec, vlen, flags, timeout);
-        None
+        #[cfg(target_os = "linux")]
+        {
+            unsafe { crate::os::recvmmsg_each(self, fd, msgvec, vlen, flags, timeout) }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (fd, msgvec, vlen, flags, timeout);
+            None
+        }
     }
 
     /// Models `select`: each non-null native `fd_set` is reduced to its ready descriptors.

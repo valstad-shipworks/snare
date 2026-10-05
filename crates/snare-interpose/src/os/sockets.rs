@@ -59,6 +59,8 @@ slot!(FCNTL);
 slot!(IF_NAMETOINDEX);
 slot!(SENDMSG);
 slot!(RECVMSG);
+#[cfg(target_os = "linux")]
+slot!(RECVMMSG);
 slot!(GETIFADDRS);
 slot!(FREEIFADDRS);
 #[cfg(target_os = "linux")]
@@ -119,6 +121,8 @@ pub(crate) fn hooks() -> Vec<Hook> {
         hook!("if_freenameindex", if_freenameindex, IF_FREENAMEINDEX),
         hook!("sendmsg", sendmsg, SENDMSG),
         hook!("recvmsg", recvmsg, RECVMSG),
+        #[cfg(target_os = "linux")]
+        hook!("recvmmsg", recvmmsg, RECVMMSG),
         hook!("getifaddrs", getifaddrs, GETIFADDRS),
         hook!("freeifaddrs", freeifaddrs, FREEIFADDRS),
         #[cfg(target_os = "linux")]
@@ -391,6 +395,93 @@ unsafe extern "C" fn recvmsg(fd: c_int, msg: *mut libc::msghdr, flags: c_int) ->
             fd, msg, flags,
         )
     }
+}
+
+/// Hook for `recvmmsg(2)`, offered only for an fd a backend owns.
+#[cfg(target_os = "linux")]
+unsafe extern "C" fn recvmmsg(
+    fd: c_int,
+    msgvec: *mut libc::mmsghdr,
+    vlen: libc::c_uint,
+    flags: c_int,
+    timeout: *mut libc::timespec,
+) -> c_int {
+    // SAFETY: `msgvec` holds `vlen` mmsghdrs and `timeout` is null or a timespec, the caller's.
+    if net_owns(fd)
+        && let Some(r) = dispatch_net(|net| unsafe {
+            net.recvmmsg(fd, msgvec.cast(), vlen, flags, timeout.cast())
+        })
+    {
+        return finish(r) as c_int;
+    }
+    domain::observe("recvmmsg", None);
+    type RecvmmsgFn =
+        unsafe extern "C" fn(c_int, *mut libc::mmsghdr, libc::c_uint, c_int, *mut libc::timespec) -> c_int;
+    // SAFETY: RECVMMSG holds libc's recvmmsg.
+    unsafe { original::<RecvmmsgFn>(&RECVMMSG)(fd, msgvec, vlen, flags, timeout) }
+}
+
+/// The default [`Net::recvmmsg`](crate::Net::recvmmsg): one `recvmsg` per message.
+///
+/// # Safety
+/// As [`Net::recvmmsg`](crate::Net::recvmmsg).
+#[cfg(target_os = "linux")]
+pub(crate) unsafe fn recvmmsg_each<N: crate::Net + ?Sized>(
+    net: &N,
+    fd: c_int,
+    msgvec: *mut u8,
+    vlen: u32,
+    flags: c_int,
+    timeout: *mut u8,
+) -> Option<crate::NetResult> {
+    use crate::NetResult::{Err, Ok};
+    const UIO_MAXIOV: u32 = 1024;
+    let messages = msgvec.cast::<libc::mmsghdr>();
+    let timeout = timeout.cast::<libc::timespec>();
+    let started = std::time::Instant::now();
+    let now = || crate::domain::virtual_now().unwrap_or_else(|| started.elapsed());
+    let end = if timeout.is_null() {
+        None
+    } else {
+        // SAFETY: a non-null `timeout` is the caller's timespec.
+        let t = unsafe { timeout.read() };
+        if t.tv_sec < 0 || !(0..1_000_000_000).contains(&t.tv_nsec) {
+            return Some(Err(libc::EINVAL));
+        }
+        Some(now() + std::time::Duration::new(t.tv_sec as u64, t.tv_nsec as u32))
+    };
+    let mut flags = flags;
+    let mut received = 0;
+    while received < vlen.min(UIO_MAXIOV) {
+        // SAFETY: `received` is below `vlen`, so the slot is the caller's.
+        let entry = unsafe { messages.add(received as usize) };
+        let hdr = unsafe { &raw mut (*entry).msg_hdr };
+        match unsafe { net.recvmsg(fd, hdr.cast(), flags & !libc::MSG_WAITFORONE) } {
+            Some(Ok(n)) => unsafe { (*entry).msg_len = n as libc::c_uint },
+            Some(Err(errno)) if received == 0 => return Some(Err(errno)),
+            Some(Err(_)) => break,
+            None if received == 0 => return None,
+            None => break,
+        }
+        received += 1;
+        if flags & libc::MSG_WAITFORONE != 0 {
+            flags |= libc::MSG_DONTWAIT;
+        }
+        if let Some(end) = end {
+            let left = end.saturating_sub(now());
+            // SAFETY: as above.
+            unsafe {
+                timeout.write(libc::timespec {
+                    tv_sec: left.as_secs() as libc::time_t,
+                    tv_nsec: left.subsec_nanos() as libc::c_long,
+                })
+            };
+            if left.is_zero() {
+                break;
+            }
+        }
+    }
+    Some(Ok(received.into()))
 }
 
 /// Hook for `getifaddrs(3)`: a backend may answer with its own simulated interface list.

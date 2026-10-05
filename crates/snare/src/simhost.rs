@@ -2065,15 +2065,16 @@ impl HostState {
         }
     }
 
-    /// Build the reply to a netlink request. `RTM_GETLINK` yields a link dump, `RTM_GETQDISC`
+    /// Build the reply to a netlink request. `RTM_GETLINK` yields a link dump, or with no
+    /// `NLM_F_DUMP` bit the one link [`getlink_one`](Self::getlink_one) picks, `RTM_GETQDISC`
     /// every interface's qdiscs, `RTM_NEWQDISC`/`RTM_DELQDISC` change them (see
     /// [`change_qdisc`](Self::change_qdisc)) and answer with an `NLMSG_ERROR` carrying the error,
     /// or 0 when `NLM_F_ACK` asked for an ack, or nothing; `GENL_ID_CTRL` a genetlink family
     /// lookup; any other type yields a bare `NLMSG_DONE` (harmless for the requests this models).
     /// Protocol: man 7 netlink / man 7 rtnetlink; message and attribute types in
     /// `<linux/rtnetlink.h>`. `RTM_GETADDR` and `RTM_GETROUTE` dump the topology's addresses and
-    /// routes. Only the first message of `req` is read, and `NLM_F_DUMP` is not inspected: every
-    /// `GET` is answered as a dump.
+    /// routes. Only the first message of `req` is read, and `NLM_F_DUMP` is inspected for
+    /// `RTM_GETLINK` alone: every other `GET` is answered as a dump.
     ///
     /// The header fields are read at their `struct nlmsghdr` offsets (include/uapi/linux/netlink.h):
     /// `nlmsg_type` at 4, `nlmsg_seq` at 8; the byte at 16 is the first byte of the payload, the
@@ -2091,6 +2092,7 @@ impl HostState {
         const GENL_ID_CTRL: u16 = 16;
         const NLMSG_ERROR: u16 = 2;
         const NLM_F_ACK: u16 = 4;
+        const NLM_F_DUMP: u16 = 0x300;
         let (ty, seq) = if req.len() >= 12 {
             (
                 u16::from_ne_bytes([req[4], req[5]]),
@@ -2101,6 +2103,17 @@ impl HostState {
         };
         let family = req.get(16).copied().unwrap_or(0);
         match ty {
+            RTM_GETLINK if u16::from_ne_bytes([req[6], req[7]]) & NLM_F_DUMP == 0 => {
+                match self.getlink_one(req) {
+                    Ok(reply) => reply,
+                    Err(errno) => {
+                        let mut body = Vec::new();
+                        body.extend_from_slice(&(-errno).to_ne_bytes());
+                        body.extend_from_slice(&req[..req.len().min(16)]);
+                        nl_message(NLMSG_ERROR, 0, seq, &body)
+                    }
+                }
+            }
             RTM_GETLINK => {
                 let nics = self.topo_nics();
                 let links: Vec<(&NicSnapshot, String)> =
@@ -2137,6 +2150,34 @@ impl HostState {
             GENL_ID_CTRL => build_genl_ctrl_reply(req, seq),
             _ => build_getlink_dump(&[], seq),
         }
+    }
+
+    /// The reply to an `RTM_GETLINK` without `NLM_F_DUMP`: the one `RTM_NEWLINK` of the interface
+    /// named by the `ifinfomsg`'s `ifi_index` (offset 20), or when that is 0 by an `IFLA_IFNAME`
+    /// attribute, with no `NLM_F_MULTI` and no `NLMSG_DONE`. `ENODEV` names no interface, and a
+    /// request naming none at all, or too short for an `ifinfomsg`, is `EINVAL` (`rtnl_getlink`
+    /// and `rtnl_valid_getlink_req` in net/core/rtnetlink.c).
+    #[cfg(target_os = "linux")]
+    fn getlink_one(&self, req: &[u8]) -> Result<Vec<u8>, c_int> {
+        const IFLA_IFNAME: u16 = 3;
+        if req.len() < 32 {
+            return Err(libc::EINVAL);
+        }
+        let seq = u32::from_ne_bytes(req[8..12].try_into().unwrap());
+        let index = i32::from_ne_bytes(req[20..24].try_into().unwrap());
+        let len = (u32::from_ne_bytes(req[0..4].try_into().unwrap()) as usize).clamp(32, req.len());
+        let name = find_nlattr(&req[32..len], IFLA_IFNAME)
+            .map(|data| data.split(|&b| b == 0).next().unwrap_or_default());
+        let nics = self.topo_nics();
+        let nic = if index > 0 {
+            nics.iter().find(|n| n.index as i32 == index)
+        } else if let Some(name) = name {
+            nics.iter().find(|n| n.spec.name.as_bytes() == name)
+        } else {
+            return Err(libc::EINVAL);
+        }
+        .ok_or(libc::ENODEV)?;
+        Ok(getlink_message(nic, &self.operstate(nic), 0, seq))
     }
 
     /// Queues the reply to netlink request `req` on socket `fd`, if the kernel would send one.
@@ -2558,7 +2599,7 @@ impl SimHost {
             crate::tstamp::looped_frame(src, dest, false, &data)
         });
         rec.note_tx_nic(sender.egress_name());
-        rec.count_udp_sent(dest);
+        rec.count_udp_sent(dest, &sender);
         drop(state);
         shared.capture_udp(
             &sender,
@@ -4985,6 +5026,17 @@ fn oper_code(state: &str) -> u8 {
 /// with the operstate string [`HostState::operstate`] computed for it.
 #[cfg(target_os = "linux")]
 fn build_getlink_dump(nics: &[(&NicSnapshot, String)], seq: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (nic, operstate) in nics {
+        out.extend_from_slice(&getlink_message(nic, operstate, NLM_F_MULTI, seq));
+    }
+    nl_done(&mut out, seq);
+    out
+}
+
+/// One `RTM_NEWLINK` of an [`RTM_GETLINK`](build_getlink_dump) reply, with header `flags`.
+#[cfg(target_os = "linux")]
+fn getlink_message(nic: &NicSnapshot, operstate: &str, flags: u16, seq: u32) -> Vec<u8> {
     const RTM_NEWLINK: u16 = 16;
     const IFLA_ADDRESS: u16 = 1;
     const IFLA_BROADCAST: u16 = 2;
@@ -4996,58 +5048,53 @@ fn build_getlink_dump(nics: &[(&NicSnapshot, String)], seq: u32) -> Vec<u8> {
     const ARPHRD_ETHER: u16 = 1;
     const ARPHRD_LOOPBACK: u16 = 772;
 
-    let mut out = Vec::new();
-    for (nic, operstate) in nics {
-        let mut body = Vec::new();
-        body.push(0); // ifi_family = AF_UNSPEC
-        body.push(0);
-        let hatype = if nic.loopback {
-            ARPHRD_LOOPBACK
-        } else {
-            ARPHRD_ETHER
-        };
-        body.extend_from_slice(&hatype.to_ne_bytes());
-        body.extend_from_slice(&(nic.index as i32).to_ne_bytes());
-        body.extend_from_slice(&crate::ifaddrs::flags(nic).to_ne_bytes()); // ifi_flags
-        body.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change
-        push_rtattr(&mut body, IFLA_IFNAME, nic.spec.name.as_bytes(), true);
-        push_rtattr(&mut body, IFLA_MTU, &nic.spec.mtu.to_ne_bytes(), false);
-        push_rtattr(&mut body, IFLA_OPERSTATE, &[oper_code(operstate)], false);
-        push_rtattr(
-            &mut body,
-            IFLA_CARRIER,
-            &[u8::from(nic.spec.carrier)],
-            false,
-        );
-        push_rtattr(&mut body, IFLA_ADDRESS, &nic.hw_addr(), false);
-        let broadcast = if nic.loopback { [0; 6] } else { [0xff; 6] };
-        push_rtattr(&mut body, IFLA_BROADCAST, &broadcast, false);
-        // struct rtnl_link_stats64 (<linux/if_link.h>) up to rx_nohandler: 24 __u64 counters,
-        // tx_carrier_errors at index 17, rx_nohandler at 23. Newer kernels append
-        // rx_otherhost_dropped; readers take the attribute length as given.
-        let c = &nic.counters;
-        let mut stats = [0u64; 24];
-        for (i, v) in [
-            (0, c.rx_packets),
-            (1, c.tx_packets),
-            (2, c.rx_bytes),
-            (3, c.tx_bytes),
-            (4, c.rx_errors),
-            (5, c.tx_errors),
-            (6, c.rx_dropped),
-            (7, c.tx_dropped),
-            (8, c.multicast),
-            (17, c.tx_carrier_errors),
-            (23, c.rx_nohandler),
-        ] {
-            stats[i] = v;
-        }
-        let stats: Vec<u8> = stats.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        push_rtattr(&mut body, IFLA_STATS64, &stats, false);
-        out.extend_from_slice(&nl_message(RTM_NEWLINK, NLM_F_MULTI, seq, &body));
+    let mut body = Vec::new();
+    body.push(0); // ifi_family = AF_UNSPEC
+    body.push(0);
+    let hatype = if nic.loopback {
+        ARPHRD_LOOPBACK
+    } else {
+        ARPHRD_ETHER
+    };
+    body.extend_from_slice(&hatype.to_ne_bytes());
+    body.extend_from_slice(&(nic.index as i32).to_ne_bytes());
+    body.extend_from_slice(&crate::ifaddrs::flags(nic).to_ne_bytes()); // ifi_flags
+    body.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change
+    push_rtattr(&mut body, IFLA_IFNAME, nic.spec.name.as_bytes(), true);
+    push_rtattr(&mut body, IFLA_MTU, &nic.spec.mtu.to_ne_bytes(), false);
+    push_rtattr(&mut body, IFLA_OPERSTATE, &[oper_code(operstate)], false);
+    push_rtattr(
+        &mut body,
+        IFLA_CARRIER,
+        &[u8::from(nic.spec.carrier)],
+        false,
+    );
+    push_rtattr(&mut body, IFLA_ADDRESS, &nic.hw_addr(), false);
+    let broadcast = if nic.loopback { [0; 6] } else { [0xff; 6] };
+    push_rtattr(&mut body, IFLA_BROADCAST, &broadcast, false);
+    // struct rtnl_link_stats64 (<linux/if_link.h>) up to rx_nohandler: 24 __u64 counters,
+    // tx_carrier_errors at index 17, rx_nohandler at 23. Newer kernels append
+    // rx_otherhost_dropped; readers take the attribute length as given.
+    let c = &nic.counters;
+    let mut stats = [0u64; 24];
+    for (i, v) in [
+        (0, c.rx_packets),
+        (1, c.tx_packets),
+        (2, c.rx_bytes),
+        (3, c.tx_bytes),
+        (4, c.rx_errors),
+        (5, c.tx_errors),
+        (6, c.rx_dropped),
+        (7, c.tx_dropped),
+        (8, c.multicast),
+        (17, c.tx_carrier_errors),
+        (23, c.rx_nohandler),
+    ] {
+        stats[i] = v;
     }
-    nl_done(&mut out, seq);
-    out
+    let stats: Vec<u8> = stats.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    push_rtattr(&mut body, IFLA_STATS64, &stats, false);
+    nl_message(RTM_NEWLINK, flags, seq, &body)
 }
 
 /// The `rtm_scope` / `ifa_scope` of an address (`<linux/rtnetlink.h>`): host for loopback, link
@@ -5934,8 +5981,10 @@ impl Net for SimHost {
     }
 
     /// Scatters a netlink reply or a datagram into the iovecs and fills name, control messages
-    /// and flags (man 2 recvmsg). Never blocks: an empty queue is `EAGAIN`. `MSG_ERRQUEUE`
-    /// returns the oldest arrived ICMP report or transmit stamp.
+    /// and flags (man 2 recvmsg). A blocking datagram receive waits as [`recvfrom`](Self::recvfrom)
+    /// does; a nonblocking one, a netlink socket and `MSG_ERRQUEUE` never wait, and are `EAGAIN`
+    /// with nothing queued. `MSG_ERRQUEUE` returns the oldest arrived ICMP report or transmit
+    /// stamp.
     /// Control messages: the receive timestamps the socket asked for (`tstamp::rx_cmsgs`), then
     /// the `SO_RXQ_OVFL` drop count when enabled and non-zero (man 7 socket).
     /// `MSG_TRUNC`/`MSG_CTRUNC` flag a short data or control buffer.
@@ -6001,31 +6050,52 @@ impl Net for SimHost {
             snare_interpose::charge_latency();
             return err(libc::EAGAIN);
         }
-        if !errqueue {
-            let shared = self.shared()?;
-            drop(state);
+        let wait = !sock.nonblocking && flags & libc::MSG_DONTWAIT == 0;
+        let shared = self.shared()?;
+        drop(state);
+        let deadline = rec.opts().rcvtimeo.map(crate::readiness::Deadline::timeout);
+        let (dg, drops) = loop {
             rec.land();
             if let Some(errno) = rec.take_error_as(&shared, crate::sockets::Taker::Recv) {
                 return err(errno);
             }
-            state = self.state.lock().unwrap();
-        }
-        let sock = state.udp.get_mut(&fd)?;
-        let got = if flags & libc::MSG_PEEK != 0 {
-            sock.rx.peek(|_| true, Some(&sock.rec))
-        } else {
-            sock.rx.pop(|_| true, Some(&sock.rec))
-        };
-        let Some((dg, drops)) = got else {
-            // Drivers poll the error queue for TX timestamps in a loop: charge the miss so the
-            // poll lets a discrete clock move. Released first, since charging can wake waiters.
-            drop(state);
-            snare_interpose::charge_latency();
-            return err(libc::EAGAIN);
+            let got = {
+                let mut state = self.state.lock().unwrap();
+                let sock = state.udp.get_mut(&fd)?;
+                if flags & libc::MSG_PEEK != 0 {
+                    sock.rx.peek(|_| true, Some(&sock.rec))
+                } else {
+                    sock.rx.pop(|_| true, Some(&sock.rec))
+                }
+            };
+            if let Some(got) = got {
+                break got;
+            }
+            if !wait {
+                // Drivers poll for datagrams in a loop: charge the miss so the poll lets a
+                // discrete clock move.
+                snare_interpose::charge_latency();
+                return err(libc::EAGAIN);
+            }
+            if !crate::fabric::readiness().wait_until_on(
+                "udp recvmsg",
+                deadline,
+                &[rec.wake_key()],
+                || rec.pending_time(),
+                || {
+                    let mut state = self.state.lock().unwrap();
+                    rec.peek_error().is_some()
+                        || state
+                            .udp
+                            .get_mut(&fd)
+                            .is_some_and(|s| s.rx.has(|_| true, Some(&s.rec)))
+                },
+            ) {
+                return err(libc::EAGAIN);
+            }
         };
         self.clock.reach_realtime(dg.timestamp);
-        let rxq_ovfl = sock.rec.state().buf.rxq_ovfl;
-        drop(state);
+        let rxq_ovfl = rec.state().buf.rxq_ovfl;
 
         let copied = unsafe { crate::fabric::scatter(hdr, &dg.data) };
         // Write the source address into the name buffer, if the caller supplied one.
