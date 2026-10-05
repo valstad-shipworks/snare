@@ -179,8 +179,8 @@ fn connected_wildcard_keeps_its_port_on_an_interface() {
             first.local_addr().unwrap().ip(),
             IpAddr::from([10, 0, 0, 1])
         );
-        let again = UdpSocket::bind("0.0.0.0:47617").map(|_| ());
-        assert_eq!(code(again), Err(libc::EADDRINUSE));
+        let again = UdpSocket::bind("0.0.0.0:47617").unwrap_err();
+        assert_eq!(again.kind(), std::io::ErrorKind::AddrInUse);
     });
 }
 
