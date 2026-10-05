@@ -42,8 +42,26 @@ jobs:
       - name: Build interpose-probe
         run: cargo build -p interpose-probe --target ${{ matrix.platform.target }}
 
+      # The runner's systemd-resolved also answers /etc/hosts names over DNS, so glibc reports a
+      # hosts-file name with no address of the asked family as EAI_NODATA. The host-truth DNS tests
+      # compare against a resolver where hosts-file names come from the hosts file alone.
+      - name: Resolve hosts-file names from the hosts file only
+        if: runner.os == 'Linux'
+        run: |
+          sudo mkdir -p /etc/systemd/resolved.conf.d
+          printf '[Resolve]\nReadEtcHosts=no\n' | sudo tee /etc/systemd/resolved.conf.d/no-etc-hosts.conf
+          sudo systemctl restart systemd-resolved
+
       - name: Tests
-        run: cargo test --workspace --target ${{ matrix.platform.target }}
+        if: runner.os != 'macOS'
+        run: cargo test --workspace --no-fail-fast --target ${{ matrix.platform.target }}
+
+      # The scale tests hold over 16k sockets; the macOS runner's default limit is 256.
+      - name: Tests (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          ulimit -n "$(sysctl -n kern.maxfilesperproc)"
+          cargo test --workspace --no-fail-fast --target ${{ matrix.platform.target }}
 
   shims:
     runs-on: ubuntu-latest
