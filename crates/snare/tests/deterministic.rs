@@ -190,6 +190,76 @@ fn randomness_across_threads_replays() {
     assert_eq!(hashes.len(), 3);
 }
 
+/// A lock in static data, held most of the time by a thread outside every sim.
+#[cfg(target_os = "macos")]
+static HELD_OUTSIDE: Mutex<()> = Mutex::new(());
+
+/// Scheduled threads take a lock a thread outside the sim keeps busy, while the threads they spawn
+/// start and exit beside the baton: each contended take waits for the outside holder in real time
+/// without letting another scheduled thread run, so the order replays however long those waits
+/// and the children's startups take. macOS only: there a pthread mutex names its owner, while a
+/// Linux futex word or Windows address word does not and gets only a short grace for an outside
+/// holder (OPEN_BUGS.md, "Locks held outside the sim").
+#[cfg(target_os = "macos")]
+#[test]
+fn a_lock_held_outside_the_sim_does_not_reorder_threads_starting_beside_it() {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let holder = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let spin = |span| {
+                let until = Instant::now() + span;
+                while Instant::now() < until {}
+            };
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let held = HELD_OUTSIDE.lock().unwrap();
+                spin(Duration::from_micros(50));
+                drop(held);
+                // macOS mutexes are not fair: a holder that relocks at once starves the waiters.
+                std::thread::sleep(Duration::from_micros(50));
+            }
+        })
+    };
+    let scenario = || {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let workers: Vec<_> = (0..8)
+            .map(|w| {
+                let log = log.clone();
+                std::thread::spawn(move || {
+                    for step in 0..20 {
+                        let children: Vec<_> = (0..4)
+                            .map(|_| {
+                                let child = std::thread::spawn(|| {});
+                                drop(HELD_OUTSIDE.lock().unwrap());
+                                child
+                            })
+                            .collect();
+                        log.lock().unwrap().push((w, step));
+                        for child in children {
+                            child.join().unwrap();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        Arc::try_unwrap(log).unwrap().into_inner().unwrap()
+    };
+    let first = dsim(1).run(scenario);
+    for _ in 0..30 {
+        assert_eq!(
+            dsim(1).run(scenario),
+            first,
+            "the same seed must replay the same run"
+        );
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    holder.join().unwrap();
+    assert_eq!(first.len(), 160);
+}
+
 #[test]
 fn testers_run_under_the_schedule() {
     let line = replays(|| {

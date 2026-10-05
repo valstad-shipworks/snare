@@ -248,6 +248,9 @@ Supported model boundaries and unverified approximations. These do not establish
 - **Locks held outside the sim:** a wait on an ownerless lock held outside the sim can still let
   time skip. Linux futex and Windows `WaitOnAddress` waits in static data get a 1 ms real grace;
   an outside holder that keeps such a lock longer, and arbitrary heap-backed std mutexes, do not.
+  Under `deterministic()` such a wait then passes the baton, so the run's order depends on how
+  long the outside holder took (a holder descheduled on a loaded or single-CPU host exceeds the
+  grace). macOS pthread mutexes name their owner and keep the baton for an outside holder.
   std's one-time Windows Winsock startup, which holds its `Once` far longer, is run outside every
   domain before the first one is installed. macOS std `RwLock` and `Once` can park on ownerless
   semaphores. An external holder's `sim.busy()` lease prevents the incorrect skip; an

@@ -2207,6 +2207,7 @@ impl Accounting {
 
     #[cfg(target_os = "macos")]
     pub(crate) fn native_mutex_lineage(&self, mutex: usize) -> Option<u64> {
+        let _passthrough = Passthrough::enter();
         let owner = unsafe { crate::os::sync::native_mutex_owner(mutex) }?;
         match owner {
             crate::os::sync::NativeMutexOwner::ThreadId(id) => lock(&self.os_ids).get(&id).copied(),
