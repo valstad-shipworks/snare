@@ -67,6 +67,17 @@ can change which reports fit and drop:
   error for the next call (`do_recvmmsg`, net/socket.c).
 - On a plain sim (no `SimHost`), `sendmsg` with any control message fails with `EOPNOTSUPP`:
   `IP_PKTINFO`, `IP_TOS`, `SCM_TXTIME` and the rest are modelled only for a `SimHost`'s sockets.
+- A UDP `connect` on a socket bound to the wildcard address leaves its local address
+  unspecified: `getsockname` keeps reporting `0.0.0.0:<port>`, on a plain sim and on a `SimHost`
+  with an interface on the peer's subnet alike, where the kernel picks the route's source address
+  at connect time (`ip4_datagram_connect`, net/ipv4/datagram.c). Code that learns its source
+  address by connecting a UDP socket, for example to advertise it to a device, reads the wildcard.
+- Linux `SO_BUSY_POLL`, `SO_PREFER_BUSY_POLL` and `SO_BUSY_POLL_BUDGET` are unmodelled (see
+  README, "Unmodelled options and `strict_sockopts`"): setting them has no effect and, under
+  `strict_sockopts`, fails with `ENOPROTOOPT`, so busy-poll configuration cannot be exercised.
+- Linux `getsockopt(SOL_SOCKET, SO_DOMAIN)` is unmodelled: without `strict_sockopts` it reads 0
+  (`AF_UNSPEC`) rather than the socket's family, and under `strict_sockopts` it fails with
+  `ENOPROTOOPT`. `SO_PROTOCOL` is unmodelled the same way; `SO_TYPE` is modelled.
 
 - Completed TCP accept queues enforce the configured backlog, with host comparisons on macOS,
   Linux and Windows. Separate incomplete-handshake queues and simultaneous SYN/ACK completion
