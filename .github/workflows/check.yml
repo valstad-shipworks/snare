@@ -20,6 +20,10 @@ jobs:
     runs-on: ${{ matrix.platform.os }}
     name: ${{ matrix.platform.target }}
 
+    env:
+      # The real-time guards' budgets are calibrated on a developer machine.
+      SNARE_PERF_SCALE: 4
+
     steps:
       - uses: actions/checkout@v4
 

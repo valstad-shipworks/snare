@@ -1,5 +1,6 @@
 //! Coarse real-time guards against pathological slowdowns. Each workload retains a generous
 //! budget calibrated on macOS and Linux in Docker, including debug-build overhead.
+//! `SNARE_PERF_SCALE` multiplies every budget for slower machines, such as shared CI runners.
 
 #![cfg(unix)]
 
@@ -8,9 +9,19 @@ use std::time::{Duration, Instant};
 
 use snare::Sim;
 
+/// `bound` multiplied by `SNARE_PERF_SCALE`, if set.
+fn scaled(bound: Duration) -> Duration {
+    let scale = std::env::var("SNARE_PERF_SCALE")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(1.0);
+    bound.mul_f64(scale)
+}
+
 /// Runs `f` on a fresh sim and fails if it took longer than `bound` of real time.
 #[track_caller]
 fn guard(what: &str, bound: Duration, f: impl FnOnce()) {
+    let bound = scaled(bound);
     let sim = Sim::new();
     let took = sim.run(|| {
         let start = snare::real(Instant::now);
@@ -127,7 +138,7 @@ fn a_hundred_sims() {
         Sim::new().run(|| ());
     }
     let took = start.elapsed();
-    let bound = Duration::from_millis(250);
+    let bound = scaled(Duration::from_millis(250));
     eprintln!("100 sims: {took:?} (bound {bound:?})");
     assert!(
         took < bound,
