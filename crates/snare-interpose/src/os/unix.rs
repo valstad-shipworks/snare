@@ -140,8 +140,6 @@ fn observed_hooks() -> Vec<Hook> {
             [pid, path, actions, attributes, arguments, environment]
         ),
         #[cfg(target_os = "linux")]
-        observed!("sendmmsg", [fd, messages, count, flags]),
-        #[cfg(target_os = "linux")]
         observed!("ppoll", [fds, count, timeout, mask]),
         #[cfg(target_os = "linux")]
         hook!("syscall", syscall, SYSCALL).observed(),

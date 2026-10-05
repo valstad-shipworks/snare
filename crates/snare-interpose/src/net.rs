@@ -560,6 +560,35 @@ pub trait Net: Send + Sync + 'static {
         None
     }
 
+    /// `sendmmsg(fd, msgvec, vlen, flags)`: send up to `vlen` messages at once.
+    ///
+    /// Models `sendmmsg(2)` (Linux); `msgvec` is an array of `struct mmsghdr`. The default sends
+    /// each message with [`sendmsg`](Net::sendmsg), as `__sys_sendmmsg` in net/socket.c does: up
+    /// to `vlen` (at most `UIO_MAXIOV`, 1024), recording each one's byte count in its `msg_len`.
+    /// An error ends the batch: with no message sent it is the call's, otherwise the count sent so
+    /// far is returned and the error dropped, as the kernel drops it. Declines when `sendmsg`
+    /// declines the first message.
+    ///
+    /// # Safety
+    /// `msgvec` points to `vlen` `mmsghdr` slots.
+    unsafe fn sendmmsg(
+        &self,
+        fd: c_int,
+        msgvec: *mut u8,
+        vlen: u32,
+        flags: c_int,
+    ) -> Option<NetResult> {
+        #[cfg(target_os = "linux")]
+        {
+            unsafe { crate::os::sendmmsg_each(self, fd, msgvec, vlen, flags) }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (fd, msgvec, vlen, flags);
+            None
+        }
+    }
+
     /// `recvmsg(fd, msg, flags)`: scatter-gather receive yielding control messages (e.g.
     /// `SCM_TIMESTAMPING`, or an error-queue entry under `MSG_ERRQUEUE`).
     ///

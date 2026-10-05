@@ -25,7 +25,7 @@ mod signal_hooks;
 #[cfg(unix)]
 mod sockets;
 #[cfg(target_os = "linux")]
-pub(crate) use sockets::recvmmsg_each;
+pub(crate) use sockets::{recvmmsg_each, sendmmsg_each};
 #[cfg(unix)]
 pub(crate) mod sync;
 #[cfg(unix)]

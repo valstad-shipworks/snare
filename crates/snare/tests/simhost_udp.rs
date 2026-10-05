@@ -685,3 +685,68 @@ fn recvmmsg_on_a_simhost_socket() {
             assert_eq!(rounds, expected_recvmmsg_rounds());
         });
 }
+
+/// `sendmmsg` of three datagrams of 1, 2 and 3 bytes to `to`: the call's result and each
+/// message's `msg_len`.
+fn sendmmsg_three(fd: i32, to: std::net::SocketAddr) -> (i32, Vec<u32>) {
+    let std::net::SocketAddr::V4(to) = to else {
+        unreachable!()
+    };
+    let mut dest = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: to.port().to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(to.ip().octets()),
+        },
+        sin_zero: [0; 8],
+    };
+    let payloads = [vec![1u8], vec![2u8; 2], vec![3u8; 3]];
+    let mut iovs: Vec<libc::iovec> = payloads
+        .iter()
+        .map(|p| libc::iovec {
+            iov_base: p.as_ptr() as *mut _,
+            iov_len: p.len(),
+        })
+        .collect();
+    let mut msgs: Vec<libc::mmsghdr> = iovs
+        .iter_mut()
+        .map(|iov| {
+            let mut m: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            m.msg_hdr.msg_name = (&raw mut dest).cast();
+            m.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
+            m.msg_hdr.msg_iov = iov;
+            m.msg_hdr.msg_iovlen = 1;
+            m
+        })
+        .collect();
+    let n = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), 3, 0) };
+    (n, msgs.iter().map(|m| m.msg_len).collect())
+}
+
+#[test]
+fn sendmmsg_sends_each_message_os_truth() {
+    use std::os::fd::AsRawFd;
+    let probe = || {
+        let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sent = sendmmsg_three(tx.as_raw_fd(), rx.local_addr().unwrap());
+        let mut buf = [0u8; 8];
+        let got: Vec<usize> = (0..3).map(|_| rx.recv(&mut buf).unwrap()).collect();
+        (sent, got)
+    };
+    let expected = ((3, vec![1, 2, 3]), vec![1, 2, 3]);
+    assert_eq!(probe(), expected);
+    assert_eq!(Sim::new().run(probe), expected);
+    let host = Sim::builder()
+        .host(station_host(std::time::Duration::ZERO))
+        .build()
+        .run(|| {
+            let rx = std::net::UdpSocket::bind("10.0.0.10:7060").unwrap();
+            let station = std::net::UdpSocket::bind("10.0.0.20:0").unwrap();
+            let sent = sendmmsg_three(rx.as_raw_fd(), station.local_addr().unwrap());
+            let mut buf = [0u8; 8];
+            let got: Vec<usize> = (0..3).map(|_| station.recv(&mut buf).unwrap()).collect();
+            (sent, got)
+        });
+    assert_eq!(host, expected);
+}
