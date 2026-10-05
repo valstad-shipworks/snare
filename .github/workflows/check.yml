@@ -42,12 +42,17 @@ jobs:
       - name: Build interpose-probe
         run: cargo build -p interpose-probe --target ${{ matrix.platform.target }}
 
-      # Windows runs every test. The Linux and macOS cells first give the runner what the
-      # host-truth tests compare against, then skip the comparisons whose host prerequisites a
-      # hosted runner cannot provide (see OPEN_BUGS.md for the Linux error-queue calibration).
+      # Each cell first gives the runner what the host-truth tests compare against; Linux and
+      # macOS then skip the comparisons whose host prerequisites a hosted runner cannot provide
+      # (see OPEN_BUGS.md for the Linux error-queue calibration).
+      # The runner starts jobs at BELOW_NORMAL_PRIORITY_CLASS, and children inherit it; the
+      # scheduling host-truth tests compare against a process started at NORMAL, as a desktop
+      # session starts it.
       - name: Tests (Windows)
         if: runner.os == 'Windows'
-        run: cargo test --workspace --no-fail-fast --target ${{ matrix.platform.target }}
+        run: |
+          (Get-Process -Id $PID).PriorityClass = 'Normal'
+          cargo test --workspace --no-fail-fast --target ${{ matrix.platform.target }}
 
       # The stub resolver also serves /etc/hosts names over DNS, so glibc would report a hosts-file
       # name asked in the wrong family as EAI_NODATA; the uplink resolver answers NXDOMAIN, as a
