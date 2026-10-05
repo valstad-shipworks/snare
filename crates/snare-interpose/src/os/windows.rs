@@ -1904,6 +1904,14 @@ pub fn performance_count(monotonic: Duration) -> u64 {
     (monotonic.as_nanos() * counter_frequency() / 1_000_000_000) as u64
 }
 
+/// The first monotonic time after `monotonic` at which the hooked `QueryPerformanceCounter` reads
+/// a higher count than at `monotonic`: the earliest a reader of the counter sees time pass.
+pub fn next_performance_count(monotonic: Duration) -> Duration {
+    let frequency = counter_frequency();
+    let next = monotonic.as_nanos() * frequency / 1_000_000_000 + 1;
+    Duration::from_nanos((next * 1_000_000_000).div_ceil(frequency) as u64)
+}
+
 /// `QueryPerformanceCounter`: the high-resolution monotonic tick count; returns a nonzero `BOOL`
 /// on success ([Microsoft Learn: QueryPerformanceCounter](https://learn.microsoft.com/en-us/windows/win32/api/profileapi/nf-profileapi-queryperformancecounter)).
 /// std's `Instant` reads it.

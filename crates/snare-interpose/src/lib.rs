@@ -151,7 +151,7 @@ on_supported_targets! {
     #[doc(hidden)]
     pub use os::joined_lists;
     #[cfg(windows)]
-    pub use os::performance_count;
+    pub use os::{next_performance_count, performance_count};
     pub use patch::{ImagePatches, InstallReport, install};
     #[doc(hidden)]
     pub use race::RaceCell;

@@ -105,7 +105,7 @@ fn jump(exec: &Executive, t: Duration) -> u32 {
 }
 
 #[test]
-fn so_timestamping_rx_stamps_equal_the_jump_target_and_the_phc_follows_the_driven_clock() {
+fn so_timestamping_rx_stamps_follow_the_landing_and_the_phc_follows_the_driven_clock() {
     let caps = PtpCaps {
         cross_timestamping: true,
         ..PtpCaps::default()
@@ -171,15 +171,23 @@ fn so_timestamping_rx_stamps_equal_the_jump_target_and_the_phc_follows_the_drive
         assert_eq!(jump(&exec, Duration::from_secs(1)), 1);
         assert_eq!(exec.now(), 7 * MS);
         assert_eq!(jump(&exec, Duration::from_secs(1)), 1);
-        assert_eq!(exec.now(), 20 * MS);
+        let ns = Duration::from_nanos(1);
+        assert!(
+            (20 * MS + ns..=20 * MS + 2 * ns).contains(&exec.now()),
+            "the sleep began 1 ns past the first landing"
+        );
         let (stamp, (phc1, real1), (phc2, real2)) = run.join().unwrap();
         let at = |t: Duration| EPOCH_NANOS + t.as_nanos() as u64;
-        assert_eq!(stamp, at(7 * MS), "the rx stamp is the jump target");
-        assert_eq!(real1, at(7 * MS));
+        assert_eq!(
+            stamp,
+            at(7 * MS + ns),
+            "the rx stamp is the landing, crept past by the send"
+        );
+        assert_eq!(real1, at(7 * MS + ns));
         assert_eq!(phc1, real1.wrapping_add_signed(PHC_OFFSET));
         assert_eq!(
             real2,
-            at(20 * MS),
+            at(20 * MS + 2 * ns),
             "the PHC moves only with the driven clock"
         );
         assert_eq!(phc2, real2.wrapping_add_signed(PHC_OFFSET));

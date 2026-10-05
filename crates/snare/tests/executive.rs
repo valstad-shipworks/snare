@@ -1048,6 +1048,14 @@ fn deadline_loop(timeout: Duration) -> Duration {
     start.elapsed()
 }
 
+/// The most a wait landed on by the clock runs past its deadline: 1 ns, or on Windows one
+/// `QueryPerformanceCounter` tick, at most a microsecond.
+const CREEP: Duration = if cfg!(windows) {
+    Duration::from_micros(1)
+} else {
+    Duration::from_nanos(1)
+};
+
 /// Joins `run`, failing the test if it has not finished within ten seconds of real time.
 fn join_soon<T>(run: thread::ScopedJoinHandle<'_, T>) -> T {
     let start = real_now();
@@ -1071,7 +1079,7 @@ fn a_wait_landed_on_by_a_jump_times_out() {
         assert_eq!(jump(&exec, Duration::from_secs(1)), 1);
         let waited = join_soon(run);
         assert!(
-            waited >= 30 * MS && waited <= 30 * MS + Duration::from_nanos(1),
+            waited >= 30 * MS && waited <= 30 * MS + CREEP,
             "the wait timed out {waited:?} in"
         );
     });
@@ -1088,7 +1096,7 @@ fn a_wait_landed_on_by_a_timestamp_times_out() {
         exec.leave_timestamp(30 * MS);
         let waited = join_soon(run);
         assert!(
-            waited >= 30 * MS && waited <= 30 * MS + Duration::from_nanos(1),
+            waited >= 30 * MS && waited <= 30 * MS + CREEP,
             "the wait timed out {waited:?} in"
         );
     });
