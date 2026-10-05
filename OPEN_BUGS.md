@@ -125,10 +125,12 @@ cases on that host, not every Winsock hook or supported Windows release.
   `SetProcessInformation`/`SetThreadInformation` classes (memory priority, app memory, dynamic
   code policy, ...) still reach the real process. `GetThreadInformation`'s rules for a short or
   long buffer and a version of 0 are assumed to be the setter's, and are unmeasured.
-- CPU sets: `GetSystemCpuSetInformation` reports one core per logical processor, last-level
-  cache 0 and no flags (`Parked`, `Allocated`, `RealTime`, efficiency classes), whatever the
-  real machine's topology; its `Process` and `Flags` arguments are ignored. Selected CPU sets do
-  not interact with `SetThreadAffinityMask` as they do on Windows.
+- CPU sets: `GetSystemCpuSetInformation` groups logical processors into uniform cores of
+  `SimBuilder::threads_per_core`, all in NUMA node 0 and last-level cache 0 with no flags
+  (`Parked`, `Allocated`, `RealTime`) and efficiency class 0, so hybrid machines with cores of
+  different sizes or classes, several caches or nodes are not represented; its `Process` and
+  `Flags` arguments are ignored. Selected CPU sets do not interact with `SetThreadAffinityMask` as
+  they do on Windows.
 - Timers created through `CreateWaitableTimerW/A` and `CreateWaitableTimerExW/A` support unnamed
   relative/absolute deadlines, periodic auto/manual-reset signals, same-process handle aliases,
   cancellation,

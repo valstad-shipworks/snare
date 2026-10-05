@@ -301,6 +301,8 @@ const PHYSICAL_MEMORY: usize = 16 << 30;
 struct HostState {
     /// One bit per simulated logical CPU, low bits first; fixed at build.
     process_affinity: u64,
+    /// How many consecutive logical CPUs share a core; fixed at build.
+    threads_per_core: u32,
     /// The `*_PRIORITY_CLASS` value `GetPriorityClass` reports; starts `NORMAL_PRIORITY_CLASS`,
     /// the Windows default ([Microsoft Learn: Scheduling Priorities, Priority Class](https://learn.microsoft.com/en-us/windows/win32/procthread/scheduling-priorities)).
     priority_class: u32,
@@ -426,8 +428,9 @@ impl WinHost {
     /// and covers one processor group, "a static set of up to 64 logical processors"
     /// ([Microsoft Learn: Processor Groups](https://learn.microsoft.com/en-us/windows/win32/procthread/processor-groups)).
     /// 64 is special-cased because `1 << 64` overflows.
-    fn new(cpus: usize) -> Self {
+    fn new(cpus: usize, threads_per_core: usize) -> Self {
         let cpus = cpus.clamp(1, 64);
+        let threads_per_core = threads_per_core.clamp(1, cpus) as u32;
         let process_affinity = if cpus == 64 {
             u64::MAX
         } else {
@@ -436,6 +439,7 @@ impl WinHost {
         WinHost {
             state: Mutex::new(HostState {
                 process_affinity,
+                threads_per_core,
                 priority_class: NORMAL_PRIORITY_CLASS,
                 process_background: false,
                 threads: Vec::new(),
@@ -972,8 +976,10 @@ impl Host for WinHost {
     }
 
     /// One `CpuSetInformation` record per simulated logical processor, ids from
-    /// [`FIRST_CPU_SET`], in group 0, each its own core and NUMA node 0, efficiency class 0,
-    /// sharing last-level cache 0, no flags set. A buffer too small for all of them fails with
+    /// [`FIRST_CPU_SET`], in group 0 and NUMA node 0, efficiency class 0, sharing last-level
+    /// cache 0, no flags set. Each run of `threads_per_core` logical processors is one core, whose
+    /// `CoreIndex` is its first logical processor's index, as Windows reports SMT siblings
+    /// (measured on Windows Server 2025, 2 cores of 2 threads each). A buffer too small for all of them fails with
     /// `ERROR_INSUFFICIENT_BUFFER` and `*returned` the size needed.
     unsafe fn system_cpu_set_information(
         &self,
@@ -983,7 +989,10 @@ impl Host for WinHost {
         _process: u64,
         _flags: u32,
     ) -> Option<HostResult> {
-        let cpus = self.state.lock().unwrap().cpus();
+        let (cpus, threads_per_core) = {
+            let state = self.state.lock().unwrap();
+            (state.cpus(), state.threads_per_core)
+        };
         let need = cpus as usize * CPU_SET_RECORD;
         if !returned.is_null() {
             // SAFETY: the caller's out-pointer.
@@ -997,7 +1006,7 @@ impl Host for WinHost {
             record[0..4].copy_from_slice(&(CPU_SET_RECORD as u32).to_ne_bytes());
             record[8..12].copy_from_slice(&(FIRST_CPU_SET + cpu).to_ne_bytes());
             record[14] = cpu as u8;
-            record[15] = cpu as u8;
+            record[15] = (cpu - cpu % threads_per_core) as u8;
             // SAFETY: `need` bytes fit in the caller's `len`.
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -1662,6 +1671,8 @@ impl Sim {
 pub struct SimBuilder {
     /// `None` means the default of 8.
     cpus: Option<usize>,
+    /// `None` means the default of 1.
+    threads_per_core: Option<usize>,
     /// Set by [`wall_clock`](Self::wall_clock); overridden by `time_rate` and cleared by
     /// `deterministic`.
     wall_clock: bool,
@@ -1729,6 +1740,14 @@ impl SimBuilder {
     /// threads apart.
     pub fn cpus(mut self, count: usize) -> Self {
         self.cpus = Some(count);
+        self
+    }
+
+    /// How many hardware threads each core runs (default 1, clamped to 1..=[`cpus`](Self::cpus)):
+    /// consecutive logical CPUs are grouped into cores of this many, which
+    /// `GetSystemCpuSetInformation` reports as sharing a `CoreIndex`.
+    pub fn threads_per_core(mut self, count: usize) -> Self {
+        self.threads_per_core = Some(count);
         self
     }
 
@@ -1877,7 +1896,10 @@ impl SimBuilder {
         if let Some(limits) = self.sys_limits {
             shared.sys.set_limits(|l| *l = limits);
         }
-        let host = Arc::new(WinHost::new(self.cpus.unwrap_or(8)));
+        let host = Arc::new(WinHost::new(
+            self.cpus.unwrap_or(8),
+            self.threads_per_core.unwrap_or(1),
+        ));
         for (nic, adapter) in self.adapters {
             host.adapters.configure(&shared, &nic, adapter);
         }

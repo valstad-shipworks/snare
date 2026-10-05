@@ -43,6 +43,7 @@ unsafe extern "system" {
         count: u32,
         required: *mut u32,
     ) -> i32;
+    fn GetLogicalProcessorInformationEx(relationship: i32, info: *mut u8, len: *mut u32) -> i32;
     fn SetThreadSelectedCpuSets(thread: Handle, ids: *const u32, count: u32) -> i32;
     fn GetThreadSelectedCpuSets(
         thread: Handle,
@@ -343,6 +344,28 @@ fn cpu_sets() -> Vec<(u32, u32, u32, u16, u8, u8)> {
     out
 }
 
+/// How many logical processors the machine's first core runs, from its `RelationProcessorCore`
+/// record's group mask
+/// ([Microsoft Learn: GetLogicalProcessorInformationEx](https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getlogicalprocessorinformationex)).
+fn threads_per_core() -> usize {
+    const RELATION_PROCESSOR_CORE: i32 = 0;
+    let mut len = 0u32;
+    unsafe {
+        GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, std::ptr::null_mut(), &mut len)
+    };
+    let mut buf = vec![0u8; len as usize];
+    assert_ne!(
+        unsafe {
+            GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, buf.as_mut_ptr(), &mut len)
+        },
+        0
+    );
+    // Relationship and Size, then PROCESSOR_RELATIONSHIP: Flags, EfficiencyClass, Reserved[20],
+    // GroupCount, and the first GROUP_AFFINITY's Mask.
+    let mask = usize::from_ne_bytes(buf[32..32 + size_of::<usize>()].try_into().unwrap());
+    mask.count_ones() as usize
+}
+
 /// The CPU sets read back: (outcome, required, ids).
 fn read_sets(thread: bool, room: u32) -> String {
     let mut ids = vec![0u32; room as usize];
@@ -402,8 +425,25 @@ fn cpu_sets_match_the_host() {
     let _host = host_state();
     let real = cpu_set_probe();
     let cpus = std::thread::available_parallelism().unwrap().get();
-    let simulated = Sim::builder().cpus(cpus).build().run(cpu_set_probe);
+    let simulated = Sim::builder()
+        .cpus(cpus)
+        .threads_per_core(threads_per_core())
+        .build()
+        .run(cpu_set_probe);
     assert_eq!(simulated, real);
+}
+
+#[test]
+fn cpu_sets_group_smt_siblings_into_cores() {
+    let cores = |threads| {
+        Sim::builder()
+            .cpus(5)
+            .threads_per_core(threads)
+            .build()
+            .run(|| cpu_sets().iter().map(|s| (s.4, s.5)).collect::<Vec<_>>())
+    };
+    assert_eq!(cores(1), [(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
+    assert_eq!(cores(2), [(0, 0), (1, 0), (2, 2), (3, 2), (4, 4)]);
 }
 
 #[test]
