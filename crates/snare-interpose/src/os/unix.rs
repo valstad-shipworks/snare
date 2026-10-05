@@ -31,6 +31,7 @@ static SETENV: AtomicUsize = AtomicUsize::new(0);
 static UNSETENV: AtomicUsize = AtomicUsize::new(0);
 static GETEUID: AtomicUsize = AtomicUsize::new(0);
 static GETUID: AtomicUsize = AtomicUsize::new(0);
+static UNAME: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(target_os = "linux")]
 static CLOCK_NANOSLEEP: AtomicUsize = AtomicUsize::new(0);
@@ -81,6 +82,7 @@ pub(crate) fn hooks() -> Vec<Hook> {
         hook!("_NSGetEnviron", ns_get_environ, NS_GET_ENVIRON),
         hook!("geteuid", geteuid, GETEUID),
         hook!("getuid", getuid, GETUID),
+        hook!("uname", uname, UNAME),
         #[cfg(target_os = "linux")]
         hook!("clock_nanosleep", clock_nanosleep, CLOCK_NANOSLEEP),
         #[cfg(target_os = "linux")]
@@ -659,6 +661,16 @@ unsafe extern "C" fn getuid() -> libc::uid_t {
     }
     // SAFETY: GETUID holds libc's getuid.
     unsafe { original::<unsafe extern "C" fn() -> libc::uid_t>(&GETUID)() }
+}
+
+/// `uname` (man 2 uname): the kernel identity, as the domain's host models it.
+unsafe extern "C" fn uname(buf: *mut libc::utsname) -> c_int {
+    // SAFETY: `buf` is the caller's `struct utsname`.
+    if let Some(r) = domain::dispatch_host(|h| unsafe { h.uname(buf.cast()) }) {
+        return crate::os::sockets::finish(r) as c_int;
+    }
+    // SAFETY: UNAME holds libc's uname.
+    unsafe { original::<unsafe extern "C" fn(*mut libc::utsname) -> c_int>(&UNAME)(buf) }
 }
 
 /// `getenv` (man 3 getenv): returns a pointer into the environment (not a copy); a later

@@ -114,6 +114,7 @@ simulation automatically. Only managed threads are interposed; the test's own bo
 | **Netlink** | `AF_NETLINK` rtnetlink `RTM_GETLINK`/`IFLA_STATS64`, genetlink `CTRL_CMD_GETFAMILY`, `RTM_GETQDISC`/ETF. |
 | **Files** | `VirtualFs`: an in-memory tree behind open, sequential/positional IO, truncate, sync, stat and directory-stream calls, with glob passthrough to real paths. `SimHost` also renders `/sys`, `/proc`, `/dev/ptp*`, `/dev/cpu_dma_latency`. Raw directory syscalls and path mutation are incomplete. |
 | **Host tuning** | Scheduling (`sched_setscheduler`/affinity/priority, `mlock`/`mlockall`), resource limits (`RLIMIT_RTPRIO`/`NICE`/`MEMLOCK`), NIC config (`ethtool` rings/coalescing/channels/pause/EEE/flags/flow rules/stats, `SIOC[GS]HWTSTAMP`, qdiscs and ETF offload, threaded NAPI, queues/IRQs), PTP, capability gating — all modeled, never touching the real scheduler or NIC. |
+| **Kernel identity** | Under a `SimHost`, `uname` (and Linux `SYS_uname`) reports the profile's `sysname`/`nodename`/`kernel_release`/`kernel_version`/`machine`: a fixed kernel by default, whose Linux version string carries `PREEMPT_RT` when the profile does, or the build machine's own with `real_uname()`. `gethostname` still reads the real name. |
 | **Tester stages** | A tester's message chain: `then_test` / `then_stateful_test` drop or rewrite a message before later stages, `then_edit_state` updates state, `then_action` / `then_stateful_action` answer — run in the order added. |
 | **Thread classes** | Every thread in a `Sim` is a participant unless marked (`snare::sched::mark_background`, `mark_helper`, `mark_driver_thread`, `spawn_as`): only participants hold up quiescence and the deterministic schedule. `busy()` / `setup_scope()` leases hold time still; thread names from `pthread_setname_np` / `SetThreadDescription` label each thread. `SimBuilder::stuck_after` fails a run a spinning participant has frozen. See [Stuck runs](#stuck-runs). |
 | **Cooperative primitives** | `snare::sched::park` / `current_unparker`, `block_on` / `block_on_until` / `block_on_timeout`, the `Sleep` future (`sleep_until`), `WakerSet` and `is_driven`: in a sim they wait on its clock and schedule — counted toward quiescence, their deadlines virtual timers, their wakes held at an executive's gate — and off one on real time. See [Cooperative primitives](#cooperative-primitives). |
@@ -155,12 +156,18 @@ let host = HostProfile::new()
         .queues(4, 4)
         .link_stats(LinkStats { rx_packets: 1000, ..Default::default() }))
     .env("RUNTIME_ENV", "sim")            // isolates + sets the environment
+    .kernel_release("6.6.30-rt30")        // uname -r; also sysname, nodename, kernel_version, machine
     .build();
 
 Sim::builder().host(host).build().run(|| {
     // sched_setscheduler(SCHED_FIFO), ethtool, /sys reads, SO_TIMESTAMPING, getenv — all served here.
 });
 ```
+
+`uname` reports a host named `snare` running a fixed kernel (Linux `6.12.0`, `#1 SMP PREEMPT_DYNAMIC`,
+or `#1 SMP PREEMPT_RT` with `preempt_rt(true)`; macOS `Darwin` `25.0.0`) on the build target's machine
+type. `HostProfile::real_uname()` copies all five fields from the machine running the test instead,
+and works inside a sim.
 
 `EasyBuilder` gives batteries-included presets when you just want a working machine:
 

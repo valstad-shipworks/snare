@@ -643,6 +643,39 @@ pub struct HostProfile {
     env: Vec<(String, String)>,
     /// Routes declared on top of the connected routes the interfaces imply.
     routes: Vec<Route>,
+    /// What `uname` reports; a `None` version follows [`preempt_rt`](Self::preempt_rt) on Linux.
+    sysname: String,
+    nodename: String,
+    kernel_release: String,
+    kernel_version: Option<String>,
+    machine: String,
+}
+
+#[cfg(target_os = "linux")]
+const DEFAULT_SYSNAME: &str = "Linux";
+#[cfg(target_os = "macos")]
+const DEFAULT_SYSNAME: &str = "Darwin";
+#[cfg(target_os = "linux")]
+const DEFAULT_KERNEL_RELEASE: &str = "6.12.0";
+#[cfg(target_os = "macos")]
+const DEFAULT_KERNEL_RELEASE: &str = "25.0.0";
+#[cfg(target_os = "linux")]
+const DEFAULT_KERNEL_VERSION: &str = "#1 SMP PREEMPT_DYNAMIC";
+#[cfg(target_os = "macos")]
+const DEFAULT_KERNEL_VERSION: &str = "Darwin Kernel Version 25.0.0";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const DEFAULT_MACHINE: &str = "arm64";
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+const DEFAULT_MACHINE: &str = std::env::consts::ARCH;
+
+/// The kernel identity a [`SimHost`] reports through `uname`.
+#[derive(Clone, Debug)]
+struct Uname {
+    sysname: String,
+    nodename: String,
+    release: String,
+    version: String,
+    machine: String,
 }
 
 impl Default for HostProfile {
@@ -660,6 +693,11 @@ impl HostProfile {
     /// distributions set through systemd's `sysctl.d/50-default.conf`; the kernel's own default
     /// is `pfifo_fast` (Documentation/admin-guide/sysctl/net.rst, `default_qdisc`). The TAI offset
     /// is 37 s, TAI−UTC since 2017-01-01 (IERS Bulletin C).
+    ///
+    /// `uname` reports a host named `snare`: on Linux release `6.12.0`, version `#1 SMP
+    /// PREEMPT_DYNAMIC` (`#1 SMP PREEMPT_RT` with [`preempt_rt`](Self::preempt_rt)), the forms
+    /// `scripts/mkcompile_h` builds; on macOS `Darwin` release `25.0.0`. The machine is the build
+    /// target's (`x86_64`, `aarch64`, or `arm64` on macOS).
     pub fn new() -> Self {
         HostProfile {
             cpu_count: 1,
@@ -679,6 +717,79 @@ impl HostProfile {
             isolate_env: false,
             env: Vec::new(),
             routes: Vec::new(),
+            sysname: DEFAULT_SYSNAME.to_string(),
+            nodename: "snare".to_string(),
+            kernel_release: DEFAULT_KERNEL_RELEASE.to_string(),
+            kernel_version: None,
+            machine: DEFAULT_MACHINE.to_string(),
+        }
+    }
+
+    /// The operating system name `uname` reports (`Linux`, `Darwin`).
+    pub fn sysname(mut self, name: impl Into<String>) -> Self {
+        self.sysname = name.into();
+        self
+    }
+
+    /// The host name `uname` reports. `gethostname` is not modelled and still reads the real one.
+    pub fn nodename(mut self, name: impl Into<String>) -> Self {
+        self.nodename = name.into();
+        self
+    }
+
+    /// The kernel release `uname` reports, such as `6.12.0-rt5`.
+    pub fn kernel_release(mut self, release: impl Into<String>) -> Self {
+        self.kernel_release = release.into();
+        self
+    }
+
+    /// The kernel version string `uname` reports, such as `#1 SMP PREEMPT_RT Mon Jan 6 12:00:00
+    /// UTC 2025`. Setting it stops it following [`preempt_rt`](Self::preempt_rt).
+    pub fn kernel_version(mut self, version: impl Into<String>) -> Self {
+        self.kernel_version = Some(version.into());
+        self
+    }
+
+    /// The hardware name `uname` reports (`x86_64`, `aarch64`, `arm64`).
+    pub fn machine(mut self, machine: impl Into<String>) -> Self {
+        self.machine = machine.into();
+        self
+    }
+
+    /// Copies every `uname` field from the machine running the test. The call bypasses the sim, so
+    /// it works inside one.
+    pub fn real_uname(mut self) -> std::io::Result<Self> {
+        let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+        if snare_interpose::real(|| unsafe { libc::uname(&mut uts) }) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let field = |f: &[c_char]| {
+            unsafe { std::ffi::CStr::from_ptr(f.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        self.sysname = field(&uts.sysname);
+        self.nodename = field(&uts.nodename);
+        self.kernel_release = field(&uts.release);
+        self.kernel_version = Some(field(&uts.version));
+        self.machine = field(&uts.machine);
+        Ok(self)
+    }
+
+    fn uname(&self) -> Uname {
+        let version = self.kernel_version.clone().unwrap_or_else(|| {
+            if cfg!(target_os = "linux") && self.preempt_rt {
+                "#1 SMP PREEMPT_RT".to_string()
+            } else {
+                DEFAULT_KERNEL_VERSION.to_string()
+            }
+        });
+        Uname {
+            sysname: self.sysname.clone(),
+            nodename: self.nodename.clone(),
+            release: self.kernel_release.clone(),
+            version,
+            machine: self.machine.clone(),
         }
     }
 
@@ -2271,6 +2382,7 @@ pub struct SimHost {
     me: std::sync::OnceLock<std::sync::Weak<SimHost>>,
     /// The interfaces and routes the profile declared, handed to the sim to build its topology.
     topology: (Vec<(NicSpec, NicCounters)>, Vec<Route>),
+    uname: Uname,
 }
 
 impl SimHost {
@@ -2467,6 +2579,7 @@ impl SimHost {
     /// Builds the host from `p`. Opens the `/dev/null` template fd with interposition bypassed
     /// (`snare_interpose::real`), so the open is never served by a sim.
     fn new(p: HostProfile) -> Self {
+        let uname = p.uname();
         let online = p.online.unwrap_or_else(|| (0..p.cpu_count).collect());
         let topology = (
             p.nics.iter().map(Nic::topology_fact).collect(),
@@ -2596,6 +2709,7 @@ impl SimHost {
             registries: Mutex::new(None),
             me: std::sync::OnceLock::new(),
             topology,
+            uname,
         }
     }
 
@@ -3736,6 +3850,25 @@ impl Host for SimHost {
         self.geteuid()
     }
 
+    /// Fills the `struct utsname` from the profile, each field cut to fit with its NUL. Linux's
+    /// `domainname` reads `(none)`, the kernel's `UTS_DOMAINNAME` default
+    /// (include/linux/uts.h).
+    unsafe fn uname(&self, buf: *mut u8) -> Option<HostResult> {
+        if buf.is_null() {
+            return err(libc::EFAULT);
+        }
+        let uts = unsafe { &mut *(buf as *mut libc::utsname) };
+        let u = &self.uname;
+        put_c_field(&mut uts.sysname, &u.sysname);
+        put_c_field(&mut uts.nodename, &u.nodename);
+        put_c_field(&mut uts.release, &u.release);
+        put_c_field(&mut uts.version, &u.version);
+        put_c_field(&mut uts.machine, &u.machine);
+        #[cfg(target_os = "linux")]
+        put_c_field(&mut uts.domainname, "(none)");
+        ok(0)
+    }
+
     /// The calling thread's simulated tid.
     fn gettid(&self) -> Option<HostResult> {
         let mut state = self.state.lock().unwrap();
@@ -4165,6 +4298,7 @@ impl Host for SimHost {
             n if n == libc::SYS_sched_setscheduler => unsafe {
                 self.sched_setscheduler(args[0] as i32, args[1] as c_int, args[2] as *const u8)
             },
+            n if n == libc::SYS_uname => unsafe { self.uname(args[0] as *mut u8) },
             n if n == libc::SYS_sched_getscheduler => unsafe {
                 self.sched_getscheduler(args[0] as i32)
             },
@@ -4231,6 +4365,16 @@ unsafe fn read_ifname(arg: i64) -> Option<String> {
         name.push(b);
     }
     String::from_utf8(name).ok()
+}
+
+/// Writes `text` into the C string field `field`, truncated to leave room for its NUL, and zeroes
+/// the rest.
+fn put_c_field(field: &mut [c_char], text: &str) {
+    field.fill(0);
+    let n = text.len().min(field.len() - 1);
+    for (dst, &b) in field.iter_mut().zip(&text.as_bytes()[..n]) {
+        *dst = b as c_char;
+    }
 }
 
 /// The never-reused 64-bit id of the thread behind `pthread_t` `thread` (man 3

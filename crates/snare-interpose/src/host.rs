@@ -63,6 +63,12 @@ pub trait Host: Send + Sync + 'static {
         None
     }
 
+    /// Models `uname(2)`; `buf` is a `struct utsname` (`<sys/utsname.h>`). Consulted by the Unix
+    /// `uname` hook and, on Linux, reachable as `SYS_uname` through [`syscall`](Host::syscall).
+    unsafe fn uname(&self, buf: *mut u8) -> Option<HostResult> {
+        None
+    }
+
     /// Models `sched_setscheduler(2)`; `policy` is `SCHED_OTHER`/`SCHED_FIFO`/`SCHED_RR`/… and
     /// `param` a `struct sched_param` carrying `sched_priority` (`<sched.h>`).
     unsafe fn sched_setscheduler(
