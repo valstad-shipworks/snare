@@ -870,7 +870,7 @@ impl Held {
             None => {
                 let _ = self
                     .spilled
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
             }
         }
     }

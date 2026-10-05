@@ -687,7 +687,7 @@ impl Clock {
         let floor = self.floor.load(Ordering::Acquire);
         let before = self
             .monotonic_nanos
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |m| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |m| {
                 Some(m.max(floor).saturating_add(by))
             })
             .unwrap_or_else(|m| m)

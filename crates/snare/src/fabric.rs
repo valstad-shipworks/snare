@@ -1472,7 +1472,6 @@ impl Sockets {
         })
     }
 
-    #[cfg(target_os = "macos")]
     fn values(&self) -> impl Iterator<Item = &Sock> {
         self.descriptions
             .iter()
@@ -6920,7 +6919,6 @@ mod socket_arena_tests {
             representatives = sockets.iter_mut().map(|(fd, _)| *fd).collect();
             representatives.sort();
             assert_eq!(representatives, [20, 40]);
-            #[cfg(target_os = "macos")]
             assert_eq!(sockets.values().count(), 2);
         });
     }

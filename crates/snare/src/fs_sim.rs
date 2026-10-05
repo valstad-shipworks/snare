@@ -138,7 +138,7 @@ struct Volume {
 impl Volume {
     fn reserve(&self) -> bool {
         self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 (used < self.capacity).then_some(used + 1)
             })
             .is_ok()

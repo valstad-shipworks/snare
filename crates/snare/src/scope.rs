@@ -197,7 +197,7 @@ impl SimShared {
     pub(crate) fn ephemeral_port(&self) -> u16 {
         let next = |port: u16| Some(port.checked_add(1).unwrap_or(EPHEMERAL_FIRST));
         self.next_ephemeral
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, next)
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, next)
             .unwrap_or(EPHEMERAL_FIRST)
     }
 
