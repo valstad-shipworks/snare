@@ -1419,6 +1419,19 @@ using it in the other mode panics rather than silently mixing an emulated ring w
 | Process limits | ✅ (`RLIMIT_RTPRIO`/`NICE`/`MEMLOCK`, `mlock`) | ✅ (`RLIMIT_MEMLOCK`, `mlock`) | priority class, working set (`WinHost`) |
 | Names / signals | ✅ | ✅ | ✅ (`GetAddrInfoW`, console control events) |
 
+Linux means glibc (`target_env = "gnu"`). Every other target — musl, 32-bit x86 and ARM, Android,
+the BSDs, illumos, Redox — stops at a single `compile_error!` naming the supported targets. A crate
+that also builds for those targets gates the dev-dependency:
+
+```toml
+[target.'cfg(any(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")), target_os = "macos", windows))'.dev-dependencies]
+snare = "2"
+```
+
+and puts its sim tests behind the same `cfg`.
+
+The minimum supported Rust version is 1.88.
+
 ## Repository layout
 
 ```
