@@ -1,9 +1,9 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicI8, AtomicUsize, Ordering},
+        atomic::{AtomicI8, AtomicU64, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use std::io;
@@ -12,10 +12,12 @@ use parking_lot::Mutex;
 
 use crate::{
     TcpListener, TcpStream, UdpSocket,
-    state::{
-        tcp_listener_status, tcp_stream_status, trigger_event, udp_socket_status, wait_for_event,
-    },
+    sched::waitset::{WaitKey, WaitTicket},
+    state::{tcp_listener_status, tcp_stream_status, udp_socket_status, wake},
+    time::Instant,
 };
+
+static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
 
 pub use mio::{Interest, Token, features, guide};
 
@@ -46,114 +48,127 @@ impl Poll {
         &self.registry
     }
 
+    /// Wait for readiness events. Timeouts are virtual time; `None` blocks
+    /// until a registered source changes or a [`Waker`] fires.
     pub fn poll(&mut self, events: &mut Events, timeout: Option<Duration>) -> io::Result<()> {
         events.clear();
-        let deadline = match timeout {
-            Some(dur) => Instant::now() + dur,
-            None => Instant::now() + Duration::from_secs(60_000),
-        };
-
+        let deadline = timeout.map(|d| Instant::now() + d);
+        let mut ticket = None;
         loop {
-            if Instant::now() >= deadline || !events.inner.is_empty() {
+            self.collect(events);
+            if !events.inner.is_empty() || deadline.is_some_and(|d| Instant::now() >= d) {
                 break;
             }
-
-            if self.registry.waker_state.swap(-1, Ordering::SeqCst) == 1 {
-                let token = self.registry.waker_token.load(Ordering::SeqCst);
-                events.inner.push(event::Event {
-                    token: Token(token),
-                    is_readable: true,
-                    is_writable: true,
-                    is_error: false,
-                    is_read_closed: false,
-                    is_write_closed: false,
-                    is_priority: false,
-                    is_aio: false,
-                    is_lio: false,
-                });
-            }
-
-            let reg_data = self.registry.data.lock();
-            for entry in reg_data.listeners.iter() {
-                let Ok(addr) = entry.src.local_addr() else {
-                    continue;
-                };
-                if let Some(status) = tcp_listener_status(addr) {
-                    let is_readable = entry.interest.is_readable() && status.pending;
-                    let is_error = status.error;
-                    let is_read_closed = status.closed && entry.interest.is_readable();
-                    if is_readable || is_error || is_read_closed {
-                        events.inner.push(event::Event {
-                            token: entry.token,
-                            is_readable,
-                            is_writable: false,
-                            is_error,
-                            is_read_closed,
-                            is_write_closed: false,
-                            is_priority: false,
-                            is_aio: false,
-                            is_lio: false,
-                        });
-                    }
+            match ticket.take() {
+                None => ticket = Some(WaitTicket::register(self.registry.wait_keys())),
+                Some(t) => {
+                    t.wait(deadline, "mio poll");
                 }
             }
+        }
+        Ok(())
+    }
 
-            for entry in reg_data.streams.iter() {
-                let Ok(addr) = entry.src.local_addr() else {
-                    continue;
-                };
-                if let Some(status) = tcp_stream_status(addr) {
-                    let is_readable = entry.interest.is_readable() && status.readable;
-                    let is_writable = entry.interest.is_writable() && status.writable;
-                    let is_error = status.error;
-                    let is_read_closed = status.read_closed && entry.interest.is_readable();
-                    let is_write_closed = status.write_closed && entry.interest.is_writable();
-                    if is_readable || is_writable || is_error || is_read_closed || is_write_closed {
-                        events.inner.push(event::Event {
-                            token: entry.token,
-                            is_readable,
-                            is_writable,
-                            is_error,
-                            is_read_closed,
-                            is_write_closed,
-                            is_priority: false,
-                            is_aio: false,
-                            is_lio: false,
-                        });
-                    }
-                }
-            }
-
-            for entry in reg_data.sockets.iter() {
-                let Ok(addr) = entry.src.local_addr() else {
-                    continue;
-                };
-                if let Some(status) = udp_socket_status(addr) {
-                    let is_readable = entry.interest.is_readable() && status.readable;
-                    let is_writable = entry.interest.is_writable() && status.writable;
-                    let is_error = status.error;
-                    let is_read_closed = status.closed && entry.interest.is_readable();
-                    let is_write_closed = status.closed && entry.interest.is_writable();
-                    if is_readable || is_writable || is_error || is_read_closed || is_write_closed {
-                        events.inner.push(event::Event {
-                            token: entry.token,
-                            is_readable,
-                            is_writable,
-                            is_error,
-                            is_read_closed,
-                            is_write_closed,
-                            is_priority: false,
-                            is_aio: false,
-                            is_lio: false,
-                        });
-                    }
-                }
-            }
-
-            wait_for_event(Some(deadline.saturating_duration_since(Instant::now())));
+    fn collect(&self, events: &mut Events) {
+        if self.registry.waker_state.swap(-1, Ordering::SeqCst) == 1 {
+            let token = self.registry.waker_token.load(Ordering::SeqCst);
+            events.inner.push(event::Event {
+                token: Token(token),
+                is_readable: true,
+                is_writable: true,
+                is_error: false,
+                is_read_closed: false,
+                is_write_closed: false,
+                is_priority: false,
+                is_aio: false,
+                is_lio: false,
+            });
         }
 
-        Ok(())
+        let mut reg_data = self.registry.data.lock();
+        for entry in reg_data.listeners.iter() {
+            let Ok(addr) = entry.src.local_addr() else {
+                continue;
+            };
+            if let Some(status) = tcp_listener_status(addr) {
+                let is_readable = entry.interest.is_readable() && status.pending;
+                let is_error = status.error;
+                let is_read_closed = status.closed && entry.interest.is_readable();
+                if is_readable || is_error || is_read_closed {
+                    events.inner.push(event::Event {
+                        token: entry.token,
+                        is_readable,
+                        is_writable: false,
+                        is_error,
+                        is_read_closed,
+                        is_write_closed: false,
+                        is_priority: false,
+                        is_aio: false,
+                        is_lio: false,
+                    });
+                }
+            }
+        }
+
+        for entry in reg_data.streams.iter_mut() {
+            if let Some(status) = tcp_stream_status(entry.src.stream_id()) {
+                let is_readable = entry.interest.is_readable() && status.readable;
+                // Edge-triggered like real mio: writability is reported once,
+                // then again only after it was lost or a write hit
+                // `WouldBlock`. Level-triggered, an idle READABLE|WRITABLE
+                // poller never blocks, so it spins and holds the clock.
+                let is_writable = entry.interest.is_writable()
+                    && status.writable
+                    && entry.writable_at != Some(status.write_blocks);
+                if !status.writable {
+                    entry.writable_at = None;
+                } else if is_writable {
+                    entry.writable_at = Some(status.write_blocks);
+                }
+                let is_error = status.error;
+                let is_read_closed = status.read_closed && entry.interest.is_readable();
+                let is_write_closed = status.write_closed && entry.interest.is_writable();
+                if is_readable || is_writable || is_error || is_read_closed || is_write_closed {
+                    events.inner.push(event::Event {
+                        token: entry.token,
+                        is_readable,
+                        is_writable,
+                        is_error,
+                        is_read_closed,
+                        is_write_closed,
+                        is_priority: false,
+                        is_aio: false,
+                        is_lio: false,
+                    });
+                }
+            }
+        }
+
+        for entry in reg_data.sockets.iter() {
+            let Ok(addr) = entry.src.local_addr() else {
+                continue;
+            };
+            if let Some(status) = udp_socket_status(addr) {
+                let is_readable = entry.interest.is_readable() && status.readable;
+                let is_writable = entry.interest.is_writable() && status.writable;
+                let is_error = status.error;
+                let is_read_closed = status.closed && entry.interest.is_readable();
+                let is_write_closed = status.closed && entry.interest.is_writable();
+                if is_readable || is_writable || is_error || is_read_closed || is_write_closed {
+                    events.inner.push(event::Event {
+                        token: entry.token,
+                        is_readable,
+                        is_writable,
+                        is_error,
+                        is_read_closed,
+                        is_write_closed,
+                        is_priority: false,
+                        is_aio: false,
+                        is_lio: false,
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -162,6 +177,8 @@ struct RegistryEntry<S> {
     src: S,
     token: Token,
     interest: Interest,
+    /// The stream's `write_blocks` count when writability was last reported.
+    writable_at: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -173,6 +190,7 @@ struct RegistryData {
 
 #[derive(Debug)]
 pub struct Registry {
+    id: u64,
     waker_state: Arc<AtomicI8>,
     waker_token: Arc<AtomicUsize>,
     data: Arc<Mutex<RegistryData>>,
@@ -189,6 +207,7 @@ impl std::os::fd::AsRawFd for Registry {
 impl Registry {
     fn new() -> Registry {
         Registry {
+            id: NEXT_REGISTRY_ID.fetch_add(1, Ordering::Relaxed),
             waker_state: Arc::new(AtomicI8::new(0)),
             waker_token: Arc::new(AtomicUsize::new(0)),
             data: Arc::new(Mutex::new(RegistryData {
@@ -197,6 +216,41 @@ impl Registry {
                 sockets: Vec::new(),
             })),
         }
+    }
+
+    /// Every wait set a readiness change of a registered source is notified
+    /// on, plus this registry's waker.
+    fn wait_keys(&self) -> Vec<WaitKey> {
+        let data = self.data.lock();
+        let mut keys = vec![WaitKey::Poll(self.id)];
+        let mut add = |k: WaitKey| {
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        };
+        for entry in &data.listeners {
+            if let Ok(addr) = entry.src.local_addr() {
+                add(WaitKey::Listener(addr));
+                add(WaitKey::Addr(addr));
+            }
+        }
+        for entry in &data.streams {
+            add(WaitKey::Stream(entry.src.stream_id()));
+            if let Ok(addr) = entry.src.local_addr() {
+                add(WaitKey::Addr(addr));
+            }
+        }
+        for entry in &data.sockets {
+            if let Ok(addr) = entry.src.local_addr() {
+                add(WaitKey::Udp(addr));
+                add(WaitKey::Addr(addr));
+            }
+        }
+        keys
+    }
+
+    fn sources_changed(&self) {
+        wake(WaitKey::Poll(self.id));
     }
 
     pub fn register<S>(&self, source: &mut S, token: Token, interests: Interest) -> io::Result<()>
@@ -222,6 +276,7 @@ impl Registry {
 
     pub fn try_clone(&self) -> io::Result<Registry> {
         Ok(Registry {
+            id: self.id,
             waker_state: self.waker_state.clone(),
             waker_token: self.waker_token.clone(),
             data: self.data.clone(),
@@ -231,6 +286,7 @@ impl Registry {
 
 #[derive(Debug)]
 pub struct Waker {
+    registry: u64,
     waker_state: Arc<AtomicI8>,
 }
 
@@ -241,14 +297,17 @@ impl Waker {
             panic!("Only a single waker is allowed per registry")
         }
         registry.waker_token.store(token.0, Ordering::SeqCst);
-        Ok(Self { waker_state })
+        Ok(Self {
+            registry: registry.id,
+            waker_state,
+        })
     }
 
     pub fn wake(&self) -> io::Result<()> {
         // SeqCst pairs with the swap in Poll::poll — Relaxed here would let
         // a concurrent poll on another thread miss the state change.
         self.waker_state.store(1, Ordering::SeqCst);
-        trigger_event();
+        wake(WaitKey::Poll(self.registry));
         Ok(())
     }
 }
@@ -436,34 +495,218 @@ pub mod event {
 }
 
 pub mod net {
-    use std::io;
+    //! mio's `net` types on snare's sockets. Like real mio they are
+    //! nonblocking from creation: [`bind`](UdpSocket::bind), `from_std`,
+    //! [`TcpStream::connect`] and [`TcpListener::accept`] all return
+    //! nonblocking sockets. Each derefs to the snare socket it wraps.
+    //!
+    //! Two differences from real mio remain: `bind`, `connect` and
+    //! `send_to` take any [`ToSocketAddrs`] rather than a `SocketAddr`, and
+    //! [`TcpStream::connect`] completes (or fails) before it returns instead
+    //! of reporting the outcome through writability and `take_error`.
+
+    use std::io::{self, Read, Write};
+    use std::net::SocketAddr;
+    use std::ops::Deref;
 
     use mio::{Interest, Token};
 
     use crate::mio_shim::{Registry, RegistryEntry, event::Source};
+    use crate::net::ToSocketAddrs;
 
-    pub use crate::{TcpListener, TcpStream, UdpSocket};
+    macro_rules! wrapper {
+        ($name:ident) => {
+            impl $name {
+                /// Wraps a snare socket, switching it to nonblocking.
+                pub fn from_std(inner: crate::net::$name) -> $name {
+                    let _ = inner.set_nonblocking(true);
+                    $name { inner }
+                }
+            }
+
+            impl Deref for $name {
+                type Target = crate::net::$name;
+
+                fn deref(&self) -> &crate::net::$name {
+                    &self.inner
+                }
+            }
+
+            impl From<crate::net::$name> for $name {
+                fn from(inner: crate::net::$name) -> $name {
+                    $name::from_std(inner)
+                }
+            }
+
+            impl From<$name> for crate::net::$name {
+                fn from(s: $name) -> crate::net::$name {
+                    s.inner
+                }
+            }
+
+            /// Returns `-1`, as the snare socket it wraps does.
+            #[cfg(unix)]
+            impl std::os::fd::AsRawFd for $name {
+                fn as_raw_fd(&self) -> std::os::fd::RawFd {
+                    -1
+                }
+            }
+
+            impl Source for $name {
+                fn register(
+                    &mut self,
+                    registry: &Registry,
+                    token: Token,
+                    interests: Interest,
+                ) -> io::Result<()> {
+                    self.inner.register(registry, token, interests)
+                }
+
+                fn reregister(
+                    &mut self,
+                    registry: &Registry,
+                    token: Token,
+                    interests: Interest,
+                ) -> io::Result<()> {
+                    self.inner.reregister(registry, token, interests)
+                }
+
+                fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+                    self.inner.deregister(registry)
+                }
+            }
+        };
+    }
+
+    /// Mirrors [`mio::net::TcpListener`].
+    #[derive(Debug)]
+    pub struct TcpListener {
+        inner: crate::net::TcpListener,
+    }
+
+    wrapper!(TcpListener);
 
     impl TcpListener {
-        pub fn from_std(listener: TcpListener) -> TcpListener {
-            let _ = listener.set_nonblocking(true);
-            listener
+        pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<TcpListener> {
+            crate::net::TcpListener::bind(addr).map(TcpListener::from_std)
+        }
+
+        /// Accepts a pending connection as a nonblocking stream, or fails
+        /// with `WouldBlock` when none is pending.
+        pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+            let (stream, addr) = self.inner.accept()?;
+            Ok((TcpStream::from_std(stream), addr))
         }
     }
 
-    impl Source for TcpListener {
+    /// Mirrors [`mio::net::TcpStream`].
+    #[derive(Debug)]
+    pub struct TcpStream {
+        inner: crate::net::TcpStream,
+    }
+
+    wrapper!(TcpStream);
+
+    impl TcpStream {
+        pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
+            crate::net::TcpStream::connect(addr).map(TcpStream::from_std)
+        }
+
+        /// Runs `f`, an I/O operation on this stream made outside its own
+        /// methods. The shim keeps no readiness state to clear on
+        /// `WouldBlock`, so this is `f()`.
+        pub fn try_io<F, T>(&self, f: F) -> io::Result<T>
+        where
+            F: FnOnce() -> io::Result<T>,
+        {
+            f()
+        }
+    }
+
+    impl Read for TcpStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            (&self.inner).read(buf)
+        }
+    }
+
+    impl Read for &TcpStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            (&self.inner).read(buf)
+        }
+    }
+
+    impl Write for TcpStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            (&self.inner).write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            (&self.inner).flush()
+        }
+    }
+
+    impl Write for &TcpStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            (&self.inner).write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            (&self.inner).flush()
+        }
+    }
+
+    /// Mirrors [`mio::net::UdpSocket`].
+    #[derive(Debug)]
+    pub struct UdpSocket {
+        inner: crate::net::UdpSocket,
+    }
+
+    wrapper!(UdpSocket);
+
+    impl UdpSocket {
+        pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
+            crate::net::UdpSocket::bind(addr).map(UdpSocket::from_std)
+        }
+
+        /// `IPV6_V6ONLY`: off by default on Linux and macOS, on on Windows,
+        /// as the emulated OS's dual-stack sockets behave. An IPv4 socket
+        /// has no such option and fails with `ENOPROTOOPT`.
+        pub fn only_v6(&self) -> io::Result<bool> {
+            let (os, faithful) = crate::state::os_ctx();
+            if self.inner.local_addr()?.is_ipv4() {
+                return Err(crate::os::os_err_for(os, crate::os::Errno::NoProtoOpt));
+            }
+            Ok(!faithful || os == crate::os::OsSemantics::Windows)
+        }
+
+        /// Runs `f`, an I/O operation on this socket made outside its own
+        /// methods. The shim keeps no readiness state to clear on
+        /// `WouldBlock`, so this is `f()`.
+        pub fn try_io<F, T>(&self, f: F) -> io::Result<T>
+        where
+            F: FnOnce() -> io::Result<T>,
+        {
+            f()
+        }
+    }
+
+    impl Source for crate::net::TcpListener {
         fn register(
             &mut self,
             registry: &Registry,
             token: Token,
             interests: Interest,
         ) -> io::Result<()> {
+            self.set_nonblocking(true)?;
             let mut reg_data = registry.data.lock();
             reg_data.listeners.push(RegistryEntry {
                 src: self.try_clone()?,
                 token,
                 interest: interests,
+                writable_at: None,
             });
+            drop(reg_data);
+            registry.sources_changed();
             Ok(())
         }
 
@@ -491,32 +734,23 @@ pub mod net {
         }
     }
 
-    impl TcpStream {
-        pub fn from_std(stream: TcpStream) -> TcpStream {
-            let _ = stream.set_nonblocking(true);
-            stream
-        }
-    }
-
-    impl Source for TcpStream {
+    impl Source for crate::net::TcpStream {
         fn register(
             &mut self,
             registry: &Registry,
             token: Token,
             interests: Interest,
         ) -> io::Result<()> {
-            // mio only ever drives non-blocking sockets; real `mio::TcpStream`
-            // is created non-blocking. The shim's `net::TcpStream` reuses the
-            // std-shim's blocking `connect`, so enforce the invariant here —
-            // otherwise a registered stream blocks in `read`/`write` inside the
-            // poll loop instead of returning `WouldBlock`.
             self.set_nonblocking(true)?;
             let mut reg_data = registry.data.lock();
             reg_data.streams.push(RegistryEntry {
                 src: self.try_clone()?,
                 token,
                 interest: interests,
+                writable_at: None,
             });
+            drop(reg_data);
+            registry.sources_changed();
             Ok(())
         }
 
@@ -544,14 +778,7 @@ pub mod net {
         }
     }
 
-    impl UdpSocket {
-        pub fn from_std(socket: UdpSocket) -> UdpSocket {
-            let _ = socket.set_nonblocking(true);
-            socket
-        }
-    }
-
-    impl Source for UdpSocket {
+    impl Source for crate::net::UdpSocket {
         fn register(
             &mut self,
             registry: &Registry,
@@ -564,7 +791,10 @@ pub mod net {
                 src: self.try_clone()?,
                 token,
                 interest: interests,
+                writable_at: None,
             });
+            drop(reg_data);
+            registry.sources_changed();
             Ok(())
         }
 

@@ -182,3 +182,67 @@ fn thread_module_surface() {
     let _: bool = snare::thread::panicking();
     let _ = snare::thread::available_parallelism();
 }
+
+#[test]
+fn park_consumes_an_earlier_unpark() {
+    snare::register_test();
+    snare::thread::current().unpark();
+    snare::thread::park();
+    let me = snare::thread::Thread::from(std::thread::current());
+    me.unpark();
+    snare::thread::park_timeout(Duration::from_secs(3600));
+}
+
+#[test]
+fn unpark_through_the_thread_handle_wakes_park() {
+    snare::register_test();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let h = snare::thread::spawn(move || {
+        tx.send(snare::thread::current()).unwrap();
+        snare::thread::park();
+    });
+    let parked = rx.recv().unwrap();
+    parked.unpark();
+    h.join().unwrap();
+}
+
+#[test]
+fn park_timeout_runs_on_virtual_time() {
+    snare::register_test();
+    snare::pause_time();
+    let t0 = snare::time_value();
+    let h = snare::thread::spawn(|| {
+        snare::thread::park_timeout(Duration::from_secs(30));
+        snare::time_value()
+    });
+    while !h.is_finished() {
+        snare::advance_time(Duration::from_secs(1));
+        snare::thread::real_sleep(Duration::from_millis(1));
+    }
+    assert!(h.join().unwrap() >= t0 + Duration::from_secs(30));
+}
+
+#[test]
+fn a_parked_participant_lets_the_driver_jump() {
+    use snare::sched::{DriverConfig, attach_driver};
+
+    snare::register_test();
+    let driver = attach_driver(DriverConfig {
+        seed: 1,
+        accounting: true,
+        audit: false,
+    })
+    .unwrap();
+    let t0 = driver.now();
+    let h = snare::thread::spawn(|| {
+        snare::thread::park_timeout(Duration::from_secs(1));
+        snare::time_value()
+    });
+    let wall = std::time::Instant::now();
+    while !driver.quiescence().quiescent || driver.next_deadline().is_none() {
+        assert!(wall.elapsed() < Duration::from_secs(5), "never parked");
+        snare::thread::real_sleep(Duration::from_millis(1));
+    }
+    assert_eq!(driver.jump_to(t0 + Duration::from_secs(2)), Ok(1));
+    assert_eq!(h.join().unwrap(), t0 + Duration::from_secs(1));
+}

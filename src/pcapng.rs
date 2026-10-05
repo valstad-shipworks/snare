@@ -6,12 +6,22 @@
 //! fabricates Ethernet + IPv4/IPv6 + TCP/UDP framing per flow — including a
 //! synthetic 3-way handshake and ACKs — so the output renders as a normal
 //! conversation in Wireshark.
+//!
+//! Packet timestamps are snare's virtual `SystemTime`, so captures line up
+//! with the simulation clock at any rate. Set `SNARE_PCAPNG_WALL_COMMENT` to
+//! also attach each packet's real wall-clock time as a packet comment.
+//!
+//! Interface 0 carries packets snare attributes to no interface, stamped in
+//! microseconds. Each snare interface a packet crosses gets its own
+//! interface block, named after it and stamped in nanoseconds at the instant
+//! the packet was on the wire, written the first time it is used.
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const BLOCK_SHB: u32 = 0x0A0D_0D0A;
@@ -36,11 +46,26 @@ const LINKTYPE_ETHERNET: u16 = 1;
 
 pub const ENV_DIR: &str = "SNARE_PCAPNG_DIR";
 pub const ENV_TESTS: &str = "SNARE_PCAPNG_TESTS";
+pub const ENV_WALL_COMMENT: &str = "SNARE_PCAPNG_WALL_COMMENT";
+
+const OPT_COMMENT: u16 = 1;
+const OPT_END: u16 = 0;
+const IF_NAME: u16 = 2;
+const IF_TSRESOL: u16 = 9;
+
+static WALL_COMMENT: LazyLock<bool> =
+    LazyLock::new(|| std::env::var(ENV_WALL_COMMENT).is_ok_and(|v| !v.is_empty() && v != "0"));
 
 pub struct PcapWriter {
     file: BufWriter<File>,
     flows: HashMap<FlowKey, FlowState>,
     next_isn: u32,
+    /// Timestamp for the packets written next, since the Unix epoch.
+    now: std::time::Duration,
+    /// The interface the packets written next are on.
+    iface: u32,
+    /// Interface ids of the snare interfaces seen so far, by index.
+    ifaces: HashMap<u32, u32>,
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
@@ -151,6 +176,9 @@ impl PcapWriter {
             file: BufWriter::new(file),
             flows: HashMap::new(),
             next_isn: 1000,
+            now: std::time::Duration::ZERO,
+            iface: 0,
+            ifaces: HashMap::new(),
         };
         w.write_shb()?;
         w.write_idb()?;
@@ -180,21 +208,78 @@ impl PcapWriter {
         Ok(())
     }
 
+    /// Stamp the packets written from now on with `now`, on interface 0.
+    pub fn set_time(&mut self, now: std::time::Duration) {
+        self.now = now;
+        self.iface = 0;
+    }
+
+    /// Stamp the packets written from now on with `at`, on the snare
+    /// interface with index `index`, describing it first if it is new.
+    pub fn set_time_on(&mut self, at: std::time::Duration, index: u32, name: &str) {
+        self.now = at;
+        self.iface = match self.ifaces.get(&index) {
+            Some(&id) => id,
+            None => {
+                let id = self.ifaces.len() as u32 + 1;
+                if self.write_named_idb(name).is_err() {
+                    self.iface = 0;
+                    return;
+                }
+                self.ifaces.insert(index, id);
+                id
+            }
+        };
+    }
+
+    fn write_named_idb(&mut self, name: &str) -> io::Result<()> {
+        let name = name.as_bytes();
+        let name_pad = name.len().next_multiple_of(4) - name.len();
+        let options = 4 + name.len() + name_pad + 8 + 4;
+        let total = (20 + options) as u32;
+        self.file.write_all(&BLOCK_IDB.to_le_bytes())?;
+        self.file.write_all(&total.to_le_bytes())?;
+        self.file.write_all(&LINKTYPE_ETHERNET.to_le_bytes())?;
+        self.file.write_all(&0u16.to_le_bytes())?;
+        self.file.write_all(&SNAPLEN.to_le_bytes())?;
+        self.file.write_all(&IF_NAME.to_le_bytes())?;
+        self.file.write_all(&(name.len() as u16).to_le_bytes())?;
+        self.file.write_all(name)?;
+        self.file.write_all(&[0u8; 4][..name_pad])?;
+        self.file.write_all(&IF_TSRESOL.to_le_bytes())?;
+        self.file.write_all(&1u16.to_le_bytes())?;
+        self.file.write_all(&[9, 0, 0, 0])?;
+        self.file.write_all(&OPT_END.to_le_bytes())?;
+        self.file.write_all(&0u16.to_le_bytes())?;
+        self.file.write_all(&total.to_le_bytes())?;
+        Ok(())
+    }
+
     fn write_epb(&mut self, frame: &[u8]) -> io::Result<()> {
         let cap_len = frame.len() as u32;
         let orig_len = cap_len;
         let pad = (4 - (frame.len() % 4)) % 4;
-        let total: u32 = 32 + cap_len + pad as u32;
-        let micros = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
-        let ts_high = (micros >> 32) as u32;
-        let ts_low = micros as u32;
+        let comment = WALL_COMMENT.then(|| {
+            let wall = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            format!("wall {}.{:09}", wall.as_secs(), wall.subsec_nanos())
+        });
+        let options_len = comment
+            .as_ref()
+            .map_or(0, |c| 4 + c.len().next_multiple_of(4) + 4);
+        let total: u32 = 32 + cap_len + pad as u32 + options_len as u32;
+        let stamp = if self.iface == 0 {
+            self.now.as_micros() as u64
+        } else {
+            self.now.as_nanos() as u64
+        };
+        let ts_high = (stamp >> 32) as u32;
+        let ts_low = stamp as u32;
 
         self.file.write_all(&BLOCK_EPB.to_le_bytes())?;
         self.file.write_all(&total.to_le_bytes())?;
-        self.file.write_all(&0u32.to_le_bytes())?;
+        self.file.write_all(&self.iface.to_le_bytes())?;
         self.file.write_all(&ts_high.to_le_bytes())?;
         self.file.write_all(&ts_low.to_le_bytes())?;
         self.file.write_all(&cap_len.to_le_bytes())?;
@@ -202,6 +287,15 @@ impl PcapWriter {
         self.file.write_all(frame)?;
         if pad > 0 {
             self.file.write_all(&[0u8; 4][..pad])?;
+        }
+        if let Some(c) = comment {
+            let bytes = c.as_bytes();
+            self.file.write_all(&OPT_COMMENT.to_le_bytes())?;
+            self.file.write_all(&(bytes.len() as u16).to_le_bytes())?;
+            self.file.write_all(bytes)?;
+            self.file
+                .write_all(&[0u8; 4][..bytes.len().next_multiple_of(4) - bytes.len()])?;
+            self.file.write_all(&[0u8; 4])?;
         }
         self.file.write_all(&total.to_le_bytes())?;
         self.file.flush()?;
@@ -560,6 +654,84 @@ mod tests {
         assert_eq!(&bytes[28..32], &BLOCK_IDB.to_le_bytes());
         // At least one EPB after IDB (20 bytes).
         assert_eq!(&bytes[48..52], &BLOCK_EPB.to_le_bytes());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn packets_carry_the_time_set_on_the_writer() {
+        let dir = std::env::temp_dir().join(format!(
+            "snare_pcapng_stamp_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.pcapng");
+        let at = std::time::Duration::from_micros(0x1_2345_6789);
+        {
+            let mut w = PcapWriter::create(&path).unwrap();
+            w.set_time(at);
+            w.udp_datagram(sa(50000), sa(50001), b"udp");
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let word = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+        assert_eq!(word(48), BLOCK_EPB);
+        let stamp = ((word(48 + 12) as u64) << 32) | word(48 + 16) as u64;
+        assert_eq!(stamp, 0x1_2345_6789);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_interface_gets_one_named_block() {
+        let dir = std::env::temp_dir().join(format!(
+            "snare_pcapng_ifaces_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.pcapng");
+        let at = std::time::Duration::from_nanos(1_700_000_000_123_456_789);
+        {
+            let mut w = PcapWriter::create(&path).unwrap();
+            w.set_time_on(at, 3, "eth0");
+            w.udp_datagram(sa(50000), sa(50001), b"a");
+            w.set_time_on(at, 4, "eth1");
+            w.udp_datagram(sa(50000), sa(50001), b"b");
+            w.set_time_on(at, 3, "eth0");
+            w.udp_datagram(sa(50000), sa(50001), b"c");
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let word = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+        let mut blocks = Vec::new();
+        let mut o = 0;
+        while o < bytes.len() {
+            blocks.push((word(o), o));
+            o += word(o + 4) as usize;
+        }
+        let idbs: Vec<usize> = blocks
+            .iter()
+            .filter(|(t, _)| *t == BLOCK_IDB)
+            .map(|&(_, o)| o)
+            .collect();
+        assert_eq!(idbs.len(), 3);
+        assert_eq!(&bytes[idbs[1] + 16..idbs[1] + 20], &[2, 0, 4, 0]);
+        assert_eq!(&bytes[idbs[1] + 20..idbs[1] + 24], b"eth0");
+        assert_eq!(&bytes[idbs[2] + 20..idbs[2] + 24], b"eth1");
+        let epbs: Vec<(u32, u64)> = blocks
+            .iter()
+            .filter(|(t, _)| *t == BLOCK_EPB)
+            .map(|&(_, o)| {
+                (
+                    word(o + 8),
+                    ((word(o + 12) as u64) << 32) | word(o + 16) as u64,
+                )
+            })
+            .collect();
+        let ns = at.as_nanos() as u64;
+        assert_eq!(epbs, vec![(1, ns), (2, ns), (1, ns)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

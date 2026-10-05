@@ -104,6 +104,69 @@ fn stream_readable_after_peer_write() {
     );
 }
 
+#[test]
+fn stream_writable_is_edge_triggered() {
+    register_test();
+    let mut poll = Poll::new().unwrap();
+    let mut events = Events::with_capacity(4);
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let client = TcpStream::connect(addr).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut server_side = accept_with_timeout(&listener, Duration::from_secs(1));
+    let mut stream = MioTcpStream::from_std(client);
+    poll.registry()
+        .register(
+            &mut stream,
+            Token(3),
+            Interest::READABLE | Interest::WRITABLE,
+        )
+        .unwrap();
+    let writable = |events: &Events| {
+        events
+            .iter()
+            .any(|e| e.token() == Token(3) && e.is_writable())
+    };
+
+    poll.poll(&mut events, Some(Duration::from_millis(10)))
+        .unwrap();
+    assert!(
+        writable(&events),
+        "a fresh registration reports writability"
+    );
+    poll.poll(&mut events, Some(Duration::from_millis(10)))
+        .unwrap();
+    assert!(
+        events.is_empty(),
+        "an idle writable stream must not wake the poller again"
+    );
+
+    snare::set_tcp_recv_window(server_side.local_addr().unwrap(), Some(4));
+    stream.write_all(b"full").unwrap();
+    let err = stream.write(b"x").unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::WouldBlock);
+    let mut buf = [0u8; 4];
+    server_side.read_exact(&mut buf).unwrap();
+    poll.poll(&mut events, Some(Duration::from_millis(10)))
+        .unwrap();
+    assert!(
+        writable(&events),
+        "a write that hit WouldBlock re-arms writability"
+    );
+
+    poll.registry()
+        .reregister(
+            &mut stream,
+            Token(3),
+            Interest::READABLE | Interest::WRITABLE,
+        )
+        .unwrap();
+    poll.poll(&mut events, Some(Duration::from_millis(10)))
+        .unwrap();
+    assert!(writable(&events), "reregistering re-arms writability");
+}
+
 const UDP_TEST_LISTENER: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 21000);
 
@@ -433,4 +496,43 @@ fn poll_and_registry_expose_raw_fd() {
     let poll = Poll::new().unwrap();
     assert_eq!(poll.as_raw_fd(), -1);
     assert_eq!(poll.registry().as_raw_fd(), -1);
+}
+
+#[test]
+fn icmp_error_polls_readable_on_windows_and_errored_everywhere() {
+    for os in [
+        snare::OsSemantics::Linux,
+        snare::OsSemantics::MacOs,
+        snare::OsSemantics::Windows,
+    ] {
+        register_test();
+        snare::set_os_semantics(os);
+        let mut poll = Poll::new().unwrap();
+        let mut events = Events::with_capacity(4);
+        let local: SocketAddr = "127.0.0.1:7800".parse().unwrap();
+        let far: SocketAddr = "127.0.0.1:7801".parse().unwrap();
+        let mut sock = MioUdpSocket::bind(local).unwrap();
+        poll.registry()
+            .register(&mut sock, Token(1), Interest::READABLE)
+            .unwrap();
+        poll.poll(&mut events, Some(Duration::from_millis(1)))
+            .unwrap();
+        assert!(events.is_empty(), "{os}");
+
+        snare::inject_icmp_port_unreachable(local, far);
+        poll.poll(&mut events, Some(Duration::from_millis(1)))
+            .unwrap();
+        let windows = os == snare::OsSemantics::Windows;
+        let seen = events.iter().find(|e| e.token() == Token(1));
+        assert_eq!(
+            seen.is_some(),
+            windows,
+            "{os}: only Windows keeps the error"
+        );
+        if let Some(e) = seen {
+            assert!(e.is_readable() && e.is_error(), "{os}");
+            let err = sock.recv_from(&mut [0u8; 8]).unwrap_err();
+            assert_eq!(snare::os_error_code(&err), Some(10054));
+        }
+    }
 }

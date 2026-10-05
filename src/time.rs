@@ -35,8 +35,6 @@ mod shimmed {
     use std::ops::{Add, AddAssign, Sub, SubAssign};
     use std::time::Duration;
 
-    use crate::state;
-
     /// Virtual monotonic clock reading, stored as a [`Duration`] since the
     /// clock's virtual epoch. Drop-in replacement for [`std::time::Instant`].
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -44,7 +42,15 @@ mod shimmed {
 
     impl Instant {
         pub fn now() -> Instant {
-            Instant(state::clock_mono_now())
+            Instant(crate::sched::mono_now())
+        }
+
+        pub(crate) fn as_virtual(&self) -> Duration {
+            self.0
+        }
+
+        pub(crate) fn from_virtual(d: Duration) -> Instant {
+            Instant(d)
         }
 
         pub fn duration_since(&self, earlier: Instant) -> Duration {
@@ -126,7 +132,7 @@ mod shimmed {
         pub const UNIX_EPOCH: SystemTime = UNIX_EPOCH;
 
         pub fn now() -> SystemTime {
-            SystemTime(state::clock_wall_now())
+            SystemTime(crate::sched::wall_now())
         }
 
         pub fn duration_since(&self, earlier: SystemTime) -> Result<Duration, SystemTimeError> {
@@ -181,6 +187,19 @@ mod shimmed {
     impl fmt::Debug for SystemTime {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_tuple("SystemTime").field(&self.0).finish()
+        }
+    }
+
+    impl From<SystemTime> for std::time::SystemTime {
+        fn from(t: SystemTime) -> Self {
+            std::time::UNIX_EPOCH + t.0
+        }
+    }
+
+    /// Readings before the Unix epoch map to the epoch.
+    impl From<std::time::SystemTime> for SystemTime {
+        fn from(t: std::time::SystemTime) -> Self {
+            SystemTime(t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default())
         }
     }
 

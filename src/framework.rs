@@ -1,16 +1,12 @@
-use std::{
-    cell::RefCell,
-    io,
-    marker::PhantomData,
-    net::SocketAddr,
-    time::{Duration, Instant},
-};
+use std::{cell::RefCell, io, marker::PhantomData, net::SocketAddr, time::Duration};
 
 use anymap2::AnyMap;
 
 use crate::{
     SocketType,
-    state::{self, wait_for_event},
+    sched::waitset::{WaitKey, WaitTicket},
+    state,
+    time::Instant,
 };
 
 /// A type that can be encoded to / decoded from network bytes. See
@@ -41,8 +37,8 @@ pub trait Packetable: Clone + Send + Sync + 'static {
 pub trait StateKey: Default + Send + Sync + 'static {}
 impl<T: Default + Send + Sync + 'static> StateKey for T {}
 
-/// Tracks elapsed time within a tester. The first [`poll_elapsed`](Self::poll_elapsed)
-/// call starts the clock and returns zero.
+/// Tracks elapsed virtual time within a tester. The first
+/// [`poll_elapsed`](Self::poll_elapsed) call starts the clock and returns zero.
 #[derive(Debug, Default)]
 pub struct TimerState {
     start_instant: Option<Instant>,
@@ -463,6 +459,7 @@ pub fn _run_testers(mut testers: Vec<&mut dyn NetTesterInterface>) {
     }
 
     loop {
+        let ticket = WaitTicket::register([WaitKey::Any]);
         for tester in testers.iter_mut() {
             tester.run_due_cycles();
         }
@@ -529,17 +526,18 @@ pub fn _run_testers(mut testers: Vec<&mut dyn NetTesterInterface>) {
 
         let duration = min_duration.unwrap_or_else(|| Duration::from_millis(10));
         if duration > Duration::from_secs(0) {
-            wait_for_event(Some(duration));
+            ticket.wait(Some(Instant::now() + duration), "run_testers");
         }
     }
 }
 
 /// Drive one or more [`NetTester`]s in a shared event loop until any tester's
-/// finish condition fires.
+/// finish condition fires. Cycles, timeouts and the idle poll run on snare's
+/// virtual clock.
 ///
 /// Takes a comma-separated list of mutable tester bindings. Panics if two testers
-/// share both the same address and socket type. Sleeps briefly before entering the
-/// loop to give spawned client threads time to start.
+/// share both the same address and socket type. Sleeps 500 ms of virtual time
+/// before entering the loop to give spawned client threads time to start.
 #[macro_export]
 macro_rules! run_testers {
     ($( $testr:ident ),* $(,)?) => {
@@ -548,7 +546,7 @@ macro_rules! run_testers {
             $(
                 testers_vec.push(&mut $testr);
             )*
-            ::std::thread::sleep(::std::time::Duration::from_millis(500));
+            $crate::thread::sleep(::std::time::Duration::from_millis(500));
             $crate::_run_testers(testers_vec);
         });
     };

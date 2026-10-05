@@ -1,6 +1,6 @@
 [package]
 name = "snare"
-version = "1.4.1"
+version = "1.5.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Bowan Foryt <bowan@valstad.com>"]
@@ -14,17 +14,32 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(snare_global)'] }
 
 [dependencies]
 anymap2 = "0.13.0"
+ctrlc = { version = "3.5.2", optional = true }
+# path for development; publishing needs a fast-talker release with the hidden "sim" feature, then drop path
+fast-talker = { version = "0.1.0", path = "../fast-talker", default-features = false, optional = true }
 mio = { version = "1", optional = true, features = ["os-poll", "os-ext", "net"] }
 parking_lot = "0.12.5"
-event-listener = { version = "5.4.1", features = ["std"] }
+serde = { version = "1.0.229", features = ["derive"], optional = true }
 
 [dev-dependencies]
 bincode = "2.0.1"
+flume = "0.12.0"
+toml = "1.1.6"
 
 [features]
 default = []
-mio-compat = ["mio"]
-shim = []
+mio-compat = ["mio", "fast-talker?/mio"]
+shim = ["fast-talker?/sim", "fast-talker?/plan", "fast-talker?/options", "fast-talker?/sys-check", "fast-talker?/monitor"]
+ctrlc-compat = ["dep:ctrlc"]
+ctrlc-termination = ["ctrlc-compat", "ctrlc/termination"]
+fast-talker-core = ["dep:fast-talker"]
+fast-talker-plan = ["fast-talker-core", "fast-talker/plan"]
+fast-talker-options = ["fast-talker-core", "fast-talker/options"]
+fast-talker-sys-check = ["fast-talker-core", "fast-talker/sys-check"]
+fast-talker-monitor = ["fast-talker-plan", "fast-talker-options", "fast-talker/monitor"]
+fast-talker-serde = ["fast-talker-core", "fast-talker/serde", "dep:serde"]
+fast-talker-pyo3 = ["fast-talker-options", "fast-talker/pyo3"]
+fast-talker-compat = ["fast-talker-monitor", "fast-talker-sys-check"]
 
 [[test]]
 name = "cyclic"
@@ -62,6 +77,11 @@ path = "tests/policy.rs"
 required-features = ["shim", "mio-compat"]
 
 [[test]]
+name = "recv_window"
+path = "tests/recv_window.rs"
+required-features = ["shim"]
+
+[[test]]
 name = "pcapng"
 path = "tests/pcapng.rs"
 required-features = ["shim"]
@@ -79,3 +99,168 @@ required-features = ["shim"]
 [[test]]
 name = "std_parity_real"
 path = "tests/std_parity_real.rs"
+
+[[test]]
+name = "sched_clock"
+path = "tests/sched_clock.rs"
+required-features = ["shim"]
+
+[[test]]
+name = "sched_stub"
+path = "tests/sched_stub.rs"
+
+[[test]]
+name = "sched_participants"
+path = "tests/sched_participants.rs"
+required-features = ["shim"]
+
+[[test]]
+name = "net_wait"
+path = "tests/net_wait.rs"
+required-features = ["shim", "mio-compat"]
+
+[[test]]
+name = "sched_driven_waits"
+path = "tests/sched_driven_waits.rs"
+required-features = ["shim"]
+
+[[test]]
+name = "thread_census"
+path = "tests/thread_census.rs"
+harness = false
+required-features = ["shim"]
+
+[[test]]
+name = "driver_epoch"
+path = "tests/driver_epoch.rs"
+required-features = ["shim"]
+
+[[test]]
+name = "sched_classes"
+path = "tests/sched_classes.rs"
+required-features = ["shim"]
+
+[[test]]
+name = "net_rng_flows"
+path = "tests/net_rng_flows.rs"
+required-features = ["shim"]
+
+[[test]]
+name = "ctrlc_shim"
+path = "tests/ctrlc_shim.rs"
+required-features = ["shim", "ctrlc-compat"]
+
+[[test]]
+name = "ctrlc_os_signal"
+path = "tests/ctrlc_os_signal.rs"
+required-features = ["ctrlc-compat"]
+
+[[test]]
+name = "os_semantics"
+path = "tests/os_semantics.rs"
+required-features = ["shim"]
+
+[[test]]
+name = "nic_model"
+path = "tests/nic_model.rs"
+required-features = ["shim"]
+
+[[test]]
+name = "nic_model_global"
+path = "tests/nic_model_global.rs"
+required-features = ["shim"]
+
+[[test]]
+name = "ft_global"
+path = "tests/ft_global.rs"
+required-features = ["shim", "fast-talker-compat"]
+
+[[test]]
+name = "ctrlc_signals"
+path = "tests/ctrlc_signals.rs"
+required-features = ["shim", "ctrlc-compat"]
+
+[[test]]
+name = "ft_skeleton"
+path = "tests/ft_skeleton.rs"
+required-features = ["shim", "fast-talker-compat"]
+
+[[test]]
+name = "ft_real_reexport"
+path = "tests/ft_real_reexport.rs"
+required-features = ["fast-talker-compat"]
+
+[[test]]
+name = "ft_udp"
+path = "tests/ft_udp.rs"
+required-features = ["shim", "fast-talker-compat"]
+
+[[test]]
+name = "ft_udp_mio"
+path = "tests/ft_udp_mio.rs"
+required-features = ["shim", "fast-talker-compat", "mio-compat"]
+
+[[test]]
+name = "ft_tcp"
+path = "tests/ft_tcp.rs"
+required-features = ["shim", "fast-talker-compat"]
+
+[[test]]
+name = "ft_tcp_mio"
+path = "tests/ft_tcp_mio.rs"
+required-features = ["shim", "fast-talker-compat", "mio-compat"]
+
+[[test]]
+name = "ft_nic"
+path = "tests/ft_nic.rs"
+required-features = ["shim", "fast-talker-compat"]
+
+[[test]]
+name = "ft_rt"
+path = "tests/ft_rt.rs"
+required-features = ["shim", "fast-talker-compat"]
+
+[[test]]
+name = "ft_sys"
+path = "tests/ft_sys.rs"
+required-features = ["shim", "fast-talker-compat"]
+
+[[test]]
+name = "ft_mio_real"
+path = "tests/ft_mio_real.rs"
+required-features = ["fast-talker-compat", "mio-compat"]
+
+[[test]]
+name = "pcapng_nics"
+path = "tests/pcapng_nics.rs"
+required-features = ["shim"]
+
+[[test]]
+name = "ft_sockets"
+path = "tests/ft_sockets.rs"
+required-features = ["shim", "fast-talker-compat"]
+
+[[test]]
+name = "ft_options_plan"
+path = "tests/ft_options_plan.rs"
+required-features = ["shim", "fast-talker-compat"]
+
+[[test]]
+name = "ft_monitor"
+path = "tests/ft_monitor.rs"
+required-features = ["shim", "fast-talker-compat"]
+
+[[test]]
+name = "ft_hspo_e2e"
+path = "tests/ft_hspo_e2e.rs"
+required-features = ["shim", "fast-talker-compat"]
+
+[[test]]
+name = "mio_parity"
+path = "tests/mio_parity.rs"
+required-features = ["mio-compat"]
+
+[[test]]
+name = "resolve_shim"
+path = "tests/resolve_shim.rs"
+required-features = ["shim"]

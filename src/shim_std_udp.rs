@@ -1,32 +1,47 @@
 use std::{
     io,
-    net::{SocketAddr, ToSocketAddrs},
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use crate::state::{
-    Packet, add_udp_connection, is_ip_addr_valid, is_port_available, reserve_ephemeral_addr,
-    wait_for_event, with_udp_connection,
-};
+use crate::resolve::ToSocketAddrs;
+
+use crate::mcast::{McastIf, McastOp, McastState};
+use crate::netif::SocketId;
+use crate::os::{Errno, OsSemantics, os_err_for};
+use crate::sched::waitset::{WaitKey, WaitTicket};
+use crate::state::{os_ctx, udp_take};
+use crate::time::Instant;
 
 #[derive(Debug, Clone, Copy)]
 enum UdpConfigs {
     ReadTimeout(Duration),
     WriteTimeout(Duration),
     Broadcast,
-    Ipv4MulticastLoop,
-    Ipv6MulticastLoop,
-    IpMulticastTtl(u32),
     IpTtl(u32),
     NonBlocking,
 }
 
 #[derive(Debug)]
 pub struct ShimStdUdpSocket {
+    handle: Arc<UdpHandle>,
     bound_addr: SocketAddr,
-    remote_addr: Arc<Mutex<Option<SocketAddr>>>,
-    configs: Arc<Mutex<Vec<UdpConfigs>>>,
+}
+
+/// The state every clone of one socket shares. The socket closes when the
+/// last clone drops.
+#[derive(Debug)]
+struct UdpHandle {
+    id: SocketId,
+    remote_addr: Mutex<Option<SocketAddr>>,
+    configs: Mutex<Vec<UdpConfigs>>,
+}
+
+impl Drop for UdpHandle {
+    fn drop(&mut self) {
+        crate::state::drop_udp_socket(self.id);
+    }
 }
 
 /// Returns `-1`: there is no kernel socket behind the shim. Raw syscalls on
@@ -44,17 +59,17 @@ impl std::os::fd::AsRawFd for ShimStdUdpSocket {
 impl ShimStdUdpSocket {
     fn set_option(&self, config: UdpConfigs) {
         self.del_option(config);
-        let mut configs = self.configs.lock().unwrap();
+        let mut configs = self.handle.configs.lock().unwrap();
         configs.push(config);
     }
 
     fn del_option(&self, config_type: UdpConfigs) {
-        let mut configs = self.configs.lock().unwrap();
+        let mut configs = self.handle.configs.lock().unwrap();
         configs.retain(|c| std::mem::discriminant(c) != std::mem::discriminant(&config_type));
     }
 
     fn get_option(&self, config_type: UdpConfigs) -> Option<UdpConfigs> {
-        let configs = self.configs.lock().unwrap();
+        let configs = self.handle.configs.lock().unwrap();
         for c in configs.iter() {
             if std::mem::discriminant(c) == std::mem::discriminant(&config_type) {
                 return Some(*c);
@@ -65,79 +80,121 @@ impl ShimStdUdpSocket {
 
     #[doc(alias = "std::net::UdpSocket::bind")]
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+        let mut last_err = None;
         for a in addr.to_socket_addrs()? {
-            if !is_ip_addr_valid(a.ip()) {
-                continue;
-            }
             // Port 0 means "any port" — reserve a concrete ephemeral one so the
             // source port on outgoing datagrams routes replies back (a GVCP/GVSP
-            // camera client binds `0.0.0.0:0`). A fixed local port chosen against
-            // the real OS (e.g. openport for a Fanuc STMO client) is blind to the
-            // single global network, so two in-process wildcard clients can pick
-            // the same port; a wildcard client bind is free to move, so fall back
-            // to an ephemeral port rather than failing. Device servers bind a
-            // concrete IP and are unaffected.
-            let bound = if a.port() == 0 {
-                reserve_ephemeral_addr(a.ip())
-            } else if is_port_available(a) {
-                a
-            } else if a.ip().is_unspecified() {
-                reserve_ephemeral_addr(a.ip())
-            } else {
-                continue;
-            };
-            add_udp_connection(bound);
-            return Ok(ShimStdUdpSocket {
-                bound_addr: bound,
-                remote_addr: Arc::new(Mutex::new(None)),
-                configs: Arc::new(Mutex::new(Vec::new())),
-            });
+            // camera client binds `0.0.0.0:0`). Device servers bind a concrete
+            // IP and are unaffected.
+            match crate::state::bind_udp(a) {
+                Ok((id, bound)) => {
+                    return Ok(ShimStdUdpSocket {
+                        handle: Arc::new(UdpHandle {
+                            id,
+                            remote_addr: Mutex::new(None),
+                            configs: Mutex::new(Vec::new()),
+                        }),
+                        bound_addr: bound,
+                    });
+                }
+                Err(Some(e)) => last_err = Some(e),
+                Err(None) => {}
+            }
         }
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "could not resolve to any addresses",
-        ))
+        Err(last_err.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "could not resolve to any addresses",
+            )
+        }))
+    }
+
+    pub(crate) fn id(&self) -> SocketId {
+        self.handle.id
+    }
+
+    /// Take the next datagram with its arrival metadata, waiting as
+    /// `recv_from` does unless `never_wait` or the socket is nonblocking.
+    /// `None` when that would block.
+    #[cfg(feature = "fast-talker-core")]
+    pub(crate) fn take_packet(
+        &self,
+        never_wait: bool,
+        effect: &'static str,
+    ) -> io::Result<Option<crate::state::RxPacket>> {
+        let nonblocking = never_wait || self.is_nonblocking();
+        let mut deadline = None;
+        let mut ticket = None;
+        loop {
+            if let Some(pkt) = crate::state::udp_take_packet(self.handle.id, None, true)? {
+                crate::sched::class_effect(effect);
+                return Ok(Some(pkt));
+            }
+            if nonblocking {
+                return Ok(None);
+            }
+            match ticket.take() {
+                None => ticket = Some(WaitTicket::register([WaitKey::Udp(self.bound_addr)])),
+                Some(t) => {
+                    let timeout = self.read_timeout()?;
+                    self.wait_for_incoming(t, timeout, &mut deadline)?;
+                }
+            }
+        }
+    }
+
+    /// Whether the socket has broadcast permission (`SO_BROADCAST`).
+    #[cfg(feature = "fast-talker-core")]
+    pub(crate) fn broadcast_ok(&self) -> bool {
+        self.get_option(UdpConfigs::Broadcast).is_some()
     }
 
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let nonblocking = self.is_nonblocking();
         let mut deadline = None;
+        let mut ticket = None;
         loop {
             if let Some((data, addr)) = self.pop_incoming_packet(None)? {
-                let copied = Self::copy_into(buf, &data);
+                let copied = Self::copy_into(buf, &data)?;
                 return Ok((copied, addr));
             }
             if nonblocking {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "no data available",
-                ));
+                return Err(would_block());
             }
-            let timeout = self.read_timeout()?;
-            self.wait_for_incoming(timeout, &mut deadline)?;
+            match ticket.take() {
+                None => ticket = Some(WaitTicket::register([WaitKey::Udp(self.bound_addr)])),
+                Some(t) => {
+                    let timeout = self.read_timeout()?;
+                    self.wait_for_incoming(t, timeout, &mut deadline)?;
+                }
+            }
         }
     }
 
     pub fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let nonblocking = self.is_nonblocking();
         let mut deadline = None;
+        let mut ticket = None;
         loop {
             if let Some((data, addr)) = self.peek_incoming_packet(None)? {
-                let copied = Self::copy_into(buf, &data);
+                let copied = Self::copy_into(buf, &data)?;
                 return Ok((copied, addr));
             }
             if nonblocking {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "no data available",
-                ));
+                return Err(would_block());
             }
-            let timeout = self.read_timeout()?;
-            self.wait_for_incoming(timeout, &mut deadline)?;
+            match ticket.take() {
+                None => ticket = Some(WaitTicket::register([WaitKey::Udp(self.bound_addr)])),
+                Some(t) => {
+                    let timeout = self.read_timeout()?;
+                    self.wait_for_incoming(t, timeout, &mut deadline)?;
+                }
+            }
         }
     }
 
     pub fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize> {
+        crate::sched::note_effect("udp send");
         if buf.len() > i32::MAX as usize {
             unimplemented!("partial writes of massive buffers");
         }
@@ -147,30 +204,18 @@ impl ShimStdUdpSocket {
                 "could not resolve to any addresses",
             )
         })?;
-        // Pre-check destruction; the policy-aware enqueue does the rest
-        // (MTU rejection, send-queue cap, etc).
-        with_udp_connection(self.bound_addr, |conn| {
-            if conn.is_destroyed {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "connection destroyed",
-                ));
-            }
-            Ok(())
-        })?;
-        crate::state::enqueue_udp_outbound(
+        family_check(self.bound_addr, first_addr, false)?;
+        crate::state::udp_send(
+            self.handle.id,
             self.bound_addr,
-            Packet {
-                data: buf.to_vec(),
-                dest: first_addr,
-                source: self.bound_addr,
-            },
-        )?;
-        Ok(buf.len())
+            buf,
+            first_addr,
+            self.get_option(UdpConfigs::Broadcast).is_some(),
+        )
     }
 
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        let remote_addr = self.remote_addr.lock().unwrap();
+        let remote_addr = self.handle.remote_addr.lock().unwrap();
         remote_addr
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no remote address set"))
     }
@@ -181,9 +226,8 @@ impl ShimStdUdpSocket {
 
     pub fn try_clone(&self) -> io::Result<ShimStdUdpSocket> {
         Ok(ShimStdUdpSocket {
+            handle: Arc::clone(&self.handle),
             bound_addr: self.bound_addr,
-            remote_addr: Arc::clone(&self.remote_addr),
-            configs: Arc::clone(&self.configs),
         })
     }
 
@@ -255,52 +299,34 @@ impl ShimStdUdpSocket {
     }
 
     pub fn set_multicast_loop_v4(&self, multicast_loop_v4: bool) -> io::Result<()> {
-        if multicast_loop_v4 {
-            self.set_option(UdpConfigs::Ipv4MulticastLoop);
-        } else {
-            self.del_option(UdpConfigs::Ipv4MulticastLoop);
-        }
-        Ok(())
+        self.mcast(|m| m.loop_v4 = multicast_loop_v4)
     }
 
     pub fn multicast_loop_v4(&self) -> io::Result<bool> {
-        if self.get_option(UdpConfigs::Ipv4MulticastLoop).is_some() {
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        self.mcast(|m| m.loop_v4)
     }
 
     pub fn set_multicast_ttl_v4(&self, multicast_ttl_v4: u32) -> io::Result<()> {
-        self.set_option(UdpConfigs::IpMulticastTtl(multicast_ttl_v4));
-        Ok(())
+        if multicast_ttl_v4 > 255 {
+            return Err(crate::os::os_err(Errno::Inval));
+        }
+        self.mcast(|m| m.ttl_v4 = multicast_ttl_v4)
     }
 
     pub fn multicast_ttl_v4(&self) -> io::Result<u32> {
-        if let Some(UdpConfigs::IpMulticastTtl(ttl)) =
-            self.get_option(UdpConfigs::IpMulticastTtl(0))
-        {
-            Ok(ttl)
-        } else {
-            Ok(1)
-        }
+        self.mcast(|m| m.ttl_v4)
     }
 
     pub fn set_multicast_loop_v6(&self, multicast_loop_v6: bool) -> io::Result<()> {
-        if multicast_loop_v6 {
-            self.set_option(UdpConfigs::Ipv6MulticastLoop);
-        } else {
-            self.del_option(UdpConfigs::Ipv6MulticastLoop);
-        }
-        Ok(())
+        self.mcast(|m| m.loop_v6 = multicast_loop_v6)
     }
 
     pub fn multicast_loop_v6(&self) -> io::Result<bool> {
-        if self.get_option(UdpConfigs::Ipv6MulticastLoop).is_some() {
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        self.mcast(|m| m.loop_v6)
+    }
+
+    fn mcast<R>(&self, f: impl FnOnce(&mut McastState) -> R) -> io::Result<R> {
+        crate::mcast::with_mcast(self.handle.id, |_, c| Ok(f(&mut c.mcast)))
     }
 
     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
@@ -316,40 +342,74 @@ impl ShimStdUdpSocket {
         }
     }
 
+    /// Joins `multiaddr` on the interface owning the address `interface`, or
+    /// the one routing picks for `0.0.0.0`.
     pub fn join_multicast_v4(
         &self,
-        _multiaddr: &std::net::Ipv4Addr,
-        _interface: &std::net::Ipv4Addr,
+        multiaddr: &std::net::Ipv4Addr,
+        interface: &std::net::Ipv4Addr,
     ) -> io::Result<()> {
-        unimplemented!("join_multicast_v4 is not implemented in ShimStdUdpSocket");
+        self.membership_v4(McastOp::Join, multiaddr, interface)
     }
 
     pub fn leave_multicast_v4(
         &self,
-        _multiaddr: &std::net::Ipv4Addr,
-        _interface: &std::net::Ipv4Addr,
+        multiaddr: &std::net::Ipv4Addr,
+        interface: &std::net::Ipv4Addr,
     ) -> io::Result<()> {
-        unimplemented!("leave_multicast_v4 is not implemented in ShimStdUdpSocket");
+        self.membership_v4(McastOp::Leave, multiaddr, interface)
     }
 
+    /// Joins `multiaddr` on the interface with index `interface`, or the one
+    /// routing picks for 0.
     pub fn join_multicast_v6(
         &self,
-        _multiaddr: &std::net::Ipv6Addr,
-        _interface: u32,
+        multiaddr: &std::net::Ipv6Addr,
+        interface: u32,
     ) -> io::Result<()> {
-        unimplemented!("join_multicast_v6 is not implemented in ShimStdUdpSocket");
+        self.membership_v6(McastOp::Join, multiaddr, interface)
     }
 
     pub fn leave_multicast_v6(
         &self,
-        _multiaddr: &std::net::Ipv6Addr,
-        _interface: u32,
+        multiaddr: &std::net::Ipv6Addr,
+        interface: u32,
     ) -> io::Result<()> {
-        unimplemented!("leave_multicast_v6 is not implemented in ShimStdUdpSocket");
+        self.membership_v6(McastOp::Leave, multiaddr, interface)
+    }
+
+    fn membership_v4(
+        &self,
+        op: McastOp,
+        group: &std::net::Ipv4Addr,
+        interface: &std::net::Ipv4Addr,
+    ) -> io::Result<()> {
+        crate::mcast::membership(
+            self.handle.id,
+            op,
+            IpAddr::V4(*group),
+            None,
+            McastIf::Addr(IpAddr::V4(*interface)),
+        )
+    }
+
+    fn membership_v6(
+        &self,
+        op: McastOp,
+        group: &std::net::Ipv6Addr,
+        interface: u32,
+    ) -> io::Result<()> {
+        crate::mcast::membership(
+            self.handle.id,
+            op,
+            IpAddr::V6(*group),
+            None,
+            McastIf::Index(interface),
+        )
     }
 
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-        with_udp_connection(self.bound_addr, |conn| Ok(conn.external_error.take()))
+        crate::state::udp_take_error(self.handle.id)
     }
 
     pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
@@ -359,59 +419,63 @@ impl ShimStdUdpSocket {
                 "could not resolve to any addresses",
             )
         })?;
-        let mut remote_addr = self.remote_addr.lock().unwrap();
+        family_check(self.bound_addr, first_addr, true)?;
+        crate::state::udp_connect(self.handle.id, first_addr)?;
+        let mut remote_addr = self.handle.remote_addr.lock().unwrap();
         *remote_addr = Some(first_addr);
         Ok(())
     }
 
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        let remote_addr = self.remote_addr.lock().unwrap();
+        let remote_addr = self.handle.remote_addr.lock().unwrap();
         let addr = remote_addr
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no remote address set"))?;
         self.send_to(buf, addr)
     }
 
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let remote_addr = self.remote_addr.lock().unwrap();
-        let addr = remote_addr
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no remote address set"))?;
+        let addr = self.peer_addr()?;
         let nonblocking = self.is_nonblocking();
         let mut deadline = None;
+        let mut ticket = None;
         loop {
             if let Some((data, _)) = self.pop_incoming_packet(Some(addr))? {
-                let copied = Self::copy_into(buf, &data);
+                let copied = Self::copy_into(buf, &data)?;
                 return Ok(copied);
             }
             if nonblocking {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "no data available from connected address",
-                ));
+                return Err(would_block());
             }
-            let timeout = self.read_timeout()?;
-            self.wait_for_incoming(timeout, &mut deadline)?;
+            match ticket.take() {
+                None => ticket = Some(WaitTicket::register([WaitKey::Udp(self.bound_addr)])),
+                Some(t) => {
+                    let timeout = self.read_timeout()?;
+                    self.wait_for_incoming(t, timeout, &mut deadline)?;
+                }
+            }
         }
     }
 
     pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let remote_addr = self.remote_addr.lock().unwrap();
-        let addr = remote_addr
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no remote address set"))?;
+        let addr = self.peer_addr()?;
         let nonblocking = self.is_nonblocking();
         let mut deadline = None;
+        let mut ticket = None;
         loop {
             if let Some((data, _)) = self.peek_incoming_packet(Some(addr))? {
-                let copied = Self::copy_into(buf, &data);
+                let copied = Self::copy_into(buf, &data)?;
                 return Ok(copied);
             }
             if nonblocking {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "no data available from connected address",
-                ));
+                return Err(would_block());
             }
-            let timeout = self.read_timeout()?;
-            self.wait_for_incoming(timeout, &mut deadline)?;
+            match ticket.take() {
+                None => ticket = Some(WaitTicket::register([WaitKey::Udp(self.bound_addr)])),
+                Some(t) => {
+                    let timeout = self.read_timeout()?;
+                    self.wait_for_incoming(t, timeout, &mut deadline)?;
+                }
+            }
         }
     }
 
@@ -432,91 +496,91 @@ impl ShimStdUdpSocket {
         &self,
         source_filter: Option<SocketAddr>,
     ) -> io::Result<Option<(Vec<u8>, SocketAddr)>> {
-        with_udp_connection(self.bound_addr, |conn| {
-            if conn.is_destroyed {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "connection destroyed",
-                ));
-            }
-            let packet = match source_filter {
-                Some(addr) => conn
-                    .to_local
-                    .iter()
-                    .position(|pkt| pkt.source == addr)
-                    .and_then(|idx| conn.to_local.remove(idx)),
-                None => conn.to_local.pop_front(),
-            };
-            Ok(packet.map(|pkt| (pkt.data, pkt.source)))
-        })
+        let packet = udp_take(self.handle.id, source_filter, true)?;
+        if packet.is_some() {
+            crate::sched::class_effect("udp recv");
+        }
+        Ok(packet)
     }
 
     fn peek_incoming_packet(
         &self,
         source_filter: Option<SocketAddr>,
     ) -> io::Result<Option<(Vec<u8>, SocketAddr)>> {
-        with_udp_connection(self.bound_addr, |conn| {
-            if conn.is_destroyed {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "connection destroyed",
-                ));
-            }
-            let packet = match source_filter {
-                Some(addr) => conn
-                    .to_local
-                    .iter()
-                    .find(|pkt| pkt.source == addr)
-                    .map(|pkt| (pkt.data.clone(), pkt.source)),
-                None => conn
-                    .to_local
-                    .front()
-                    .map(|pkt| (pkt.data.clone(), pkt.source)),
-            };
-            Ok(packet)
-        })
+        udp_take(self.handle.id, source_filter, false)
     }
 
+    /// Park on `ticket` until the socket is notified or the virtual read
+    /// timeout (armed on the first wait) passes. A passed timeout is
+    /// `SO_RCVTIMEO`'s error: `EAGAIN`, or `WSAETIMEDOUT` on Windows.
     fn wait_for_incoming(
         &self,
+        ticket: WaitTicket,
         timeout: Option<Duration>,
         deadline: &mut Option<Instant>,
     ) -> io::Result<()> {
-        if let Some(duration) = timeout {
-            let now = Instant::now();
-            let target = match deadline {
-                Some(existing) => *existing,
-                None => {
-                    let new_deadline = now + duration;
-                    *deadline = Some(new_deadline);
-                    new_deadline
-                }
-            };
-            if now >= target {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "operation timed out",
-                ));
+        let target = match timeout {
+            Some(d) => Some(*deadline.get_or_insert_with(|| Instant::now() + d)),
+            None => {
+                *deadline = None;
+                None
             }
-            let remaining = target - now;
-            if !wait_for_event(Some(remaining)) {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "operation timed out",
-                ));
-            }
-        } else {
-            *deadline = None;
-            wait_for_event(None);
+        };
+        if target.is_some_and(|t| Instant::now() >= t) {
+            return Err(timed_out());
         }
+        ticket.wait(target, "udp read");
         Ok(())
     }
 
-    fn copy_into(buf: &mut [u8], data: &[u8]) -> usize {
+    /// Copy a datagram into `buf`. A datagram longer than `buf` is truncated;
+    /// Windows then also reports `WSAEMSGSIZE`.
+    pub(crate) fn copy_into(buf: &mut [u8], data: &[u8]) -> io::Result<usize> {
         let amount = buf.len().min(data.len());
         if amount > 0 {
             buf[..amount].copy_from_slice(&data[..amount]);
         }
-        amount
+        if amount < data.len() {
+            let (os, faithful) = os_ctx();
+            if faithful && os == OsSemantics::Windows {
+                return Err(os_err_for(os, Errno::MsgSize));
+            }
+        }
+        Ok(amount)
+    }
+}
+
+/// An IPv4 socket cannot address an IPv6 destination, not even a
+/// v4-mapped one. Linux refuses with `EAFNOSUPPORT`. macOS refuses `connect`
+/// with `EINVAL`, and `send_to` with `EHOSTUNREACH` from a socket bound to a
+/// specific address or `EINVAL` from a wildcard one. Windows refuses with
+/// `WSAEAFNOSUPPORT`.
+pub(crate) fn family_check(bound: SocketAddr, dst: SocketAddr, connect: bool) -> io::Result<()> {
+    if bound.is_ipv6() || dst.is_ipv4() {
+        return Ok(());
+    }
+    let os = os_ctx().0;
+    let errno = match os {
+        OsSemantics::MacOs if connect || bound.ip().is_unspecified() => Errno::Inval,
+        OsSemantics::MacOs => Errno::HostUnreach,
+        OsSemantics::Linux | OsSemantics::Windows => Errno::AfNoSupport,
+    };
+    Err(os_err_for(os, errno))
+}
+
+/// A nonblocking operation that found nothing to do.
+pub(crate) fn would_block() -> io::Error {
+    match os_ctx() {
+        (os, true) => os_err_for(os, Errno::WouldBlock),
+        _ => io::Error::from(io::ErrorKind::WouldBlock),
+    }
+}
+
+/// A blocking operation whose `SO_RCVTIMEO` / `SO_SNDTIMEO` passed.
+pub(crate) fn timed_out() -> io::Error {
+    match os_ctx() {
+        (OsSemantics::Windows, true) => os_err_for(OsSemantics::Windows, Errno::TimedOut),
+        (os, true) => os_err_for(os, Errno::WouldBlock),
+        _ => io::Error::from(io::ErrorKind::WouldBlock),
     }
 }

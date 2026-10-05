@@ -10,6 +10,8 @@
 //! `std::net` — nothing extra runs.
 
 #[cfg(feature = "shim")]
+pub use crate::resolve::ToSocketAddrs;
+#[cfg(feature = "shim")]
 pub use crate::shim_std_tcp::{
     Incoming, ShimStdTcpListener as TcpListener, ShimStdTcpStream as TcpStream,
 };
@@ -17,4 +19,4 @@ pub use crate::shim_std_tcp::{
 pub use crate::shim_std_udp::ShimStdUdpSocket as UdpSocket;
 
 #[cfg(not(feature = "shim"))]
-pub use std::net::{Incoming, TcpListener, TcpStream, UdpSocket};
+pub use std::net::{Incoming, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
