@@ -32,6 +32,14 @@ UDP data and arrived error reports share a bounded receive-memory budget, measur
 IPv4/IPv6 payload sizes and buffer limits in `error_queue_limits.rs`. Remaining TCP differences
 can change which reports fit and drop:
 
+- The UDP budget is calibrated on the kernels it was measured on. On 6.17.0-azure (GitHub's
+  `ubuntu-latest`), the real bursts in `report_capacity_charge_and_payload_match_linux` fall
+  outside that calibration: every one of 32 reports fits within a 32768-byte limit at a
+  30720-byte charge. In `ordinary_data_and_error_reports_share_the_receive_budget`, four errors
+  plus four datagrams are all held. `SysLimits::from_real_host` does not measure the per-report
+  charge or the minimum receive buffer, so the sim cannot follow such a kernel. CI skips both
+  tests on Linux.
+
 - TCP uses calibrated MSS, GSO grouping and advertised-window updates when the receiver has
   explicitly set `SO_RCVBUF` or the sender requests transmit timestamps. The enabled
   `tcp_error_queue_segments.rs` IPv4 host comparisons cover writes through 128000 bytes across

@@ -19,6 +19,13 @@ use std::time::Duration;
 use snare::Sim;
 use snare::sched::ExecutiveConfig;
 
+/// Each test holds about a thousand threads at once; run them one at a time so the process stays
+/// under per-process thread limits (2048 on macOS, `kern.num_taskthreads`).
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 const WAITERS: usize = 1_000;
 
 #[derive(Default)]
@@ -64,6 +71,7 @@ fn notify_all_run(sim: &Sim) -> (Vec<usize>, Duration) {
 
 #[test]
 fn a_thousand_condvar_waiters_all_wake_from_one_notify_all() {
+    let _serial = one_at_a_time();
     let (mut woke, took) = notify_all_run(&Sim::new());
     assert_eq!(took, Duration::ZERO, "waking is not a timed wait");
     woke.sort_unstable();
@@ -76,6 +84,7 @@ fn a_thousand_condvar_waiters_all_wake_from_one_notify_all() {
 
 #[test]
 fn a_thousand_condvar_waiters_wake_in_a_golden_order_under_deterministic() {
+    let _serial = one_at_a_time();
     let sim = || Sim::builder().deterministic().seed(1).build();
     let (woke, took) = notify_all_run(&sim());
     assert_eq!(took, Duration::ZERO);
@@ -114,6 +123,7 @@ fn lineages(sim: &Sim) -> (Vec<u64>, Vec<u64>) {
 
 #[test]
 fn lineage_ids_of_deep_and_wide_trees_are_distinct_stable_and_golden() {
+    let _serial = one_at_a_time();
     let (chain_ids, tree_ids) = lineages(&Sim::new());
     assert_eq!((chain_ids.len(), tree_ids.len()), (301, 1_111));
     let mut all: Vec<u64> = chain_ids[1..]
@@ -151,6 +161,7 @@ fn lineage_ids_of_deep_and_wide_trees_are_distinct_stable_and_golden() {
 
 #[test]
 fn the_executive_lists_a_thousand_blocked_participants() {
+    let _serial = one_at_a_time();
     let sim = Sim::new();
     let exec = sim.executive(ExecutiveConfig::default()).unwrap();
     std::thread::scope(|s| {

@@ -49,8 +49,23 @@ fn forward_real_signals() {
         after.sa_sigaction, before.sa_sigaction,
         "restored by the last sim"
     );
-    assert_eq!(after.sa_flags, before.sa_flags);
+    assert_eq!(
+        after.sa_flags & !SA_RESTORER,
+        before.sa_flags & !SA_RESTORER
+    );
 }
+
+/// glibc sets `SA_RESTORER` (<asm/signal.h>) on every action it installs on x86 and x86-64, so a
+/// restored default carries it where the inherited one did not.
+#[cfg(unix)]
+const SA_RESTORER: libc::c_int = if cfg!(all(
+    target_os = "linux",
+    any(target_arch = "x86", target_arch = "x86_64")
+)) {
+    0x0400_0000
+} else {
+    0
+};
 
 #[cfg(windows)]
 #[test]

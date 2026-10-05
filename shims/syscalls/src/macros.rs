@@ -7,7 +7,7 @@
 ///  - `Err(errno)` if the syscall failed.
 ///
 /// # Example
-/// ```
+/// ```no_run
 /// use syscalls::{Sysno, syscall};
 ///
 /// match unsafe { syscall!(Sysno::clone) } {

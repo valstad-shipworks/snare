@@ -118,9 +118,16 @@ fn report_capacity_charge_and_payload_match_linux() {
         out
     };
     let real = probe();
-    assert!(real.iter().all(|(memory, limit, drops, reports, after)| {
-        memory < limit && *drops == 0 && reports.len() < 32 && *after == 0
-    }));
+    let outside: Vec<_> = real
+        .iter()
+        .filter(|(memory, limit, drops, reports, after)| {
+            !(memory < limit && *drops == 0 && reports.len() < 32 && *after == 0)
+        })
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "bursts outside the calibrated range: {outside:?}"
+    );
     let limits = SysLimits::from_real_host().unwrap();
     assert_eq!(
         Sim::builder().sys_limits(limits.clone()).build().run(probe),
@@ -188,9 +195,13 @@ fn ordinary_data_and_error_reports_share_the_receive_budget() {
         out
     };
     let real = probe();
+    let outside: Vec<_> = real
+        .iter()
+        .filter(|(_, _, errors, _, data, after)| !(errors + data < 8 && *after == 0))
+        .collect();
     assert!(
-        real.iter()
-            .all(|(_, _, errors, _, data, after)| errors + data < 8 && *after == 0)
+        outside.is_empty(),
+        "bursts outside the calibrated range: {outside:?}"
     );
     let limits = SysLimits::from_real_host().unwrap();
     assert_eq!(

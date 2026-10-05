@@ -28,18 +28,19 @@ fn rc(r: i32) -> i64 {
     if r == 0 { 0 } else { errno() }
 }
 
-/// A kernel cpu list (`0-3,8,10-11`).
+/// A kernel cpu list (`0-3,8,10-11`); anything else, such as `(null)`, is no CPUs.
 fn parse_cpus(s: &str) -> Vec<usize> {
     s.trim()
         .split(',')
         .filter(|p| !p.is_empty())
-        .flat_map(|p| match p.split_once('-') {
-            Some((a, b)) => a.parse().unwrap_or(0)..=b.parse().unwrap_or(0),
+        .filter_map(|p| match p.split_once('-') {
+            Some((a, b)) => Some(a.parse().ok()?..=b.parse().ok()?),
             None => {
-                let n = p.parse().unwrap_or(0);
-                n..=n
+                let n = p.parse().ok()?;
+                Some(n..=n)
             }
         })
+        .flatten()
         .collect()
 }
 
@@ -134,6 +135,15 @@ fn hw_rt_host_facts_match() {
         if r.1 == Err(libc::ENOENT) && r.0 == "/sys/devices/system/cpu/nohz_full" {
             hw::note(&format!(
                 "{} is absent here (no CONFIG_NO_HZ_FULL); the sim always renders it ({:?})",
+                r.0, s.1
+            ));
+            continue;
+        }
+        // With CONFIG_CPUMASK_OFFSTACK and no nohz_full= argument the mask is never allocated,
+        // and the attribute prints the null cpumask pointer.
+        if r.1.as_deref() == Ok("(null)\n") && r.0 == "/sys/devices/system/cpu/nohz_full" {
+            hw::note(&format!(
+                "{} is an unallocated mask here; the sim renders an empty set ({:?})",
                 r.0, s.1
             ));
             continue;
@@ -328,9 +338,11 @@ fn hw_rt_scheduling_matches() {
         "getscheduler",
     ];
     let h = hw::hw();
-    let no_dma_latency = real[21] == i64::from(libc::ENOENT);
-    if no_dma_latency {
+    let no_dma_latency = real[21] == i64::from(libc::ENOENT) || real[21] == i64::from(libc::EACCES);
+    if real[21] == i64::from(libc::ENOENT) {
         hw::note("/dev/cpu_dma_latency is absent here; the sim always has it");
+    } else if real[21] == i64::from(libc::EACCES) {
+        hw::note("/dev/cpu_dma_latency is root-only here; the sim opens it without privilege");
     }
     for (i, name) in names.iter().enumerate() {
         if no_dma_latency && (i == 21 || i == 22) {
