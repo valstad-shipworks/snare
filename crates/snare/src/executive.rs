@@ -432,7 +432,8 @@ impl Executive {
         self.domain.begin_timestamp();
         let target = self.at(t);
         snare_interpose::real(|| {
-            self.clock.jump_driven(target.saturating_sub(1), false, false);
+            self.clock
+                .jump_driven(target.saturating_sub(1), false, false);
             self.clock.set_stamp(Some(target));
         });
         clock::set_driver_time(Some(self.clock.driver_time_at(target)));
@@ -451,7 +452,8 @@ impl Executive {
                     || self.timer_blocker(Some(target)),
                     true,
                     || {
-                        self.clock.jump_driven(target.saturating_sub(1), false, false);
+                        self.clock
+                            .jump_driven(target.saturating_sub(1), false, false);
                         self.clock.set_stamp(Some(target));
                     },
                 )
