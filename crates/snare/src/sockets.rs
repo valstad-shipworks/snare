@@ -386,6 +386,10 @@ pub(crate) struct SockState {
     /// The family and protocol Linux `SO_DOMAIN` and `SO_PROTOCOL` report.
     #[cfg(target_os = "linux")]
     pub(crate) family: (c_int, c_int),
+    /// The type Linux `SO_TYPE` reports, or 0 where the owning backend answers it from its own
+    /// descriptor kind.
+    #[cfg(target_os = "linux")]
+    pub(crate) ty: c_int,
     /// The descriptors open on this file description; it closes when the last goes.
     fds: BTreeSet<c_int>,
     pub(crate) local: Option<SocketAddr>,
@@ -541,6 +545,12 @@ impl SockRec {
     #[cfg(target_os = "linux")]
     pub(crate) fn set_family(&self, family: c_int, protocol: c_int) {
         self.state().family = (family, protocol);
+    }
+
+    /// Records the type `SO_TYPE` reports, without `SOCK_NONBLOCK`/`SOCK_CLOEXEC`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_type(&self, ty: c_int) {
+        self.state().ty = ty;
     }
 
     /// Records the bound address, and whether it is a station address of the calling thread's sim.
@@ -1277,6 +1287,8 @@ impl SocketTable {
                 kind,
                 #[cfg(target_os = "linux")]
                 family: (0, 0),
+                #[cfg(target_os = "linux")]
+                ty: 0,
                 fds: BTreeSet::from([fd]),
                 local: None,
                 station: false,

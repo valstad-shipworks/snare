@@ -1388,6 +1388,7 @@ struct NetlinkSocket {
     _probe: Arc<NetlinkRx>,
     nonblocking: bool,
     descriptors: std::collections::BTreeSet<c_int>,
+    sockopts: HashMap<(c_int, c_int), Vec<u8>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -2498,8 +2499,8 @@ impl SimHost {
     }
 
     /// The record of the host's datagram or netlink socket on `fd`, and whether it is a netlink
-    /// one. A netlink socket answers only the socket-level options of [`crate::limits::sockopt`]
-    /// itself.
+    /// one. A netlink socket answers the socket-level options of [`crate::limits::sockopt`] and
+    /// `SO_ERROR`, and stores any other option as it is set.
     #[cfg(target_os = "linux")]
     fn sockopt_rec(&self, fd: c_int) -> Option<(Arc<SockRec>, bool)> {
         let state = self.state.lock().unwrap();
@@ -5581,11 +5582,17 @@ impl Net for SimHost {
     #[cfg(target_os = "linux")]
     unsafe fn socket(&self, domain: c_int, ty: c_int, protocol: c_int) -> Option<NetResult> {
         if domain == libc::AF_NETLINK {
+            // netlink_create (net/netlink/af_netlink.c) takes only raw and datagram sockets.
+            let base = ty & 0xf;
+            if base != libc::SOCK_RAW && base != libc::SOCK_DGRAM {
+                return err(libc::ESOCKTNOSUPPORT);
+            }
             let (fd, rec) = match self.open_socket(SocketKind::Netlink) {
                 Ok(opened) => opened,
                 Err(errno) => return err(errno),
             };
             rec.set_family(domain, protocol);
+            rec.set_type(base);
             let probe = Arc::new(NetlinkRx {
                 host: self.me.get().cloned().unwrap_or_default(),
                 id: rec.id.get(),
@@ -5600,6 +5607,7 @@ impl Net for SimHost {
                     _probe: probe,
                     nonblocking: ty & libc::SOCK_NONBLOCK != 0,
                     descriptors: std::collections::BTreeSet::from([fd]),
+                    sockopts: HashMap::new(),
                 },
             );
             if ty & libc::SOCK_CLOEXEC != 0 {
@@ -5627,6 +5635,7 @@ impl Net for SimHost {
                 protocol
             },
         );
+        rec.set_type(libc::SOCK_DGRAM);
         let probe = Arc::new(HostRx {
             host: self.me.get().cloned().unwrap_or_default(),
             id: rec.id.get(),
@@ -6057,6 +6066,14 @@ impl Net for SimHost {
         } as i64)
     }
 
+    #[cfg(target_os = "linux")]
+    fn keep_error(&self, fd: c_int, errno: c_int) {
+        let rec = self.state.lock().unwrap().socket_rec(fd);
+        if let Some(rec) = rec {
+            rec.raise_error(errno, crate::sockets::ErrorOrigin::Raised, None);
+        }
+    }
+
     /// Scatters a netlink reply or a datagram into the iovecs and fills name, control messages
     /// and flags (man 2 recvmsg). A blocking datagram receive waits as [`recvfrom`](Self::recvfrom)
     /// does; a nonblocking one, a netlink socket and `MSG_ERRQUEUE` never wait, and are `EAGAIN`
@@ -6228,12 +6245,30 @@ impl Net for SimHost {
         let (rec, netlink) = self.sockopt_rec(fd)?;
         if netlink {
             let shared = self.shared()?;
-            let result =
-                unsafe { crate::limits::sockopt::set(&shared, &rec, level, name, val, len)? };
-            return match result {
-                Ok(()) => ok(0),
-                Err(errno) => err(errno),
+            if let Some(result) =
+                unsafe { crate::limits::sockopt::set(&shared, &rec, level, name, val, len) }
+            {
+                return match result {
+                    Ok(()) => ok(0),
+                    Err(errno) => err(errno),
+                };
+            }
+            if shared.unmodelled_option(&rec, crate::sockets::UnmodelledOption::Set { level, name })
+            {
+                return err(libc::ENOPROTOOPT);
+            }
+            let bytes = if val.is_null() {
+                Vec::new()
+            } else {
+                unsafe { std::slice::from_raw_parts(val, len as usize) }.to_vec()
             };
+            let mut state = self.state.lock().unwrap();
+            state
+                .netlinks
+                .get_mut(&fd)?
+                .sockopts
+                .insert((level, name), bytes);
+            return ok(0);
         }
         if let Some(shared) = self.shared()
             && let Some(result) = unsafe {
@@ -6358,11 +6393,54 @@ impl Net for SimHost {
     ) -> Option<NetResult> {
         let (rec, netlink) = self.sockopt_rec(fd)?;
         if netlink {
-            let result = unsafe { crate::limits::sockopt::get(&rec, level, name, val, len)? };
-            return match result {
-                Ok(()) => ok(0),
-                Err(errno) => err(errno),
+            if let Some(result) =
+                unsafe { crate::limits::sockopt::get(&rec, level, name, val, len) }
+            {
+                return match result {
+                    Ok(()) => ok(0),
+                    Err(errno) => err(errno),
+                };
+            }
+            if val.is_null() || len.is_null() {
+                return err(libc::EFAULT);
+            }
+            if level == libc::SOL_SOCKET && name == libc::SO_ERROR {
+                let errno = self
+                    .shared()
+                    .and_then(|shared| rec.take_error_as(&shared, crate::sockets::Taker::SoError))
+                    .unwrap_or(0);
+                unsafe { crate::fabric::write_opt(errno, val, len) };
+                return ok(0);
+            }
+            let stored = self
+                .state
+                .lock()
+                .unwrap()
+                .netlinks
+                .get(&fd)?
+                .sockopts
+                .get(&(level, name))
+                .cloned()
+                .unwrap_or_default();
+            if stored.is_empty()
+                && let Some(shared) = self.shared()
+                && shared
+                    .unmodelled_option(&rec, crate::sockets::UnmodelledOption::Get { level, name })
+            {
+                return err(libc::ENOPROTOOPT);
+            }
+            let cap = unsafe { *len } as usize;
+            let n = if stored.is_empty() {
+                cap.min(4)
+            } else {
+                stored.len().min(cap)
             };
+            unsafe {
+                std::ptr::write_bytes(val, 0, n);
+                std::ptr::copy_nonoverlapping(stored.as_ptr(), val, n.min(stored.len()));
+                *len = n as u32;
+            }
+            return ok(0);
         }
         rec.land();
         if val.is_null() || len.is_null() {

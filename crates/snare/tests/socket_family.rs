@@ -21,7 +21,7 @@ mod linux {
         std::io::Error::last_os_error().raw_os_error().unwrap()
     }
 
-    /// `SO_DOMAIN` and `SO_PROTOCOL` read into 4-, 2- and 8-byte buffers, and set.
+    /// `SO_TYPE`, `SO_DOMAIN` and `SO_PROTOCOL` read into 4-, 2- and 8-byte buffers, and set.
     fn ident(fd: i32) -> Vec<String> {
         let read = |name: i32, cap: u32| {
             let mut v = [0xa5u8; 8];
@@ -41,7 +41,7 @@ mod linux {
                 unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, name, (&raw const v).cast(), 4) };
             if rc == 0 { 0 } else { errno() }
         };
-        [libc::SO_DOMAIN, libc::SO_PROTOCOL]
+        [libc::SO_TYPE, libc::SO_DOMAIN, libc::SO_PROTOCOL]
             .into_iter()
             .flat_map(|name| {
                 [
@@ -139,10 +139,48 @@ mod linux {
                 ] {
                     let nl = unsafe { libc::socket(libc::AF_NETLINK, ty, protocol) };
                     assert!(nl >= 0);
+                    assert_eq!(read(nl, libc::SO_TYPE), Ok(ty));
                     assert_eq!(read(nl, libc::SO_DOMAIN), Ok(libc::AF_NETLINK));
                     assert_eq!(read(nl, libc::SO_PROTOCOL), Ok(protocol));
+                    assert_eq!(read(nl, libc::SO_ERROR), Ok(0));
                     unsafe { libc::close(nl) };
                 }
+                assert_eq!(read(fd, libc::SO_TYPE), Ok(libc::SOCK_DGRAM));
+                let stream = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_STREAM, 0) };
+                assert_eq!((stream, errno()), (-1, libc::ESOCKTNOSUPPORT));
+            });
+    }
+
+    /// Options a `SimHost`'s netlink socket does not model read back what was set, as on a
+    /// UDP socket.
+    #[test]
+    fn simhost_netlink_options_read_back() {
+        const SOL_NETLINK: i32 = 270;
+        const NETLINK_EXT_ACK: i32 = 11;
+        Sim::builder()
+            .host(HostProfile::new().build())
+            .build()
+            .run(|| {
+                let nl = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, 0) };
+                assert!(nl >= 0);
+                let on = 1i32;
+                let rc = unsafe {
+                    libc::setsockopt(nl, SOL_NETLINK, NETLINK_EXT_ACK, (&raw const on).cast(), 4)
+                };
+                assert_eq!(rc, 0, "errno {}", errno());
+                let mut v = 0i32;
+                let mut len = 4u32;
+                let rc = unsafe {
+                    libc::getsockopt(
+                        nl,
+                        SOL_NETLINK,
+                        NETLINK_EXT_ACK,
+                        (&raw mut v).cast(),
+                        &mut len,
+                    )
+                };
+                assert_eq!((rc, v, len), (0, 1, 4));
+                unsafe { libc::close(nl) };
             });
     }
 }

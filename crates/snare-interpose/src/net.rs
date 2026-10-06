@@ -613,9 +613,9 @@ pub trait Net: Send + Sync + 'static {
     /// (which block, as the kernel's do, unless `MSG_WAITFORONE` adds `MSG_DONTWAIT` after the
     /// first). `timeout` is checked only after a message arrives and is written back with the time
     /// left, so it never cuts a wait short (man 2 recvmmsg, BUGS). An error ends the batch: with
-    /// no message yet it is the call's, otherwise the messages so far are returned and the error
-    /// is dropped where the kernel would keep it for the next call. Declines when `recvmsg` declines
-    /// the first message.
+    /// no message yet it is the call's, otherwise the messages so far are returned and the error,
+    /// unless `EAGAIN`, goes to [`keep_error`](Net::keep_error) for the next call. Declines when
+    /// `recvmsg` declines the first message.
     ///
     /// # Safety
     /// `msgvec` points to `vlen` `mmsghdr` slots; `timeout`, when non-null, is a `timespec`.
@@ -636,6 +636,15 @@ pub trait Net: Send + Sync + 'static {
             let _ = (fd, msgvec, vlen, flags, timeout);
             None
         }
+    }
+
+    /// Keeps `errno` as `fd`'s pending socket error, which its next receive or `SO_ERROR` reports.
+    ///
+    /// The default [`recvmmsg`](Net::recvmmsg) calls it for an error after the first message, as
+    /// `do_recvmmsg` (net/socket.c) stores one in `sk_err` rather than lose it. The default does
+    /// nothing.
+    fn keep_error(&self, fd: c_int, errno: c_int) {
+        let _ = (fd, errno);
     }
 
     /// Models `select`: each non-null native `fd_set` is reduced to its ready descriptors.
