@@ -1312,7 +1312,7 @@ unsafe fn futex_call(args: [usize; 6], real: impl Fn([usize; 6]) -> c_long) -> O
     if timeout == 0 {
         if domain::counts_native_waits()
             && domain::in_static_image(word)
-            && let Some(r) = outside_grace(op, command, args, &real)
+            && let Some(r) = outside_grace(OUTSIDE_HOLDER_GRACE, op, command, args, &real)
         {
             return Some(r);
         }
@@ -1412,6 +1412,15 @@ const MATCH_ANY: usize = 0xffff_ffff;
 #[cfg(target_os = "linux")]
 const OUTSIDE_HOLDER_GRACE: Duration = Duration::from_millis(1);
 
+/// [`OUTSIDE_HOLDER_GRACE`] for a wait under a deterministic schedule, which keeps the baton
+/// meanwhile. Once a wait passes the baton on, which thread runs next depends on how long the outside
+/// holder took, so the run no longer replays; std's thread-start lock, which another test's spawning
+/// threads hold, stays held for a few milliseconds on a loaded machine. A snare choice: long enough
+/// to outlast such a holder, at the cost of that much real time per wait on a word a parked thread
+/// of the domain holds.
+#[cfg(target_os = "linux")]
+const DET_OUTSIDE_HOLDER_GRACE: Duration = Duration::from_millis(50);
+
 /// The first [`OUTSIDE_HOLDER_GRACE`] of a futex wait on a word in static data, which may be a lock
 /// shared with threads outside the simulation (std's own statics: the stack-overflow handler's
 /// thread-info lock every thread start and exit takes, stdout's lock), as a real wait the domain
@@ -1425,13 +1434,14 @@ const OUTSIDE_HOLDER_GRACE: Duration = Duration::from_millis(1);
 /// `FUTEX_WAIT_BITSET`, bitset, with an absolute deadline on `CLOCK_MONOTONIC` (man 2 futex).
 #[cfg(target_os = "linux")]
 fn outside_grace(
+    grace: Duration,
     op: c_int,
     command: c_int,
     args: [usize; 6],
     real: &impl Fn([usize; 6]) -> c_long,
 ) -> Option<c_long> {
     let [word, _, value, _, word2, bitset] = args;
-    let deadline = to_timespec(crate::real(real_monotonic) + OUTSIDE_HOLDER_GRACE);
+    let deadline = to_timespec(crate::real(real_monotonic) + grace);
     let attempt_op = ((op & libc::FUTEX_PRIVATE_FLAG) | libc::FUTEX_WAIT_BITSET) as usize;
     let bits = if command == libc::FUTEX_WAIT_BITSET {
         bitset
@@ -1509,7 +1519,7 @@ unsafe fn det_futex(
             // cannot release the word meanwhile, so whether this wait yields never depends on
             // outside timing.
             if domain::in_static_image(word)
-                && let Some(r) = outside_grace(op, command, args, real)
+                && let Some(r) = outside_grace(DET_OUTSIDE_HOLDER_GRACE, op, command, args, real)
             {
                 return Some(r);
             }
