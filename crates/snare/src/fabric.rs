@@ -2902,6 +2902,7 @@ impl Net for Fabric {
                 // SO_PROTOCOL reads 0 on a packet socket whatever protocol it was opened with
                 // (measured on Linux 7.0 by tests/socket_family.rs).
                 rec.set_family(domain, 0);
+                rec.set_type(base);
                 Sock::Raw {
                     ifindex: None,
                     rx: VecDeque::new(),
@@ -3236,10 +3237,10 @@ impl Net for Fabric {
 
     /// Takes the oldest pending connection as a new stream fd, writing the peer's address to
     /// `addr`. `flags` is `accept4`'s: `SOCK_NONBLOCK` makes the new fd nonblocking (man 2
-    /// accept4); otherwise it starts blocking whatever the listener's mode. That is Linux's rule
-    /// (man 2 accept: the new socket does not inherit `O_NONBLOCK`); macOS's accept(2) gives the
-    /// new socket "the same properties" as the listener, which is not modelled. If no fd can be
-    /// reserved the connection goes back to the head of the queue.
+    /// accept4); otherwise on Linux it starts blocking whatever the listener's mode (man 2 accept:
+    /// the new socket does not inherit `O_NONBLOCK`), while macOS's accept(2) gives it "the same
+    /// properties" as the listener, `O_NONBLOCK` included, which mio relies on there. If no fd
+    /// can be reserved the connection goes back to the head of the queue.
     unsafe fn accept(
         &self,
         fd: c_int,
@@ -3321,7 +3322,8 @@ impl Net for Fabric {
                 Sock::Stream {
                     conn,
                     end: End::B,
-                    nonblocking: flags & sock_nonblock() != 0,
+                    nonblocking: flags & sock_nonblock() != 0
+                        || (cfg!(target_os = "macos") && nonblocking),
                     rec,
                 },
             );
@@ -3798,6 +3800,12 @@ impl Net for Fabric {
             DgramRecvEndpoint::from_sock(socks.get(&fd)?)?
         };
         unsafe { self.recvfrom_dgram(endpoint, buf, len, flags, addr, addr_len) }
+    }
+
+    fn keep_error(&self, fd: c_int, errno: c_int) {
+        if let Some(rec) = self.rec(fd) {
+            rec.raise_error(errno, crate::sockets::ErrorOrigin::Raised, None);
+        }
     }
 
     /// Receives one datagram into `msg`'s iovecs (man 2 recvmsg), setting `MSG_TRUNC` in
@@ -5525,7 +5533,7 @@ pub(crate) unsafe fn write_opt(value: i32, val: *mut u8, len: *mut u32) {
     let n = size_of::<i32>().min(cap);
     unsafe {
         std::ptr::copy_nonoverlapping(&value as *const i32 as *const u8, val, n);
-        *len = size_of::<i32>() as u32;
+        *len = n as u32;
     }
 }
 

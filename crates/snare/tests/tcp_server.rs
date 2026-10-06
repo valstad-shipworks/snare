@@ -187,6 +187,35 @@ fn nonblocking_accept_would_block() {
     });
 }
 
+/// Whether a stream accepted from a nonblocking listener is itself nonblocking. Linux's accept(2)
+/// starts it blocking; macOS's copies the listener's `O_NONBLOCK`, which mio counts on there.
+#[cfg(unix)]
+fn accepted_from_nonblocking_listener_is_nonblocking() -> bool {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (stream, _) = loop {
+        match listener.accept() {
+            Ok(accepted) => break accepted,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => std::thread::yield_now(),
+            Err(e) => panic!("accept: {e}"),
+        }
+    };
+    let flags = unsafe { libc::fcntl(raw_of(&stream), libc::F_GETFL) };
+    flags & libc::O_NONBLOCK != 0
+}
+
+#[cfg(unix)]
+#[test]
+fn accepted_stream_nonblocking_follows_the_host() {
+    let host = accepted_from_nonblocking_listener_is_nonblocking();
+    assert_eq!(host, cfg!(target_os = "macos"));
+    assert_eq!(
+        Sim::new().run(accepted_from_nonblocking_listener_is_nonblocking),
+        host
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn accept4_flags() {

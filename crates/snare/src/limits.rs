@@ -1520,7 +1520,9 @@ pub(crate) mod sockopt {
                     return Some(read_int(val, len).map(|v| rec.state().buf.rxq_ovfl = v != 0));
                 }
                 // Read-only: sk_setsockopt has no case for them.
-                name::SO_DOMAIN | name::SO_PROTOCOL => return Some(Err(libc::ENOPROTOOPT)),
+                libc::SO_TYPE | name::SO_DOMAIN | name::SO_PROTOCOL => {
+                    return Some(Err(libc::ENOPROTOOPT));
+                }
                 // sk_setsockopt (net/core/sock.c, Linux 7.0, measured): any non-negative
                 // SO_BUSY_POLL, unprivileged; turning SO_PREFER_BUSY_POLL on needs CAP_NET_ADMIN;
                 // raising SO_BUSY_POLL_BUDGET above its current value needs CAP_NET_ADMIN, checked
@@ -1605,6 +1607,12 @@ pub(crate) mod sockopt {
         match name {
             name::SO_PRIORITY => return Some(int(rec.state().opts.priority)),
             name::SO_MARK => return Some(int(rec.state().opts.mark as c_int)),
+            libc::SO_TYPE => {
+                let ty = rec.state().ty;
+                if ty != 0 {
+                    return Some(int(ty));
+                }
+            }
             name::SO_DOMAIN => return Some(int(rec.state().family.0)),
             name::SO_PROTOCOL => return Some(int(rec.state().family.1)),
             name::SO_BUSY_POLL => return Some(int(rec.state().opts.busy_poll.usecs)),

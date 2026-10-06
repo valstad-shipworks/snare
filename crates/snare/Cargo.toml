@@ -12,7 +12,7 @@ readme = "../../README.md"
 description = "Ergonomic in-process network testing on top of snare-interpose: write the code under test against std, describe the peer with a tester builder"
 
 [dependencies]
-snare-interpose = { version = "2.0.3", path = "../snare-interpose" }
+snare-interpose = { version = "2.0.4", path = "../snare-interpose" }
 
 [target.'cfg(unix)'.dependencies]
 glob = "0.3.4"

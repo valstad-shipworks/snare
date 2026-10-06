@@ -516,7 +516,12 @@ pub(crate) unsafe fn recvmmsg_each<N: crate::Net + ?Sized>(
         match unsafe { net.recvmsg(fd, hdr.cast(), flags & !libc::MSG_WAITFORONE) } {
             Some(Ok(n)) => unsafe { (*entry).msg_len = n as libc::c_uint },
             Some(Err(errno)) if received == 0 => return Some(Err(errno)),
-            Some(Err(_)) => break,
+            Some(Err(errno)) => {
+                if errno != libc::EAGAIN {
+                    net.keep_error(fd, errno);
+                }
+                break;
+            }
             None if received == 0 => return None,
             None => break,
         }

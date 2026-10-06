@@ -671,6 +671,38 @@ fn recvmmsg_takes_what_is_queued_os_truth() {
     assert_eq!(Sim::new().run(probe), expected_recvmmsg_rounds());
 }
 
+/// A blocking two-message `recvmmsg` takes one datagram, then an ICMP port unreachable for a send
+/// to a closed port ends its wait for the second: the batch returns the first and the error stays
+/// pending for the next receive (net/socket.c `do_recvmmsg` stores it in `sk_err`).
+#[test]
+fn recvmmsg_keeps_an_error_after_the_first_message_os_truth() {
+    use std::os::fd::AsRawFd;
+    let probe = || {
+        let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let closed = tx.local_addr().unwrap();
+        rx.connect(closed).unwrap();
+        tx.send_to(&[1], rx.local_addr().unwrap()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        drop(tx);
+        let sender = rx.try_clone().unwrap();
+        let send = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            sender.send(&[2]).unwrap();
+        });
+        let batch = recvmmsg_firsts(rx.as_raw_fd(), 2, 0, None);
+        send.join().unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 8];
+        let next = rx.recv(&mut buf).map_err(|e| e.raw_os_error().unwrap());
+        let after = rx.recv(&mut buf).map_err(|e| e.raw_os_error().unwrap());
+        (batch, next, after)
+    };
+    let expected = (Ok(vec![1]), Err(libc::ECONNREFUSED), Err(libc::EAGAIN));
+    assert_eq!(probe(), expected);
+    assert_eq!(Sim::new().run(probe), expected);
+}
+
 #[test]
 fn recvmmsg_on_a_simhost_socket() {
     Sim::builder()
