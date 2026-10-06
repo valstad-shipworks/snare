@@ -1094,6 +1094,11 @@ impl Readiness {
                     // A lease taken since the check above holds the domain busy.
                     continue;
                 }
+                if snare_interpose::parked_on_shared_word() {
+                    // A thread waits on a lock in static data, which a thread outside the sim may
+                    // hold: once that lets go the domain runs again.
+                    continue;
+                }
                 let result = ready();
                 return self.leave(state, parked, result);
             }

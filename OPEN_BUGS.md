@@ -222,7 +222,11 @@ Four tests retain guards for information unavailable at the current interception
   Treating every such wait as outside-held would prevent an inside holder's virtual sleep from
   completing. Supporting both cases requires ownership instrumentation above the wait ABI,
   such as an instrumented std build or an owner-aware lock API. A `busy()` lease remains an
-  explicit application workaround; it does not make this unchanged regression pass.
+  explicit application workaround; it does not make this unchanged regression pass. A participant
+  blocked on a word in static data no longer makes the run read as deadlocked, so blocking socket
+  calls keep waiting instead of failing with `EAGAIN`/`WSAEWOULDBLOCK`
+  (`blocking_read_outside_lock`); a genuine deadlock on such a word now stalls with the stall
+  warning rather than giving up.
 - **Windows realtime thread priority:**
   `win_host_os_truth::current_process_background_and_priority_classes_match_the_host` reports
   a mismatch when this VM grants `REALTIME_PRIORITY_CLASS`: native `SetThreadPriority(-14)`

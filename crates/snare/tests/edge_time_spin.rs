@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 use snare::Sim;
 use snare::sched::{self, ExecutiveConfig, Grant};
 
+#[path = "support/landing.rs"]
+mod landing;
+
 const US: u64 = 1_000;
 
 /// Sim time in nanoseconds, read without ticking the clock.
@@ -130,11 +133,15 @@ fn a_spin_steps_from_where_it_was_caught() {
                 })
                 .collect::<Vec<_>>()
         });
-        assert_eq!(seen, spin_model(1_000_000_001, 300), "{name}");
+        assert_eq!(
+            seen,
+            spin_model(landing::past(1_000_000_000), 300),
+            "{name}"
+        );
     }
 }
 
-/// A spin passing a sleeper's deadline lands 1 ns short of it, then 1 ns past it, where the
+/// A spin passing a sleeper's deadline lands 1 ns short of it, then just past it, where the
 /// sleeper wakes; the distinct readings the spinner sees are fixed. On the plain clock the spinner
 /// may read the landing past the deadline more than once while the woken sleeper gets to run, so
 /// repeats are folded.
@@ -154,7 +161,8 @@ fn a_spin_lands_just_short_of_then_just_past_a_timer() {
             spun.dedup();
             (spun, sleeper.join().unwrap())
         });
-        assert_eq!(woke, 50 * US + 1, "{name}");
+        let past = landing::past(50 * US);
+        assert_eq!(woke, past, "{name}");
         let near: Vec<u64> = spun
             .iter()
             .copied()
@@ -162,7 +170,7 @@ fn a_spin_lands_just_short_of_then_just_past_a_timer() {
             .collect();
         assert_eq!(
             near,
-            vec![48 * US, 49 * US, 50 * US - 1, 50 * US + 1, 51 * US + 1],
+            vec![48 * US, 49 * US, 50 * US - 1, past, past + US],
             "{name}: {spun:?}"
         );
     }

@@ -1,0 +1,8 @@
+         0ns +0 TcpPolicyChanged { addr: 127.0.0.63:16250, policy: TcpPolicy { latency: 2ms, jitter: 0ns, recv_window: None } }
+         0ns +1 Accepted { tester: 127.0.0.63:16250, peer: 127.0.0.1:49152 }
+    2.0001ms +2 Received { transport: Tcp, tester: 127.0.0.63:16250, peer: 127.0.0.1:49152, len: 4 }
+    2.0001ms +3 Sent { transport: Tcp, tester: 127.0.0.63:16250, peer: 127.0.0.1:49152, len: 9 }
+    6.0003ms +4 Received { transport: Tcp, tester: 127.0.0.63:16250, peer: 127.0.0.1:49152, len: 4 }
+    6.0003ms +5 Sent { transport: Tcp, tester: 127.0.0.63:16250, peer: 127.0.0.1:49152, len: 9 }
+    8.0004ms +6 PeerClosed { tester: 127.0.0.63:16250, peer: 127.0.0.1:49152 }
+  100.0001ms +7 Closed { tester: 127.0.0.63:16250, peer: 127.0.0.1:49152 }

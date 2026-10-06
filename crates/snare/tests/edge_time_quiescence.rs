@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 use snare::Sim;
 use snare::sched::{self, ExecutiveConfig};
 
+#[path = "support/landing.rs"]
+mod landing;
+
 const MS: Duration = Duration::from_millis(1);
 
 fn ns() -> u64 {
@@ -158,11 +161,15 @@ fn a_deadlock_behind_a_timer_gives_up_just_past_it() {
             sleeper.join().unwrap();
             (kind, ns())
         });
-        assert_eq!(seen, (std::io::ErrorKind::WouldBlock, 7_000_001), "{name}");
+        assert_eq!(
+            seen,
+            (std::io::ErrorKind::WouldBlock, landing::past(7_000_000)),
+            "{name}"
+        );
     }
 }
 
-/// A thread left sleeping in a loop after its run returns keeps landing exactly 1 ns past each
+/// A thread left sleeping in a loop after its run returns keeps landing exactly just past each
 /// deadline, but no further ahead of where the run left the clock than real time has moved.
 #[test]
 fn a_thread_left_over_after_its_run_sleeps_no_faster_than_real_time() {
@@ -182,11 +189,7 @@ fn a_thread_left_over_after_its_run_sleeps_no_faster_than_real_time() {
         });
         let seen = rx.recv_timeout(Duration::from_secs(30)).unwrap();
         let elapsed = snare::real(|| real.elapsed());
-        assert_eq!(
-            seen,
-            vec![10_000_001, 20_000_002, 30_000_003, 40_000_004, 50_000_005],
-            "{name}"
-        );
+        assert_eq!(seen, landing::steps(0, 10_000_000, 5), "{name}");
         assert!(
             Duration::from_nanos(seen[4]) <= elapsed,
             "{name}: {:?} of sim time in {elapsed:?} of real time",
@@ -231,9 +234,7 @@ fn concurrent_sims_keep_independent_exact_clocks() {
             .collect();
         for run in runs {
             let (k, seen, end) = run.join().unwrap();
-            let expected: Vec<u64> = (1..=50u64)
-                .map(|i| i * (k as u64 * 1_000_000 + 1))
-                .collect();
+            let expected = landing::steps(0, u64::from(k) * 1_000_000, 50);
             assert_eq!(seen, expected, "sim {k}");
             assert_eq!(end, Duration::from_nanos(expected[49]), "sim {k}");
         }
@@ -269,7 +270,11 @@ fn the_stuck_watchdog_stays_quiet_through_legitimate_waits() {
             }
             ns()
         });
-        assert_eq!(at, 3_600_000_000_060, "deterministic {deterministic}");
+        assert_eq!(
+            at,
+            landing::steps(0, 60_000_000_000, 60)[59],
+            "deterministic {deterministic}"
+        );
         sim.pause_time();
         let time = sim.time();
         let resumer = thread::spawn(move || {
@@ -283,7 +288,7 @@ fn the_stuck_watchdog_stays_quiet_through_legitimate_waits() {
         resumer.join().unwrap();
         assert_eq!(
             woke,
-            3_600_000_000_060 + 1_000_001,
+            landing::past(at + 1_000_000),
             "deterministic {deterministic}"
         );
     }
@@ -404,7 +409,7 @@ fn a_sleep_future_is_polled_once_more_only_at_its_own_deadline() {
             }
             (polls.load(Ordering::SeqCst), at)
         });
-        assert_eq!((polls, at), (2, 2_501_001), "{name}");
+        assert_eq!((polls, at), (2, landing::past(2_501_000)), "{name}");
     }
 }
 
