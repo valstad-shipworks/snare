@@ -2308,10 +2308,10 @@ impl Drop for AddressWaitValue {
 /// How many `WakeByAddressSingle`/`WakeByAddressAll` calls have reached each address, hashed into
 /// a fixed table, so a timed wait can tell whether any wake was made on its address while it
 /// waited. Two addresses sharing a slot only make a spurious return look like a wake.
-static ADDRESS_WAKES: [AtomicU64; 4096] = [const { AtomicU64::new(0) }; 4096];
+static ADDRESS_WAKES: [AtomicU64; 65536] = [const { AtomicU64::new(0) }; 65536];
 
 fn address_wakes(addr: usize) -> &'static AtomicU64 {
-    let hash = (addr as u64 >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 52;
+    let hash = (addr as u64 >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 48;
     &ADDRESS_WAKES[hash as usize]
 }
 
@@ -2456,12 +2456,21 @@ unsafe fn wait_on_address_call(
                     )
                     .then_some(1)
             },
-            || {
+            || loop {
                 if crate::os::nested::spoiled(addr) {
-                    1
-                } else {
-                    unsafe { wait(address, compare, size, millis) }
+                    break 1;
                 }
+                let woke = unsafe { wait(address, compare, size, millis) };
+                // A return with the comparand in place and no wake made on the address since the
+                // wait began is spurious: waiting on would be the same wait, and returning would
+                // hand the caller (std's condition variable) a wake no thread made.
+                if woke != 0
+                    && !woken_at(addr, woke)
+                    && address_wakes(addr).load(Ordering::Acquire) == wakes
+                {
+                    continue;
+                }
+                break woke;
             },
             |woke| woken_at(addr, *woke),
         );

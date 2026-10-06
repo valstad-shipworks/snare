@@ -137,10 +137,11 @@ cases on that host, not every Winsock hook or supported Windows release.
   contexts, cross-process aliases, alertable timer waits and blocking mixed-object waits return
   `ERROR_NOT_SUPPORTED` (50). Tolerable-delay requests use the exact deadline
   rather than modelling the host's coalescing policy.
-- A timed `WaitOnAddress` outlasts a spurious return (`TRUE` with the comparand still in place)
-  only when no `WakeByAddress*` reached its address meanwhile, tracked in a fixed table of 4096
-  hashed counters. A wake of another address sharing the slot lets the spurious return through, and
-  std's `park_timeout` then returns before its virtual timeout.
+- A `WaitOnAddress`, timed or not, outlasts a spurious return (`TRUE` with the comparand still in
+  place) only when no `WakeByAddress*` reached its address meanwhile, tracked in a fixed table of
+  65 536 hashed counters. A wake of another address sharing the slot lets the spurious return
+  through: std's `park_timeout` then returns before its virtual timeout, and a condition variable
+  wait returns with no notify.
 - Rust's Windows sleep conversion discards sub-100 ns precision; finite std synchronization
   timeouts use a millisecond `WaitOnAddress` timeout. Overflowing Rust sleep durations reach the
   clock through a typed hook before conversion and saturate at the finite clock limit. Native
