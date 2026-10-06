@@ -137,10 +137,11 @@ cases on that host, not every Winsock hook or supported Windows release.
   contexts, cross-process aliases, alertable timer waits and blocking mixed-object waits return
   `ERROR_NOT_SUPPORTED` (50). Tolerable-delay requests use the exact deadline
   rather than modelling the host's coalescing policy.
-- A timed `WaitOnAddress` outlasts a spurious return (`TRUE` with the comparand still in place)
-  only when no `WakeByAddress*` reached its address meanwhile, tracked in a fixed table of 4096
-  hashed counters. A wake of another address sharing the slot lets the spurious return through, and
-  std's `park_timeout` then returns before its virtual timeout.
+- A `WaitOnAddress`, timed or not, outlasts a spurious return (`TRUE` with the comparand still in
+  place) only when no `WakeByAddress*` reached its address meanwhile, tracked in a fixed table of
+  65 536 hashed counters. A wake of another address sharing the slot lets the spurious return
+  through: std's `park_timeout` then returns before its virtual timeout, and a condition variable
+  wait returns with no notify.
 - Rust's Windows sleep conversion discards sub-100 ns precision; finite std synchronization
   timeouts use a millisecond `WaitOnAddress` timeout. Overflowing Rust sleep durations reach the
   clock through a typed hook before conversion and saturate at the finite clock limit. Native
@@ -222,7 +223,11 @@ Four tests retain guards for information unavailable at the current interception
   Treating every such wait as outside-held would prevent an inside holder's virtual sleep from
   completing. Supporting both cases requires ownership instrumentation above the wait ABI,
   such as an instrumented std build or an owner-aware lock API. A `busy()` lease remains an
-  explicit application workaround; it does not make this unchanged regression pass.
+  explicit application workaround; it does not make this unchanged regression pass. A participant
+  blocked on a word in static data no longer makes the run read as deadlocked, so blocking socket
+  calls keep waiting instead of failing with `EAGAIN`/`WSAEWOULDBLOCK`
+  (`blocking_read_outside_lock`); a genuine deadlock on such a word now stalls with the stall
+  warning rather than giving up.
 - **Windows realtime thread priority:**
   `win_host_os_truth::current_process_background_and_priority_classes_match_the_host` reports
   a mismatch when this VM grants `REALTIME_PRIORITY_CLASS`: native `SetThreadPriority(-14)`
@@ -245,9 +250,10 @@ Supported model boundaries and unverified approximations. These do not establish
 - **Locks held outside the sim:** a wait on an ownerless lock held outside the sim can still let
   time skip. Linux futex and Windows `WaitOnAddress` waits in static data get a 1 ms real grace;
   an outside holder that keeps such a lock longer, and arbitrary heap-backed std mutexes, do not.
-  Under `deterministic()` such a wait then passes the baton, so the run's order depends on how
-  long the outside holder took (a holder descheduled on a loaded or single-CPU host exceeds the
-  grace). macOS pthread mutexes name their owner and keep the baton for an outside holder.
+  Under `deterministic()` such a wait keeps the baton for 50 ms of real time before it passes it,
+  after which the run's order depends on how long the outside holder took; std's thread-start lock,
+  which parallel tests' spawning threads hold, otherwise broke replay under load
+  (`edge_scale_testers`). A holder inside the domain costs a deterministic wait those 50 ms. macOS pthread mutexes name their owner and keep the baton for an outside holder.
   std's one-time Windows Winsock startup, which holds its `Once` far longer, is run outside every
   domain before the first one is installed. macOS std `RwLock` and `Once` can park on ownerless
   semaphores. An external holder's `sim.busy()` lease prevents the incorrect skip; an

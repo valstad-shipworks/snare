@@ -14,6 +14,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::time::Duration;
 
+#[path = "support/landing.rs"]
+mod landing;
+
 use snare::{
     Bytes, CrLf, Delimited, Delimiter, Endian, FrameLength, LengthField, LengthPrefixed, Line,
     Packet, Sim, TcpPolicy, TesterAction, connect_tester, run_testers, set_tcp_policy, udp_tester,
@@ -436,11 +439,11 @@ fn cyclic_ticks() -> [Vec<Duration>; 3] {
     [rel(&phased), rel(&zero), rel(&plain)]
 }
 
-/// Every tick but a zero phase's first is a timed wake, landing 1 ns past its deadline as every
+/// Every tick but a zero phase's first is a timed wake, landing just past its deadline as every
 /// time skip does; the lattice itself never drifts.
 #[test]
 fn cyclic_ticks_land_on_their_exact_lattice() {
-    let at = |ms: u64| Duration::from_millis(ms) + Duration::from_nanos(1);
+    let at = |ms: u64| Duration::from_nanos(landing::past(ms * 1_000_000));
     for sim in sims() {
         let [phased, zero, plain] = sim.run(cyclic_ticks);
         assert_eq!(phased, [at(3), at(10), at(17), at(24)]);
@@ -491,5 +494,10 @@ fn a_deterministic_echo_session_logs_the_golden_events() {
         echo_session_log(),
         "the same seed logs the same entries"
     );
-    golden::check_text("edge_net_testers_events.txt", &log);
+    let name = if cfg!(windows) {
+        "edge_net_testers_events.windows.txt"
+    } else {
+        "edge_net_testers_events.txt"
+    };
+    golden::check_text(name, &log);
 }

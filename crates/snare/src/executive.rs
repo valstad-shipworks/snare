@@ -391,8 +391,8 @@ impl Executive {
     /// quiescent — checked in the same step as the move, so no participant starts running in
     /// between. It lands exactly on that timer, so one jump releases one timer group; returns how
     /// many participant waits, events and wakers were due there. The line re-anchors there at the
-    /// grant's rate, its horizon raised to reach just past it if need be (1 ns, or one
-    /// `QueryPerformanceCounter` tick on Windows), so the clock holds there — but for that creep,
+    /// grant's rate, its horizon raised to reach just past it if need be (1 ns, or on Windows 100 ns
+    /// or one `QueryPerformanceCounter` tick where that is longer), so the clock holds there — but for that creep,
     /// which only a charged call can cross — unless the grant flows on beyond. On `Err` nothing changed.
     ///
     /// Landing exactly on a deadline leaves a loop such as std's `Condvar::wait_timeout_while`

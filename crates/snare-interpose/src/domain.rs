@@ -1546,6 +1546,29 @@ pub fn quiescent(settling: bool) -> bool {
     here().is_some_and(|domain| domain.quiescent(settling))
 }
 
+/// Whether a participant of the calling thread's domain is parked in a native wait on a word in a
+/// loaded image: a lock in static data that a thread outside the domain may hold, so a quiescent
+/// domain with no time left to pass is not deadlocked while it waits there.
+pub fn parked_on_shared_word() -> bool {
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        let Some(domain) = here() else {
+            return false;
+        };
+        let _passthrough = Passthrough::enter();
+        let core = domain.accounting.core();
+        core.rows.values().any(|row| {
+            row.class == ThreadClass::Participant
+                && row
+                    .wait
+                    .and_then(|wait| wait.key)
+                    .is_some_and(crate::os::address_in_image)
+        })
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    false
+}
+
 /// Marks the calling participant as entering (`true`) or leaving (`false`) a native wait that never
 /// gives up (a join, a lock), for its domain's quiescence count; a no-op for other classes and off
 /// a domain. The returned bump runs an armed epoch callback when dropped, so a caller holding a

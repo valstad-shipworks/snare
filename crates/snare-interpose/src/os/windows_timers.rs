@@ -946,9 +946,17 @@ fn wait_dormant_word(word: &AtomicU32, expected: u32, timeout: u32) -> i32 {
         )
     };
     let preflight = || (word.load(Ordering::Acquire) != expected).then_some(1);
+    // `WaitOnAddress` may return TRUE with the comparand still in place (Microsoft Learn:
+    // WaitOnAddress, "spurious wakeups"); only a changed word ends the wait, or such a return would
+    // read as a wake from outside the domain.
     let attempt = || {
         domain::foreign_time_skip();
-        unsafe { wait(address, std::ptr::from_ref(&expected).cast(), 4, 2) }
+        let result = unsafe { wait(address, std::ptr::from_ref(&expected).cast(), 4, 2) };
+        if result != 0 && word.load(Ordering::Acquire) == expected {
+            unsafe { SetLastError(1460) };
+            return 0;
+        }
+        result
     };
     if timeout == u32::MAX {
         domain::native_wait_at_checked(

@@ -17,6 +17,14 @@ use std::time::{Duration, Instant};
 
 use snare::{Sim, TimeHandle, sched};
 
+#[path = "support/landing.rs"]
+mod landing;
+
+/// Where a time skip to `deadline` lands.
+fn past(deadline: Duration) -> Duration {
+    Duration::from_nanos(landing::past(deadline.as_nanos() as u64))
+}
+
 const MS: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -224,7 +232,7 @@ fn waiters_released_by_advance_and_set_value_wake_at_the_reading_they_left() {
 /// A paused clock resumed with a sleeper pending moves on by a time skip, landing 1 ns past the
 /// sleeper's deadline.
 #[test]
-fn a_waiter_released_by_resume_wakes_one_nanosecond_past_its_deadline() {
+fn a_waiter_released_by_resume_wakes_just_past_its_deadline() {
     for deterministic in [false, true] {
         let sim = if deterministic {
             Sim::builder().deterministic().build()
@@ -244,11 +252,7 @@ fn a_waiter_released_by_resume_wakes_one_nanosecond_past_its_deadline() {
             sched::now()
         });
         driver.join().unwrap();
-        assert_eq!(
-            woke,
-            10 * MS + Duration::from_nanos(1),
-            "deterministic {deterministic}"
-        );
+        assert_eq!(woke, past(10 * MS), "deterministic {deterministic}");
     }
 }
 
@@ -285,8 +289,8 @@ fn controls_from_inside_the_run_read_back_exactly() {
                 2 * MS,
                 5 * MS,
                 9 * MS,
-                10 * MS + Duration::from_nanos(1),
-                11 * MS + Duration::from_nanos(2),
+                past(10 * MS),
+                past(past(10 * MS) + MS),
             ],
             "deterministic {deterministic}"
         );

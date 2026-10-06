@@ -215,6 +215,15 @@ struct Blocked {
 }
 
 impl Blocked {
+    /// Whether only the wake of a timer the waiter registered itself ends the wait, as for a
+    /// Windows waitable timer, rather than a re-poll.
+    fn woken_by_timer(&self) -> bool {
+        #[cfg(windows)]
+        return self.timer_waker;
+        #[cfg(not(windows))]
+        false
+    }
+
     fn should_repoll(&self) -> bool {
         let DetKey::Addr(addr) = self.key else {
             return false;
@@ -1056,13 +1065,17 @@ impl Scheduler {
         Self::grant_if_idle(st);
     }
 
+    /// Times out the native waits `now` reached when a call's latency moved the clock. While other
+    /// threads wait for their turn only waits on a timer's own wake are released: nothing re-polls
+    /// them for that wake, and a time skip taken once those threads have run would carry the clock
+    /// on to the next deadline first.
     pub(crate) fn release_due_native_at(&self, now: Option<Duration>) {
         let _passthrough = Passthrough::enter();
         let mut st = self.lock();
-        if !st.runnable.is_empty() {
-            return;
-        }
-        Self::release_due_matching(&mut st, now, |wait| matches!(wait.key, DetKey::Addr(_)));
+        let others_run = !st.runnable.is_empty();
+        Self::release_due_matching(&mut st, now, |wait| {
+            matches!(wait.key, DetKey::Addr(_)) && (!others_run || wait.woken_by_timer())
+        });
         Self::grant_if_idle(st);
     }
 
@@ -1146,8 +1159,12 @@ impl Scheduler {
                 }
                 continue;
             }
-            // No time left to pass. Sim waits give up, as a deadlock makes them.
-            if Self::wake_key(&mut st, DetKey::Readiness, usize::MAX, DetWake::Deadlock) > 0 {
+            // No time left to pass. Sim waits give up, as a deadlock makes them — unless a thread
+            // waits on a word in static data, which a thread outside the sim may hold: then the
+            // wait for it to let go below is no deadlock.
+            if !Self::blocked_on_shared_word(&st)
+                && Self::wake_key(&mut st, DetKey::Readiness, usize::MAX, DetWake::Deadlock) > 0
+            {
                 continue;
             }
             // Every participant waits on something only a thread outside the schedule can do (a
@@ -1176,6 +1193,21 @@ impl Scheduler {
                 return skipped;
             }
             Self::repoll_addr_waiters(&mut st);
+        }
+    }
+
+    /// Whether a blocked thread waits on a word in a loaded image: a lock in static data (std's
+    /// stdout and stderr locks, a `static` mutex) that a thread of another sim or of none may hold,
+    /// and which carries no owner to tell.
+    fn blocked_on_shared_word(st: &State) -> bool {
+        #[cfg(any(target_os = "linux", windows))]
+        return st.blocked.values().any(
+            |b| matches!(b.key, DetKey::Addr(addr) if crate::domain::in_static_image(addr)),
+        );
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            let _ = st;
+            false
         }
     }
 

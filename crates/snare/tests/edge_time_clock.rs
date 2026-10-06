@@ -1,8 +1,8 @@
 //! Behaviour pins for the discrete virtual clock, ahead of performance work on it: the exact
 //! nanosecond every sleep, timed wait and time skip lands on, asserted with `==`.
 //!
-//! The rules pinned: a time skip lands 1 ns past the earliest pending deadline, so a wait for `d`
-//! from `t` wakes at `t + d + 1`; every wait whose deadline the landing reached wakes there with
+//! The rules pinned: a time skip lands just past the earliest pending deadline (1 ns, or on Windows
+//! the next `QueryPerformanceCounter` tick), so a wait for `d` from `t` wakes at `past(t + d)`; every wait whose deadline the landing reached wakes there with
 //! it (adjacent deadlines coalesce, they are not visited one by one); a zero wait moves nothing;
 //! a satisfied or dropped timed wait leaves no timer behind for a later skip to visit; deadlines
 //! at the far end of the clock saturate instead of wrapping. Each holds on the plain discrete
@@ -20,6 +20,11 @@ use std::time::{Duration, Instant};
 
 use snare::sched;
 use snare::{Sim, SimBuilder};
+
+#[path = "support/landing.rs"]
+mod landing;
+
+use landing::{past, steps, wakes};
 
 const MS: Duration = Duration::from_millis(1);
 const US: Duration = Duration::from_micros(1);
@@ -66,16 +71,18 @@ fn pin_each<T: PartialEq + std::fmt::Debug>(
 }
 
 #[test]
-fn chained_sleeps_land_one_nanosecond_past_each_deadline() {
-    let third = 20_000_003 + SLEEP_NS;
+fn chained_sleeps_land_just_past_each_deadline() {
+    let second = past(past(10_000_000) + 10_000_000);
+    let third = past(second + SLEEP_NS);
+    let fifth = past(third + 1_000_000_000);
     pin(
         vec![
-            10_000_001,
-            20_000_002,
+            past(10_000_000),
+            second,
             third,
             third,
-            third + 1_000_000_001,
-            third + 1_000_001_002,
+            fifth,
+            past(fifth + 1_000),
         ],
         || {
             let mut seen = Vec::new();
@@ -96,8 +103,8 @@ fn chained_sleeps_land_one_nanosecond_past_each_deadline() {
 }
 
 #[test]
-fn timed_waits_that_expire_land_one_nanosecond_past_their_deadline() {
-    pin(vec![5_000_001, 10_000_002, 15_000_003, 20_000_004], || {
+fn timed_waits_that_expire_land_just_past_their_deadline() {
+    pin(steps(0, 5_000_000, 4), || {
         let mut seen = Vec::new();
 
         let pair = (Mutex::new(()), Condvar::new());
@@ -125,7 +132,8 @@ fn timed_waits_that_expire_land_one_nanosecond_past_their_deadline() {
 
 #[test]
 fn socket_read_timeouts_expire_on_the_virtual_clock() {
-    pin(vec![7_000_001, 7_000_001, 14_000_002], || {
+    let first = past(7_000_000);
+    pin(vec![first, first, past(first + 7_000_000)], || {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         sock.set_read_timeout(Some(7 * MS)).unwrap();
         let mut buf = [0u8; 8];
@@ -175,9 +183,9 @@ fn zero_timeouts_never_skip_and_charge_only_native_waits_on_the_plain_clock() {
 }
 
 #[test]
-fn smallest_common_wait_quantum_lands_one_nanosecond_past_each_deadline() {
+fn smallest_common_wait_quantum_lands_just_past_each_deadline() {
     let wait = if cfg!(windows) { 1_000_000 } else { 1 };
-    pin(vec![wait + 1, 2 * (wait + 1), 3 * (wait + 1)], || {
+    pin(steps(0, wait, 3), || {
         let mut seen = Vec::new();
         thread::sleep(Duration::from_nanos(wait));
         seen.push(ns());
@@ -199,7 +207,9 @@ fn smallest_common_wait_quantum_lands_one_nanosecond_past_each_deadline() {
 /// is ended, and the far-off deadline it registered never pulls the clock along afterwards.
 #[test]
 fn duration_max_waits_end_on_their_event_and_leave_no_far_timer() {
-    pin(vec![5_000_001, 10_000_002, 10_000_002], || {
+    let notified = past(5_000_000);
+    let sent = past(notified + 5_000_000);
+    pin(vec![notified, sent, sent], || {
         let mut seen = Vec::new();
 
         let pair = Arc::new((Mutex::new(false), Condvar::new()));
@@ -248,7 +258,7 @@ fn sleeps_near_the_end_of_the_clock_land_exactly() {
         u64::MAX - 10
     };
     let final_wait = 5 * SLEEP_NS;
-    pin(vec![far + 1, far + final_wait + 2], move || {
+    pin(vec![past(far), past(past(far) + final_wait)], move || {
         let mut seen = Vec::new();
         thread::sleep(Duration::from_nanos(far));
         seen.push(ns());
@@ -276,18 +286,17 @@ fn a_lone_duration_max_sleep_saturates_at_the_end_of_the_clock() {
     });
 }
 
-/// Every thread sleeping to the same instant wakes at that instant plus one, however many there
-/// are, and the threads with deadlines inside the landing's 1 ns wake there with them.
+/// Every thread sleeping to the same instant wakes at the same landing just past it, however many
+/// there are, and the threads with deadlines the landing reached wake there with them.
 #[test]
 fn tied_and_adjacent_deadlines_share_one_landing() {
-    let mut expected: Vec<(u64, u64)> = (0..8).map(|i| (i, 10_000_001)).collect();
-    expected.push((8, 10_000_000 + if cfg!(windows) { SLEEP_NS + 1 } else { 1 }));
-    expected.push((9, 10_000_000 + 2 * SLEEP_NS + 1));
-    pin(expected, || {
-        let deadlines: Vec<u64> = (0..8)
-            .map(|_| 10_000_000)
-            .chain([10_000_000 + SLEEP_NS, 10_000_000 + 2 * SLEEP_NS])
-            .collect();
+    let deadlines: Vec<u64> = (0..8)
+        .map(|_| 10_000_000)
+        .chain([10_000_000 + SLEEP_NS, 10_000_000 + 2 * SLEEP_NS])
+        .collect();
+    let expected: Vec<(u64, u64)> = (0..).zip(wakes(&deadlines)).collect();
+    pin(expected, move || {
+        let deadlines = deadlines.clone();
         let sleepers: Vec<_> = deadlines
             .into_iter()
             .enumerate()
@@ -313,20 +322,7 @@ fn many_sleepers_wake_at_the_first_landing_past_their_deadline() {
             deadline / SLEEP_NS * SLEEP_NS
         })
         .collect();
-    let mut sorted = deadlines.clone();
-    sorted.sort_unstable();
-    let mut landings = Vec::new();
-    let mut now = 0u64;
-    for &d in &sorted {
-        if d > now {
-            now = d + 1;
-            landings.push(now);
-        }
-    }
-    let expected: Vec<u64> = deadlines
-        .iter()
-        .map(|&d| *landings.iter().find(|&&l| l >= d).unwrap())
-        .collect();
+    let expected = wakes(&deadlines);
     let given = deadlines.clone();
     pin(expected, move || {
         let sleepers: Vec<_> = given
@@ -345,28 +341,31 @@ fn many_sleepers_wake_at_the_first_landing_past_their_deadline() {
     });
 }
 
-/// A thread woken by a skip that at once registers a new wait 1 ns out, beside a sleeper whose
-/// deadline was registered from the start at the same instant: both land together.
+/// A thread woken by a skip that at once registers a new wait one sleep quantum out, beside a
+/// sleeper whose deadline was registered from the start at the same instant: both land together.
+/// A Windows sleep falls on a 100 ns grid while a landing need not, so there the sleeper takes the
+/// grid instant at or before the new wait's deadline, and the new wait lands with it only if that
+/// landing reaches it.
 #[test]
 fn a_timer_registered_right_after_a_skip_coalesces_with_one_already_there() {
-    let landing = if cfg!(windows) {
-        10_000_101
+    let woke = past(10_000_000);
+    let early = woke + SLEEP_NS;
+    let late = early / SLEEP_NS * SLEEP_NS;
+    let late_landing = past(late);
+    let again = if late_landing >= early {
+        late_landing
     } else {
-        10_000_003
+        past(early)
     };
-    pin((10_000_001, landing, landing), || {
+    pin((woke, again, late_landing), move || {
         let early = thread::spawn(|| {
             thread::sleep(10 * MS);
             let woke = ns();
             thread::sleep(Duration::from_nanos(SLEEP_NS));
             (woke, ns())
         });
-        let late = thread::spawn(|| {
-            thread::sleep(Duration::from_nanos(if cfg!(windows) {
-                10_000_100
-            } else {
-                10_000_002
-            }));
+        let late = thread::spawn(move || {
+            thread::sleep(Duration::from_nanos(late));
             ns()
         });
         let (woke, again) = early.join().unwrap();
@@ -379,7 +378,8 @@ fn a_timer_registered_right_after_a_skip_coalesces_with_one_already_there() {
 /// the early wake.
 #[test]
 fn a_timed_wait_ended_early_leaves_no_ghost_deadline() {
-    pin((3_000_001, 3_000_001, 13_000_002), || {
+    let woke = past(3_000_000);
+    pin((woke, woke, past(woke + 10_000_000)), || {
         let (tx, rx) = mpsc::channel();
         let sender = thread::spawn(move || {
             thread::sleep(3 * MS);
@@ -431,15 +431,15 @@ impl Future for AllSleeps {
     }
 }
 
-/// Three thousand timers on one thread, many sharing an instant: each completes at its deadline
-/// plus one, and the waiting thread is polled no more than once per distinct deadline plus the
+/// Three thousand timers on one thread, many sharing an instant: each completes just past its
+/// deadline, and the waiting thread is polled no more than once per distinct deadline plus the
 /// first poll, however many timers share one. A socket call between the sleeps keeps their
 /// clock reads from adding up to a clock spin (see `building_many_sleeps_in_a_row_moves_no_time`).
 #[test]
-fn thousands_of_timers_each_complete_one_nanosecond_past_their_deadline() {
+fn thousands_of_timers_each_complete_just_past_their_deadline() {
     const N: u64 = 3_000;
     const DISTINCT: u64 = 1_500;
-    let expected: Vec<u64> = (0..N).map(|i| (i % DISTINCT + 1) * 1_000 + 1).collect();
+    let expected: Vec<u64> = (0..N).map(|i| past((i % DISTINCT + 1) * 1_000)).collect();
     for (name, builder) in builders() {
         let polls = Arc::new(AtomicUsize::new(0));
         let done = builder().build().run({

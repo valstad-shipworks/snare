@@ -1,6 +1,9 @@
 #![cfg(windows)]
 
 use snare::Sim;
+
+#[path = "support/landing.rs"]
+mod landing;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NOT_SUPPORTED, GetLastError, HANDLE};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
@@ -68,7 +71,11 @@ fn creation_probe(api: Creation, manual: bool, measured: bool) -> Vec<u32> {
     );
     observed.push(unsafe { WaitForSingleObject(timer, 5000) });
     if measured {
-        assert_eq!(start.elapsed(), Duration::from_millis(2), "{api:?}");
+        let elapsed = start.elapsed();
+        assert!(
+            landing::just_past(elapsed, Duration::from_millis(2)),
+            "{api:?}: {elapsed:?}"
+        );
     }
     observed.push(unsafe { WaitForSingleObject(timer, 0) });
     assert_eq!(unsafe { CancelWaitableTimer(timer) }, 1);
@@ -300,8 +307,8 @@ fn an_unwaited_periodic_timer_does_not_hold_unrelated_sleep_at_its_first_tick() 
                 let before = snare::sched::now();
                 std::thread::sleep(Duration::from_millis(20));
                 assert_eq!(
-                    snare::sched::now() - before,
-                    Duration::from_nanos(20_000_001)
+                    snare::sched::now(),
+                    Duration::from_nanos(landing::past(before.as_nanos() as u64 + 20_000_000))
                 );
                 assert_eq!(unsafe { WaitForSingleObject(timer, 0) }, 0);
                 assert_eq!(unsafe { CancelWaitableTimer(timer) }, 1);
@@ -330,11 +337,13 @@ fn periodic_auto_reset_waits_follow_successive_deadlines() {
                 unsafe { SetWaitableTimer(timer, &-20_000, 2, None, std::ptr::null(), 0) },
                 1
             );
-            for tick in 1..=5 {
+            let mut deadline = before.as_nanos() as u64;
+            for _ in 1..=5 {
                 assert_eq!(unsafe { WaitForSingleObject(timer, u32::MAX) }, 0);
+                deadline += 2_000_000;
                 assert_eq!(
-                    snare::sched::now() - before,
-                    Duration::from_nanos(tick * 2_000_000 + 1)
+                    snare::sched::now(),
+                    Duration::from_nanos(landing::past(deadline))
                 );
             }
             assert_eq!(unsafe { CancelWaitableTimer(timer) }, 1);
@@ -596,7 +605,11 @@ fn timer_probe(manual: bool) {
         1
     );
     assert_eq!(unsafe { WaitForSingleObject(timer, u32::MAX) }, 0);
-    assert_eq!(start.elapsed(), Duration::from_micros(6500));
+    let elapsed = start.elapsed();
+    assert!(
+        landing::just_past(elapsed, Duration::from_micros(6500)),
+        "{elapsed:?}"
+    );
     assert_eq!(
         unsafe { WaitForSingleObject(timer, 0) },
         if manual { 0 } else { 258 }
@@ -647,7 +660,11 @@ fn cancelling_an_armed_timer_removes_its_far_deadline() {
             assert_eq!(unsafe { CancelWaitableTimer(timer) }, 1);
             let start = Instant::now();
             std::thread::sleep(Duration::from_micros(1500));
-            assert_eq!(start.elapsed(), Duration::from_micros(1500));
+            let elapsed = start.elapsed();
+            assert!(
+                landing::just_past(elapsed, Duration::from_micros(1500)),
+                "{elapsed:?}"
+            );
             assert_eq!(unsafe { WaitForSingleObject(timer, 0) }, 258);
             assert_eq!(unsafe { CloseHandle(timer) }, 1);
         });
@@ -697,7 +714,11 @@ fn closing_a_fired_timer_outside_the_sim_releases_its_deadline_hold() {
         sim.run(|| {
             let start = Instant::now();
             std::thread::sleep(Duration::from_micros(1500));
-            assert_eq!(start.elapsed(), Duration::from_micros(1500));
+            let elapsed = start.elapsed();
+            assert!(
+                landing::just_past(elapsed, Duration::from_micros(1500)),
+                "{elapsed:?}"
+            );
         });
     }
 }
@@ -757,8 +778,8 @@ fn relative_timer_deadlines_use_the_100_nanosecond_api_grid() {
                 );
                 assert_eq!(unsafe { WaitForSingleObject(timer, u32::MAX) }, 0);
                 assert_eq!(
-                    snare::sched::now() - before,
-                    Duration::from_nanos(nanos + 1)
+                    snare::sched::now(),
+                    Duration::from_nanos(landing::past(before.as_nanos() as u64 + nanos))
                 );
             }
             assert_eq!(unsafe { CloseHandle(timer) }, 1);
@@ -841,11 +862,12 @@ fn a_child_left_after_the_run_finishes_timer_sleeps_at_real_pace() {
             snare_interpose::Domain::current().unwrap()
         });
         let readings = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(
-            readings,
-            vec![1_500_001, 3_000_002, 4_500_003, 6_000_004, 7_500_005]
-        );
-        assert!(snare::real(|| real_start.elapsed()) >= Duration::from_nanos(7_500_005));
+        let expected: Vec<u128> = landing::steps(0, 1_500_000, 5)
+            .into_iter()
+            .map(u128::from)
+            .collect();
+        assert_eq!(readings, expected);
+        assert!(snare::real(|| real_start.elapsed()) >= Duration::from_nanos(expected[4] as u64));
         assert_eq!(domain.outside_wakes(), 0);
     }
 }

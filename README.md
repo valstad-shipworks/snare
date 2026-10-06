@@ -211,8 +211,13 @@ See [OPEN_BUGS.md](OPEN_BUGS.md) for the file-plane boundaries.
 Time is virtual, so a test that "waits a second" finishes instantly and every run sees the same
 timestamps; randomness is seeded (`SimBuilder::seed`), per thread, so `HashMap` order, random ids and
 link faults replay. When every thread is blocked with no timer left to fire, the run is deadlocked and
-the blocked simulated wait gives up (`EAGAIN`) rather than hanging the test.
-Timers due at one instant all fire there: a time skip lands 1 ns past the earliest deadline, and the
+the blocked simulated wait gives up (`EAGAIN`) rather than hanging the test. A thread blocked on a
+word in static data (Linux futex, Windows `WaitOnAddress`; std's stdout and stderr locks, a
+`static` mutex) is the exception: a thread outside the sim, such as another test's, may hold it, so
+the run waits in real time for it to be let go instead of reading as deadlocked.
+Timers due at one instant all fire there: a time skip lands just past the earliest deadline (1 ns;
+on Windows 100 ns, or one `QueryPerformanceCounter` tick where that is longer, so `Instant` reads
+past it), and the
 next skip waits until every timed wait it reached has returned, so a park, condvar or channel timeout —
 which notices its deadline only between real-time slices of at most 2 ms — wakes at its deadline even
 when a sleeper on another thread is due at the same instant and would otherwise skip straight on.
@@ -450,7 +455,7 @@ Sim's clock is owned by an Executive". The clock is frozen at its reading until 
 | `grant(Grant { anchor_v, anchor_wall, rate, horizon })` | Time runs from `anchor_v` at the real instant `anchor_wall`, `rate` virtual seconds per real second (in `[0, 1e6]`, NaN as 0), never past `horizon`. An anchor behind the clock anchors at the clock's reading, now. Timers the clock flows past fire as real time reaches them. |
 | `freeze()` | Holds the clock where it is (horizon at the reading, rate 0). |
 | `next_deadline()` | The earliest participant timer after the reading. Background timers are never jump targets; they fire as the clock passes them. |
-| `jump_to(t)` | If the sim is quiescent — checked under the sim's locks in the same step as the move, so no participant starts running in between — moves the clock to `t` or to the earliest participant timer before it, exactly onto that deadline, and returns how many waits and events were due there; `Err(NotQuiescent)` changes nothing. The horizon rises to reach just past the landing — 1 ns, or one `QueryPerformanceCounter` tick on Windows — so a wait that recomputes a zero timeout at its deadline can creep over it on the latency its call is charged; the rate stays the grant's. Code that runs after the landing may therefore read up to that much past it. |
+| `jump_to(t)` | If the sim is quiescent — checked under the sim's locks in the same step as the move, so no participant starts running in between — moves the clock to `t` or to the earliest participant timer before it, exactly onto that deadline, and returns how many waits and events were due there; `Err(NotQuiescent)` changes nothing. The horizon rises to reach just past the landing — 1 ns, or on Windows 100 ns or one `QueryPerformanceCounter` tick where that is longer — so a wait that recomputes a zero timeout at its deadline can creep over it on the latency its call is charged; the rate stays the grant's. Code that runs after the landing may therefore read up to that much past it. |
 | `enter_timestamp(t)` / `leave_timestamp(t)` | The calling thread becomes the driver and acts at `t`: it reads exactly `t` from every clock and the code under test reads at least `t`, while the clock itself stands just before `t`, so timers at `t` are still pending. Participants released meanwhile — by what the driver sends, or by timers before `t` — wait at a gate, still counted blocked, until `leave_timestamp(t)` moves the clock to `t` (its horizon just past `t`, as for `jump_to`), fires what is due there (returning the count) and opens the gate. It wakes only waiters something reached: a timestamp at which nothing was sent and nothing came due leaves a quiescent sim quiescent. |
 | `enter_timestamp_checked(t)` | As `enter_timestamp`, only if the sim is quiescent and no participant timer falls before `t`, checked in the same step; on `Err` nothing changes but the calling thread becoming the driver. |
 | `with_driver_time(t, f)` | On a driver thread (a pool worker doing the executive's work), runs `f` reading `t` as the sim's time; its sends are held at the gate like the executive's own. |

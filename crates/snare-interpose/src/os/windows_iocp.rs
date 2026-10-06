@@ -141,7 +141,12 @@ unsafe extern "system" fn create_file(
     result
 }
 
+/// The domain that owns `handle`. The table is shared by every sim of the process, so the lock is
+/// taken in passthrough: a wait for it while another sim's thread holds it is a real wait, not a
+/// participant parked in its own domain, which would let that domain skip time or read as
+/// deadlocked.
 fn owner(handle: usize) -> Option<Domain> {
+    let _pass = state::Passthrough::enter();
     owners()
         .lock()
         .unwrap()
@@ -474,4 +479,45 @@ pub(super) unsafe fn duplicate_boundary(
     }
     unsafe { SetLastError(50) };
     Some(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The handle table is shared by every sim of the process. A participant that finds it held by
+    /// a thread outside its domain is waiting for real, not parked in its domain: counting it
+    /// parked would let its sim skip time past work it is about to do.
+    #[test]
+    fn a_handle_lookup_held_up_outside_the_domain_is_not_a_parked_participant() {
+        use std::sync::mpsc;
+
+        let domain = Domain::builder().install();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _table = owners().lock().unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+        let looker = std::thread::spawn({
+            let domain = domain.clone();
+            move || domain.run(|| owner(1).is_none())
+        });
+        // A sleep would close a timer handle, which looks the handle up in the held table.
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(100) {
+            std::hint::spin_loop();
+        }
+        let quiescent = domain.quiescent(false);
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(looker.join().unwrap());
+        assert!(
+            !quiescent,
+            "the participant waiting on the table counted as parked"
+        );
+    }
 }

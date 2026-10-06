@@ -1,0 +1,7 @@
+        1100 cb3 done
+        2100 cb2 done
+        3100 cb1 done
+        4100 cb0 done
+        4100 main waited [3, 2, 1, 0]
+       20100 unparker unpark
+       20100 main parked

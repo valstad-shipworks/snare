@@ -293,15 +293,27 @@ pub(crate) fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// The 100 ns interval Windows timer APIs count in.
+#[cfg(windows)]
+const WINDOWS_TIMER_UNIT: u64 = 100;
+
 /// The earliest monotonic time past `t` at which the code under test sees the clock move: 1 ns
-/// later, or on Windows the next `QueryPerformanceCounter` tick, whose period std's `Instant`
-/// cannot see inside.
+/// later; on Windows 100 ns, the unit of its timer APIs, or the next `QueryPerformanceCounter` tick
+/// should that be later, since std's `Instant` cannot see inside a tick. 100 ns covers a tick at
+/// every counter frequency from 10 MHz up (the frequency under a hypervisor and on recent
+/// Windows), so the landing does not depend on the host. Saturates at the end of the clock.
 fn creep_past(t: u64) -> u64 {
     #[cfg(windows)]
     {
-        nanos(snare_interpose::next_performance_count(
+        let tick = u128::from(nanos(snare_interpose::next_performance_count(
             Duration::from_nanos(t),
-        ))
+        )));
+        let tick = if tick > u128::from(t) {
+            tick as u64
+        } else {
+            t.saturating_add(1)
+        };
+        tick.max(t.saturating_add(WINDOWS_TIMER_UNIT))
     }
     #[cfg(not(windows))]
     {
@@ -1000,7 +1012,7 @@ impl Clock {
             let target = now.saturating_add(nanos(step).max(1));
             let landing = match self.next_deadline_after(now) {
                 Some(at) if target >= at && now < at - 1 => at - 1,
-                Some(at) if target >= at => at.saturating_add(1),
+                Some(at) if target >= at => creep_past(at),
                 _ => target,
             };
             let (before, after) = self.step_base(landing - now);
@@ -1641,15 +1653,15 @@ impl Clock {
         if self.dormant_limit().is_some_and(|limit| next >= limit) {
             return (false, pruned);
         }
-        // Land just past the deadline, as a real timer fires: discrete time never ticks on its
-        // own, so landing exactly on it would leave `elapsed == timeout` and a caller's
-        // "re-wait while elapsed < timeout" loop (std's `Condvar::wait_timeout_while`)
-        // re-waiting with a zero timeout forever.
-        self.monotonic_nanos
-            .fetch_max(next.saturating_add(1), Ordering::Relaxed);
+        // Land just past the deadline as the code under test reads the clock, as a real timer
+        // fires: discrete time never ticks on its own, so landing exactly on it would leave
+        // `elapsed == timeout` and a caller's "re-wait while elapsed < timeout" loop (std's
+        // `Condvar::wait_timeout_while`) re-waiting with a zero timeout forever.
+        let landing = creep_past(next);
+        self.monotonic_nanos.fetch_max(landing, Ordering::Relaxed);
         drop(pending);
         let mut pruned = pruned;
-        pruned.extend(self.take_wakers(next.saturating_add(1)));
+        pruned.extend(self.take_wakers(landing));
         (true, pruned)
     }
 
@@ -1686,9 +1698,9 @@ impl Clock {
                 .min()
                 .filter(|&next| self.dormant_limit().is_none_or(|limit| next < limit));
             if let Some(next) = next {
-                self.monotonic_nanos
-                    .fetch_max(next.saturating_add(1), Ordering::Relaxed);
-                pruned.extend(self.take_wakers(next.saturating_add(1)));
+                let landing = creep_past(next);
+                self.monotonic_nanos.fetch_max(landing, Ordering::Relaxed);
+                pruned.extend(self.take_wakers(landing));
             }
             (next.is_some(), pruned)
         });

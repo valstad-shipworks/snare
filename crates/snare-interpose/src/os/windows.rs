@@ -2308,10 +2308,10 @@ impl Drop for AddressWaitValue {
 /// How many `WakeByAddressSingle`/`WakeByAddressAll` calls have reached each address, hashed into
 /// a fixed table, so a timed wait can tell whether any wake was made on its address while it
 /// waited. Two addresses sharing a slot only make a spurious return look like a wake.
-static ADDRESS_WAKES: [AtomicU64; 4096] = [const { AtomicU64::new(0) }; 4096];
+static ADDRESS_WAKES: [AtomicU64; 65536] = [const { AtomicU64::new(0) }; 65536];
 
 fn address_wakes(addr: usize) -> &'static AtomicU64 {
-    let hash = (addr as u64 >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 52;
+    let hash = (addr as u64 >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 48;
     &ADDRESS_WAKES[hash as usize]
 }
 
@@ -2324,6 +2324,13 @@ const ERROR_TIMEOUT: u32 = 1460;
 /// waits on an inside one.
 const OUTSIDE_HOLDER_GRACE_MS: u32 = 1;
 
+/// [`OUTSIDE_HOLDER_GRACE_MS`] for a wait under a deterministic schedule, which keeps the baton
+/// meanwhile: once a wait passes the baton on, which thread runs next depends on how long the outside
+/// holder took, so the run no longer replays. A snare choice, as on Linux: long enough to outlast an
+/// outside holder on a loaded machine, at the cost of that much real time per wait on a word a parked
+/// thread of the domain holds.
+const DET_OUTSIDE_HOLDER_GRACE_MS: u32 = 50;
+
 /// The first [`OUTSIDE_HOLDER_GRACE_MS`] of a `WaitOnAddress` on a word in static data, which may
 /// be a lock shared with threads outside the simulation (std's own statics: stdout's and stderr's
 /// locks, the `Once` around Winsock's startup), as a real wait the domain does not count. The word
@@ -2335,6 +2342,7 @@ const OUTSIDE_HOLDER_GRACE_MS: u32 = 1;
 /// # Safety
 /// As for `WaitOnAddress`.
 unsafe fn outside_grace(
+    grace_ms: u32,
     address: *const c_void,
     compare: *const c_void,
     size: usize,
@@ -2346,7 +2354,7 @@ unsafe fn outside_grace(
         )
     };
     // SAFETY: the caller's address and comparand, with the grace as the timeout.
-    let woke = unsafe { wait(address, compare, size, OUTSIDE_HOLDER_GRACE_MS) };
+    let woke = unsafe { wait(address, compare, size, grace_ms) };
     // SAFETY: reading this thread's last-error value.
     (woke != 0 || unsafe { GetLastError() } != ERROR_TIMEOUT).then_some(woke)
 }
@@ -2415,7 +2423,8 @@ unsafe fn wait_on_address_call(
         // A holder inside the simulation is parked while this thread keeps the baton and cannot
         // release the word meanwhile, so whether this wait yields never depends on outside timing.
         if domain::in_static_image(addr)
-            && let Some(woke) = unsafe { outside_grace(address, compare, size) }
+            && let Some(woke) =
+                unsafe { outside_grace(DET_OUTSIDE_HOLDER_GRACE_MS, address, compare, size) }
         {
             return woke;
         }
@@ -2432,7 +2441,8 @@ unsafe fn wait_on_address_call(
     if millis == INFINITE {
         if domain::counts_native_waits()
             && domain::in_static_image(addr)
-            && let Some(woke) = unsafe { outside_grace(address, compare, size) }
+            && let Some(woke) =
+                unsafe { outside_grace(OUTSIDE_HOLDER_GRACE_MS, address, compare, size) }
         {
             return woke;
         }
@@ -2446,12 +2456,21 @@ unsafe fn wait_on_address_call(
                     )
                     .then_some(1)
             },
-            || {
+            || loop {
                 if crate::os::nested::spoiled(addr) {
-                    1
-                } else {
-                    unsafe { wait(address, compare, size, millis) }
+                    break 1;
                 }
+                let woke = unsafe { wait(address, compare, size, millis) };
+                // A return with the comparand in place and no wake made on the address since the
+                // wait began is spurious: waiting on would be the same wait, and returning would
+                // hand the caller (std's condition variable) a wake no thread made.
+                if woke != 0
+                    && !woken_at(addr, woke)
+                    && address_wakes(addr).load(Ordering::Acquire) == wakes
+                {
+                    continue;
+                }
+                break woke;
             },
             |woke| woken_at(addr, *woke),
         );

@@ -1,0 +1,7 @@
+           0 client echo:m0
+     2000100 client echo:m1
+     3000100 ticks tick
+     4000200 client echo:m2
+     6000100 ticks tick
+     9000100 ticks tick
+    20000100 main testers done

@@ -1,5 +1,8 @@
 #![cfg(windows)]
 
+#[path = "support/landing.rs"]
+mod landing;
+
 use std::io::{BufRead, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, mpsc};
@@ -45,7 +48,7 @@ fn huge_finite_rust_sleeps_saturate_instead_of_becoming_infinite() {
                 sim.set_time_value(start);
                 sim.run(|| thread::sleep(duration));
                 let expected = if duration == END && start.is_zero() {
-                    Duration::from_nanos(u64::MAX / 100 * 100 + 1)
+                    Duration::from_nanos(landing::past(u64::MAX / 100 * 100))
                 } else {
                     END
                 };
@@ -104,7 +107,10 @@ fn the_largest_finite_native_sleep_keeps_its_millisecond_duration() {
     for deterministic in [false, true] {
         let sim = builder(deterministic).build();
         sim.run(|| unsafe { Sleep(u32::MAX - 1) });
-        assert_eq!(sim.time_value(), duration + Duration::from_nanos(1));
+        assert_eq!(
+            sim.time_value(),
+            Duration::from_nanos(landing::past(duration.as_nanos() as u64))
+        );
     }
 }
 
