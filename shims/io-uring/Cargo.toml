@@ -41,7 +41,7 @@ name = "io_uring"
 path = "src/lib.rs"
 
 [dependencies]
-snare-interpose = { version = "2.0.0", path = "../../crates/snare-interpose" }
+snare-interpose = { version = "3.0.0", path = "../../crates/snare-interpose" }
 
 [dependencies.bitflags]
 version = "2"

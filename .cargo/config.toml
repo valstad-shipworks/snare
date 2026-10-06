@@ -1,0 +1,6 @@
+# snare refuses to build without `--cfg snare` (`cargo snare` sets it for dependents). Setting
+# `RUSTFLAGS`/`RUSTDOCFLAGS` in the environment replaces these lists, so add `--cfg snare` to it
+# as well.
+[build]
+rustflags = ["--cfg", "snare"]
+rustdocflags = ["--cfg", "snare"]

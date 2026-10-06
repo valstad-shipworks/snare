@@ -9,7 +9,7 @@ OS-call boundary underneath it and serves those calls from an in-memory model: a
 virtual filesystem, a simulated host, a virtual clock. The test drives the other side of the wire.
 
 ```rust
-use snare::{Sim, connect_tester, run_testers, Line, TesterAction};
+use snare::prelude::*;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 
@@ -60,8 +60,8 @@ bookkeeping, fixtures and native comparisons.
 
 Two needs, one library:
 
-- **Deterministic unit tests** — write them in-crate guarded by `#[cfg(snare)]` and run them with
-  `cargo snare` (below), or as ordinary integration tests that build a `Sim`.
+- **Deterministic unit tests** — write them in-crate or as integration tests, guarded by
+  `#[cfg(snare)]`, and run them with `cargo snare test` (below).
 - **One process, one API** — the test body, its scripted peers (testers) and any higher-level harness
   run in the same process as the code under test and drive the simulation through the same in-process
   API (`Sim`, testers, `set_udp_policy`, the time controls). There is no controller process and no
@@ -664,7 +664,7 @@ name or its last `::` segments, so `my_test` lists `tests::my_test`; a blank lis
 An explicit `pcapng(path)` is captured either way.
 
 ```console
-$ SNARE_PCAPNG_TESTS=my_test,other_mod::another_test cargo test
+$ SNARE_PCAPNG_TESTS=my_test,other_mod::another_test cargo snare test
 ```
 
 Stamps are always the sim's clock. `SimBuilder::pcapng_wall_comment(true)`, or
@@ -1405,13 +1405,39 @@ under test.
 
 ## The `cargo snare` harness
 
-Write deterministic tests in the crate, guarded by `#[cfg(snare)]`, and run them under interposition:
+snare only compiles with `--cfg snare`; without it the build stops at a `compile_error!`. On Linux,
+rustix and the raw-syscall crates reach the kernel with an inline `syscall` instruction unless they
+are built for snare (below), and such calls would silently escape the simulation.
+
+Set a package up once:
+
+```console
+$ cargo snare --init
+```
+
+It puts snare under a `cfg(snare)` target table (moving an existing snare dev-dependency there and
+combining its platform `cfg`), and declares the cfg to the `unexpected_cfgs` lint (in
+`[workspace.lints.rust]` when the package inherits its lints):
+
+```toml
+[target.'cfg(snare)'.dev-dependencies]
+snare = "3"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(snare)'] }
+```
+
+Guard the tests with the same cfg — `#![cfg(snare)]` at the top of an integration test file,
+`#[cfg(all(test, snare))]` on an in-crate test module:
 
 ```rust
-#[cfg(snare)]
+#![cfg(snare)]
+
+use snare::prelude::*;
+
 #[test]
 fn deterministic() {
-    snare::Sim::new().run(|| { /* ... */ });
+    Sim::new().run(|| { /* ... */ });
 }
 ```
 
@@ -1420,8 +1446,8 @@ $ cargo snare test            # builds with --cfg snare, patches in the shims, r
 ```
 
 `cargo snare` sets `--cfg snare` (and `--cfg rustix_use_libc`) and injects the drop-in shims via
-`cargo --config patch.crates-io...` — no edits to your `Cargo.toml`. Plain `cargo test` leaves the
-`#[cfg(snare)]` tests out.
+`cargo --config patch.crates-io...`. Plain `cargo test` builds neither snare nor the
+`#[cfg(snare)]` tests.
 
 ## Shims (`shims/`)
 
@@ -1457,8 +1483,8 @@ the BSDs, illumos, Redox — stops at a single `compile_error!` naming the suppo
 that also builds for those targets gates the dev-dependency:
 
 ```toml
-[target.'cfg(any(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")), target_os = "macos", windows))'.dev-dependencies]
-snare = "2"
+[target.'cfg(all(snare, any(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")), target_os = "macos", windows)))'.dev-dependencies]
+snare = "3"
 ```
 
 and puts its sim tests behind the same `cfg`.
@@ -1475,6 +1501,9 @@ shims/                    io-uring, xsk-rs, sc, syscalls drop-ins ([patch.crates
 ```
 
 ## Running the tests
+
+`.cargo/config.toml` builds this workspace with `--cfg snare`; a `RUSTFLAGS` set in the environment
+replaces it, so include `--cfg snare` there too.
 
 ```console
 cargo test                                  # macOS / Linux
