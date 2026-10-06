@@ -4,6 +4,9 @@
 //! second argument will be the subcommand name itself", so `argv[1]` is dropped before parsing
 //! ([The Cargo Book: External tools, Custom subcommands](https://doc.rust-lang.org/cargo/reference/external-tools.html#custom-subcommands)).
 //!
+//! `cargo snare --init` prepares a package's manifest: snare as a dev-dependency only under
+//! `cfg(snare)`, and the cfg declared to the `unexpected_cfgs` lint.
+//!
 //! `cargo snare test` runs `cargo test` with three changes: `--cfg snare` (so the crate's
 //! `#[cfg(snare)]` tests and helpers compile), `--cfg rustix_use_libc` (so rustix calls libc,
 //! whose imports snare interposes, instead of issuing raw syscalls), and a
@@ -11,6 +14,8 @@
 //! replacing crates that would otherwise reach the kernel with inline syscall instructions the
 //! interposer cannot see (see `shims/README.md`). The shims come from the snare repository at the
 //! tag matching this binary's version, or from a local `--shims-dir`.
+
+mod init;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
@@ -48,11 +53,23 @@ const SNARE_RUSTFLAGS: [&str; 6] = [
     name = "cargo-snare",
     bin_name = "cargo snare",
     version,
-    about = "Run a crate's #[cfg(snare)] tests under the snare interposer"
+    about = "Run a crate's #[cfg(snare)] tests under the snare interposer",
+    args_conflicts_with_subcommands = true,
+    arg_required_else_help = true
 )]
 struct Cli {
+    /// Put the package's snare dev-dependency under `[target.'cfg(snare)'.dev-dependencies]`
+    /// (adding it if missing) and declare `cfg(snare)` in its `[lints.rust]`.
+    #[arg(long)]
+    init: bool,
+
+    /// The package manifest `--init` edits, instead of the one cargo finds from the current
+    /// directory.
+    #[arg(long, value_name = "PATH", requires = "init")]
+    manifest_path: Option<PathBuf>,
+
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 /// `cargo snare`'s subcommands.
@@ -98,8 +115,10 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("snare") {
         args.remove(1);
     }
-    match Cli::parse_from(args).cmd {
-        Cmd::Test(args) => exit(run_test(args)),
+    let cli = Cli::parse_from(args);
+    match cli.cmd {
+        Some(Cmd::Test(args)) => exit(run_test(args)),
+        None => exit(init::run(cli.manifest_path)),
     }
 }
 

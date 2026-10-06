@@ -204,6 +204,27 @@ fn with_proc_net(
 /// `snare::real(|| std::env::var("KEY"))`.
 pub use snare_interpose::real;
 
+#[cfg(not(snare))]
+compile_error!(
+    "snare must be built with `--cfg snare`. Run the tests with `cargo snare test`, which sets it \
+     and routes rustix and the raw-syscall crates through libc where snare can see them. \
+     `cargo snare --init` moves snare under `[target.'cfg(snare)'.dev-dependencies]` so plain \
+     `cargo test` leaves it out."
+);
+
+/// The items most tests use: `use snare::prelude::*;`.
+pub mod prelude {
+    pub use crate::{
+        Bytes, Delimited, Direction, FrameLength, IpNet, LengthPrefixed, Line, ListenerBehavior,
+        NicPolicy, NicSpec, Packet, Privileges, Recorder, Rlimit, Sim, SimBuilder, SocketKind,
+        SysLimits, TcpPolicy, Tester, TesterAction, UdpPolicy, connect_tester,
+        inject_icmp_port_unreachable, raise_socket_error, real, run_testers, set_listener_behavior,
+        set_tcp_policy, set_udp_policy, udp_tester,
+    };
+    #[cfg(unix)]
+    pub use crate::{HostProfile, Nic, SimHost};
+}
+
 /// A running simulation: a [`Domain`] whose managed threads' sockets are
 /// serviced by an in-memory [`Fabric`], and whose file operations may be served by a
 /// [`VirtualFs`]. One per test.
