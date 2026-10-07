@@ -244,6 +244,11 @@ pub(super) fn follow_woken(relock: Option<&dyn Fn(bool)>) {
 /// The longest [`settle`] waits for a sim's leftover threads in all. A snare choice.
 const SETTLE_CAP: Duration = Duration::from_secs(5);
 
+/// How long [`settle`] waits in all for a leftover thread that has never blocked: one just spawned
+/// (a pool's worker on its way to its first wait) can go unscheduled for longer than [`SETTLE`] on
+/// a loaded machine. A snare choice.
+const SETTLE_FRESH: Duration = Duration::from_secs(1);
+
 /// How often [`settle`] looks at a sim's leftover threads. A snare choice.
 const SETTLE_POLL: Duration = Duration::from_micros(200);
 
@@ -254,7 +259,7 @@ const SETTLE_POLL: Duration = Duration::from_micros(200);
 /// follow, doing that sim's work in this one's world. The wait goes on while threads keep coming to
 /// rest, each within [`SETTLE`] of the last (a deterministic schedule hands the spinners its baton
 /// one at a time), up to [`SETTLE_CAP`]; a thread that never rests (computing, or blocked in a call
-/// snare does not see) holds it up [`SETTLE`] at most. A rest must hold across two looks, since a
+/// snare does not see) holds it up [`SETTLE`] at most, or [`SETTLE_FRESH`] if it has never blocked. A rest must hold across two looks, since a
 /// thread a deterministic schedule lets go returns from its wait there before it waits natively.
 pub(super) fn settle(domain: &Inner) {
     let _passthrough = Passthrough::enter();
@@ -266,7 +271,7 @@ pub(super) fn settle(domain: &Inner) {
         if !domain.dormant.load(Ordering::SeqCst) {
             return;
         }
-        let (any, running) = {
+        let (any, running, fresh) = {
             let core = domain.accounting.core();
             let participants = core
                 .rows
@@ -274,11 +279,13 @@ pub(super) fn settle(domain: &Inner) {
                 .filter(|row| row.class == ThreadClass::Participant);
             let mut any = false;
             let mut running = 0;
+            let mut fresh = false;
             for row in participants {
                 any = true;
                 running += usize::from(row.wait.is_none());
+                fresh |= row.wait.is_none() && row.last_wait.is_none();
             }
-            (any, running)
+            (any, running, fresh)
         };
         let at_rest =
             !any || (running == 0 && domain.sched.as_ref().is_none_or(|sched| sched.detached()));
@@ -289,6 +296,9 @@ pub(super) fn settle(domain: &Inner) {
         if running < fewest {
             fewest = running;
             by = Instant::now() + SETTLE;
+        }
+        if fresh {
+            by = by.max(start + SETTLE_FRESH);
         }
         std::thread::sleep(SETTLE_POLL);
     }

@@ -365,7 +365,8 @@ Supported model boundaries and unverified approximations. These do not establish
   running sim that wakes it through a condition variable, futex, semaphore, parker or
   `WaitOnAddress` (README, "Process-wide pools"). Work it picks up with no wake stays in its old
   world: a worker still spinning when the later sim posts work (a run's end waits up to 200 ms of
-  real time with no thread coming to rest, 5 s in all, for its leftovers to park), or one polling
+  real time with no thread coming to rest, 1 s for one that has never blocked, 5 s in all, for its
+  leftovers to park), or one polling
   an atomic. A yield gives nothing to tell which running sim, if any, posted the work it finds. Only
   participants are listed as waiters, so background, helper and driver leftovers never move. A
   futex word does not say whether it is a lock or a condition: on Linux a leftover parked on a
