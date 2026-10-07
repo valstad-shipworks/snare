@@ -783,6 +783,9 @@ unsafe extern "C" fn syscall(
             return r;
         }
     }
+    if let Some(r) = net_syscall(number, [a, b, c, d, e, f]) {
+        return crate::os::sockets::finish(r);
+    }
     // A managed host may model this number (fast-talker reaches the sched policy family only here,
     // since musl stubs the named wrappers). It diverts only numbers it recognises; the rest forward.
     // SYS_sched_setscheduler / SYS_sched_getscheduler etc.: man 2 sched_setscheduler.
@@ -810,6 +813,68 @@ unsafe extern "C" fn syscall(
                 usize,
             ) -> libc::c_long,
         >(&SYSCALL)(number, a, b, c, d, e, f)
+    }
+}
+
+/// The raw-syscall forms of the descriptor calls a [`Net`](crate::Net) models, offered to it as
+/// the named wrappers are (rustix's libc backend reaches `eventfd2` and, on Linux 5.11 builds,
+/// `epoll_pwait2` only through `syscall`). The kernel entry is the same whichever way it is
+/// called, so the model must be too. Arguments are as the kernel takes them (man 2 syscalls).
+#[cfg(target_os = "linux")]
+fn net_syscall(number: libc::c_long, [a, b, c, d, _, _]: [usize; 6]) -> Option<i64> {
+    let fd = a as c_int;
+    match number {
+        libc::SYS_eventfd2 => domain::descriptor_transaction(|| {
+            domain::dispatch_net(|net| unsafe { net.eventfd(a as u32, b as c_int) })
+        }),
+        #[cfg(target_arch = "x86_64")]
+        libc::SYS_eventfd => {
+            domain::descriptor_transaction(|| {
+                domain::dispatch_net(|net| unsafe { net.eventfd(a as u32, 0) })
+            })
+        }
+        libc::SYS_timerfd_create => domain::descriptor_transaction(|| {
+            domain::dispatch_net(|net| unsafe { net.timerfd_create(a as c_int, b as c_int) })
+        }),
+        libc::SYS_timerfd_settime => domain::dispatch_owned(fd, |net| unsafe {
+            net.timerfd_settime(fd, b as c_int, c as *const u8, d as *mut u8)
+        }),
+        libc::SYS_timerfd_gettime => {
+            domain::dispatch_owned(fd, |net| unsafe { net.timerfd_gettime(fd, b as *mut u8) })
+        }
+        libc::SYS_epoll_create1 => domain::descriptor_transaction(|| {
+            domain::dispatch_net(|net| unsafe { net.epoll_create1(a as c_int) })
+        }),
+        // man 2 epoll_create: `size` is ignored but must be positive.
+        #[cfg(target_arch = "x86_64")]
+        libc::SYS_epoll_create => domain::descriptor_transaction(|| {
+            domain::dispatch_net(|net| {
+                if (a as c_int) <= 0 {
+                    return Some(crate::net::NetResult::Err(libc::EINVAL));
+                }
+                unsafe { net.epoll_create1(0) }
+            })
+        }),
+        libc::SYS_epoll_ctl => {
+            domain::dispatch_on(fd, |net| unsafe {
+                net.epoll_ctl(fd, b as c_int, c as c_int, d as *const u8)
+            })
+        }
+        #[cfg(target_arch = "x86_64")]
+        libc::SYS_epoll_wait => {
+            domain::dispatch_on(fd, |net| unsafe {
+                net.epoll_wait(fd, b as *mut u8, c as c_int, d as c_int)
+            })
+        }
+        libc::SYS_epoll_pwait => {
+            domain::dispatch_on(fd, |net| unsafe {
+                net.epoll_wait(fd, b as *mut u8, c as c_int, d as c_int)
+            })
+        }
+        libc::SYS_epoll_pwait2 => domain::dispatch_on(fd, |net| unsafe {
+            net.epoll_pwait2(fd, b as *mut u8, c as c_int, d as *const u8)
+        }),
+        _ => None,
     }
 }
 
@@ -870,9 +935,8 @@ pub(crate) unsafe extern "C" fn ioctl(fd: c_int, request: libc::c_ulong, argumen
         return crate::os::sockets::finish(r) as c_int;
     }
     // SAFETY: as above.
-    if domain::net_owns(fd)
-        && let Some(r) =
-            domain::dispatch_net(|net| unsafe { net.ioctl(fd, request, argument as i64) })
+    if let Some(r) =
+        domain::dispatch_owned(fd, |net| unsafe { net.ioctl(fd, request, argument as i64) })
     {
         return crate::os::sockets::finish(r) as c_int;
     }

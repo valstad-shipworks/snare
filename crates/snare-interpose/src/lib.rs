@@ -109,6 +109,8 @@ on_supported_targets! {
     mod layer;
     mod net;
     mod os;
+    #[cfg(unix)]
+    mod owners;
     mod patch;
     mod race;
     mod resolve;
@@ -127,9 +129,11 @@ on_supported_targets! {
         service_thread,
     };
     pub use domain::{
-        Domain, DomainBuilder, Managed, WeakDomain, bump_epoch, cancel_wake, charge_latency,
+        Domain, DomainBuilder, FdWait, Managed, WeakDomain, bump_epoch, cancel_wake, charge_latency,
+        current_sim,
         det_active, det_block, det_block_readiness, det_wake, det_wake_readiness, domain_key, dormant,
-        end_spin, executive_attached, expire_timer, foreign_time_skip, idle_wait, in_passthrough,
+        end_spin, executive_attached, expire_timer, fd_wait, foreign_time_skip, idle_wait,
+        in_passthrough,
         mark_sim_waiting, mark_waiting, note_effect, now, parked_on_shared_word, pass_gate, quiescent,
         real, real_span,
         recorded_thread_class, register_event_timer, register_timer, register_wake, set_thread_class,
@@ -148,7 +152,9 @@ on_supported_targets! {
     pub use net::IpHlpCall;
     #[cfg(windows)]
     pub use net::{CompletionCall, CompletionPost, CompletionQuery};
-    pub use net::{Net, NetResult};
+    pub use net::{HandOver, Net, NetResult};
+    #[cfg(unix)]
+    pub use owners::{bury_fd, claim_fd, orphan, release_fd};
     #[doc(hidden)]
     pub use os::joined_lists;
     #[cfg(windows)]

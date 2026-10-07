@@ -392,6 +392,20 @@ The next `Sim::run` on the same sim takes its leftovers back: they are its parti
 time skips go back to virtual time at once (monotonic time never goes backwards across the switch).
 A test that wants none of this stops its threads before the run returns.
 
+**Process-wide reactors.** An epoll set, a kqueue, an eventfd or a timerfd belongs to the process,
+not to a network, and a library may create one once per process: async-io keeps its poller and
+the "async-io" thread that waits on it in statics, made under whichever sim touches it first.
+When a running sim reaches such a descriptor of a dormant (or dropped) sim, it takes over every
+one that sim holds, and the leftover threads blocked on them join it, as threads it had spawned:
+they run on its clock, in its schedule, and count toward its quiescence. A timerfd keeps the time
+it had left. One closed outside every sim is gone, and its number is the OS's to reuse for a real
+file. Sockets never move: another sim's socket fails with `EBADF`, as a descriptor its world
+never opened would. Two sims running at the same time cannot share one such object: a sim that
+reaches a descriptor another running sim holds waits until that run ends, but one that only
+touches the library's memory (a timer queued while the reactor's notifier is already pending)
+gives snare nothing to wait at, so tests that share a process-wide reactor must take turns (a
+static `Mutex` held across the test, or `--test-threads=1`).
+
 ## Controlling time
 
 The clock every `Sim` runs on can be driven from the test, through `Sim` methods or a `TimeHandle`

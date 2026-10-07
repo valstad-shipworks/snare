@@ -270,6 +270,13 @@ Supported model boundaries and unverified approximations. These do not establish
   for a single address. Shared waits on different virtual addresses mapping the same backing
   object offset do not share a modeled key. Native kernel wakes still occur, but census wake
   attribution and deterministic wake selection do not resolve that backing-object identity.
+- **async-io reactors:** the reactor thread async-io starts under the first `Sim` that uses it
+  lives for the rest of the process, so a second `Sim` in the same process that uses async-io
+  (ethercrab's timers, for one) hangs; on Linux that reactor also spins under snare. fieldhand
+  runs all such cases in turn inside one `Sim`, on macOS only.
+- **Real pipes in a sim poll:** `pipe`/`pipe2` stay real, so a `poll` over a pipe and sim
+  sockets cannot block on the pipe; a loop waiting on both spins until `stuck_after` reports it.
+  `socketpair(AF_UNIX)` is simulated and works as a wake-up channel.
 - **Pure atomic spins** (`while !flag { spin_loop() }`) bypass function hooks and can prevent a
   virtual sleeper from waking. Block or yield cooperatively. A `busy()` lease around the spin
   does not solve that dependency and suppresses watchdog detection.

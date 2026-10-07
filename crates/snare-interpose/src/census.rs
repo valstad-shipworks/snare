@@ -99,6 +99,16 @@ pub(crate) fn register(domain: &Domain) {
     domains.push((domain.id(), domain.downgrade()));
 }
 
+/// The live domain with serial `serial`.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn find(serial: u64) -> Option<Domain> {
+    let _passthrough = Passthrough::enter();
+    lock(&DOMAINS)
+        .iter()
+        .find(|(id, _)| id.0 == serial)
+        .and_then(|(_, weak)| weak.upgrade())
+}
+
 /// Returned by [`service_thread`]: the calling thread counts as snare's own until it drops.
 #[must_use]
 #[derive(Debug)]

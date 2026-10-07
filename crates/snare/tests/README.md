@@ -110,6 +110,8 @@ still be runtime-unverified; consult [Windows run triage](#windows-run-triage).
 | Truncated datagram | `udp_win` | ✗ | ✗ | ✅ | Windows `WSAEMSGSIZE`. |
 | Testers | `testers`, `tester_chain`, `tester_conns`, `tester_framing`, `tester_arrivals` | ✅ | ✅ | ✅ | |
 | Readiness syscalls | `kqueue_raw`, `mio_kqueue`, `mio_readiness`, `demo_tcp_mio`, `wsapoll_win`, `tcp_server` | ✅ | ✅ | ✅ | `WSAPoll`/`select` on Windows. |
+| timerfd, raw descriptor syscalls | `timerfd` | — | ✅ | — | Expiry on the sim's clock bounds epoll and poll waits; `syscall(SYS_eventfd2)`/`SYS_epoll_*` reach the model; host-checked. |
+| Process-wide reactors across sims | `async_io_reactor`, `process_local_fds` | ✅ | ✅ | ⛔ | Epoll sets, kqueues, eventfds and timerfds move to the next sim with the threads blocked on them; another sim's socket is `EBADF`. Tests sharing one take turns. |
 | mio edge-triggered events | `mio_waker`, `backpressure`, `connect_faults`, `pcapng`, `windows_iocp` | ✅ | ✅ | ✅ | Windows supports Mio's single-socket, infinite, non-exclusive AFD poll profile; wakeups, edges, backpressure and connection errors run by default. |
 | Socket faults, back-pressure | `faults`, `backpressure` | ✅ | ✅ | ✅ | |
 | Connect faults | `connect_faults` | ✅ | ✅ | ✅ | |

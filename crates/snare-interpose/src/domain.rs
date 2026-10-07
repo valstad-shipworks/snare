@@ -47,6 +47,12 @@ use crate::resolve::Resolver;
 use crate::signals::Signals;
 use crate::state::{self, Passthrough};
 
+#[cfg_attr(not(unix), allow(dead_code))]
+mod follow;
+#[cfg(unix)]
+pub(crate) use follow::{Elsewhere, elsewhere};
+pub use follow::{FdWait, fd_wait};
+
 #[cfg(windows)]
 pub(crate) type TimerWordWake = (usize, usize, Arc<dyn Send + Sync>);
 
@@ -147,12 +153,28 @@ pub(crate) struct Inner {
     /// Every run that began has ended, so the threads still managed are left over from one (see
     /// [`Layer::dormant`]). `false` until the first run ends.
     dormant: AtomicBool,
+    /// Places another sim made ready for this domain's threads that are to follow descriptors
+    /// handed over to it, by lineage (see `follow`).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    followers: Mutex<std::collections::HashMap<u64, SendInherited>>,
+    /// The threads blocked on one of the domain's descriptors (see [`fd_wait`]).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fd_waits: Mutex<Vec<follow::FdWaiter>>,
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
         if let Some(watchdog) = self.watchdog.get() {
             watchdog.stop();
+        }
+        let followers = std::mem::take(
+            self.followers
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        for (_, SendInherited(place)) in followers {
+            // SAFETY: each place was made by `place_in` and never adopted.
+            unsafe { follow::give_back(place) };
         }
     }
 }
@@ -210,6 +232,7 @@ impl Inner {
         }
         drop(runs);
         self.wake_waiters();
+        follow::run_ended();
     }
 
     /// The first layer's answer to [`Layer::virtual_now`]; see the free [`virtual_now`].
@@ -489,6 +512,7 @@ impl Domain {
             previous_lineage: swap_lineage(self.0.root_lineage()),
             previous_class: accounting::swap_class(ThreadClass::Participant, None),
             previous_held: ptr::null(),
+            previous_followable: follow::set_followable(false),
             _not_send: PhantomData,
         };
         self.0
@@ -1272,6 +1296,8 @@ impl DomainBuilder {
             watchdog: std::sync::OnceLock::new(),
             runs: Mutex::new(0),
             dormant: AtomicBool::new(false),
+            followers: Mutex::default(),
+            fd_waits: Mutex::default(),
         }));
         crate::census::register(&domain);
         if let Some(after) = self.stuck_after {
@@ -1302,6 +1328,8 @@ pub struct Managed {
     previous_class: (ThreadClass, Option<&'static str>),
     /// The thread's mutex-hold record before this guard (see `accounting::Held`), restored on drop.
     previous_held: *const accounting::Held,
+    /// Whether the thread could follow a descriptor to another domain before this guard.
+    previous_followable: bool,
     /// Makes the guard `!Send` and `!Sync`.
     _not_send: PhantomData<*const ()>,
 }
@@ -1395,34 +1423,39 @@ impl Drop for Managed {
         {
             sched.exit(thread_lineage(), true);
         }
-        state::replace_domain(self.previous);
+        // A thread that followed a descriptor (see `follow`) now belongs to the domain it joined,
+        // which its guard releases in place of the one it was built with.
+        let current = state::replace_domain(self.previous);
+        let domain = if self.root { self.domain } else { current };
+        follow::set_followable(self.previous_followable);
         accounting::swap_held(self.previous_held);
         let lineage = swap_lineage(self.previous_lineage).id;
         let (class, _) = accounting::swap_class(self.previous_class.0, self.previous_class.1);
-        if !self.domain.is_null() {
+        if !domain.is_null() {
             if self.root {
                 // SAFETY: the domain pointer is live until the Arc below is dropped.
-                unsafe { (*self.domain).end_run() };
+                unsafe { (*domain).end_run() };
             }
             // SAFETY: the domain pointer is live until the Arc below is dropped.
-            let accounting = unsafe { &(*self.domain).accounting };
+            let accounting = unsafe { &(*domain).accounting };
             accounting.forget_handle(crate::os::current_thread_handle(), lineage);
-            accounting.remove_row(lineage);
+            // SAFETY: as above.
+            follow::forget(unsafe { &*domain }, lineage);
             {
                 let _passthrough = Passthrough::enter();
                 accounting.core().exited(lineage);
             }
             if class == ThreadClass::Participant {
                 // SAFETY: the domain pointer is live until the Arc below is dropped.
-                unsafe { (*self.domain).participants.fetch_sub(1, Ordering::SeqCst) };
+                unsafe { (*domain).participants.fetch_sub(1, Ordering::SeqCst) };
                 drop(accounting.bump());
                 // SAFETY: as above.
-                wake_if_quiescent(unsafe { &*self.domain });
-                offer_idle_skip(self.domain);
+                wake_if_quiescent(unsafe { &*domain });
+                offer_idle_skip(domain);
             }
-            // SAFETY: `domain` came from `Arc::into_raw` in `enter` or `inherit` and is released
-            // exactly once, here.
-            unsafe { drop(Arc::from_raw(self.domain)) };
+            // SAFETY: `domain` came from `Arc::into_raw` in `enter`, `inherit` or `follow` and is
+            // released exactly once, here.
+            unsafe { drop(Arc::from_raw(domain)) };
         }
     }
 }
@@ -2154,6 +2187,11 @@ pub(crate) fn record_thread_name(handle: Option<usize>, name: &[u8]) {
     let _passthrough = Passthrough::enter();
     let name = Arc::<str>::from(String::from_utf8_lossy(name));
     domain.accounting.set_name(lineage, Some(name));
+}
+
+/// The calling thread's domain's [`Domain::id`], in or out of passthrough; `None` off a domain.
+pub fn current_sim() -> Option<SimId> {
+    here().map(|domain| SimId(domain.accounting.serial.0))
 }
 
 /// The calling thread's domain's [`Domain::key`], in or out of passthrough; 0 off a domain.
@@ -3486,6 +3524,62 @@ pub(crate) fn net_owns(fd: core::ffi::c_int) -> bool {
     domain.net.iter().any(|net| net.owns(fd))
 }
 
+/// [`dispatch_net`] for a call on `fd`, offered only when a backend of the calling thread's domain
+/// owns it. An fd another sim minted is first settled by [`elsewhere`]: taken over, followed, or
+/// refused with its errno. `None` goes to the OS.
+#[cfg(unix)]
+pub(crate) fn dispatch_owned(
+    fd: core::ffi::c_int,
+    mut op: impl FnMut(&dyn Net) -> Option<crate::net::NetResult>,
+) -> Option<i64> {
+    loop {
+        if net_owns(fd)
+            && let Some(r) = dispatch_net(&mut op)
+        {
+            return Some(r);
+        }
+        match elsewhere(fd) {
+            Elsewhere::Real => return None,
+            Elsewhere::Retry => continue,
+            Elsewhere::Fail(errno) => return Some(-i64::from(errno)),
+        }
+    }
+}
+
+/// As [`dispatch_owned`], offering the call whoever owns `fd`: for a call a backend declines
+/// itself when the fd is not its own (`epoll_ctl`, `epoll_wait`).
+#[cfg(target_os = "linux")]
+pub(crate) fn dispatch_on(
+    fd: core::ffi::c_int,
+    mut op: impl FnMut(&dyn Net) -> Option<crate::net::NetResult>,
+) -> Option<i64> {
+    loop {
+        if let Some(r) = dispatch_net(&mut op) {
+            return Some(r);
+        }
+        match elsewhere(fd) {
+            Elsewhere::Real => return None,
+            Elsewhere::Retry => continue,
+            Elsewhere::Fail(errno) => return Some(-i64::from(errno)),
+        }
+    }
+}
+
+/// [`dispatch_owned`] for a call that changes what other threads see, noted as
+/// [`dispatch_net_effect`] notes it.
+#[cfg(unix)]
+pub(crate) fn dispatch_owned_effect(
+    op: &'static str,
+    fd: core::ffi::c_int,
+    net: impl FnMut(&dyn Net) -> Option<crate::net::NetResult>,
+) -> Option<i64> {
+    let r = dispatch_owned(fd, net);
+    if r.is_some() {
+        note_effect(op);
+    }
+    r
+}
+
 /// [`dispatch_net`] for a call that changes what other threads see (a send, a connect, a close),
 /// noted for an executive's audit when a backend handled it.
 pub(crate) fn dispatch_net_effect(
@@ -3612,12 +3706,18 @@ pub(crate) fn inherit() -> Option<Inherited> {
     if state::passthrough() {
         return None;
     }
+    let (class, label) = accounting::child_class();
+    inherit_with(class, label)
+}
+
+/// As [`inherit`], for a thread of `class` (with `label`) whatever the calling thread's children
+/// would be, and also from under passthrough.
+pub(crate) fn inherit_with(class: ThreadClass, label: Option<&'static str>) -> Option<Inherited> {
     let domain = state::domain();
     if domain.is_null() {
         return None;
     }
     end_spin();
-    let (class, label) = accounting::child_class();
     // SAFETY: see `Domain::current`.
     unsafe {
         Arc::increment_strong_count(domain);
@@ -3665,6 +3765,7 @@ pub(crate) unsafe fn adopt(inherited: Inherited) -> Child {
         }),
         previous_class: accounting::swap_class(class, label),
         previous_held: accounting::swap_held(held),
+        previous_followable: follow::set_followable(true),
         _not_send: PhantomData,
     };
     // SAFETY: `domain` is live (see above).
@@ -3689,9 +3790,12 @@ pub(crate) unsafe fn adopt(inherited: Inherited) -> Child {
 pub(crate) unsafe fn release(inherited: Inherited) {
     let participant = inherited.class == ThreadClass::Participant;
     // SAFETY: the caller hands back the reference `inherit` created, so the domain is live.
-    unsafe { &(*inherited.domain).accounting }.remove_row(inherited.lineage);
-    if participant {
-        with_sched(|sched| sched.unspawned(inherited.lineage));
+    let domain = unsafe { &*inherited.domain };
+    domain.accounting.remove_row(inherited.lineage);
+    if participant
+        && let Some(sched) = domain.sched.as_ref().filter(|sched| !sched.detached())
+    {
+        sched.unspawned(inherited.lineage);
     }
     // SAFETY: the caller hands back the single reference `inherit` created, and with it the count
     // it took for a thread that never started.

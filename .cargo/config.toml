@@ -1,6 +1,7 @@
-# snare refuses to build without `--cfg snare` (`cargo snare` sets it for dependents). Setting
-# `RUSTFLAGS`/`RUSTDOCFLAGS` in the environment replaces these lists, so add `--cfg snare` to it
-# as well.
+# snare refuses to build without `--cfg snare` (`cargo snare` sets it for dependents), and rustix
+# must use its libc backend (`--cfg rustix_use_libc`) for its calls to reach the interposer, as
+# `cargo snare` also arranges. Setting `RUSTFLAGS`/`RUSTDOCFLAGS` in the environment replaces
+# these lists, so add both cfgs to it as well.
 [build]
-rustflags = ["--cfg", "snare"]
-rustdocflags = ["--cfg", "snare"]
+rustflags = ["--cfg", "snare", "--cfg", "rustix_use_libc", "--check-cfg=cfg(rustix_use_libc)"]
+rustdocflags = ["--cfg", "snare", "--cfg", "rustix_use_libc", "--check-cfg=cfg(rustix_use_libc)"]

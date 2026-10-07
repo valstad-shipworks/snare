@@ -11,8 +11,9 @@
 //! backend's duration, so a backend's own libc calls reach the OS rather than recursing here.
 //!
 //! The generic fd calls (`read`, `write`, `close`, `fcntl`) are shared with the file backend.
-//! They ask [`fs_owns`] first and then [`net_owns`], and offer the call only to the plane that owns
-//! the fd: an fd is minted by at most one backend, and a real fd must never be handed to one.
+//! They ask [`fs_owns`] first and then [`net_owns`](domain::net_owns), and offer the call only to
+//! the plane that owns the fd: an fd is minted by at most one backend, and a real fd must never be
+//! handed to one.
 //! Unowned fds forward without being observed, since every program does this I/O on real fds.
 
 use std::ffi::{c_char, c_int, c_void};
@@ -20,7 +21,7 @@ use std::sync::atomic::AtomicUsize;
 
 use libc::{nfds_t, pollfd, size_t, sockaddr, socklen_t, ssize_t};
 
-use crate::domain::{self, dispatch_fs, dispatch_net, fs_owns, net_owns};
+use crate::domain::{self, dispatch_fs, dispatch_net, fs_owns};
 use crate::hooks::{Hook, hook, original};
 
 /// Declares the `AtomicUsize` that holds one hooked function's original address, filled when the
@@ -77,6 +78,14 @@ slot!(EPOLL_CTL);
 slot!(EPOLL_WAIT);
 #[cfg(target_os = "linux")]
 slot!(EPOLL_PWAIT);
+#[cfg(target_os = "linux")]
+slot!(EPOLL_PWAIT2);
+#[cfg(target_os = "linux")]
+slot!(TIMERFD_CREATE);
+#[cfg(target_os = "linux")]
+slot!(TIMERFD_SETTIME);
+#[cfg(target_os = "linux")]
+slot!(TIMERFD_GETTIME);
 #[cfg(target_os = "macos")]
 slot!(KQUEUE);
 #[cfg(target_os = "macos")]
@@ -141,6 +150,14 @@ pub(crate) fn hooks() -> Vec<Hook> {
         hook!("epoll_wait", epoll_wait, EPOLL_WAIT),
         #[cfg(target_os = "linux")]
         hook!("epoll_pwait", epoll_pwait, EPOLL_PWAIT),
+        #[cfg(target_os = "linux")]
+        hook!("epoll_pwait2", epoll_pwait2, EPOLL_PWAIT2),
+        #[cfg(target_os = "linux")]
+        hook!("timerfd_create", timerfd_create, TIMERFD_CREATE),
+        #[cfg(target_os = "linux")]
+        hook!("timerfd_settime", timerfd_settime, TIMERFD_SETTIME),
+        #[cfg(target_os = "linux")]
+        hook!("timerfd_gettime", timerfd_gettime, TIMERFD_GETTIME),
         #[cfg(target_os = "macos")]
         hook!("kqueue", kqueue, KQUEUE),
         #[cfg(target_os = "macos")]
@@ -192,7 +209,9 @@ unsafe extern "C" fn epoll_ctl(
 ) -> c_int {
     // man 2 epoll_ctl: op is EPOLL_CTL_ADD/MOD/DEL; struct epoll_event {events, data}.
     // SAFETY: `event` points to an epoll_event for add/mod.
-    if let Some(r) = dispatch_net(|net| unsafe { net.epoll_ctl(epfd, op, fd, event.cast()) }) {
+    if let Some(r) =
+        domain::dispatch_on(epfd, |net| unsafe { net.epoll_ctl(epfd, op, fd, event.cast()) })
+    {
         return finish(r) as c_int;
     }
     domain::observe("epoll_ctl", None);
@@ -215,7 +234,9 @@ unsafe extern "C" fn epoll_wait(
     // man 2 epoll_wait: returns up to `maxevents` ready events; timeout in ms, -1 blocks.
     // SAFETY: `events` points to `maxevents` slots.
     if let Some(r) =
-        dispatch_net(|net| unsafe { net.epoll_wait(epfd, events.cast(), maxevents, timeout) })
+        domain::dispatch_on(epfd, |net| unsafe {
+            net.epoll_wait(epfd, events.cast(), maxevents, timeout)
+        })
     {
         return finish(r) as c_int;
     }
@@ -241,7 +262,9 @@ unsafe extern "C" fn epoll_pwait(
     // The signal mask does not affect a simulated wait; model it as `epoll_wait`.
     // SAFETY: `events` points to `maxevents` slots.
     if let Some(r) =
-        dispatch_net(|net| unsafe { net.epoll_wait(epfd, events.cast(), maxevents, timeout) })
+        domain::dispatch_on(epfd, |net| unsafe {
+            net.epoll_wait(epfd, events.cast(), maxevents, timeout)
+        })
     {
         return finish(r) as c_int;
     }
@@ -260,6 +283,91 @@ unsafe extern "C" fn epoll_pwait(
     }
 }
 
+#[cfg(target_os = "linux")]
+/// Hook for `epoll_pwait2(2)` (Linux 5.11, glibc 2.35): [`epoll_pwait`] with a timespec timeout.
+unsafe extern "C" fn epoll_pwait2(
+    epfd: c_int,
+    events: *mut libc::epoll_event,
+    maxevents: c_int,
+    timeout: *const libc::timespec,
+    sigmask: *const libc::sigset_t,
+) -> c_int {
+    // SAFETY: `events` points to `maxevents` slots; `timeout` is null or a timespec.
+    if let Some(r) = domain::dispatch_on(epfd, |net| unsafe {
+        net.epoll_pwait2(epfd, events.cast(), maxevents, timeout.cast())
+    }) {
+        return finish(r) as c_int;
+    }
+    domain::observe("epoll_pwait2", None);
+    type EpollPwait2Fn = unsafe extern "C" fn(
+        c_int,
+        *mut libc::epoll_event,
+        c_int,
+        *const libc::timespec,
+        *const libc::sigset_t,
+    ) -> c_int;
+    // SAFETY: EPOLL_PWAIT2 holds libc's epoll_pwait2.
+    unsafe { original::<EpollPwait2Fn>(&EPOLL_PWAIT2)(epfd, events, maxevents, timeout, sigmask) }
+}
+
+#[cfg(target_os = "linux")]
+/// Hook for `timerfd_create(2)` (Linux): a backend may mint a simulated timer on the sim's clock;
+/// otherwise observed and forwarded.
+unsafe extern "C" fn timerfd_create(clockid: libc::clockid_t, flags: c_int) -> c_int {
+    // SAFETY: no pointers.
+    if let Some(r) = domain::descriptor_transaction(|| {
+        dispatch_net(|net| unsafe { net.timerfd_create(clockid, flags) })
+    }) {
+        return finish(r) as c_int;
+    }
+    domain::observe("timerfd_create", None);
+    // SAFETY: TIMERFD_CREATE holds libc's timerfd_create.
+    unsafe {
+        original::<unsafe extern "C" fn(libc::clockid_t, c_int) -> c_int>(&TIMERFD_CREATE)(
+            clockid, flags,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// Hook for `timerfd_settime(2)` (Linux), offered only for an fd a backend owns.
+unsafe extern "C" fn timerfd_settime(
+    fd: c_int,
+    flags: c_int,
+    new_value: *const libc::itimerspec,
+    old_value: *mut libc::itimerspec,
+) -> c_int {
+    // SAFETY: `new_value` is the caller's itimerspec; `old_value` null or writable.
+    if let Some(r) = domain::dispatch_owned(fd, |net| unsafe {
+        net.timerfd_settime(fd, flags, new_value.cast(), old_value.cast())
+    }) {
+        return finish(r) as c_int;
+    }
+    domain::observe("timerfd_settime", None);
+    type TimerfdSettimeFn =
+        unsafe extern "C" fn(c_int, c_int, *const libc::itimerspec, *mut libc::itimerspec) -> c_int;
+    // SAFETY: TIMERFD_SETTIME holds libc's timerfd_settime.
+    unsafe { original::<TimerfdSettimeFn>(&TIMERFD_SETTIME)(fd, flags, new_value, old_value) }
+}
+
+#[cfg(target_os = "linux")]
+/// Hook for `timerfd_gettime(2)` (Linux), offered only for an fd a backend owns.
+unsafe extern "C" fn timerfd_gettime(fd: c_int, curr_value: *mut libc::itimerspec) -> c_int {
+    // SAFETY: `curr_value` is the caller's writable itimerspec.
+    if let Some(r) =
+        domain::dispatch_owned(fd, |net| unsafe { net.timerfd_gettime(fd, curr_value.cast()) })
+    {
+        return finish(r) as c_int;
+    }
+    domain::observe("timerfd_gettime", None);
+    // SAFETY: TIMERFD_GETTIME holds libc's timerfd_gettime.
+    unsafe {
+        original::<unsafe extern "C" fn(c_int, *mut libc::itimerspec) -> c_int>(&TIMERFD_GETTIME)(
+            fd, curr_value,
+        )
+    }
+}
+
 #[cfg(target_os = "macos")]
 /// Hook for `kqueue(2)` (macOS).
 unsafe extern "C" fn kqueue() -> c_int {
@@ -275,8 +383,9 @@ unsafe extern "C" fn kqueue() -> c_int {
 }
 
 #[cfg(target_os = "macos")]
-/// Hook for `kevent(2)` (macOS). Unlike the Linux epoll hooks this one is gated on [`net_owns`],
-/// so a kqueue the OS made (for libdispatch, say) never reaches a backend.
+/// Hook for `kevent(2)` (macOS). Unlike the Linux epoll hooks this one is gated on
+/// [`net_owns`](domain::net_owns), so a kqueue the OS made (for libdispatch, say) never reaches a
+/// backend.
 unsafe extern "C" fn kevent(
     kq: c_int,
     changelist: *const libc::kevent,
@@ -287,8 +396,7 @@ unsafe extern "C" fn kevent(
 ) -> c_int {
     // man 2 kevent: applies `changelist` then returns up to `nevents` ready events; `timeout`
     // is a timespec (null blocks). SAFETY: the caller's change/event arrays and timeout.
-    if net_owns(kq)
-        && let Some(r) = dispatch_net(|net| unsafe {
+    if let Some(r) = domain::dispatch_owned(kq, |net| unsafe {
             net.kevent(
                 kq,
                 changelist.cast(),
@@ -367,8 +475,7 @@ unsafe extern "C" fn sendmsg(fd: c_int, msg: *const libc::msghdr, flags: c_int) 
     // man 2 sendmsg: struct msghdr {msg_name, msg_iov/msg_iovlen scatter-gather,
     // msg_control/msg_controllen ancillary cmsg(3)}; returns bytes sent.
     // SAFETY: `msg` is the caller's msghdr.
-    if net_owns(fd)
-        && let Some(r) = domain::dispatch_net_effect("sendmsg", |net| unsafe {
+    if let Some(r) = domain::dispatch_owned_effect("sendmsg", fd, |net| unsafe {
             net.sendmsg(fd, msg.cast(), flags)
         })
     {
@@ -387,8 +494,7 @@ unsafe extern "C" fn sendmsg(fd: c_int, msg: *const libc::msghdr, flags: c_int) 
 unsafe extern "C" fn recvmsg(fd: c_int, msg: *mut libc::msghdr, flags: c_int) -> ssize_t {
     // man 2 recvmsg: fills the msghdr's iovecs and sets msg_flags (e.g. MSG_TRUNC/MSG_CTRUNC).
     // SAFETY: `msg` is the caller's msghdr.
-    if net_owns(fd)
-        && let Some(r) = dispatch_net(|net| unsafe { net.recvmsg(fd, msg.cast(), flags) })
+    if let Some(r) = domain::dispatch_owned(fd, |net| unsafe { net.recvmsg(fd, msg.cast(), flags) })
     {
         return finish(r) as ssize_t;
     }
@@ -411,8 +517,7 @@ unsafe extern "C" fn recvmmsg(
     timeout: *mut libc::timespec,
 ) -> c_int {
     // SAFETY: `msgvec` holds `vlen` mmsghdrs and `timeout` is null or a timespec, the caller's.
-    if net_owns(fd)
-        && let Some(r) = dispatch_net(|net| unsafe {
+    if let Some(r) = domain::dispatch_owned(fd, |net| unsafe {
             net.recvmmsg(fd, msgvec.cast(), vlen, flags, timeout.cast())
         })
     {
@@ -434,9 +539,8 @@ unsafe extern "C" fn sendmmsg(
     flags: c_int,
 ) -> c_int {
     // SAFETY: `msgvec` holds `vlen` mmsghdrs, the caller's.
-    if net_owns(fd)
-        && let Some(r) =
-            dispatch_net(|net| unsafe { net.sendmmsg(fd, msgvec.cast(), vlen, flags) })
+    if let Some(r) =
+        domain::dispatch_owned(fd, |net| unsafe { net.sendmmsg(fd, msgvec.cast(), vlen, flags) })
     {
         return finish(r) as c_int;
     }
@@ -895,15 +999,15 @@ unsafe extern "C" fn close(fd: c_int) -> c_int {
         {
             return Some(result);
         }
-        if net_owns(fd)
-            && let Some(result) =
-                domain::dispatch_net_effect("close", |net| unsafe { net.close(fd) })
+        if let Some(result) =
+            domain::dispatch_owned_effect("close", fd, |net| unsafe { net.close(fd) })
         {
             return Some(result);
         }
         if domain::descriptor_close_can_wait(fd) {
             return None;
         }
+        crate::owners::forget_real(fd);
         let result = unsafe { original::<unsafe extern "C" fn(c_int) -> c_int>(&CLOSE)(fd) };
         Some(if result < 0 {
             -i64::from(
@@ -918,6 +1022,7 @@ unsafe extern "C" fn close(fd: c_int) -> c_int {
     if let Some(result) = handled {
         return finish(result) as c_int;
     }
+    crate::owners::forget_real(fd);
     unsafe { original::<unsafe extern "C" fn(c_int) -> c_int>(&CLOSE)(fd) }
 }
 
@@ -1024,8 +1129,7 @@ unsafe extern "C" fn dup(fd: c_int) -> c_int {
 }
 
 unsafe fn dup_inner(fd: c_int) -> c_int {
-    if net_owns(fd)
-        && let Some(r) = dispatch_net(|net| unsafe { net.dup(fd) })
+    if let Some(r) = domain::dispatch_owned(fd, |net| unsafe { net.dup(fd) })
     {
         return finish(r) as c_int;
     }
@@ -1037,8 +1141,14 @@ unsafe fn dup_inner(fd: c_int) -> c_int {
 }
 
 unsafe extern "C" fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
-    let real =
-        || unsafe { original::<unsafe extern "C" fn(c_int, c_int) -> c_int>(&DUP2)(oldfd, newfd) };
+    let real = || {
+        let result =
+            unsafe { original::<unsafe extern "C" fn(c_int, c_int) -> c_int>(&DUP2)(oldfd, newfd) };
+        if result >= 0 && oldfd != newfd {
+            crate::owners::forget_real(newfd);
+        }
+        result
+    };
     if let Some(result) =
         domain::descriptor_transaction(|| domain::dispatch_dup_to(oldfd, newfd, None, real))
     {
@@ -1049,8 +1159,16 @@ unsafe extern "C" fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
 
 #[cfg(target_os = "linux")]
 unsafe extern "C" fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int {
-    let real = || unsafe {
-        original::<unsafe extern "C" fn(c_int, c_int, c_int) -> c_int>(&DUP3)(oldfd, newfd, flags)
+    let real = || {
+        let result = unsafe {
+            original::<unsafe extern "C" fn(c_int, c_int, c_int) -> c_int>(&DUP3)(
+                oldfd, newfd, flags,
+            )
+        };
+        if result >= 0 {
+            crate::owners::forget_real(newfd);
+        }
+        result
     };
     if let Some(result) =
         domain::descriptor_transaction(|| domain::dispatch_dup_to(oldfd, newfd, Some(flags), real))
@@ -1102,8 +1220,7 @@ unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, len: size_t) -> ssize_t {
         return finish(r) as ssize_t;
     }
     // SAFETY: `buf` points to `len` writable bytes.
-    if net_owns(fd)
-        && let Some(r) = dispatch_net(|net| unsafe { net.read(fd, buf.cast(), len) })
+    if let Some(r) = domain::dispatch_owned(fd, |net| unsafe { net.read(fd, buf.cast(), len) })
     {
         return finish(r) as ssize_t;
     }
@@ -1124,9 +1241,9 @@ unsafe extern "C" fn write(fd: c_int, buf: *const c_void, len: size_t) -> ssize_
         return finish(r) as ssize_t;
     }
     // SAFETY: `buf` points to `len` readable bytes.
-    if net_owns(fd)
-        && let Some(r) =
-            domain::dispatch_net_effect("write", |net| unsafe { net.write(fd, buf.cast(), len) })
+    if let Some(r) = domain::dispatch_owned_effect("write", fd, |net| unsafe {
+        net.write(fd, buf.cast(), len)
+    })
     {
         return finish(r) as ssize_t;
     }
@@ -1175,8 +1292,7 @@ unsafe fn fcntl_inner(fd: c_int, cmd: c_int, arg: i64) -> c_int {
         return finish(r) as c_int;
     }
     // SAFETY: no pointer args for the fcntl commands a socket sees (flags, dup).
-    if net_owns(fd)
-        && let Some(r) = dispatch_net(|net| unsafe { net.fcntl(fd, cmd, arg) })
+    if let Some(r) = domain::dispatch_owned(fd, |net| unsafe { net.fcntl(fd, cmd, arg) })
     {
         return finish(r) as c_int;
     }

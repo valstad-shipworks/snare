@@ -1295,6 +1295,24 @@ enum Sock {
         /// Reads so far; `eventfd_read` there wakes with `EPOLLOUT`.
         reads: u64,
     },
+    /// A timerfd (man 2 timerfd_create): readable once it has expired, a read returning the
+    /// expirations since the last read as a native-endian u64. Expiry is played lazily against
+    /// the sim's monotonic clock ([`Fabric::settle_timers`]).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Timer {
+        /// `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` or `CLOCK_REALTIME`, for `TFD_TIMER_ABSTIME`.
+        clock: c_int,
+        /// When it next expires, on the sim's monotonic timeline; `None` while disarmed.
+        expires: Option<Duration>,
+        /// The reload interval; zero for a one-shot timer.
+        interval: Duration,
+        /// Expirations not yet read.
+        ticks: u64,
+        /// Expirations ever: a wake each, as Linux fs/timerfd.c `timerfd_triggered` wakes the
+        /// waitqueue on every expiry.
+        expired: u64,
+        nonblocking: bool,
+    },
     /// An epoll set: each watched fd's registration. Level-triggered unless registered with
     /// `EPOLLET` (see [`Edge`]); `EPOLLONESHOT` disables a registration once reported.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -1409,6 +1427,12 @@ struct Sockets {
     #[cfg(target_os = "linux")]
     identities: HashMap<u64, usize>,
     next_id: u64,
+    /// How many descriptions are timerfds, so settling them costs nothing without one.
+    timers: usize,
+    /// The sim whose descriptors these are, recorded with each (`snare_interpose::claim_fd`) so a
+    /// thread of another sim reaching one is not sent to the OS's placeholder. Learnt from the
+    /// first thread to mint one, which is always one of the sim's.
+    owner: Option<snare_interpose::SimId>,
 }
 
 impl Sockets {
@@ -1447,9 +1471,21 @@ impl Sockets {
         self.descriptors.contains_key(fd)
     }
 
+    fn claim(&mut self, fd: c_int, local: bool) {
+        if self.owner.is_none() {
+            self.owner = snare_interpose::current_sim();
+        }
+        if let Some(owner) = self.owner {
+            snare_interpose::claim_fd(fd, owner, local);
+        }
+    }
+
     fn insert(&mut self, fd: c_int, sock: Sock) {
+        self.claim(fd, sock.process_local());
+        self.timers += usize::from(matches!(sock, Sock::Timer { .. }));
         if let Some(description) = self.description_mut(&fd) {
-            description.sock = sock;
+            let replaced = std::mem::replace(&mut description.sock, sock);
+            self.timers -= usize::from(matches!(replaced, Sock::Timer { .. }));
         } else {
             self.next_id += 1;
             let id = self.next_id;
@@ -1470,6 +1506,8 @@ impl Sockets {
     }
 
     fn alias(&mut self, fd: c_int, new_fd: c_int) {
+        let local = self.get(&fd).is_some_and(Sock::process_local);
+        self.claim(new_fd, local);
         let key = self.descriptors[&fd];
         self.descriptors.insert(new_fd, key);
         self.descriptions[key.slot]
@@ -1481,6 +1519,9 @@ impl Sockets {
 
     fn remove(&mut self, fd: &c_int) -> Option<Option<Sock>> {
         let key = self.descriptors.remove(fd)?;
+        if let Some(owner) = self.owner {
+            snare_interpose::release_fd(*fd, owner);
+        }
         let description = self.descriptions[key.slot].as_mut().unwrap();
         description.descriptors.remove(fd);
         Some(if description.descriptors.is_empty() {
@@ -1488,10 +1529,111 @@ impl Sockets {
             self.free_slots.push(key.slot);
             #[cfg(target_os = "linux")]
             self.identities.remove(&key.id);
+            self.timers -= usize::from(matches!(retired.sock, Sock::Timer { .. }));
             Some(retired.sock)
         } else {
             None
         })
+    }
+
+    /// Plays every timerfd forward to `now`, turning the expirations due into ticks.
+    fn settle_timers(&mut self, now: Duration) {
+        if self.timers == 0 {
+            return;
+        }
+        for description in self.descriptions.iter_mut().flatten() {
+            if let Sock::Timer {
+                expires,
+                interval,
+                ticks,
+                expired,
+                ..
+            } = &mut description.sock
+            {
+                let (due, next) = timer_due(*expires, *interval, now);
+                *ticks = ticks.saturating_add(due);
+                *expired = expired.saturating_add(due);
+                *expires = next;
+            }
+        }
+    }
+
+    /// The earliest expiry among the armed timerfds `keep` selects, on the sim's monotonic
+    /// timeline.
+    fn next_expiry(&self, mut keep: impl FnMut(&SocketDescription) -> bool) -> Option<Duration> {
+        if self.timers == 0 {
+            return None;
+        }
+        self.descriptions
+            .iter()
+            .flatten()
+            .filter_map(|description| match description.sock {
+                Sock::Timer {
+                    expires: Some(at), ..
+                } if keep(description) => Some(at),
+                _ => None,
+            })
+            .min()
+    }
+
+    /// Takes out every process-local description (see [`Sock::process_local`]) for another sim's
+    /// fabric to [`adopt`](Self::adopt), leaving each descriptor recorded as this sim's until the
+    /// other claims it.
+    fn take_local(&mut self) -> Vec<SocketDescription> {
+        let mut taken = Vec::new();
+        for slot in 0..self.descriptions.len() {
+            if !self.descriptions[slot]
+                .as_ref()
+                .is_some_and(|description| description.sock.process_local())
+            {
+                continue;
+            }
+            let description = self.descriptions[slot].take().unwrap();
+            self.free_slots.push(slot);
+            for fd in &description.descriptors {
+                self.descriptors.remove(fd);
+            }
+            #[cfg(target_os = "linux")]
+            self.identities.remove(&description.id);
+            self.timers -= usize::from(matches!(description.sock, Sock::Timer { .. }));
+            taken.push(description);
+        }
+        taken
+    }
+
+    /// Takes in descriptions another sim's fabric [took out](Self::take_local), each under a new
+    /// identity.
+    /// `rename` then sees each description with the identities every old one became.
+    fn adopt(
+        &mut self,
+        mut descriptions: Vec<SocketDescription>,
+        mut rename: impl FnMut(&mut Sock, &HashMap<u64, u64>),
+    ) {
+        let renamed: HashMap<u64, u64> = descriptions
+            .iter()
+            .enumerate()
+            .map(|(i, description)| (description.id, self.next_id + 1 + i as u64))
+            .collect();
+        for description in &mut descriptions {
+            rename(&mut description.sock, &renamed);
+        }
+        for mut description in descriptions {
+            self.next_id += 1;
+            let id = self.next_id;
+            description.id = id;
+            let slot = self.free_slots.pop().unwrap_or_else(|| {
+                self.descriptions.push(None);
+                self.descriptions.len() - 1
+            });
+            for &fd in &description.descriptors {
+                self.claim(fd, true);
+                self.descriptors.insert(fd, DescriptionKey { slot, id });
+            }
+            #[cfg(target_os = "linux")]
+            self.identities.insert(id, slot);
+            self.timers += usize::from(matches!(description.sock, Sock::Timer { .. }));
+            self.descriptions[slot] = Some(description);
+        }
     }
 
     fn values(&self) -> impl Iterator<Item = &Sock> {
@@ -1527,6 +1669,40 @@ pub struct Fabric {
     regs: Arc<Registries>,
     /// A real `/dev/null` descriptor, `dup`ed to mint each virtual fd.
     devnull: c_int,
+}
+
+/// Descriptions on their way to another sim's fabric (see [`Net::hand_over`]).
+struct Handed(Vec<SocketDescription>);
+
+impl Drop for Fabric {
+    /// Keeps the process-local descriptors still served for the next sim to reach them (see
+    /// `snare_interpose::orphan`), and leaves every other one recorded as gone: its placeholder
+    /// stays open, so code still holding the number does not reach whatever the OS would hand out
+    /// next under it.
+    fn drop(&mut self) {
+        let now = self.regs.shared.monotonic_now();
+        let socks = self.socks.get_mut().unwrap_or_else(|e| e.into_inner());
+        let Some(owner) = socks.owner else {
+            return;
+        };
+        socks.settle_timers(now);
+        let mut kept = socks.take_local();
+        for description in &mut kept {
+            if let Sock::Timer { expires, .. } = &mut description.sock {
+                *expires = expires.map(|at| at.saturating_sub(now));
+            }
+        }
+        if !kept.is_empty() {
+            let fds = kept
+                .iter()
+                .flat_map(|description| description.descriptors.iter().copied())
+                .collect();
+            snare_interpose::orphan(fds, owner, Box::new(Handed(kept)));
+        }
+        for &fd in socks.descriptors.keys() {
+            snare_interpose::bury_fd(fd, owner);
+        }
+    }
 }
 
 struct UdpSendEndpoint {
@@ -2878,6 +3054,84 @@ impl Net for Fabric {
     /// Whether `fd` is one of the fabric's virtual descriptors.
     fn owns(&self, fd: c_int) -> bool {
         self.socks.lock().unwrap().contains_key(&fd)
+    }
+
+    /// Gives up the fabric's epoll sets, kqueues, eventfds and timerfds. A timer keeps the time
+    /// it had left; registrations of the fabric's network sockets stay behind, as those sockets
+    /// do.
+    unsafe fn hand_over(&self) -> Option<snare_interpose::HandOver> {
+        let now = self.shared().monotonic_now();
+        let mut taken = {
+            let mut socks = self.socks.lock().unwrap();
+            socks.settle_timers(now);
+            socks.take_local()
+        };
+        if taken.is_empty() {
+            return None;
+        }
+        for description in &mut taken {
+            if let Sock::Timer { expires, .. } = &mut description.sock {
+                *expires = expires.map(|at| at.saturating_sub(now));
+            }
+        }
+        let fds = taken
+            .iter()
+            .flat_map(|description| description.descriptors.iter().copied())
+            .collect();
+        let keys: Vec<_> = taken
+            .iter()
+            .map(|description| crate::readiness::WakeKey::Descriptor(description.id))
+            .collect();
+        let regs = self.regs.clone();
+        Some(snare_interpose::HandOver {
+            fds,
+            state: Box::new(Handed(taken)),
+            wake: Box::new(move || regs.shared.bump_keys(&keys)),
+        })
+    }
+
+    unsafe fn take_over(
+        &self,
+        state: Box<dyn std::any::Any + Send>,
+        fds: &[c_int],
+    ) -> Result<(), Box<dyn std::any::Any + Send>> {
+        let Handed(mut descriptions) = *state.downcast::<Handed>()?;
+        let now = self.shared().monotonic_now();
+        let moved: BTreeSet<c_int> = fds.iter().copied().collect();
+        descriptions.retain_mut(|description| {
+            description.descriptors.retain(|fd| moved.contains(fd));
+            !description.descriptors.is_empty()
+        });
+        self.socks
+            .lock()
+            .unwrap()
+            .adopt(descriptions, |sock, renamed| match sock {
+                Sock::Timer { expires, .. } => *expires = expires.map(|left| now + left),
+                Sock::Event { ready_at, .. } => *ready_at = now,
+                Sock::Epoll { interests } => {
+                    *interests = std::mem::take(interests)
+                        .into_iter()
+                        .filter_map(|((fd, identity), mut interest)| {
+                            let identity = match identity {
+                                EpollIdentity::Local(id) => {
+                                    EpollIdentity::Local(*renamed.get(&id)?)
+                                }
+                                EpollIdentity::Foreign(_) => return None,
+                                EpollIdentity::Untracked => EpollIdentity::Untracked,
+                            };
+                            interest.pending_order = None;
+                            Some(((fd, identity), interest))
+                        })
+                        .collect();
+                }
+                Sock::Kqueue { state } => {
+                    let mut state = state.lock().unwrap();
+                    state.reads.retain(|fd, _| moved.contains(fd));
+                    state.writes.retain(|fd, _| moved.contains(fd));
+                }
+                _ => {}
+            });
+        Ok(())
     }
 
     /// Opens an `AF_INET`/`AF_INET6` stream or datagram socket, or on Linux an `AF_PACKET` one;
@@ -4390,6 +4644,7 @@ impl Net for Fabric {
             | Some(Sock::Dgram { nonblocking, .. })
             | Some(Sock::UnixDgram { nonblocking, .. })
             | Some(Sock::Event { nonblocking, .. })
+            | Some(Sock::Timer { nonblocking, .. })
             | Some(Sock::Raw { nonblocking, .. }) => nonblocking,
             _ => return None,
         };
@@ -4602,15 +4857,26 @@ impl Net for Fabric {
                 }
                 return ok(ready as i64);
             }
-            last = !readiness().wait_until_dynamic(
+            let expiry = self.fds_timer_expiry(&fds);
+            let timer = expiry.map(|at| self.timer_deadline(at));
+            let woke = readiness().wait_until_dynamic(
                 "poll",
-                deadline,
+                earlier(deadline, timer),
                 |keys| self.fd_interests(fds.iter().copied(), keys),
                 || {
                     self.poll_revents(&watched).iter().any(|r| *r != 0)
                         || self.connecting_due(Some(&fds))
+                        || self.fds_timer_expiry(&fds) != expiry
                 },
             );
+            last = !woke;
+            if let (false, Some(at), Some(timer)) = (woke, expiry, timer)
+                && timer.passed()
+                && deadline.is_none_or(|d| !d.passed())
+            {
+                snare_interpose::expire_timer(at);
+                last = false;
+            }
             waited = true;
         }
     }
@@ -4692,6 +4958,8 @@ impl Net for Fabric {
     unsafe fn read(&self, fd: c_int, buf: *mut u8, len: usize) -> Option<NetResult> {
         match self.kind(fd)? {
             Kind::Event => self.eventfd_read(fd, buf, len),
+            #[cfg(target_os = "linux")]
+            Kind::Timer => self.timerfd_read(fd, buf, len),
             Kind::Stream | Kind::Dgram | Kind::Fresh | Kind::Listener => unsafe {
                 self.recv(fd, buf, len, 0)
             },
@@ -4793,6 +5061,9 @@ impl Net for Fabric {
                         EpollIdentity::Foreign(rec.id.get())
                     })
             });
+        if identity == EpollIdentity::Untracked && !real_pollable(fd) {
+            return err(libc::EPERM);
+        }
         if matches!(identity, EpollIdentity::Local(id) if Some(id) == socks.identity(epfd)) {
             return err(libc::EINVAL);
         }
@@ -4846,61 +5117,149 @@ impl Net for Fabric {
         maxevents: c_int,
         timeout: c_int,
     ) -> Option<NetResult> {
+        let timeout = (timeout >= 0).then(|| Duration::from_millis(timeout as u64));
+        unsafe { self.epoll_wait_for(epfd, events, maxevents, timeout) }
+    }
+
+    /// man 2 epoll_pwait2: `epoll_wait` with a timespec timeout; EINVAL for a negative or
+    /// out-of-range one (fs/eventpoll.c `poll_select_set_timeout`).
+    #[cfg(target_os = "linux")]
+    unsafe fn epoll_pwait2(
+        &self,
+        epfd: c_int,
+        events: *mut u8,
+        maxevents: c_int,
+        timeout: *const u8,
+    ) -> Option<NetResult> {
         if !Net::owns(self, epfd) {
             return None;
         }
-        if maxevents <= 0 {
+        let timeout = if timeout.is_null() {
+            None
+        } else {
+            let ts = unsafe { std::ptr::read_unaligned(timeout.cast::<libc::timespec>()) };
+            match timespec_span(&ts) {
+                Some(span) => Some(span),
+                None => return err(libc::EINVAL),
+            }
+        };
+        unsafe { self.epoll_wait_for(epfd, events, maxevents, timeout) }
+    }
+
+    /// man 2 timerfd_create: CLOCK_REALTIME, CLOCK_MONOTONIC or CLOCK_BOOTTIME, with
+    /// TFD_NONBLOCK/TFD_CLOEXEC; EINVAL for other flags or clocks. The alarm clocks need
+    /// CAP_WAKE_ALARM (fs/timerfd.c `timerfd_create`), which a sim's process lacks: EPERM.
+    #[cfg(target_os = "linux")]
+    unsafe fn timerfd_create(&self, clockid: c_int, flags: c_int) -> Option<NetResult> {
+        if flags & !(libc::TFD_NONBLOCK | libc::TFD_CLOEXEC) != 0 {
             return err(libc::EINVAL);
         }
-        if events.is_null() {
+        match clockid {
+            libc::CLOCK_REALTIME | libc::CLOCK_MONOTONIC | libc::CLOCK_BOOTTIME => {}
+            libc::CLOCK_REALTIME_ALARM | libc::CLOCK_BOOTTIME_ALARM => return err(libc::EPERM),
+            _ => return err(libc::EINVAL),
+        }
+        match self.reserve_fd_flags(flags) {
+            Ok(fd) => {
+                self.socks.lock().unwrap().insert(
+                    fd,
+                    Sock::Timer {
+                        clock: clockid,
+                        expires: None,
+                        interval: Duration::ZERO,
+                        ticks: 0,
+                        expired: 0,
+                        nonblocking: flags & libc::TFD_NONBLOCK != 0,
+                    },
+                );
+                ok(fd as i64)
+            }
+            Err(e) => err(e.raw_os_error().unwrap_or(libc::EMFILE)),
+        }
+    }
+
+    /// man 2 timerfd_settime: a zero `it_value` disarms, anything else arms the timer to expire
+    /// that long from now (or at that time on its clock with TFD_TIMER_ABSTIME), then every
+    /// `it_interval`. Arming or disarming discards unread expirations (fs/timerfd.c
+    /// `timerfd_setup` zeroes `ticks`). `old_value` receives the setting replaced, as
+    /// `timerfd_gettime` would have read it.
+    #[cfg(target_os = "linux")]
+    unsafe fn timerfd_settime(
+        &self,
+        fd: c_int,
+        flags: c_int,
+        new_value: *const u8,
+        old_value: *mut u8,
+    ) -> Option<NetResult> {
+        let now = self.shared().monotonic_now();
+        let mut socks = self.socks.lock().unwrap();
+        socks.settle_timers(now);
+        let Sock::Timer {
+            clock,
+            expires,
+            interval,
+            ticks,
+            ..
+        } = socks.get_mut(&fd)?
+        else {
+            return err(libc::EINVAL);
+        };
+        if flags & !(libc::TFD_TIMER_ABSTIME | libc::TFD_TIMER_CANCEL_ON_SET) != 0 {
+            return err(libc::EINVAL);
+        }
+        if new_value.is_null() {
             return err(libc::EFAULT);
         }
-        if !matches!(
-            self.socks.lock().unwrap().get(&epfd),
-            Some(Sock::Epoll { .. })
-        ) {
+        let new = unsafe { std::ptr::read_unaligned(new_value.cast::<libc::itimerspec>()) };
+        let (Some(value), Some(reload)) = (
+            timespec_span(&new.it_value),
+            timespec_span(&new.it_interval),
+        ) else {
             return err(libc::EINVAL);
+        };
+        if !old_value.is_null() {
+            let old = itimerspec(expires.map(|at| at.saturating_sub(now)), *interval);
+            unsafe { std::ptr::write_unaligned(old_value.cast::<libc::itimerspec>(), old) };
         }
-        let deadline = (timeout >= 0)
-            .then(|| Deadline::timeout(std::time::Duration::from_millis(timeout as u64)));
-        // A wait that returns without blocking — events already pending, or a zero timeout — is a
-        // busy-poll step when repeated, so it is charged the call latency.
-        let mut waited = false;
-        loop {
-            self.advance_connecting(None);
-            let ready = self.collect_ready(epfd, maxevents as usize, true);
-            if !ready.is_empty() {
-                if !waited {
-                    snare_interpose::charge_latency();
+        *ticks = 0;
+        *interval = reload;
+        *expires = (!value.is_zero()).then(|| {
+            if flags & libc::TFD_TIMER_ABSTIME == 0 {
+                now.saturating_add(value)
+            } else if *clock == libc::CLOCK_REALTIME {
+                let real = self.shared().tstamp_now().real;
+                match value.checked_sub(real) {
+                    Some(ahead) => now.saturating_add(ahead),
+                    None => now.saturating_sub(real - value),
                 }
-                for (i, (ev, data)) in ready.iter().enumerate() {
-                    let slot = unsafe { events.cast::<libc::epoll_event>().add(i) };
-                    unsafe {
-                        std::ptr::write_unaligned(
-                            slot,
-                            libc::epoll_event {
-                                events: *ev,
-                                u64: *data,
-                            },
-                        )
-                    };
-                }
-                return ok(ready.len() as i64);
+            } else {
+                value
             }
-            let woke = readiness().wait_until_dynamic(
-                "epoll_wait",
-                deadline,
-                |keys| self.epoll_interests(epfd, keys),
-                || !self.collect_ready(epfd, 1, false).is_empty() || self.connecting_due(None),
-            );
-            if !woke {
-                if timeout == 0 {
-                    snare_interpose::charge_latency();
-                }
-                return ok(0);
-            }
-            waited = true;
+        });
+        drop(socks);
+        self.bump_fds([fd]);
+        ok(0)
+    }
+
+    /// man 2 timerfd_gettime: the time left to the next expiry (zero while disarmed) and the
+    /// interval.
+    #[cfg(target_os = "linux")]
+    unsafe fn timerfd_gettime(&self, fd: c_int, curr_value: *mut u8) -> Option<NetResult> {
+        let now = self.shared().monotonic_now();
+        let mut socks = self.socks.lock().unwrap();
+        socks.settle_timers(now);
+        let Sock::Timer {
+            expires, interval, ..
+        } = socks.get(&fd)?
+        else {
+            return err(libc::EINVAL);
+        };
+        if curr_value.is_null() {
+            return err(libc::EFAULT);
         }
+        let current = itimerspec(expires.map(|at| at.saturating_sub(now)), *interval);
+        unsafe { std::ptr::write_unaligned(curr_value.cast::<libc::itimerspec>(), current) };
+        ok(0)
     }
 
     /// man 2 kqueue: a new kernel event queue.
@@ -5103,7 +5462,11 @@ impl Net for Fabric {
         // As for epoll_wait: a return that never blocked is charged the call latency.
         let immediate = deadline.is_some_and(|d| d.passed());
         let mut waited = false;
+        let _waiting = snare_interpose::fd_wait(kq);
         loop {
+            if !Net::owns(self, kq) {
+                return None;
+            }
             self.advance_connecting(None);
             let ready = self.collect_kevents(kq, cap, true);
             if !ready.is_empty() {
@@ -5132,8 +5495,15 @@ impl Net for Fabric {
                 "kevent",
                 deadline,
                 |keys| self.kqueue_interests(kq, keys),
-                || !self.collect_kevents(kq, 1, false).is_empty() || self.connecting_due(None),
+                || {
+                    !Net::owns(self, kq)
+                        || !self.collect_kevents(kq, 1, false).is_empty()
+                        || self.connecting_due(None)
+                },
             );
+            if !Net::owns(self, kq) {
+                return None;
+            }
             if !woke {
                 if immediate {
                     snare_interpose::charge_latency();
@@ -5852,10 +6222,69 @@ enum Kind {
     Listener,
     Dgram,
     Event,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Timer,
     Epoll,
     Raw,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Kqueue,
+}
+
+/// The expirations of a timer armed for `expires` (reloading every `interval`, or once for
+/// zero) that have fallen due by `now`, and when it expires next. Overruns are counted whole, as
+/// Linux kernel/time/hrtimer.c `hrtimer_forward` does for fs/timerfd.c.
+fn timer_due(
+    expires: Option<Duration>,
+    interval: Duration,
+    now: Duration,
+) -> (u64, Option<Duration>) {
+    match expires {
+        Some(at) if at <= now => {
+            if interval.is_zero() {
+                return (1, None);
+            }
+            let due = (now - at).as_nanos() / interval.as_nanos() + 1;
+            let next = at.as_nanos() + due * interval.as_nanos();
+            (
+                u64::try_from(due).unwrap_or(u64::MAX),
+                Some(Duration::from_nanos(
+                    u64::try_from(next).unwrap_or(u64::MAX),
+                )),
+            )
+        }
+        _ => (0, expires),
+    }
+}
+
+/// Whichever of two deadlines falls first; either may be absent.
+fn earlier(a: Option<Deadline>, b: Option<Deadline>) -> Option<Deadline> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if b.remaining() < a.remaining() { b } else { a }),
+        (a, b) => a.or(b),
+    }
+}
+
+/// A `timespec` as a span; `None` when negative or with `tv_nsec` out of range, which the kernel
+/// rejects with EINVAL (include/linux/time64.h `timespec64_valid`).
+#[cfg(target_os = "linux")]
+fn timespec_span(ts: &libc::timespec) -> Option<Duration> {
+    if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+        return None;
+    }
+    Some(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+}
+
+/// An `itimerspec` reading `value` left (zero for `None`, a disarmed timer) and `interval`.
+#[cfg(target_os = "linux")]
+fn itimerspec(value: Option<Duration>, interval: Duration) -> libc::itimerspec {
+    let ts = |span: Duration| libc::timespec {
+        tv_sec: span.as_secs() as libc::time_t,
+        tv_nsec: span.subsec_nanos() as libc::c_long,
+    };
+    libc::itimerspec {
+        it_interval: ts(interval),
+        it_value: ts(value.unwrap_or_default()),
+    }
 }
 
 pub(crate) fn readiness_sequence() -> u64 {
@@ -5972,6 +6401,46 @@ fn foreign_ready(rec: &SockRec) -> Option<(u32, Wakes)> {
     ))
 }
 
+/// Whether the OS's epoll accepts real descriptor `fd`: Linux refuses, with `EPERM`, a file
+/// whose driver has no poll (a regular file, a directory, `/dev/null`; fs/eventpoll.c
+/// `do_epoll_ctl` checks `file_can_poll`), which only the OS can tell, so it is asked with a
+/// probe set of its own.
+#[cfg(target_os = "linux")]
+fn real_pollable(fd: c_int) -> bool {
+    snare_interpose::real(|| unsafe {
+        let probe = libc::epoll_create1(libc::EPOLL_CLOEXEC);
+        if probe < 0 {
+            return true;
+        }
+        let mut event = libc::epoll_event { events: 0, u64: 0 };
+        let added = libc::epoll_ctl(probe, libc::EPOLL_CTL_ADD, fd, &mut event);
+        let refused =
+            added < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        libc::close(probe);
+        !refused
+    })
+}
+
+/// The readiness of a real descriptor registered in a simulated epoll set, as a zero-timeout
+/// `poll(2)` of it reads now; `None` once it is closed. Linux keeps an epoll registration until
+/// the file's last descriptor closes (fs/eventpoll.c `eventpoll_release`), so a live one stays
+/// registered. Its readiness cannot wake a simulated wait; it is seen when the wait next looks.
+#[cfg(target_os = "linux")]
+fn real_ready(fd: c_int) -> Option<u32> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN | libc::POLLOUT | libc::POLLPRI | libc::POLLRDHUP,
+        revents: 0,
+    };
+    let polled = snare_interpose::real(|| unsafe { libc::poll(&mut pfd, 1, 0) });
+    if polled < 0 || pfd.revents & libc::POLLNVAL != 0 {
+        return None;
+    }
+    // The poll bits share their values with the epoll bits on Linux (include/uapi/linux/
+    // eventpoll.h defines EPOLLIN as POLLIN and so on).
+    Some(u32::from(pfd.revents as u16))
+}
+
 /// The readiness of `sock` apart from a pending error. A stream is writable while its window has
 /// room and readable once data, end of stream or a reset is there; datagram, eventfd and raw
 /// endpoints are always writable (sends never block on them here, bar a stalled link); a
@@ -6025,6 +6494,7 @@ fn base_mask(sock: &Sock) -> u32 {
             }
             m
         }
+        Sock::Timer { ticks, .. } if *ticks > 0 => epollin,
         Sock::Listener { listener, .. } if listener.has_pending() => epollin,
         // A connect that failed: writable, with its error and the hang-up of a closed socket
         // (net/ipv4/tcp.c tcp_poll: TCP_CLOSE gives EPOLLHUP, SEND_SHUTDOWN gives EPOLLOUT, sk_err
@@ -6100,6 +6570,11 @@ fn wakes(sock: &Sock) -> Wakes {
             write: *reads,
             ..Wakes::default()
         },
+        Sock::Timer { expired, .. } => Wakes {
+            read: *expired,
+            write: 0,
+            ..Wakes::default()
+        },
         Sock::Raw { arrived, .. } => Wakes {
             read: *arrived,
             write: 0,
@@ -6161,6 +6636,16 @@ impl Edge {
 
 impl Sock {
     /// The socket record, for every variant that is a socket.
+    /// Whether this is a kernel object of the process rather than of a network: an epoll set, a
+    /// kqueue, an eventfd or a timerfd. These may move to another sim of the process (see
+    /// [`Net::hand_over`]).
+    fn process_local(&self) -> bool {
+        matches!(
+            self,
+            Sock::Epoll { .. } | Sock::Kqueue { .. } | Sock::Event { .. } | Sock::Timer { .. }
+        )
+    }
+
     fn rec(&self) -> Option<&Arc<SockRec>> {
         match self {
             Sock::Fresh { rec, .. }
@@ -6265,6 +6750,7 @@ impl Fabric {
             Sock::Listener { .. } => Kind::Listener,
             Sock::Dgram { .. } | Sock::UnixDgram { .. } => Kind::Dgram,
             Sock::Event { .. } => Kind::Event,
+            Sock::Timer { .. } => Kind::Timer,
             Sock::Epoll { .. } => Kind::Epoll,
             Sock::Raw { .. } => Kind::Raw,
             Sock::Kqueue { .. } => Kind::Kqueue,
@@ -6278,6 +6764,9 @@ impl Fabric {
         matches!(
             socks.get(&fd),
             Some(Sock::Event {
+                nonblocking: true,
+                ..
+            }) | Some(Sock::Timer {
                 nonblocking: true,
                 ..
             }) | Some(Sock::Stream {
@@ -6302,7 +6791,8 @@ impl Fabric {
             .foreign_masks(watched.iter().map(|w| w.0))
             .into_iter()
             .collect();
-        let socks = self.socks.lock().unwrap();
+        let mut socks = self.socks.lock().unwrap();
+        socks.settle_timers(self.shared().monotonic_now());
         watched
             .iter()
             .map(|(fd, events)| match socks.get(fd) {
@@ -6338,6 +6828,182 @@ impl Fabric {
             .collect()
     }
 
+    /// `epoll_wait` with its timeout as a span (`None` blocks). A watched timerfd's next expiry
+    /// bounds the wait as well, so the timer fires on the sim's clock like any other deadline: a
+    /// time skip lands on it, and an as-fast-as-possible clock jumps to it.
+    #[cfg(target_os = "linux")]
+    unsafe fn epoll_wait_for(
+        &self,
+        epfd: c_int,
+        events: *mut u8,
+        maxevents: c_int,
+        timeout: Option<Duration>,
+    ) -> Option<NetResult> {
+        if !Net::owns(self, epfd) {
+            return None;
+        }
+        if maxevents <= 0 {
+            return err(libc::EINVAL);
+        }
+        if events.is_null() {
+            return err(libc::EFAULT);
+        }
+        if !matches!(
+            self.socks.lock().unwrap().get(&epfd),
+            Some(Sock::Epoll { .. })
+        ) {
+            return err(libc::EINVAL);
+        }
+        let deadline = timeout.map(Deadline::timeout);
+        // A wait that returns without blocking — events already pending, or a zero timeout — is a
+        // busy-poll step when repeated, so it is charged the call latency.
+        let mut waited = false;
+        let _waiting = snare_interpose::fd_wait(epfd);
+        loop {
+            if !Net::owns(self, epfd) {
+                return None;
+            }
+            self.advance_connecting(None);
+            let ready = self.collect_ready(epfd, maxevents as usize, true);
+            if !ready.is_empty() {
+                if !waited {
+                    snare_interpose::charge_latency();
+                }
+                for (i, (ev, data)) in ready.iter().enumerate() {
+                    let slot = unsafe { events.cast::<libc::epoll_event>().add(i) };
+                    unsafe {
+                        std::ptr::write_unaligned(
+                            slot,
+                            libc::epoll_event {
+                                events: *ev,
+                                u64: *data,
+                            },
+                        )
+                    };
+                }
+                return ok(ready.len() as i64);
+            }
+            let expiry = self.epoll_timer_expiry(epfd);
+            let timer = expiry.map(|at| self.timer_deadline(at));
+            let woke = readiness().wait_until_dynamic(
+                "epoll_wait",
+                earlier(deadline, timer),
+                |keys| self.epoll_interests(epfd, keys),
+                || {
+                    !Net::owns(self, epfd)
+                        || !self.collect_ready(epfd, 1, false).is_empty()
+                        || self.connecting_due(None)
+                        || self.epoll_timer_expiry(epfd) != expiry
+                },
+            );
+            if !Net::owns(self, epfd) {
+                return None;
+            }
+            if !woke {
+                if let (Some(at), Some(timer)) = (expiry, timer)
+                    && timer.passed()
+                    && deadline.is_none_or(|d| !d.passed())
+                {
+                    snare_interpose::expire_timer(at);
+                    waited = true;
+                    continue;
+                }
+                if timeout.is_some_and(|t| t.is_zero()) {
+                    snare_interpose::charge_latency();
+                }
+                return ok(0);
+            }
+            waited = true;
+        }
+    }
+
+    /// The earliest expiry among the timerfds epoll set `epfd` watches.
+    #[cfg(target_os = "linux")]
+    fn epoll_timer_expiry(&self, epfd: c_int) -> Option<Duration> {
+        let socks = self.socks.lock().unwrap();
+        let Some(Sock::Epoll { interests }) = socks.get(&epfd) else {
+            return None;
+        };
+        let watched: std::collections::HashSet<u64> = interests
+            .iter()
+            .filter(|(_, interest)| !interest.spent)
+            .filter_map(|((_, identity), _)| match identity {
+                EpollIdentity::Local(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        if watched.is_empty() {
+            return None;
+        }
+        socks.next_expiry(|description| watched.contains(&description.id))
+    }
+
+    /// The earliest expiry among the timerfds in `fds`.
+    fn fds_timer_expiry(&self, fds: &[c_int]) -> Option<Duration> {
+        let socks = self.socks.lock().unwrap();
+        socks.next_expiry(|description| description.descriptors.iter().any(|fd| fds.contains(fd)))
+    }
+
+    /// A wait's deadline for a timer expiring at `at` on the sim's monotonic timeline.
+    fn timer_deadline(&self, at: Duration) -> Deadline {
+        Deadline::timeout(at.saturating_sub(self.shared().monotonic_now()))
+    }
+
+    /// man 2 timerfd_create, "Operating on a timer file descriptor": a read of at least 8 bytes
+    /// returns the expirations since the last read and resets them, blocking (or EAGAIN when
+    /// nonblocking) until there is one; a shorter buffer is EINVAL.
+    #[cfg(target_os = "linux")]
+    fn timerfd_read(&self, fd: c_int, buf: *mut u8, len: usize) -> Option<NetResult> {
+        if len < 8 {
+            return err(libc::EINVAL);
+        }
+        let take = || -> Option<u64> {
+            let mut socks = self.socks.lock().unwrap();
+            socks.settle_timers(self.shared().monotonic_now());
+            match socks.get_mut(&fd) {
+                Some(Sock::Timer { ticks, .. }) if *ticks > 0 => Some(std::mem::take(ticks)),
+                _ => None,
+            }
+        };
+        let _waiting = snare_interpose::fd_wait(fd);
+        let value = loop {
+            if !Net::owns(self, fd) {
+                return None;
+            }
+            if let Some(value) = take() {
+                break value;
+            }
+            if self.is_nonblocking(fd) {
+                return would_block();
+            }
+            let expiry = self.fds_timer_expiry(&[fd]);
+            let timer = expiry.map(|at| self.timer_deadline(at));
+            let woke = readiness().wait_until_dynamic(
+                "timerfd",
+                timer,
+                |keys| self.fd_interests([fd], keys),
+                || {
+                    !Net::owns(self, fd)
+                        || self.fds_timer_expiry(&[fd]) != expiry
+                        || matches!(
+                            self.socks.lock().unwrap().get(&fd),
+                            Some(Sock::Timer { ticks, .. }) if *ticks > 0
+                        )
+                },
+            );
+            if !woke && Net::owns(self, fd) {
+                match (expiry, timer) {
+                    (Some(at), Some(timer)) if timer.passed() => {
+                        snare_interpose::expire_timer(at);
+                    }
+                    _ => return err(libc::EAGAIN),
+                }
+            }
+        };
+        unsafe { std::ptr::copy_nonoverlapping(value.to_ne_bytes().as_ptr(), buf, 8) };
+        ok(8)
+    }
+
     /// Ready registrations in activation order; reported level-triggered registrations move
     /// behind the remaining ready registrations. `take` consumes edges and one-shot events.
     #[cfg(target_os = "linux")]
@@ -6360,11 +7026,18 @@ impl Fabric {
                     EpollIdentity::Foreign(id) => self.shared().sockets.lookup_raw_id(id),
                     EpollIdentity::Untracked => self.shared().sockets.lookup_fd(key.0),
                     EpollIdentity::Local(_) => None,
-                }?;
-                Some((key, foreign_ready(&rec)?))
+                };
+                match rec {
+                    Some(rec) => Some((key, foreign_ready(&rec)?)),
+                    None if key.1 == EpollIdentity::Untracked => {
+                        Some((key, (real_ready(key.0)?, Wakes::default())))
+                    }
+                    None => None,
+                }
             })
             .collect();
         let mut socks = self.socks.lock().unwrap();
+        socks.settle_timers(self.shared().monotonic_now());
         let Some(Sock::Epoll { interests }) = socks.get(&epfd) else {
             return Vec::new();
         };
@@ -6767,15 +7440,21 @@ impl Fabric {
             v
         } else if self.is_nonblocking(fd) {
             return would_block();
-        } else if readiness().wait_until_dynamic(
-            "eventfd",
-            None,
-            |keys| self.fd_interests([fd], keys),
-            || self.eventfd_peek(fd) > 0,
-        ) {
-            self.eventfd_take(fd).unwrap_or(0)
         } else {
-            return err(libc::EAGAIN); // quiescent: nothing will post to this eventfd
+            let _waiting = snare_interpose::fd_wait(fd);
+            let woke = readiness().wait_until_dynamic(
+                "eventfd",
+                None,
+                |keys| self.fd_interests([fd], keys),
+                || !Net::owns(self, fd) || self.eventfd_peek(fd) > 0,
+            );
+            if !Net::owns(self, fd) {
+                return None;
+            }
+            if !woke {
+                return err(libc::EAGAIN); // quiescent: nothing will post to this eventfd
+            }
+            self.eventfd_take(fd).unwrap_or(0)
         };
         unsafe { std::ptr::copy_nonoverlapping(value.to_ne_bytes().as_ptr(), buf, 8) };
         self.bump_fds([fd]);
