@@ -64,7 +64,7 @@ features = ["wasm_js"]
 version = "0.3"
 
 [target.'cfg(snare)'.dependencies.snare-interpose]
-version = "3.1.0"
+version = "3.1.1"
 path = "../../crates/snare-interpose"
 
 [target.'cfg(snare)'.dev-dependencies.snare]

@@ -25,7 +25,7 @@ repository = "https://github.com/Keruspe/async-global-executor"
 doctest = false
 
 [dependencies.snare-interpose]
-version = "3.1.0"
+version = "3.1.1"
 path = "../../crates/snare-interpose"
 
 [dependencies.async-channel]

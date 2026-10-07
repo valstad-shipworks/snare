@@ -32,7 +32,7 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies.snare-interpose]
-version = "3.1.0"
+version = "3.1.1"
 path = "../../crates/snare-interpose"
 
 [dependencies.async-channel]

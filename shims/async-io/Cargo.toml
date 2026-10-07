@@ -23,7 +23,7 @@ parking = "2.0.0"
 polling = "3.4.0"
 rustix = { version = "1.0.7", default-features = false, features = ["fs", "net", "std"] }
 slab = "0.4.2"
-snare-interpose = { version = "3.1.0", path = "../../crates/snare-interpose" }
+snare-interpose = { version = "3.1.1", path = "../../crates/snare-interpose" }
 tracing = { version = "0.1.37", default-features = false, optional = true }
 
 [target.'cfg(windows)'.dependencies]
