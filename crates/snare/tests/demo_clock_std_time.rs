@@ -13,14 +13,15 @@ const VIRTUAL_EPOCH_SECS: u64 = 1_700_000_000;
 /// A sim with a `SimHost` where there is one; on Windows, whose `SystemTime` and `Instant` read
 /// `GetSystemTimePreciseAsFileTime` and `QueryPerformanceCounter`
 /// ([Microsoft Learn: Acquiring high-resolution time stamps](https://learn.microsoft.com/en-us/windows/win32/sysinfo/acquiring-high-resolution-time-stamps)),
-/// the plain sim on the same virtual clock.
+/// the plain sim on the same virtual clock. On the fixed epoch, so the readings are absolute.
 fn sim() -> Sim {
     #[cfg(unix)]
     return Sim::builder()
         .host(snare::HostProfile::new().build())
+        .fixed_epoch()
         .build();
     #[cfg(windows)]
-    return Sim::new();
+    return Sim::builder().fixed_epoch().build();
 }
 
 #[test]

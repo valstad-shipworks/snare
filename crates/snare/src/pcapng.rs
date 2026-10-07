@@ -254,7 +254,9 @@ impl TcpTap {
         return_delay: Duration,
     ) {
         self.capture.with(|writer, _| {
-            let at = crate::clock::nanos(at.timeline_at(self.capture.real_origin));
+            let at = crate::clock::nanos(
+                at.timeline_at(self.capture.real_origin, self.capture.clock.as_deref()),
+            );
             writer.retarget_reset(self, from, at, return_delay);
         });
     }
@@ -262,7 +264,9 @@ impl TcpTap {
     #[cfg(target_os = "macos")]
     pub(crate) fn defer_reset_receipt(&self, to: usize, at: crate::readiness::Deadline) {
         self.capture.with(|writer, _| {
-            let at = crate::clock::nanos(at.timeline_at(self.capture.real_origin));
+            let at = crate::clock::nanos(
+                at.timeline_at(self.capture.real_origin, self.capture.clock.as_deref()),
+            );
             if let Some(flow) = writer.flows.get_mut(&self.key()) {
                 flow.closed_at[to] = Some(at);
             }
@@ -288,7 +292,9 @@ impl TcpTap {
         return_delay: Duration,
     ) {
         self.capture.with(|writer, _| {
-            let at = crate::clock::nanos(at.timeline_at(self.capture.real_origin));
+            let at = crate::clock::nanos(
+                at.timeline_at(self.capture.real_origin, self.capture.clock.as_deref()),
+            );
             writer.reset_route(
                 TcpRoute {
                     link: &self.link,
@@ -311,8 +317,8 @@ pub(crate) struct Capture {
     path: PathBuf,
     /// The sim's seed, mixed into every connection's initial sequence numbers.
     seed: u64,
-    /// The Unix time the sim's timeline starts at: the virtual clock's realtime base, or, without
-    /// one, the real time the sim was built.
+    /// The Unix time the sim's timeline starts at: the virtual clock's realtime at sim time zero,
+    /// or, without one, the real time the sim was built.
     base_realtime: Duration,
     /// The sim's virtual clock, when it has one; stamps are read from it without advancing it.
     clock: Option<Arc<Clock>>,
@@ -470,7 +476,7 @@ impl Capture {
     ) -> io::Result<Arc<Capture>> {
         let file = snare_interpose::real(|| File::create(&path))?;
         let base_realtime = match &shared.clock {
-            Some(clock) => clock.base_realtime(),
+            Some(clock) => clock.timeline_realtime(),
             None => snare_interpose::real(|| {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

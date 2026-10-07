@@ -6,6 +6,15 @@
 //! later are patched from the `LoadLibrary*` hooks, and each module's delay-load table is
 //! patched too, so a delay-loaded import is redirected before its first call resolves it.
 //!
+//! A function's address stored in data needs nothing more. PE has no relocation that binds a data
+//! word to an imported symbol: a static initialized with an import's address (a Rust
+//! `static F: unsafe extern "system" fn(u32) = Sleep`, which rustc emits as an
+//! `IMAGE_REL_AMD64_ADDR64` against `Sleep`, not `__imp_Sleep`) is resolved by the linker to the
+//! import thunk, a `jmp [__imp_Sleep]` in the image's own code, so a call through it reads the
+//! patched IAT slot. Only code that copies an `__imp_` slot into data at run time (an MSVC C++
+//! dynamic initializer of `&dllimport_function`, or MinGW's pseudo-relocations) keeps the real
+//! address, if it ran before the module was patched.
+//!
 //! Only PE32+ images (64-bit) are handled; header offsets and table layouts follow
 //! ([Microsoft Learn: PE Format](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format)).
 

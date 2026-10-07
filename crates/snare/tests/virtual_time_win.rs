@@ -17,9 +17,23 @@ fn vsim() -> Sim {
     Sim::builder().virtual_clock().build()
 }
 
+unsafe extern "C" {
+    /// The UCRT's `time` (Microsoft Learn: time, _time32, _time64).
+    fn _time64(out: *mut i64) -> i64;
+}
+
+#[test]
+fn crt_time_reads_the_virtual_clock() {
+    let (t, stored) = vsim().run(|| {
+        let mut stored = 0i64;
+        (unsafe { _time64(&mut stored) }, stored)
+    });
+    assert_eq!((t, stored), (1_700_000_000, 1_700_000_000));
+}
+
 #[test]
 fn reads_do_not_tick() {
-    vsim().run(|| {
+    Sim::builder().fixed_epoch().build().run(|| {
         let a = Instant::now();
         let b = Instant::now();
         assert_eq!(a, b);
@@ -78,7 +92,7 @@ fn a_lone_sleep_skips_virtual_time() {
 
 #[test]
 fn advance_time_steps_the_clock() {
-    let sim = vsim();
+    let sim = Sim::builder().fixed_epoch().build();
     sim.advance_time(Duration::from_secs(5));
     sim.run(|| {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();

@@ -317,11 +317,14 @@ pub trait Net: Send + Sync + 'static {
         Err(state)
     }
 
-    /// Starts serving `fd`, a descriptor another sim minted (or one gone with its sim), when it
-    /// names an object with no network identity that every world of the process may hold its
-    /// own instance of: an `AF_UNIX` socketpair end. A library may make one once per process and
-    /// keep it in a static (tokio's signal self-pipe), so each sim that reaches it gets this
-    /// world's instance of the pair, under the same number. `true` once this backend owns `fd`.
+    /// Starts serving `fd`, a descriptor another sim minted (or one gone with its sim) that does
+    /// not belong to the process. An object with no network identity, an `AF_UNIX` socketpair
+    /// end, gets this world's own instance: a library may make one once per process and keep it
+    /// in a static (tokio's signal self-pipe), so each sim that reaches it gets an instance of
+    /// the pair, under the same number. A network socket has no instance in this world, and is
+    /// served as a connection that is gone, so code that kept it (a connection pool in a static)
+    /// sees it fail as a dropped connection and opens another. `true` once this backend owns
+    /// `fd`.
     ///
     /// # Safety
     /// No pointers are involved.

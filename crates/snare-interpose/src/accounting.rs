@@ -17,7 +17,7 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -937,6 +937,61 @@ pub(crate) fn held() -> Option<&'static Held> {
     })
 }
 
+/// How many watched mutexes [`WatchedMutexes`] holds before it allocates. A snare choice, far past
+/// the distinct locks a domain's participants wait on at once.
+const WATCHED_MUTEXES: usize = 64;
+
+/// The census's watched mutexes, with room for [`WATCHED_MUTEXES`] made when the census is: a
+/// participant starts watching a lock as its wait begins, and when that is an allocator's own lock,
+/// taken inside the allocator, an allocation under the census lock could wait on the very lock it
+/// waits for, or on its holder, which may need the census lock to record taking it.
+struct WatchedMutexes(HashMap<usize, Watched>);
+
+impl Default for WatchedMutexes {
+    fn default() -> Self {
+        Self(HashMap::with_capacity(WATCHED_MUTEXES))
+    }
+}
+
+impl std::ops::Deref for WatchedMutexes {
+    type Target = HashMap<usize, Watched>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for WatchedMutexes {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// Slots of [`WatchFilter`].
+const WATCH_SLOTS: usize = 256;
+
+/// How many participants' waits watch a pthread mutex, counted in the slot its address hashes to,
+/// so a lock or an unlock of a mutex nobody waits for skips the census lock without taking it. An
+/// allocator's locks are taken and let go inside the allocator, by threads that may hold one while
+/// another thread holds the census lock and allocates; only a lock a participant is waiting for
+/// right then, or one sharing its slot, makes its holder take the census lock.
+pub(crate) struct WatchFilter([AtomicU32; WATCH_SLOTS]);
+
+impl Default for WatchFilter {
+    fn default() -> Self {
+        Self([const { AtomicU32::new(0) }; WATCH_SLOTS])
+    }
+}
+
+impl WatchFilter {
+    /// The count for `mutex`'s slot. Read and written sequentially consistent, as [`Held`] relies
+    /// on.
+    pub(crate) fn slot(&self, mutex: usize) -> &AtomicU32 {
+        let hash = ((mutex >> 3) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        &self.0[(hash >> 56) as usize % WATCH_SLOTS]
+    }
+}
+
 /// A pthread mutex the census tracks because a participant's wait needs it.
 #[cfg_attr(windows, allow(dead_code))]
 struct Watched {
@@ -976,7 +1031,7 @@ pub(crate) struct Core {
     #[cfg(target_os = "linux")]
     ready_rows: usize,
     /// The pthread mutexes participants' waits need, with their holders.
-    mutexes: HashMap<usize, Watched>,
+    mutexes: WatchedMutexes,
     #[cfg(windows)]
     shared_mutexes: HashMap<usize, std::collections::BTreeSet<u64>>,
     #[cfg(windows)]
@@ -1735,9 +1790,11 @@ pub(crate) struct Accounting {
     auditing: AtomicBool,
     /// Participants parked in a native wait on an address, so a wake elsewhere skips the census.
     pub(crate) keyed: std::sync::atomic::AtomicU32,
-    /// How many pthread mutexes the census watches, so a lock elsewhere skips it. Read and written
-    /// sequentially consistent, as [`Held`] relies on.
+    /// How many pthread mutexes the census watches. Read and written sequentially consistent, as
+    /// [`Held`] relies on.
     pub(crate) watching: AtomicUsize,
+    /// Which pthread mutexes the census may watch, so a lock elsewhere skips it.
+    pub(crate) watched: WatchFilter,
     /// Effects of non-participant threads, to tell their wakes from outside ones.
     effects: AtomicU64,
     /// Participants woken from a native wait by something outside the domain (see

@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex, Weak};
 
 use snare_interpose::{Fs, NetResult as FsResult};
 
-use crate::fs_sim::{OpenFiles, descriptor_fcntl, path_of, set_cloexec, status_flags};
+use crate::fs_sim::{
+    OpenFiles, Stamp, clock_now, descriptor_fcntl, path_of, set_cloexec, status_flags,
+};
 use crate::scope::SimShared;
 use crate::simhost::{host_stat, host_statx};
 
@@ -26,6 +28,9 @@ pub(crate) struct ProcNetFs {
     files: Mutex<OpenFiles<OpenFile>>,
     /// A real `/dev/null` descriptor, `dup`ed to mint each file's fd.
     devnull: c_int,
+    /// The instant the files carry: the sim's boot, or the real time it was built at on the real
+    /// clock.
+    boot: Stamp,
 }
 
 /// One open counter file.
@@ -46,10 +51,15 @@ impl ProcNetFs {
         let devnull = snare_interpose::real(|| unsafe {
             libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC)
         });
+        let boot = match &shared.clock {
+            Some(clock) => clock.base_realtime().as_nanos() as Stamp,
+            None => clock_now(None),
+        };
         ProcNetFs {
             shared: Arc::downgrade(shared),
             files: Mutex::default(),
             devnull,
+            boot,
         }
     }
 
@@ -141,7 +151,7 @@ impl Fs for ProcNetFs {
     unsafe fn stat(&self, path: *const c_char, buf: *mut u8) -> Option<FsResult> {
         let path = unsafe { path_of(path) }?;
         self.render(&path)?;
-        host_stat(buf, &path, MODE, 0, 1)
+        host_stat(buf, &path, MODE, 0, 1, self.boot)
     }
 
     unsafe fn lstat(&self, path: *const c_char, buf: *mut u8) -> Option<FsResult> {
@@ -173,11 +183,11 @@ impl Fs for ProcNetFs {
         if unsafe { path.as_ref() }.is_some_and(|p| *p == 0) {
             let files = self.files.lock().unwrap();
             let file = files.get(&dirfd)?;
-            return host_statx(buf, &file.path, MODE, 0, 1);
+            return host_statx(buf, &file.path, MODE, 0, 1, self.boot);
         }
         let path = unsafe { path_of(path) }?;
         self.render(&path)?;
-        host_statx(buf, &path, MODE, 0, 1)
+        host_statx(buf, &path, MODE, 0, 1, self.boot)
     }
 
     /// Readable by anyone, writable by no one (`0444`).
@@ -202,7 +212,7 @@ impl Fs for ProcNetFs {
     unsafe fn fstat(&self, fd: c_int, buf: *mut u8) -> Option<FsResult> {
         let files = self.files.lock().unwrap();
         let file = files.get(&fd)?;
-        host_stat(buf, &file.path, MODE, 0, 1)
+        host_stat(buf, &file.path, MODE, 0, 1, self.boot)
     }
 
     /// Moves the cursor (man 2 lseek); `EINVAL` for an unknown `whence` or a negative result.

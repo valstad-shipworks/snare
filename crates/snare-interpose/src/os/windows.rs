@@ -55,6 +55,8 @@ static GET_TICK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static QUERY_UNBIASED_INTERRUPT_TIME: AtomicUsize = AtomicUsize::new(0);
 static GET_SYSTEM_TIME_PRECISE_AS_FILE_TIME: AtomicUsize = AtomicUsize::new(0);
 static GET_SYSTEM_TIME_AS_FILE_TIME: AtomicUsize = AtomicUsize::new(0);
+static CRT_TIME64: AtomicUsize = AtomicUsize::new(0);
+static CRT_TIME32: AtomicUsize = AtomicUsize::new(0);
 static SLEEP: AtomicUsize = AtomicUsize::new(0);
 static SLEEP_EX: AtomicUsize = AtomicUsize::new(0);
 static CREATE_THREAD: AtomicUsize = AtomicUsize::new(0);
@@ -154,6 +156,18 @@ pub(crate) fn hooks() -> Vec<Hook> {
             "kernel32.dll",
             get_system_time_as_file_time,
             GET_SYSTEM_TIME_AS_FILE_TIME
+        ),
+        hook!(
+            "_time64",
+            "api-ms-win-crt-time-l1-1-0.dll",
+            crt_time64,
+            CRT_TIME64
+        ),
+        hook!(
+            "_time32",
+            "api-ms-win-crt-time-l1-1-0.dll",
+            crt_time32,
+            CRT_TIME32
         ),
         hook!("Sleep", "kernel32.dll", sleep, SLEEP),
         hook!("SleepEx", "kernel32.dll", sleep_ex, SLEEP_EX),
@@ -2012,6 +2026,38 @@ unsafe extern "system" fn get_system_time_as_file_time(out: *mut FILETIME) {
     }
 }
 
+/// The UCRT's `_time64`, which C's `time` and the `libc` crate's `time` name on Windows: the
+/// realtime clock in whole seconds since 1970, also stored through a non-null `out`
+/// ([Microsoft Learn: time, _time32, _time64](https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/time-time32-time64)).
+/// The UCRT reads the clock inside itself, where no hook sees it.
+unsafe extern "C" fn crt_time64(out: *mut i64) -> i64 {
+    if let Some(now) = crate::domain::read_clock(ClockKind::Realtime) {
+        let secs = now.as_secs() as i64;
+        if !out.is_null() {
+            // SAFETY: the caller passed a writable __time64_t.
+            unsafe { out.write(secs) };
+        }
+        return secs;
+    }
+    // SAFETY: CRT_TIME64 holds the UCRT's _time64.
+    unsafe { original::<unsafe extern "C" fn(*mut i64) -> i64>(&CRT_TIME64)(out) }
+}
+
+/// The UCRT's `_time32`: as `_time64`, and `-1` past 2038-01-18 23:59:59 UTC, the last second a
+/// `__time32_t` holds.
+unsafe extern "C" fn crt_time32(out: *mut i32) -> i32 {
+    if let Some(now) = crate::domain::read_clock(ClockKind::Realtime) {
+        let secs = i32::try_from(now.as_secs()).unwrap_or(-1);
+        if !out.is_null() {
+            // SAFETY: the caller passed a writable __time32_t.
+            unsafe { out.write(secs) };
+        }
+        return secs;
+    }
+    // SAFETY: CRT_TIME32 holds the UCRT's _time32.
+    unsafe { original::<unsafe extern "C" fn(*mut i32) -> i32>(&CRT_TIME32)(out) }
+}
+
 /// Sleeps `millis` on the domain's clock. `false` (the caller sleeps for real) off a domain, and
 /// for `INFINITE`, a sleep that never returns and so has nothing to simulate.
 fn virtual_sleep(millis: u32) -> bool {
@@ -2330,7 +2376,7 @@ const OUTSIDE_HOLDER_GRACE_MS: u32 = 1;
 /// holder took, so the run no longer replays. A snare choice, as on Linux: long enough to outlast an
 /// outside holder on a loaded machine, at the cost of that much real time per wait on a word a parked
 /// thread of the domain holds.
-const DET_OUTSIDE_HOLDER_GRACE_MS: u32 = 50;
+pub(super) const DET_OUTSIDE_HOLDER_GRACE_MS: u32 = 50;
 
 /// The first [`OUTSIDE_HOLDER_GRACE_MS`] of a `WaitOnAddress` on a word in static data, which may
 /// be a lock shared with threads outside the simulation (std's own statics: stdout's and stderr's
@@ -2523,9 +2569,7 @@ unsafe fn wait_on_address_call(
 unsafe extern "system" fn wake_by_address_single(address: *const c_void) {
     domain::note_hook_effect("WakeByAddressSingle");
     address_wakes(address as usize).fetch_add(1, Ordering::Release);
-    if domain::det_wakes() {
-        domain::det_wake(crate::DetKey::Addr(address as usize), 1);
-    }
+    domain::det_wake_addr(address as usize, 1);
     // SAFETY: WAKE_BY_ADDRESS_SINGLE holds the system's function; argument forwarded.
     domain::release_native(address as usize, 1, || unsafe {
         original::<unsafe extern "system" fn(*const c_void)>(&WAKE_BY_ADDRESS_SINGLE)(address)
@@ -2538,9 +2582,7 @@ unsafe extern "system" fn wake_by_address_single(address: *const c_void) {
 unsafe extern "system" fn wake_by_address_all(address: *const c_void) {
     domain::note_hook_effect("WakeByAddressAll");
     address_wakes(address as usize).fetch_add(1, Ordering::Release);
-    if domain::det_wakes() {
-        domain::det_wake(crate::DetKey::Addr(address as usize), usize::MAX);
-    }
+    domain::det_wake_addr(address as usize, usize::MAX);
     // SAFETY: WAKE_BY_ADDRESS_ALL holds the system's function; argument forwarded.
     domain::release_native(address as usize, usize::MAX, || unsafe {
         original::<unsafe extern "system" fn(*const c_void)>(&WAKE_BY_ADDRESS_ALL)(address)
@@ -2840,6 +2882,7 @@ fn semaphore_wait(
         .then(|| domain::virtual_now().map(|now| now + Duration::from_millis(timeout.into())))
         .flatten();
     while domain::counts_native_waits() && domain::det_active() {
+        let _listed = domain::det_listen(handle as usize);
         // SAFETY: a non-blocking take on the caller's semaphore.
         if unsafe { wait(handle, 0) } == WAIT_OBJECT_0 {
             return WAIT_OBJECT_0;
@@ -2884,10 +2927,10 @@ unsafe extern "system" fn release_semaphore(handle: HANDLE, count: i32, previous
             handle, count, previous,
         )
     };
-    if r != 0 && domain::det_wakes() {
+    if r != 0 {
         // SAFETY: reading and restoring this thread's last-error value.
         let saved = unsafe { GetLastError() };
-        domain::det_wake(crate::DetKey::Addr(handle as usize), n);
+        domain::det_wake_addr(handle as usize, n);
         // SAFETY: as above.
         unsafe { SetLastError(saved) };
     }

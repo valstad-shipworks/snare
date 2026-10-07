@@ -1482,6 +1482,83 @@ fn process_pairs() -> std::sync::MutexGuard<'static, ProcessPairs> {
 /// Identities for socketpairs, unique in the process.
 static NEXT_PAIR: AtomicU64 = AtomicU64::new(1);
 
+/// The descriptors registered in `sock` when it is an epoll set or a kqueue, real ones aside.
+fn registered_sockets(sock: &Sock) -> Vec<c_int> {
+    match sock {
+        Sock::Epoll { interests } => interests
+            .keys()
+            .filter(|(_, identity)| matches!(identity, EpollIdentity::Local(_)))
+            .map(|&(fd, _)| fd)
+            .collect(),
+        Sock::Kqueue { state } => {
+            let state = state.lock().unwrap();
+            state
+                .reads
+                .iter()
+                .chain(&state.writes)
+                .filter(|(_, note)| !note.untracked)
+                .map(|(&fd, _)| fd)
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Sets or clears `O_NONBLOCK` on real descriptor `fd`.
+fn set_real_nonblocking(fd: c_int, on: bool) {
+    snare_interpose::real(|| unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            return;
+        }
+        let wanted = if on {
+            flags | libc::O_NONBLOCK
+        } else {
+            flags & !libc::O_NONBLOCK
+        };
+        if wanted != flags {
+            libc::fcntl(fd, libc::F_SETFL, wanted);
+        }
+    });
+}
+
+/// What [`Sockets::mirrors`] records for a descriptor of another sim's network socket, served
+/// here as a connection that is gone: no socketpair has this identity.
+const DEAD: u64 = 0;
+
+/// The real descriptor every virtual one but a socketpair end is a `dup` of, so each holds a
+/// number the OS will not hand out meanwhile: the read end of a pipe whose write end is closed. A
+/// call that reaches the OS with such a number instead of the fabric (one no hook covers, or one
+/// from a thread outside every sim) finds a peer that has gone, as a dropped connection would
+/// show it: end of file on a read, `EBADF` on a write, `ESPIPE` on a positioned call, `ENOTSOCK`
+/// on a socket call and a hang-up in `poll`, never a write that succeeds and goes nowhere.
+fn placeholder() -> c_int {
+    static PLACEHOLDER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+    let held = PLACEHOLDER.load(Ordering::Acquire);
+    if held >= 0 {
+        return held;
+    }
+    let made = snare_interpose::real(|| unsafe {
+        let mut ends = [-1; 2];
+        if libc::pipe(ends.as_mut_ptr()) != 0 {
+            return -1;
+        }
+        libc::close(ends[1]);
+        libc::fcntl(ends[0], libc::F_SETFD, libc::FD_CLOEXEC);
+        ends[0]
+    });
+    if made < 0 {
+        return made;
+    }
+    match PLACEHOLDER.compare_exchange(-1, made, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => made,
+        Err(held) => {
+            snare_interpose::real(|| unsafe { libc::close(made) });
+            held
+        }
+    }
+}
+
 struct SocketDescription {
     id: u64,
     sock: Sock,
@@ -1553,6 +1630,8 @@ impl Sockets {
         self.descriptors.contains_key(fd)
     }
 
+    /// Records `fd` as this sim's. A number that named a socketpair end of another sim, closed
+    /// from elsewhere since, names that end no more.
     fn claim(&mut self, fd: c_int, local: bool) {
         if self.owner.is_none() {
             self.owner = snare_interpose::current_sim();
@@ -1560,6 +1639,7 @@ impl Sockets {
         if let Some(owner) = self.owner {
             snare_interpose::claim_fd(fd, owner, local);
         }
+        process_pairs().remove(fd);
     }
 
     fn insert(&mut self, fd: c_int, sock: Sock) {
@@ -1604,9 +1684,12 @@ impl Sockets {
     /// Whether `fd` is a mirror whose pair the process no longer holds under that number: the
     /// sim that minted it closed it, and the OS may have reused it.
     fn stale_mirror(&self, fd: c_int) -> bool {
-        self.mirrors
-            .get(&fd)
-            .is_some_and(|&pair| process_pairs().get(fd).is_none_or(|end| end.pair != pair))
+        self.mirrors.get(&fd).is_some_and(|&pair| {
+            if pair == DEAD {
+                return !snare_interpose::minted(fd);
+            }
+            process_pairs().get(fd).is_none_or(|end| end.pair != pair)
+        })
     }
 
     /// Records every descriptor of `fd`'s description, when it is a socketpair end this sim
@@ -1622,6 +1705,13 @@ impl Sockets {
             return;
         };
         let dgram = matches!(description.sock, Sock::UnixDgram { .. });
+        if let Some(&held) = description
+            .descriptors
+            .iter()
+            .find(|fd| !self.mirrors.contains_key(fd))
+        {
+            set_real_nonblocking(held, nonblocking);
+        }
         let mut pairs = process_pairs();
         for &fd in &description.descriptors {
             if !self.mirrors.contains_key(&fd) {
@@ -1834,8 +1924,6 @@ pub struct Fabric {
     /// never held across a readiness bump or wait.
     socks: Mutex<Sockets>,
     regs: Arc<Registries>,
-    /// A real `/dev/null` descriptor, `dup`ed to mint each virtual fd.
-    devnull: c_int,
 }
 
 /// Descriptions on their way to another sim's fabric (see [`Net::hand_over`]).
@@ -1941,15 +2029,10 @@ impl DgramRecvEndpoint {
 impl Fabric {
     /// A fabric with empty registries over the sim state `shared`.
     pub(crate) fn new(shared: Arc<SimShared>) -> Self {
-        // A real fd we `dup` per virtual socket, so each has a unique number the OS won't reuse
-        // and `close` frees. Opened with redirection off — we are constructed outside a domain.
-        let devnull = snare_interpose::real(|| unsafe {
-            libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC)
-        });
+        placeholder();
         Fabric {
             socks: Mutex::new(Sockets::default()),
             regs: Arc::new(Registries::new(shared)),
-            devnull,
         }
     }
 
@@ -2218,14 +2301,107 @@ impl Fabric {
         self.regs.clone()
     }
 
-    /// A fresh real fd number for a virtual descriptor: a `dup` of `/dev/null`, which the OS
+    /// A fresh real fd number for a virtual descriptor: a `dup` of [`placeholder`], which the OS
     /// will not hand out again until the virtual descriptor's `close` closes it.
     fn reserve_fd(&self) -> io::Result<c_int> {
-        let fd = unsafe { libc::dup(self.devnull) };
+        let fd = snare_interpose::real(|| unsafe { libc::dup(placeholder()) });
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        self.forget_stale_mirror(fd);
         Ok(fd)
+    }
+
+    /// Fresh real fd numbers for the ends of a socketpair of type `ty`: the ends of a real
+    /// socketpair, each held until its virtual end's `close`. A thread outside every sim that
+    /// reaches one of them (a pair a library made in a sim and keeps in a static) uses that real
+    /// pair, the outside world's instance of it, as each sim uses an instance of its own
+    /// ([`ProcessPairs`]).
+    fn reserve_pair(&self, ty: c_int) -> io::Result<[c_int; 2]> {
+        #[cfg(target_os = "linux")]
+        let ty = ty & (0xff | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK);
+        #[cfg(not(target_os = "linux"))]
+        let ty = ty & 0xff;
+        let mut fds = [-1; 2];
+        if snare_interpose::real(|| unsafe {
+            libc::socketpair(libc::AF_UNIX, ty, 0, fds.as_mut_ptr())
+        }) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        for fd in fds {
+            self.forget_stale_mirror(fd);
+        }
+        Ok(fds)
+    }
+
+    /// Serves `fd`, another sim's network socket (or one gone with its sim), as a connection
+    /// that is gone: one end of a TCP connection its peer reset, so the first read or write
+    /// reports `ECONNRESET`, later reads end of stream and later writes `EPIPE`, and readiness
+    /// shows the hang-up and the error. A world has no instance of another world's connection;
+    /// this is how a connection pool kept across sims finds its connection dead, discards it and
+    /// dials again.
+    fn mirror_dead(&self, fd: c_int) -> bool {
+        let stale = {
+            let mut socks = self.socks.lock().unwrap();
+            if !socks.contains_key(&fd) {
+                None
+            } else if socks.stale_mirror(fd) {
+                socks.remove(&fd)
+            } else {
+                return true;
+            }
+        };
+        if let Some(stale) = stale {
+            self.retire_descriptor(fd, stale, None, None);
+        }
+        let rec = self.shared().new_socket(SocketKind::TcpStream, fd);
+        let conn = Arc::new(Conn {
+            a_to_b: Pipe::new(None, None, self.shared().domain_key()),
+            b_to_a: Pipe::new(None, None, self.shared().domain_key()),
+            client: UNNAMED,
+            server: UNNAMED,
+            regs: self.regs.clone(),
+            hop: None,
+            pair: false,
+            pair_id: 0,
+            tap: None,
+            stamps: Default::default(),
+            write_delays: Default::default(),
+            #[cfg(target_os = "macos")]
+            mac_shutdown: Default::default(),
+        });
+        conn.b_to_a.read_by(&rec);
+        conn.a_to_b.write_by(&rec);
+        conn.b_to_a.reset_reader();
+        conn.a_to_b.reset();
+        conn.b_to_a.reset();
+        let mut socks = self.socks.lock().unwrap();
+        if !socks.contains_key(&fd) {
+            let sock = Sock::Stream {
+                conn,
+                end: End::A,
+                nonblocking: false,
+                rec,
+            };
+            socks.insert_mirror(fd, sock, DEAD);
+        }
+        true
+    }
+
+    /// Stops serving `fd`, a number the OS has just handed out, as this sim's instance of another
+    /// sim's descriptor: that sim has closed it since, so the number names something new.
+    fn forget_stale_mirror(&self, fd: c_int) {
+        let removed = {
+            let mut socks = self.socks.lock().unwrap();
+            if !socks.mirrors.contains_key(&fd) {
+                return;
+            }
+            socks.remove(&fd)
+        };
+        if let Some(removed) = removed {
+            self.retire_descriptor(fd, removed, None, None);
+        }
     }
 
     fn reserve_fd_flags(&self, flags: c_int) -> io::Result<c_int> {
@@ -3292,10 +3468,12 @@ impl Net for Fabric {
     /// bytes written in one world are never read in another, and each instance wakes only its
     /// own sim's waiters, so neither sim's run touches the other's. Both ends of the instance
     /// start open, as the process's pair is; a number of an end this sim has already reached
-    /// joins that end's description. `O_NONBLOCK` is the end's as its sim last set it.
+    /// joins that end's description. `O_NONBLOCK` is the end's as its sim last set it. Any
+    /// other descriptor is a network socket, served as a connection that is gone
+    /// ([`Fabric::mirror_dead`]).
     unsafe fn mirror(&self, fd: c_int) -> bool {
         let Some(end) = process_pairs().get(fd) else {
-            return false;
+            return self.mirror_dead(fd);
         };
         let fresh = {
             let mut socks = self.socks.lock().unwrap();
@@ -3392,39 +3570,49 @@ impl Net for Fabric {
             description.descriptors.retain(|fd| moved.contains(fd));
             !description.descriptors.is_empty()
         });
-        self.socks
-            .lock()
-            .unwrap()
-            .adopt(descriptions, |sock, renamed| match sock {
-                Sock::Timer { expires, .. } => *expires = expires.map(|left| now + left),
-                Sock::Event { ready_at, .. } => *ready_at = now,
-                Sock::Epoll { interests } => {
-                    *interests = std::mem::take(interests)
-                        .into_iter()
-                        .filter_map(|((fd, identity), mut interest)| {
-                            let identity = match identity {
-                                EpollIdentity::Local(id) => {
-                                    EpollIdentity::Local(*renamed.get(&id)?)
-                                }
-                                EpollIdentity::Foreign(_) => return None,
-                                EpollIdentity::Untracked => EpollIdentity::Untracked,
-                            };
-                            interest.pending_order = None;
-                            Some(((fd, identity), interest))
-                        })
-                        .collect();
-                }
-                Sock::Kqueue { state } => {
-                    let mut state = state.lock().unwrap();
-                    state
-                        .reads
-                        .retain(|fd, note| note.untracked || moved.contains(fd));
-                    state
-                        .writes
-                        .retain(|fd, note| note.untracked || moved.contains(fd));
-                }
-                _ => {}
-            });
+        let staying: BTreeSet<c_int> = descriptions
+            .iter()
+            .flat_map(|description| registered_sockets(&description.sock))
+            .filter(|fd| !moved.contains(fd) && snare_interpose::minted_socket(*fd))
+            .collect();
+        for &fd in &staying {
+            // SAFETY: no pointers are involved.
+            unsafe { Net::mirror(self, fd) };
+        }
+        let mut socks = self.socks.lock().unwrap();
+        let mirrored: HashMap<c_int, u64> = staying
+            .iter()
+            .filter_map(|&fd| Some((fd, socks.identity(fd)?)))
+            .collect();
+        socks.adopt(descriptions, |sock, renamed| match sock {
+            Sock::Timer { expires, .. } => *expires = expires.map(|left| now + left),
+            Sock::Event { ready_at, .. } => *ready_at = now,
+            Sock::Epoll { interests } => {
+                *interests = std::mem::take(interests)
+                    .into_iter()
+                    .filter_map(|((fd, identity), mut interest)| {
+                        let identity = match identity {
+                            EpollIdentity::Local(id) => EpollIdentity::Local(
+                                *renamed.get(&id).or_else(|| mirrored.get(&fd))?,
+                            ),
+                            EpollIdentity::Foreign(_) => return None,
+                            EpollIdentity::Untracked => EpollIdentity::Untracked,
+                        };
+                        interest.pending_order = None;
+                        Some(((fd, identity), interest))
+                    })
+                    .collect();
+            }
+            Sock::Kqueue { state } => {
+                let mut state = state.lock().unwrap();
+                let keep = |fd: &c_int, note: &mut Knote| {
+                    note.untracked || moved.contains(fd) || mirrored.contains_key(fd)
+                };
+                state.reads.retain(keep);
+                state.writes.retain(keep);
+            }
+            _ => {}
+        });
         Ok(())
     }
 
@@ -3529,20 +3717,9 @@ impl Net for Fabric {
             return err(libc::EPROTONOSUPPORT);
         }
         let nonblocking = ty & sock_nonblock() != 0;
-        let (a, b) = match (self.reserve_fd_flags(ty), self.reserve_fd_flags(ty)) {
-            (Ok(a), Ok(b)) => (a, b),
-            (a, b) => {
-                let mut errno = libc::EMFILE;
-                for r in [a, b] {
-                    match r {
-                        Ok(fd) => unsafe {
-                            libc::close(fd);
-                        },
-                        Err(e) => errno = e.raw_os_error().unwrap_or(errno),
-                    }
-                }
-                return err(errno);
-            }
+        let [a, b] = match self.reserve_pair(ty) {
+            Ok(fds) => fds,
+            Err(e) => return err(e.raw_os_error().unwrap_or(libc::EMFILE)),
         };
         let pair = NEXT_PAIR.fetch_add(1, Ordering::Relaxed);
         let [sa, sb] = self.pair_ends(base == libc::SOCK_DGRAM, [a, b], nonblocking, pair);
@@ -4520,8 +4697,9 @@ impl Net for Fabric {
     }
 
     /// The connected peer's address; the unnamed `AF_UNIX` address for a socketpair end, ENOTCONN
-    /// for an unconnected socket (man 2 getpeername). A truncated buffer gets the address's
-    /// prefix and the full length, as man 2 getpeername describes.
+    /// for an unconnected socket (man 2 getpeername) and for another sim's socket, a connection
+    /// that is gone here. A truncated buffer gets the address's prefix and the full length, as
+    /// man 2 getpeername describes.
     unsafe fn getpeername(
         &self,
         fd: c_int,
@@ -4529,6 +4707,9 @@ impl Net for Fabric {
         addr_len: *mut u32,
     ) -> Option<NetResult> {
         let socks = self.socks.lock().unwrap();
+        if socks.mirrors.get(&fd) == Some(&DEAD) && socks.contains_key(&fd) {
+            return err(libc::ENOTCONN);
+        }
         let peer = match socks.get(&fd)? {
             Sock::Stream { conn, .. } if conn.pair => None,
             Sock::UnixDgram { .. } => None,
@@ -4853,9 +5034,18 @@ impl Net for Fabric {
                     .raw_os_error()
                     .unwrap_or(libc::EMFILE));
             }
+            let stale = if socks.mirrors.contains_key(&new_fd) {
+                socks.remove(&new_fd)
+            } else {
+                None
+            };
             socks.alias(fd, new_fd);
             if let Some(rec) = rec {
                 self.shared().sockets.alias(new_fd, &rec);
+            }
+            drop(socks);
+            if let Some(stale) = stale {
+                self.retire_descriptor(new_fd, stale, None, None);
             }
             return ok(new_fd as i64);
         }
@@ -5294,6 +5484,12 @@ impl Net for Fabric {
         if !socks.contains_key(&epfd) {
             return None;
         }
+        if !socks.contains_key(&fd) && snare_interpose::minted_socket(fd) {
+            drop(socks);
+            // SAFETY: no pointers are involved.
+            unsafe { Net::mirror(self, fd) };
+            socks = self.socks.lock().unwrap();
+        }
         if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
             return err(libc::EBADF);
         }
@@ -5540,7 +5736,9 @@ impl Net for Fabric {
     /// returns only the receipts, without waiting: XNU bsd/kern/kern_event.c kevent_internal
     /// scans for events only when `noutputs == 0`. A real descriptor the fabric does not serve
     /// registers with the errno the OS's kqueue would give it (`real_pollable`) and reports the
-    /// OS's readiness (`real_kevent`) until it is closed; another sim's descriptor is EBADF.
+    /// OS's readiness (`real_kevent`) until it is closed; another sim's socket is served as a
+    /// connection that is gone ([`Fabric::mirror_dead`]), and any other descriptor of another
+    /// sim is EBADF.
     #[cfg(target_os = "macos")]
     unsafe fn kevent(
         &self,
@@ -5558,6 +5756,17 @@ impl Net for Fabric {
                 _ => return None,
             }
         };
+        for i in 0..nchanges.max(0) as usize {
+            let ch = unsafe { changelist.cast::<libc::kevent>().add(i).read_unaligned() };
+            let fd = ch.ident as c_int;
+            if matches!(ch.filter, libc::EVFILT_READ | libc::EVFILT_WRITE)
+                && !Net::owns(self, fd)
+                && snare_interpose::minted_socket(fd)
+            {
+                // SAFETY: no pointers are involved.
+                unsafe { Net::mirror(self, fd) };
+            }
+        }
         // Apply the changelist, collecting any EV_RECEIPT acknowledgements to return at once.
         let targets: Vec<Result<bool, c_int>> = {
             let socks = self.socks.lock().unwrap();

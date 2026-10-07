@@ -8,7 +8,8 @@
 //! prefix fails with `ENOENT`; anything else is declined. Relative paths use the virtual working
 //! directory when one is selected, otherwise the process working directory. Owned directory
 //! descriptors resolve relative paths against their live inode. Symlinks resolve within this
-//! plane; targets escaping its namespace are rejected with `EXDEV`.
+//! plane; targets escaping its namespace are rejected with `EXDEV`. Nodes keep their timestamps
+//! on the sim's clock ([`Times`]); [`HostTimes`] keeps the times of the real files a sim touches.
 //!
 //! An open virtual file holds a real fd, a `dup` of one `/dev/null` descriptor, so the number is
 //! unique process-wide, `close` on it is safe, and any call the backend does not model degrades to
@@ -18,18 +19,22 @@
 //! sim, or of none, that reaches one is served here too, by whichever plane opened it.
 //!
 //! Locks: `tree` is never held together with `open` or `dirs`; `open` precedes `dirs` when both
-//! tables are needed. File contents are locked after either table. Locks are plain `std`
-//! mutexes; the backend runs inside the interposer's hook, where they are the real OS primitives.
+//! tables are needed. File contents are locked after either table. An inode's advisory locks
+//! ([`Locks`]) are taken with no table held. Locks are plain `std` mutexes; the backend runs inside the interposer's hook, where they are the real OS primitives.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::{CStr, CString, OsStr, c_char, c_int};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use glob::Pattern;
-use snare_interpose::{Fs, NetResult as FsResult};
+use snare_interpose::{Fs, NetResult as FsResult, SetTimes};
+
+use crate::clock::Clock;
+use crate::fs_locks::{self, Locks, Target};
 
 pub(crate) struct OpenFiles<T> {
     handles: HashMap<c_int, u64>,
@@ -123,6 +128,130 @@ struct VInode {
     number: u64,
     data: Mutex<SparseFile>,
     links: AtomicU64,
+    /// Locked after `data` when both are held, and never held across another lock.
+    times: Mutex<Times>,
+    locks: Locks,
+}
+
+/// A timestamp in nanoseconds since the Unix epoch, negative before it.
+pub(crate) type Stamp = i128;
+
+const DAY: Stamp = 86_400 * 1_000_000_000;
+
+/// The four timestamps `stat(2)` and `statx(2)` report (inode(7), "Timestamps"): last access,
+/// last data modification, last status change, and creation (macOS `st_birthtime`, Linux
+/// `stx_btime`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Times {
+    pub(crate) accessed: Stamp,
+    pub(crate) modified: Stamp,
+    pub(crate) changed: Stamp,
+    pub(crate) born: Stamp,
+}
+
+impl Times {
+    /// A node made at `now`: POSIX sets all three of `st_atime`, `st_mtime` and `st_ctime` on a
+    /// file `open` creates (IEEE Std 1003.1-2017, `open`, `O_CREAT`), and the birth time is the
+    /// creation.
+    pub(crate) fn at(now: Stamp) -> Self {
+        Self {
+            accessed: now,
+            modified: now,
+            changed: now,
+            born: now,
+        }
+    }
+
+    /// The contents changed: POSIX `write` marks `st_mtime` and `st_ctime` for update.
+    fn modify(&mut self, now: Stamp) {
+        self.modified = now;
+        self.changed = now;
+    }
+
+    /// The contents were read. Linux's default `relatime` mount option (Documentation/
+    /// filesystems/vfs.rst; `relatime_need_update` in fs/inode.c) updates `st_atime` only when it
+    /// is not after `st_mtime` or `st_ctime`, or is a day old; APFS behaves alike on macOS.
+    fn access(&mut self, now: Stamp) {
+        if self.accessed <= self.modified
+            || self.accessed <= self.changed
+            || now - self.accessed >= DAY
+        {
+            self.accessed = now;
+        }
+    }
+
+    /// `utimensat(2)` or `setattrlist(2)` set `set`. Linux marks `st_ctime` whenever any time is
+    /// set (man 2 utimensat); macOS only when the modification or creation time is, and moves the
+    /// creation time back to a modification time set before it (measured on APFS; see
+    /// tests/fs_times.rs).
+    fn set(&mut self, set: &snare_interpose::SetTimes, now: Stamp) {
+        use snare_interpose::TimeSet;
+        let value = |time: TimeSet| match time {
+            TimeSet::Omit => None,
+            TimeSet::Now => Some(now),
+            TimeSet::At(at) => Some(at),
+        };
+        let (accessed, modified, created) =
+            (value(set.accessed), value(set.modified), value(set.created));
+        if let Some(at) = accessed {
+            self.accessed = at;
+        }
+        if let Some(at) = modified {
+            self.modified = at;
+        }
+        let changed = if cfg!(target_os = "macos") {
+            if let Some(at) = created {
+                self.born = at;
+            }
+            if let Some(at) = modified {
+                self.born = self.born.min(at);
+            }
+            modified.is_some() || created.is_some()
+        } else {
+            accessed.is_some() || modified.is_some()
+        };
+        if changed {
+            self.changed = now;
+        }
+    }
+}
+
+/// Timestamps for a node an [`FsBuilder`] declares. A field left `None` takes the instant the
+/// sim the file system is handed to ([`SimBuilder::fs`](crate::SimBuilder::fs)) is built at, on
+/// that sim's clock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NodeTimes {
+    pub accessed: Option<SystemTime>,
+    pub modified: Option<SystemTime>,
+    pub changed: Option<SystemTime>,
+    pub created: Option<SystemTime>,
+}
+
+impl NodeTimes {
+    fn resolve(&self, now: Stamp) -> Times {
+        let stamp = |time: Option<SystemTime>| time.map_or(now, stamp_of);
+        Times {
+            accessed: stamp(self.accessed),
+            modified: stamp(self.modified),
+            changed: stamp(self.changed),
+            born: stamp(self.created),
+        }
+    }
+}
+
+pub(crate) fn stamp_of(time: SystemTime) -> Stamp {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(after) => after.as_nanos() as Stamp,
+        Err(before) => -(before.duration().as_nanos() as Stamp),
+    }
+}
+
+/// `CLOCK_REALTIME` of the sim's clock, or of the OS for a sim on the real clock.
+pub(crate) fn clock_now(clock: Option<&Clock>) -> Stamp {
+    match clock {
+        Some(clock) => clock.realtime_peek().as_nanos() as Stamp,
+        None => stamp_of(snare_interpose::real(SystemTime::now)),
+    }
 }
 
 const PAGE_SIZE: usize = 4096;
@@ -279,12 +408,22 @@ impl Drop for SparseFile {
 }
 
 impl VInode {
-    fn new(number: u64, data: Vec<u8>, directory: bool) -> Arc<Self> {
+    fn new(number: u64, data: Vec<u8>, directory: bool, now: Stamp) -> Arc<Self> {
         Arc::new(Self {
             number,
             data: Mutex::new(SparseFile::new(data)),
             links: AtomicU64::new(if directory { 2 } else { 1 }),
+            times: Mutex::new(Times::at(now)),
+            locks: Locks::default(),
         })
+    }
+
+    fn times(&self) -> Times {
+        *self.times.lock().unwrap()
+    }
+
+    fn touch(&self, change: impl FnOnce(&mut Times)) {
+        change(&mut self.times.lock().unwrap());
     }
 }
 
@@ -309,6 +448,14 @@ struct OpenFile {
     /// A directory opened with `open` rather than `opendir`: `fstat` reports it, `read` fails.
     is_dir: bool,
     directory: Option<Arc<Mutex<DirStream>>>,
+    /// Owns the description's OFD and `flock` locks.
+    description: u64,
+}
+
+impl Drop for OpenFile {
+    fn drop(&mut self) {
+        self.inode.locks.release_description(self.description);
+    }
 }
 
 /// Builds a [`VirtualFs`]: declare virtual files and directories, the prefixes it owns, and glob
@@ -322,6 +469,7 @@ pub struct FsBuilder {
     passthrough: Vec<Pattern>,
     deny: Vec<Pattern>,
     storage_limit: Option<u64>,
+    times: BTreeMap<PathBuf, NodeTimes>,
 }
 
 impl FsBuilder {
@@ -382,6 +530,16 @@ impl FsBuilder {
         self
     }
 
+    /// Sets the timestamps a declared node starts with; see [`NodeTimes`]. Without a call, every
+    /// declared node starts at the instant its sim is built.
+    ///
+    /// # Panics
+    /// [`build`](Self::build) panics if `path` is not declared.
+    pub fn times(mut self, path: impl AsRef<Path>, times: NodeTimes) -> Self {
+        self.times.insert(normalize(path.as_ref()), times);
+        self
+    }
+
     /// Marks a path prefix as owned: an undeclared path under it fails with `ENOENT` rather than
     /// reaching the real OS (default-deny within owned prefixes).
     pub fn own_prefix(mut self, path: impl AsRef<Path>) -> Self {
@@ -415,7 +573,7 @@ impl FsBuilder {
     fn inode(&mut self, data: Vec<u8>, directory: bool) -> Arc<VInode> {
         let number = self.next_inode | 1;
         self.next_inode = number + 2;
-        VInode::new(number, data, directory)
+        VInode::new(number, data, directory, 0)
     }
 }
 
@@ -437,6 +595,11 @@ pub struct VirtualFs {
     /// A real `/dev/null` fd, `O_CLOEXEC`, opened once and never closed; -1 if the open failed, in
     /// which case every virtual open fails with `EMFILE`.
     devnull: c_int,
+    /// The clock of the first sim built with this file system (`None` inside: the real clock);
+    /// unset, the real clock.
+    clock: OnceLock<Option<Arc<Clock>>>,
+    /// The declared nodes, with their builder times, until a sim's clock stamps them.
+    declared: Mutex<Vec<(Arc<VInode>, NodeTimes)>>,
 }
 
 /// A directory snapshot with a stable heap address for `readdir` results.
@@ -542,6 +705,15 @@ impl VirtualFs {
         let devnull = snare_interpose::real(|| unsafe {
             libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC)
         });
+        let mut times = b.times;
+        let declared = b
+            .tree
+            .iter()
+            .map(|(path, node)| (node.inode().clone(), times.remove(path).unwrap_or_default()))
+            .collect();
+        if let Some(path) = times.keys().next() {
+            panic!("FsBuilder::times for undeclared path {}", path.display());
+        }
         for (path, node) in &b.tree {
             if matches!(node, VNode::Dir(_))
                 && let Some(VNode::Dir(parent)) =
@@ -561,6 +733,68 @@ impl VirtualFs {
             passthrough: b.passthrough,
             deny: b.deny,
             devnull,
+            clock: OnceLock::new(),
+            declared: Mutex::new(declared),
+        }
+    }
+
+    /// Puts the file system on `clock`, the clock of the sim being built with it (`None`: the
+    /// real clock), and stamps the declared nodes with that sim's start. Only the first sim's
+    /// clock is kept.
+    pub(crate) fn attach_clock(&self, clock: Option<Arc<Clock>>) {
+        if self.clock.set(clock).is_err() {
+            return;
+        }
+        let now = self.now();
+        for (inode, times) in std::mem::take(&mut *self.declared.lock().unwrap()) {
+            *inode.times.lock().unwrap() = times.resolve(now);
+        }
+    }
+
+    /// The inode and lock-call view of open file `fd`; `None` for any other fd, a directory
+    /// stream's included.
+    fn lock_target(&self, fd: c_int) -> Option<(Arc<VInode>, Target)> {
+        let open = self.open.lock().unwrap();
+        let file = open.get(&fd)?;
+        let target = Target {
+            readable: file.flags & libc::O_ACCMODE != libc::O_WRONLY,
+            writable: file.writable,
+            cursor: file.cursor as u64,
+            len: file.inode.data.lock().unwrap().len() as u64,
+            description: file.description,
+        };
+        Some((file.inode.clone(), target))
+    }
+
+    /// A lock call on a directory stream's fd, which this plane does not lock: `EINVAL`.
+    fn stream_lock(&self, fd: c_int) -> Option<FsResult> {
+        self.dirs
+            .lock()
+            .unwrap()
+            .contains_key(&fd)
+            .then_some(FsResult::Err(libc::EINVAL))
+    }
+
+    fn now(&self) -> Stamp {
+        clock_now(self.clock.get().and_then(Option::as_deref))
+    }
+
+    /// A read of `requested` bytes that returned `read`. Linux marks the access for any read of
+    /// a nonzero count, even one at end of file (`vfs_read` returns early only for a zero count);
+    /// macOS only for a read that returns data (tests/fs_times.rs).
+    fn read_access(&self, inode: &VInode, requested: usize, read: usize) {
+        if requested > 0 && (read > 0 || cfg!(target_os = "linux")) {
+            let now = self.now();
+            inode.touch(|times| times.access(now));
+        }
+    }
+
+    /// A directory listing read: Linux (`iterate_dir` calls `file_accessed`) and macOS both mark
+    /// the directory's access time, under the same relatime rule as a file read.
+    fn list_access(&self, stream: &DirStream) {
+        if let Some(inode) = &stream.inode {
+            let now = self.now();
+            inode.touch(|times| times.access(now));
         }
     }
 
@@ -585,8 +819,9 @@ impl VirtualFs {
             .any(|prefix| path.starts_with(prefix))
     }
 
-    /// (mode, size, nlink) for an owned fd, for `fstat` and `statx(AT_EMPTY_PATH)`.
-    fn fd_meta(&self, fd: c_int) -> Option<(u32, u64, u64, u64)> {
+    /// (mode, size, nlink, inode number, times) for an owned fd, for `fstat` and
+    /// `statx(AT_EMPTY_PATH)`.
+    fn fd_meta(&self, fd: c_int) -> Option<(u32, u64, u64, u64, Times)> {
         let open = self.open.lock().unwrap();
         let Some(file) = open.get(&fd) else {
             let dirs = self.dirs.lock().unwrap();
@@ -597,6 +832,7 @@ impl VirtualFs {
                 0,
                 inode.links.load(Ordering::Acquire),
                 inode.number,
+                inode.times(),
             ));
         };
         Some(if file.is_dir {
@@ -605,6 +841,7 @@ impl VirtualFs {
                 0,
                 file.inode.links.load(Ordering::Acquire),
                 file.inode.number,
+                file.inode.times(),
             )
         } else {
             (
@@ -612,6 +849,7 @@ impl VirtualFs {
                 file.inode.data.lock().unwrap().len() as u64,
                 file.inode.links.load(Ordering::Acquire),
                 file.inode.number,
+                file.inode.times(),
             )
         })
     }
@@ -700,6 +938,7 @@ impl VirtualFs {
                 flags: status_flags(flags),
                 is_dir: true,
                 directory: Some(Arc::new(Mutex::new(stream))),
+                description: fs_locks::description(),
             },
         );
         set_cloexec(fd, flags);
@@ -833,12 +1072,17 @@ impl VirtualFs {
         follow: bool,
     ) -> Option<FsResult> {
         if let Some(inode) = unsafe { self.retained_directory(libc::AT_FDCWD, path) } {
-            return fill_stat(
+            return with_times(
                 buf,
-                dir_mode(),
-                0,
-                inode.number,
-                inode.links.load(Ordering::Acquire),
+                fill_stat(
+                    buf,
+                    dir_mode(),
+                    0,
+                    inode.number,
+                    inode.links.load(Ordering::Acquire),
+                ),
+                &inode.times(),
+                false,
             );
         }
         let path_absolute = match unsafe { self.absolute(path) } {
@@ -869,14 +1113,57 @@ impl VirtualFs {
                 }
                 let (mode, size, nlink) = mode_size_nlink(node);
                 let blocks = node.inode().data.lock().unwrap().pages.len() as u64 * 8;
-                allocated_blocks(
+                let result = allocated_blocks(
                     buf,
                     fill_stat(buf, mode, size, node.inode().number, nlink),
                     blocks,
                     false,
-                )
+                );
+                with_times(buf, result, &node.inode().times(), false)
             }
             None if self.owned(&path) => err(libc::ENOENT),
+            None => None,
+        }
+    }
+
+    /// The node `path` names relative to `dirfd`, resolved as `fstatat` resolves it; `None` for
+    /// a path this plane declines.
+    unsafe fn lookup(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        follow: bool,
+    ) -> Option<Result<Arc<VInode>, c_int>> {
+        if let Some(inode) = unsafe { self.retained_directory(dirfd, path) } {
+            return Some(Ok(inode));
+        }
+        let resolved = match unsafe { self.resolve_at(dirfd, path) } {
+            Ok(path) => path?,
+            Err(error) => return Some(Err(error)),
+        };
+        let absolute = match unsafe { self.absolute(resolved.as_ptr()) } {
+            Ok(path) => path?,
+            Err(error) => return Some(Err(error)),
+        };
+        let raw = absolute.as_ptr();
+        let trailing_slash = absolute.to_bytes().ends_with(b"/");
+        let path = unsafe { path_of(raw) }?;
+        if Self::matches(&self.deny, &path) {
+            return Some(Err(libc::EACCES));
+        }
+        if Self::matches(&self.passthrough, &path) {
+            return None;
+        }
+        let tree = self.tree.lock().unwrap();
+        let path =
+            match unsafe { self.traversal(&tree, raw, &path, true, follow || trailing_slash) } {
+                Ok(path) => path,
+                Err(error) => return Some(Err(error)),
+            };
+        match tree.get(&path) {
+            Some(VNode::File(_)) if trailing_slash => Some(Err(libc::ENOTDIR)),
+            Some(node) => Some(Ok(node.inode().clone())),
+            None if self.owned(&path) => Some(Err(libc::ENOENT)),
             None => None,
         }
     }
@@ -1098,19 +1385,23 @@ impl Fs for VirtualFs {
         if tree.contains_key(&path) {
             return err(libc::EEXIST);
         }
-        if let Err(error) = Self::parent(&tree, &path) {
-            return err(error);
-        }
+        let parent = match Self::parent(&tree, &path) {
+            Ok(parent) => parent,
+            Err(error) => return err(error),
+        };
         if absolute.to_bytes().ends_with(b"/") {
             return err(libc::ENOENT);
         }
+        let now = self.now();
         let inode = VInode::new(
             self.next_inode.fetch_add(2, Ordering::Relaxed),
             Vec::new(),
             false,
+            now,
         );
         inode.data.lock().unwrap().attach(&self.volume);
         tree.insert(path, VNode::Symlink(inode, Arc::new(target.to_vec())));
+        parent.touch(|times| times.modify(now));
         ok(0)
     }
 
@@ -1319,6 +1610,7 @@ impl Fs for VirtualFs {
                             self.next_inode.fetch_add(2, Ordering::Relaxed),
                             Vec::new(),
                             false,
+                            self.now(),
                         ),
                         false,
                         writable(flags),
@@ -1337,9 +1629,18 @@ impl Fs for VirtualFs {
         if creating {
             data.data.lock().unwrap().attach(&self.volume);
             tree.insert(path.clone(), VNode::File(data.clone()));
+            if let Ok(parent) = Self::parent(&tree, &path) {
+                parent.touch(|times| times.modify(data.times().born));
+            }
         }
         if !is_dir && flags & libc::O_TRUNC != 0 {
             data.data.lock().unwrap().clear();
+            if !creating {
+                // POSIX `open`: O_TRUNC on an existing regular file marks st_ctime and st_mtime,
+                // even one already empty on both Linux and macOS (tests/fs_times.rs).
+                let now = self.now();
+                data.touch(|times| times.modify(now));
+            }
         }
         let directory = is_dir.then(|| {
             let mut stream = DirStream::new(snapshot(&tree, &path));
@@ -1357,6 +1658,7 @@ impl Fs for VirtualFs {
                 flags: status_flags(flags),
                 is_dir,
                 directory,
+                description: fs_locks::description(),
             },
         );
         set_cloexec(fd, flags);
@@ -1470,6 +1772,8 @@ impl Fs for VirtualFs {
         }
         if let Some(VNode::Dir(parent)) = path.parent().and_then(|parent| tree.get(parent)) {
             parent.links.fetch_sub(1, Ordering::Release);
+            let now = self.now();
+            parent.touch(|times| times.modify(now));
         }
         ok(0)
     }
@@ -1515,6 +1819,11 @@ impl Fs for VirtualFs {
         }
         let inode = tree.remove(&path).unwrap();
         inode.inode().links.fetch_sub(1, Ordering::AcqRel);
+        let now = self.now();
+        inode.inode().touch(|times| times.changed = now);
+        if let Ok(parent) = Self::parent(&tree, &path) {
+            parent.touch(|times| times.modify(now));
+        }
         ok(0)
     }
 
@@ -1566,14 +1875,17 @@ impl Fs for VirtualFs {
             Ok(parent) => parent,
             Err(error) => return err(error),
         };
+        let now = self.now();
         let inode = VInode::new(
             self.next_inode.fetch_add(2, Ordering::Relaxed),
             Vec::new(),
             true,
+            now,
         );
         inode.data.lock().unwrap().attach(&self.volume);
         tree.insert(path, VNode::Dir(inode));
         parent.links.fetch_add(1, Ordering::Release);
+        parent.touch(|times| times.modify(now));
         ok(0)
     }
 
@@ -1688,7 +2000,14 @@ impl Fs for VirtualFs {
             }
             _ => {}
         }
+        let now = self.now();
+        if let Ok(parent) = Self::parent(&tree, &from) {
+            parent.touch(|times| times.modify(now));
+        }
+        target_parent.touch(|times| times.modify(now));
+        source.inode().touch(|times| times.changed = now);
         if let Some(target) = tree.remove(&to) {
+            target.inode().touch(|times| times.changed = now);
             if matches!(target, VNode::Dir(_)) {
                 #[cfg(target_os = "linux")]
                 target.inode().links.store(0, Ordering::Release);
@@ -1783,10 +2102,14 @@ impl Fs for VirtualFs {
         if tree.contains_key(&target) {
             return err(libc::EEXIST);
         }
-        if let Err(error) = Self::parent(&tree, &target) {
-            return err(error);
-        }
+        let parent = match Self::parent(&tree, &target) {
+            Ok(parent) => parent,
+            Err(error) => return err(error),
+        };
         node.inode().links.fetch_add(1, Ordering::AcqRel);
+        let now = self.now();
+        node.inode().touch(|times| times.changed = now);
+        parent.touch(|times| times.modify(now));
         tree.insert(target, node);
         ok(0)
     }
@@ -1909,12 +2232,17 @@ impl Fs for VirtualFs {
             return unsafe { self.fstat(dirfd, buf) };
         }
         if let Some(inode) = unsafe { self.retained_directory(dirfd, path) } {
-            return fill_stat(
+            return with_times(
                 buf,
-                dir_mode(),
-                0,
-                inode.number,
-                inode.links.load(Ordering::Acquire),
+                fill_stat(
+                    buf,
+                    dir_mode(),
+                    0,
+                    inode.number,
+                    inode.links.load(Ordering::Acquire),
+                ),
+                &inode.times(),
+                false,
             );
         }
         let path = match unsafe { self.resolve_at(dirfd, path) } {
@@ -1926,8 +2254,8 @@ impl Fs for VirtualFs {
 
     /// `fstat(2)` reports the inode's current size.
     unsafe fn fstat(&self, fd: c_int, buf: *mut u8) -> Option<FsResult> {
-        let (mode, size, nlink, ino) = self.fd_meta(fd)?;
-        let result = fill_stat(buf, mode, size, ino, nlink);
+        let (mode, size, nlink, ino, times) = self.fd_meta(fd)?;
+        let result = with_times(buf, fill_stat(buf, mode, size, ino, nlink), &times, false);
         if matches!(result, Some(FsResult::Ok(_))) {
             let blocks = self.open.lock().unwrap().get(&fd).map_or(0, |file| {
                 file.inode.data.lock().unwrap().pages.len() as u64 * 8
@@ -1970,27 +2298,29 @@ impl Fs for VirtualFs {
             // man 2 statx: an empty pathname with AT_EMPTY_PATH stats `dirfd` itself. std's
             // `File::metadata` is exactly `statx(fd, "", AT_EMPTY_PATH)`.
             if flags & libc::AT_EMPTY_PATH != 0
-                && let Some((mode, size, nlink, ino)) = self.fd_meta(dirfd)
+                && let Some((mode, size, nlink, ino, times)) = self.fd_meta(dirfd)
             {
                 let blocks = self.open.lock().unwrap().get(&dirfd).map_or(0, |file| {
                     file.inode.data.lock().unwrap().pages.len() as u64 * 8
                 });
-                return allocated_blocks(
-                    buf,
-                    fill_statx(buf, mode, size, ino, nlink),
-                    blocks,
-                    true,
-                );
+                let result =
+                    allocated_blocks(buf, fill_statx(buf, mode, size, ino, nlink), blocks, true);
+                return with_times(buf, result, &times, true);
             }
             return None;
         }
         if let Some(inode) = unsafe { self.retained_directory(dirfd, path) } {
-            return fill_statx(
+            return with_times(
                 buf,
-                dir_mode(),
-                0,
-                inode.number,
-                inode.links.load(Ordering::Acquire),
+                fill_statx(
+                    buf,
+                    dir_mode(),
+                    0,
+                    inode.number,
+                    inode.links.load(Ordering::Acquire),
+                ),
+                &inode.times(),
+                true,
             );
         }
         let resolved = match unsafe { self.resolve_at(dirfd, path) } {
@@ -2031,16 +2361,50 @@ impl Fs for VirtualFs {
                 }
                 let (mode, size, nlink) = mode_size_nlink(node);
                 let blocks = node.inode().data.lock().unwrap().pages.len() as u64 * 8;
-                allocated_blocks(
+                let result = allocated_blocks(
                     buf,
                     fill_statx(buf, mode, size, node.inode().number, nlink),
                     blocks,
                     true,
-                )
+                );
+                with_times(buf, result, &node.inode().times(), true)
             }
             None if self.owned(&path) => err(libc::ENOENT),
             None => None,
         }
+    }
+
+    /// Sets a node's times (man 2 utimensat): a null `path` names the descriptor `dirfd`, else
+    /// `path` resolves as for `fstatat`. Permission checks are not modelled: the caller owns every
+    /// virtual node.
+    unsafe fn set_times(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        times: &SetTimes,
+        flags: c_int,
+    ) -> Option<FsResult> {
+        let inode = if path.is_null() {
+            let open = self.open.lock().unwrap();
+            match open.get(&dirfd) {
+                Some(file) => file.inode.clone(),
+                None => {
+                    let dirs = self.dirs.lock().unwrap();
+                    dirs.get(&dirfd)?.lock().unwrap().inode.clone()?
+                }
+            }
+        } else {
+            match unsafe { self.lookup(dirfd, path, flags & libc::AT_SYMLINK_NOFOLLOW == 0) }? {
+                Ok(inode) => inode,
+                Err(error) => return err(error),
+            }
+        };
+        if flags & !libc::AT_SYMLINK_NOFOLLOW != 0 {
+            return err(libc::EINVAL);
+        }
+        let now = self.now();
+        inode.touch(|current| current.set(times, now));
+        ok(0)
     }
 
     /// Snapshots a directory listing and reserves its descriptor. Files return `ENOTDIR`.
@@ -2081,6 +2445,7 @@ impl Fs for VirtualFs {
         let (name, ino, dtype) = (entry.name.clone(), entry.ino, entry.dtype);
         d.cursor += 1;
         fill_dirent(&mut d.scratch, &name, ino, dtype);
+        self.list_access(&d);
         let ptr = (&*d.scratch as *const Dirent) as i64;
         ok(ptr)
     }
@@ -2100,6 +2465,7 @@ impl Fs for VirtualFs {
             Some(e) => {
                 let (name, ino, dtype) = (e.name.clone(), e.ino, e.dtype);
                 d.cursor += 1;
+                self.list_access(&d);
                 // SAFETY: `entry` points to a caller `struct dirent`.
                 fill_dirent(unsafe { &mut *entry.cast::<Dirent>() }, &name, ino, dtype);
                 // SAFETY: `result` is a writable `*mut dirent`.
@@ -2127,7 +2493,9 @@ impl Fs for VirtualFs {
         let Some(stream) = &file.directory else {
             return err(libc::ENOTDIR);
         };
-        pack_directory(&mut stream.lock().unwrap(), buf, len)
+        let mut stream = stream.lock().unwrap();
+        self.list_access(&stream);
+        pack_directory(&mut stream, buf, len)
     }
 
     /// `read(2)` at the cursor; 0 at or past the end. `EISDIR` on a directory
@@ -2144,6 +2512,8 @@ impl Fs for VirtualFs {
         let data = file.inode.data.lock().unwrap();
         let n = unsafe { data.read(file.cursor, buf, len) };
         file.cursor += n;
+        drop(data);
+        self.read_access(&file.inode, len, n);
         ok(n as i64)
     }
 
@@ -2168,6 +2538,9 @@ impl Fs for VirtualFs {
         match data.write(file.cursor, bytes) {
             Ok(written) => {
                 file.cursor += written;
+                drop(data);
+                let now = self.now();
+                file.inode.touch(|times| times.modify(now));
                 ok(written as i64)
             }
             Err(error) => err(error),
@@ -2192,6 +2565,8 @@ impl Fs for VirtualFs {
         }
         let data = file.inode.data.lock().unwrap();
         let n = unsafe { data.read(offset as usize, buf, len) };
+        drop(data);
+        self.read_access(&file.inode, len, n);
         ok(n as i64)
     }
 
@@ -2221,7 +2596,12 @@ impl Fs for VirtualFs {
         };
         let bytes = unsafe { std::slice::from_raw_parts(buf, len) };
         match data.write(start, bytes) {
-            Ok(written) => ok(written as i64),
+            Ok(written) => {
+                drop(data);
+                let now = self.now();
+                file.inode.touch(|times| times.modify(now));
+                ok(written as i64)
+            }
             Err(error) => err(error),
         }
     }
@@ -2236,14 +2616,24 @@ impl Fs for VirtualFs {
             return err(libc::EINVAL);
         }
         let len = len as usize;
-        let mut data = file.inode.data.lock().unwrap();
-        data.resize(len);
+        file.inode.data.lock().unwrap().resize(len);
+        // POSIX `ftruncate` marks st_ctime and st_mtime when the size changes; Linux and macOS
+        // mark them even when it does not (tests/fs_times.rs).
+        let now = self.now();
+        file.inode.touch(|times| times.modify(now));
         ok(0)
     }
 
     unsafe fn fsync(&self, fd: c_int) -> Option<FsResult> {
         self.open.lock().unwrap().get(&fd)?;
         ok(0)
+    }
+
+    unsafe fn flock(&self, fd: c_int, operation: c_int) -> Option<FsResult> {
+        let Some((inode, target)) = self.lock_target(fd) else {
+            return self.stream_lock(fd);
+        };
+        inode.locks.flock(target.description, operation)
     }
 
     /// `lseek(2)` on an open virtual file. Any `whence` other than `SEEK_SET`/`SEEK_CUR`/`SEEK_END`
@@ -2284,12 +2674,17 @@ impl Fs for VirtualFs {
 
     unsafe fn fd_replaced(&self, fd: c_int) -> Option<FsResult> {
         let mut open = self.open.lock().unwrap();
+        let inode = open.get(&fd).map(|file| file.inode.clone());
         let file = open.remove(&fd);
         let stream = self.dirs.lock().unwrap().remove(&fd);
+        drop(open);
         if file.is_none() && stream.is_none() {
             return None;
         }
         drop(file);
+        if let Some(inode) = inode {
+            inode.locks.release_process();
+        }
         ok(0)
     }
 
@@ -2303,6 +2698,9 @@ impl Fs for VirtualFs {
     unsafe fn dup(&self, oldfd: c_int, newfd: c_int) -> Option<FsResult> {
         let mut open = self.open.lock().unwrap();
         let mut dirs = self.dirs.lock().unwrap();
+        let replaced = (oldfd != newfd)
+            .then(|| open.get(&newfd).map(|file| file.inode.clone()))
+            .flatten();
         let released = if open.contains_key(&oldfd) {
             dirs.remove(&newfd);
             open.alias(oldfd, newfd)?
@@ -2317,6 +2715,9 @@ impl Fs for VirtualFs {
         drop(dirs);
         drop(open);
         drop(released);
+        if let Some(inode) = replaced {
+            inode.locks.release_process();
+        }
         ok(newfd as i64)
     }
 
@@ -2333,6 +2734,9 @@ impl Fs for VirtualFs {
                 .raw_os_error()
                 .unwrap_or(libc::EBADF));
         }
+        let replaced = (oldfd != newfd)
+            .then(|| open.get(&newfd).map(|file| file.inode.clone()))
+            .flatten();
         let released = if is_file {
             dirs.remove(&newfd);
             open.alias(oldfd, newfd).flatten()
@@ -2344,10 +2748,19 @@ impl Fs for VirtualFs {
         drop(dirs);
         drop(open);
         drop(released);
+        if let Some(inode) = replaced {
+            inode.locks.release_process();
+        }
         ok(result as i64)
     }
 
     unsafe fn fcntl(&self, fd: c_int, cmd: c_int, arg: i64) -> Option<FsResult> {
+        if fs_locks::is_record_lock(cmd) {
+            let Some((inode, target)) = self.lock_target(fd) else {
+                return self.stream_lock(fd);
+            };
+            return unsafe { inode.locks.fcntl(cmd, arg, &target) };
+        }
         let mut open = self.open.lock().unwrap();
         let mut dirs = self.dirs.lock().unwrap();
         let is_file = open.contains_key(&fd);
@@ -2462,6 +2875,116 @@ fn allocated_blocks(
         }
     }
     result
+}
+
+/// Writes `times` into the `struct stat` (or Linux `struct statx`) a successful `result` filled,
+/// and on Linux claims them in `stx_mask`.
+pub(crate) fn with_times(
+    buf: *mut u8,
+    result: Option<FsResult>,
+    times: &Times,
+    statx: bool,
+) -> Option<FsResult> {
+    if matches!(result, Some(FsResult::Ok(_))) {
+        if statx {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                statx_times(buf, times)
+            };
+        } else {
+            unsafe { stat_times(&mut *buf.cast::<libc::stat>(), times) };
+        }
+    }
+    result
+}
+
+/// Seconds and nanoseconds of `stamp`, the nanoseconds in `0..1e9` (a `timespec` before the
+/// epoch has a negative `tv_sec` and a positive `tv_nsec`).
+fn split(stamp: Stamp) -> (i64, i64) {
+    (
+        stamp.div_euclid(1_000_000_000) as i64,
+        stamp.rem_euclid(1_000_000_000) as i64,
+    )
+}
+
+fn join(secs: i64, nanos: i64) -> Stamp {
+    Stamp::from(secs) * 1_000_000_000 + Stamp::from(nanos)
+}
+
+/// Stores `times` in a `struct stat`: `st_atime`/`st_mtime`/`st_ctime` with their `_nsec` parts
+/// (man 3type stat), and on macOS `st_birthtime` (`<sys/stat.h>`, `struct stat64`).
+fn stat_times(st: &mut libc::stat, times: &Times) {
+    (st.st_atime, st.st_atime_nsec) = split(times.accessed);
+    (st.st_mtime, st.st_mtime_nsec) = split(times.modified);
+    (st.st_ctime, st.st_ctime_nsec) = split(times.changed);
+    #[cfg(target_os = "macos")]
+    {
+        (st.st_birthtime, st.st_birthtime_nsec) = split(times.born);
+    }
+}
+
+/// The times in a `struct stat`; the birth time only on macOS, 0 on Linux.
+fn stat_times_of(st: &libc::stat) -> Times {
+    Times {
+        accessed: join(st.st_atime, st.st_atime_nsec),
+        modified: join(st.st_mtime, st.st_mtime_nsec),
+        changed: join(st.st_ctime, st.st_ctime_nsec),
+        #[cfg(target_os = "macos")]
+        born: join(st.st_birthtime, st.st_birthtime_nsec),
+        #[cfg(not(target_os = "macos"))]
+        born: 0,
+    }
+}
+
+/// `struct statx_timestamp` offsets in `struct statx` (`include/uapi/linux/stat.h`): `stx_atime`
+/// @64, `stx_btime` @80, `stx_ctime` @96, `stx_mtime` @112, each an `i64 tv_sec` then a
+/// `u32 tv_nsec`; with the `STATX_*` bit that claims each.
+#[cfg(target_os = "linux")]
+const STATX_TIMES: [(usize, u32); 4] = [
+    (64, libc::STATX_ATIME),
+    (112, libc::STATX_MTIME),
+    (96, libc::STATX_CTIME),
+    (80, libc::STATX_BTIME),
+];
+
+/// Writes `times` into a `struct statx` and sets their bits in `stx_mask`.
+///
+/// # Safety
+/// `buf` is a 256-byte `struct statx`.
+#[cfg(target_os = "linux")]
+unsafe fn statx_times(buf: *mut u8, times: &Times) {
+    let values = [times.accessed, times.modified, times.changed, times.born];
+    unsafe {
+        let mut mask = buf.cast::<u32>().read_unaligned();
+        for ((offset, bit), value) in STATX_TIMES.into_iter().zip(values) {
+            let (secs, nanos) = split(value);
+            buf.add(offset).cast::<i64>().write_unaligned(secs);
+            buf.add(offset + 8)
+                .cast::<u32>()
+                .write_unaligned(nanos as u32);
+            mask |= bit;
+        }
+        buf.cast::<u32>().write_unaligned(mask);
+    }
+}
+
+/// The times a `struct statx` claims, `None` for one its `stx_mask` leaves out.
+///
+/// # Safety
+/// `buf` is a 256-byte `struct statx`.
+#[cfg(target_os = "linux")]
+unsafe fn statx_times_of(buf: *const u8) -> [Option<Stamp>; 4] {
+    unsafe {
+        let mask = buf.cast::<u32>().read_unaligned();
+        STATX_TIMES.map(|(offset, bit)| {
+            (mask & bit != 0).then(|| {
+                join(
+                    buf.add(offset).cast::<i64>().read_unaligned(),
+                    i64::from(buf.add(offset + 8).cast::<u32>().read_unaligned()),
+                )
+            })
+        })
+    }
 }
 
 /// Fills a caller `struct stat` for a virtual node. `st_mode`/`st_size`/… are field names common
@@ -2631,8 +3154,8 @@ fn mode_size_nlink(node: &VNode) -> (u32, u64, u64) {
 /// Offsets, from `include/uapi/linux/stat.h` `struct statx`: `stx_mask` u32 @0, `stx_blksize`
 /// u32 @4, `stx_attributes` u64 @8, `stx_nlink` u32 @16, `stx_uid` u32 @20, `stx_gid` u32 @24,
 /// `stx_mode` u16 @28, `stx_ino` u64 @32, `stx_size` u64 @40, `stx_blocks` u64 @48 (512-byte
-/// units, man 2 statx). `stx_mask` claims type, mode, size, inode and link count only: uid,
-/// gid and blocks are written but unclaimed, and timestamps and the device fields stay zero.
+/// units, man 2 statx). `stx_mask` claims type, mode, size, inode, link count, uid, gid and
+/// blocks; the device fields stay zero, and [`with_times`] adds the timestamps.
 #[cfg(target_os = "linux")]
 pub(crate) fn fill_statx(
     buf: *mut u8,
@@ -2680,6 +3203,19 @@ pub(crate) struct FsChain(pub(crate) Vec<Arc<dyn Fs>>);
 macro_rules! first {
     ($self:ident, |$fs:ident| $call:expr) => {
         $self.0.iter().find_map(|$fs| unsafe { $call })
+    };
+}
+
+/// Forwards a call on `fd` to the plane that minted it. A plane may answer a call on a descriptor
+/// it never minted as if it had (the fabric's raw endpoints), so planes behind it would never see
+/// their own.
+macro_rules! owner {
+    ($self:ident, $fd:expr, |$fs:ident| $call:expr) => {
+        $self
+            .0
+            .iter()
+            .filter(|$fs| $fs.owns($fd))
+            .find_map(|$fs| unsafe { $call })
     };
 }
 
@@ -2882,19 +3418,19 @@ impl Fs for FsChain {
     }
 
     unsafe fn fstatfs(&self, fd: c_int, buf: *mut u8) -> Option<FsResult> {
-        first!(self, |fs| fs.fstatfs(fd, buf))
+        owner!(self, fd, |fs| fs.fstatfs(fd, buf))
     }
 
     unsafe fn fstat(&self, fd: c_int, buf: *mut u8) -> Option<FsResult> {
-        first!(self, |fs| fs.fstat(fd, buf))
+        owner!(self, fd, |fs| fs.fstat(fd, buf))
     }
 
     unsafe fn lseek(&self, fd: c_int, offset: i64, whence: c_int) -> Option<FsResult> {
-        first!(self, |fs| fs.lseek(fd, offset, whence))
+        owner!(self, fd, |fs| fs.lseek(fd, offset, whence))
     }
 
     unsafe fn pread(&self, fd: c_int, buf: *mut u8, len: usize, offset: i64) -> Option<FsResult> {
-        first!(self, |fs| fs.pread(fd, buf, len, offset))
+        owner!(self, fd, |fs| fs.pread(fd, buf, len, offset))
     }
 
     unsafe fn pwrite(
@@ -2904,19 +3440,51 @@ impl Fs for FsChain {
         len: usize,
         offset: i64,
     ) -> Option<FsResult> {
-        first!(self, |fs| fs.pwrite(fd, buf, len, offset))
+        owner!(self, fd, |fs| fs.pwrite(fd, buf, len, offset))
     }
 
     unsafe fn ftruncate(&self, fd: c_int, len: i64) -> Option<FsResult> {
-        first!(self, |fs| fs.ftruncate(fd, len))
+        owner!(self, fd, |fs| fs.ftruncate(fd, len))
     }
 
     unsafe fn fsync(&self, fd: c_int) -> Option<FsResult> {
-        first!(self, |fs| fs.fsync(fd))
+        owner!(self, fd, |fs| fs.fsync(fd))
+    }
+
+    unsafe fn set_times(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        times: &SetTimes,
+        flags: c_int,
+    ) -> Option<FsResult> {
+        if path.is_null() {
+            owner!(self, dirfd, |fs| fs.set_times(dirfd, path, times, flags))
+        } else {
+            first!(self, |fs| fs.set_times(dirfd, path, times, flags))
+        }
+    }
+
+    unsafe fn host_times_set(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        times: &SetTimes,
+        flags: c_int,
+    ) {
+        for fs in &self.0 {
+            unsafe { fs.host_times_set(dirfd, path, times, flags) };
+        }
+    }
+
+    unsafe fn host_metadata(&self, buf: *mut u8, statx: bool) {
+        for fs in &self.0 {
+            unsafe { fs.host_metadata(buf, statx) };
+        }
     }
 
     unsafe fn getdents64(&self, fd: c_int, buf: *mut u8, len: usize) -> Option<FsResult> {
-        first!(self, |fs| fs.getdents64(fd, buf, len))
+        owner!(self, fd, |fs| fs.getdents64(fd, buf, len))
     }
 
     unsafe fn opendir(&self, path: *const c_char) -> Option<FsResult> {
@@ -2924,11 +3492,11 @@ impl Fs for FsChain {
     }
 
     unsafe fn fdopendir(&self, fd: c_int) -> Option<FsResult> {
-        first!(self, |fs| fs.fdopendir(fd))
+        owner!(self, fd, |fs| fs.fdopendir(fd))
     }
 
     unsafe fn readdir(&self, fd: c_int) -> Option<FsResult> {
-        first!(self, |fs| fs.readdir(fd))
+        owner!(self, fd, |fs| fs.readdir(fd))
     }
 
     unsafe fn readdir_r(
@@ -2937,39 +3505,43 @@ impl Fs for FsChain {
         entry: *mut u8,
         result: *mut *mut u8,
     ) -> Option<FsResult> {
-        first!(self, |fs| fs.readdir_r(fd, entry, result))
+        owner!(self, fd, |fs| fs.readdir_r(fd, entry, result))
     }
 
     unsafe fn closedir(&self, fd: c_int) -> Option<FsResult> {
-        first!(self, |fs| fs.closedir(fd))
+        owner!(self, fd, |fs| fs.closedir(fd))
     }
 
     unsafe fn read(&self, fd: c_int, buf: *mut u8, len: usize) -> Option<FsResult> {
-        first!(self, |fs| fs.read(fd, buf, len))
+        owner!(self, fd, |fs| fs.read(fd, buf, len))
     }
 
     unsafe fn write(&self, fd: c_int, buf: *const u8, len: usize) -> Option<FsResult> {
-        first!(self, |fs| fs.write(fd, buf, len))
+        owner!(self, fd, |fs| fs.write(fd, buf, len))
     }
 
     unsafe fn close(&self, fd: c_int) -> Option<FsResult> {
-        first!(self, |fs| fs.close(fd))
+        owner!(self, fd, |fs| fs.close(fd))
     }
 
     unsafe fn fcntl(&self, fd: c_int, cmd: c_int, arg: i64) -> Option<FsResult> {
-        first!(self, |fs| fs.fcntl(fd, cmd, arg))
+        owner!(self, fd, |fs| fs.fcntl(fd, cmd, arg))
+    }
+
+    unsafe fn flock(&self, fd: c_int, operation: c_int) -> Option<FsResult> {
+        owner!(self, fd, |fs| fs.flock(fd, operation))
     }
 
     unsafe fn ioctl(&self, fd: c_int, request: u64, arg: i64) -> Option<FsResult> {
-        first!(self, |fs| fs.ioctl(fd, request, arg))
+        owner!(self, fd, |fs| fs.ioctl(fd, request, arg))
     }
 
     unsafe fn fd_replaced(&self, fd: c_int) -> Option<FsResult> {
-        first!(self, |fs| fs.fd_replaced(fd))
+        owner!(self, fd, |fs| fs.fd_replaced(fd))
     }
 
     unsafe fn dup(&self, oldfd: c_int, newfd: c_int) -> Option<FsResult> {
-        first!(self, |fs| fs.dup(oldfd, newfd))
+        owner!(self, oldfd, |fs| fs.dup(oldfd, newfd))
     }
 
     unsafe fn dup_to(&self, oldfd: c_int, newfd: c_int, flags: Option<c_int>) -> Option<FsResult> {
@@ -2983,5 +3555,668 @@ impl Fs for FsChain {
             unsafe { self.0[target].fd_replaced(newfd) };
         }
         Some(result)
+    }
+}
+
+/// The timestamps of real files under a sim's virtual clock: a plane behind every other of such
+/// a sim, consulted for the real paths and descriptors the others decline.
+///
+/// It keeps, per (device, inode), the times the sim gave the real files and directories it
+/// created or changed: creating a file, directory or symlink stamps all four times and the
+/// parent's modification and change times; `O_TRUNC`, `write`, `pwrite` and `ftruncate` through
+/// a descriptor the sim opened for writing stamp modification and change; unlink, rename and link
+/// stamp the inode's change time and the parents'; `utimensat`, `futimens`, `utimes`, `futimes`
+/// and macOS `setattrlist` stamp what they set, by [`Times::set`]'s rules. The OS still performs
+/// every call, so the real file keeps real times; [`host_metadata`](Fs::host_metadata) restates
+/// what `stat` reports. A change the sim did not make through these calls (another process's
+/// write, a write through a descriptor opened before the sim or duplicated past this plane, a
+/// write through a mapping) shows at the sim's time of the first `stat` that sees it.
+///
+/// A real file the sim never touched shows its host times moved by one constant, the host clock
+/// minus the sim's when the sim was built. Host files then sit in the sim's past by as much as
+/// they sat in the host's when the sim started, in their host order, rather than years after the
+/// sim's clock; code that compares a file's age with `SystemTime::now()` sees a plausible one.
+/// A zero time (the OS's "unknown") stays zero. Reads do not stamp access times.
+pub(crate) struct HostTimes {
+    clock: Arc<Clock>,
+    /// Host `CLOCK_REALTIME` minus the sim's, when the sim was built.
+    offset: Stamp,
+    files: Mutex<HashMap<(u64, u64), HostFile>>,
+    /// Real descriptors the sim opened for writing, with the file each names. They are this
+    /// plane's, so writes through them reach it from any thread.
+    writers: Mutex<HashMap<c_int, (u64, u64)>>,
+    any_writers: AtomicU64,
+}
+
+/// What a sim did to one real file.
+#[derive(Default)]
+struct HostFile {
+    /// The times the sim gave it (access, modification, change, birth); `None` keeps the host's.
+    sim: [Option<Stamp>; 4],
+    /// The host's times when last seen (birth 0 where the OS did not report it).
+    seen: Option<Times>,
+    /// A write through one of `writers` the host's times may not yet have been seen to reflect.
+    pending: bool,
+}
+
+const ACCESSED: usize = 0;
+const MODIFIED: usize = 1;
+const CHANGED: usize = 2;
+const BORN: usize = 3;
+
+impl HostTimes {
+    pub(crate) fn new(clock: Arc<Clock>) -> Self {
+        let offset = stamp_of(snare_interpose::real(SystemTime::now)) - clock_now(Some(&clock));
+        Self {
+            clock,
+            offset,
+            files: Mutex::default(),
+            writers: Mutex::default(),
+            any_writers: AtomicU64::new(0),
+        }
+    }
+
+    fn now(&self) -> Stamp {
+        clock_now(Some(&self.clock))
+    }
+
+    /// The real `fstatat` of `path` under `dirfd`, or `fstat` of `dirfd` for a null `path`.
+    unsafe fn host_stat(dirfd: c_int, path: *const c_char, follow: bool) -> Option<libc::stat> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            if path.is_null() {
+                libc::fstat(dirfd, &mut st)
+            } else {
+                let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+                libc::fstatat(dirfd, path, &mut st, flags)
+            }
+        };
+        (result == 0).then_some(st)
+    }
+
+    /// `dev_t` is `i32` on macOS and `u64` on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    fn key(st: &libc::stat) -> (u64, u64) {
+        (st.st_dev as u64, st.st_ino)
+    }
+
+    /// Applies `change` to the record of the file `st` describes, `st` being its state after the
+    /// call that changed it.
+    fn record(&self, st: &libc::stat, change: impl FnOnce(&mut HostFile, Stamp)) {
+        let now = self.now();
+        let mut files = self.files.lock().unwrap();
+        let file = files.entry(Self::key(st)).or_default();
+        change(file, now);
+        file.seen = Some(stat_times_of(st));
+        file.pending = false;
+    }
+
+    /// Records a new file, directory or symlink at `path`, and the change to its parent.
+    unsafe fn created(&self, dirfd: c_int, path: *const c_char) {
+        if let Some(st) = unsafe { Self::host_stat(dirfd, path, false) } {
+            self.record(&st, |file, now| file.sim = [Some(now); 4]);
+        }
+        unsafe { self.entries_changed(dirfd, path) };
+    }
+
+    /// Stamps the modification and change times of the directory holding `path`'s final
+    /// component, whose entries just changed (POSIX `open`, `mkdir`, `unlink`, `rename`, `link`).
+    unsafe fn entries_changed(&self, dirfd: c_int, path: *const c_char) {
+        let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
+        let end = bytes
+            .iter()
+            .rposition(|byte| *byte != b'/')
+            .map_or(0, |last| last + 1);
+        let parent = match bytes[..end].iter().rposition(|byte| *byte == b'/') {
+            Some(0) => b"/".to_vec(),
+            Some(slash) => bytes[..slash].to_vec(),
+            None => b".".to_vec(),
+        };
+        let Ok(parent) = CString::new(parent) else {
+            return;
+        };
+        if let Some(st) = unsafe { Self::host_stat(dirfd, parent.as_ptr(), true) } {
+            self.record(&st, |file, now| {
+                file.sim[MODIFIED] = Some(now);
+                file.sim[CHANGED] = Some(now);
+            });
+        }
+    }
+
+    /// Stamps the change time of the inode `before` described, which a link count or name
+    /// change touched, or forgets it once its last link is gone.
+    fn inode_changed(&self, before: &libc::stat, links_left: bool) {
+        let key = Self::key(before);
+        if !links_left {
+            self.files.lock().unwrap().remove(&key);
+            return;
+        }
+        let now = self.now();
+        let mut files = self.files.lock().unwrap();
+        let file = files.entry(key).or_default();
+        file.sim[CHANGED] = Some(now);
+        file.pending = true;
+    }
+
+    fn written(&self, fd: c_int) {
+        if self.any_writers.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let Some(key) = self.writers.lock().unwrap().get(&fd).copied() else {
+            return;
+        };
+        let now = self.now();
+        let mut files = self.files.lock().unwrap();
+        let file = files.entry(key).or_default();
+        file.sim[MODIFIED] = Some(now);
+        file.sim[CHANGED] = Some(now);
+        file.pending = true;
+    }
+
+    fn watch(&self, fd: c_int, key: (u64, u64)) {
+        if self.writers.lock().unwrap().insert(fd, key).is_none() {
+            self.any_writers.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn unwatch(&self, fd: c_int) {
+        if self.any_writers.load(Ordering::Acquire) != 0
+            && self.writers.lock().unwrap().remove(&fd).is_some()
+        {
+            self.any_writers.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    fn alias(&self, fd: c_int, newfd: c_int) {
+        let key = self.writers.lock().unwrap().get(&fd).copied();
+        if let Some(key) = key {
+            self.watch(newfd, key);
+        }
+    }
+
+    /// `openat(2)` of a real regular file for writing, or with `O_CREAT` or `O_TRUNC`: performs it
+    /// and records what it did. Directories, `O_PATH`, and existing files of other types (a FIFO
+    /// whose open may block, a device) are declined.
+    unsafe fn open_real(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        flags: c_int,
+        mode: u32,
+    ) -> Option<FsResult> {
+        let writes = writable(flags);
+        if path.is_null()
+            || flags & libc::O_DIRECTORY != 0
+            || (!writes && flags & (libc::O_CREAT | libc::O_TRUNC) == 0)
+        {
+            return None;
+        }
+        #[cfg(target_os = "linux")]
+        if flags & libc::O_PATH != 0 {
+            return None;
+        }
+        let before = unsafe { Self::host_stat(dirfd, path, flags & libc::O_NOFOLLOW == 0) };
+        match &before {
+            Some(st) if st.st_mode & libc::S_IFMT != libc::S_IFREG => return None,
+            None if flags & libc::O_CREAT == 0 => return None,
+            _ => {}
+        }
+        let fd = unsafe { libc::openat(dirfd, path, flags, mode as libc::c_uint) };
+        if fd < 0 {
+            return err(last_error());
+        }
+        let Some(after) = (unsafe { Self::host_stat(fd, std::ptr::null(), true) }) else {
+            return ok(fd as i64);
+        };
+        if after.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return ok(fd as i64);
+        }
+        if before.is_none() {
+            self.record(&after, |file, now| file.sim = [Some(now); 4]);
+            unsafe { self.entries_changed(dirfd, path) };
+        } else if flags & libc::O_TRUNC != 0 {
+            self.record(&after, |file, now| {
+                file.sim[MODIFIED] = Some(now);
+                file.sim[CHANGED] = Some(now);
+            });
+        }
+        if writes {
+            self.watch(fd, Self::key(&after));
+        }
+        ok(fd as i64)
+    }
+
+    /// Performs a real call that removes or renames `path`, recording the inode's change time
+    /// and the parent's entries.
+    unsafe fn unlinked(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        call: impl FnOnce() -> c_int,
+    ) -> Option<FsResult> {
+        if path.is_null() {
+            return None;
+        }
+        let before = unsafe { Self::host_stat(dirfd, path, false) };
+        let result = call();
+        if result < 0 {
+            return err(last_error());
+        }
+        if let Some(before) = before {
+            let directory = before.st_mode & libc::S_IFMT == libc::S_IFDIR;
+            self.inode_changed(&before, !directory && before.st_nlink > 1);
+        }
+        unsafe { self.entries_changed(dirfd, path) };
+        ok(result as i64)
+    }
+
+    /// Performs a real call that makes `path` (`mkdir`, `symlink`), recording it as created.
+    unsafe fn made(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        call: impl FnOnce() -> c_int,
+    ) -> Option<FsResult> {
+        if path.is_null() {
+            return None;
+        }
+        let result = call();
+        if result < 0 {
+            return err(last_error());
+        }
+        unsafe { self.created(dirfd, path) };
+        ok(result as i64)
+    }
+
+    /// Performs a real `renameat` or `linkat`, recording the inode's change time and both
+    /// parents' entries (and the source's last link for a rename).
+    unsafe fn relinked(
+        &self,
+        fromfd: c_int,
+        from: *const c_char,
+        tofd: c_int,
+        to: *const c_char,
+        rename: bool,
+        call: impl FnOnce() -> c_int,
+    ) -> Option<FsResult> {
+        if from.is_null() || to.is_null() {
+            return None;
+        }
+        let result = call();
+        if result < 0 {
+            return err(last_error());
+        }
+        if let Some(st) = unsafe { Self::host_stat(tofd, to, false) } {
+            self.record(&st, |file, now| file.sim[CHANGED] = Some(now));
+        }
+        if rename {
+            unsafe { self.entries_changed(fromfd, from) };
+        }
+        unsafe { self.entries_changed(tofd, to) };
+        ok(result as i64)
+    }
+}
+
+/// The last error of a real call, as the plane's result.
+fn last_error() -> c_int {
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO)
+}
+
+impl Drop for HostTimes {
+    /// A real descriptor outlives its sim: it goes back to the OS, rather than failing with
+    /// `EBADF` as a descriptor of a gone sim's plane does.
+    fn drop(&mut self) {
+        for fd in self.writers.get_mut().unwrap().keys() {
+            snare_interpose::release_file(*fd);
+        }
+    }
+}
+
+impl Fs for HostTimes {
+    fn owns(&self, fd: c_int) -> bool {
+        self.any_writers.load(Ordering::Acquire) != 0
+            && self.writers.lock().unwrap().contains_key(&fd)
+    }
+
+    unsafe fn open(&self, path: *const c_char, flags: c_int, mode: u32) -> Option<FsResult> {
+        unsafe { self.open_real(libc::AT_FDCWD, path, flags, mode) }
+    }
+
+    unsafe fn openat(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        flags: c_int,
+        mode: u32,
+    ) -> Option<FsResult> {
+        unsafe { self.open_real(dirfd, path, flags, mode) }
+    }
+
+    unsafe fn mkdir(&self, path: *const c_char, mode: u32) -> Option<FsResult> {
+        unsafe {
+            self.made(libc::AT_FDCWD, path, || {
+                libc::mkdir(path, mode as libc::mode_t)
+            })
+        }
+    }
+
+    unsafe fn mkdirat(&self, dirfd: c_int, path: *const c_char, mode: u32) -> Option<FsResult> {
+        unsafe {
+            self.made(dirfd, path, || {
+                libc::mkdirat(dirfd, path, mode as libc::mode_t)
+            })
+        }
+    }
+
+    unsafe fn symlink(&self, target: *const c_char, link: *const c_char) -> Option<FsResult> {
+        unsafe { self.made(libc::AT_FDCWD, link, || libc::symlink(target, link)) }
+    }
+
+    unsafe fn symlinkat(
+        &self,
+        target: *const c_char,
+        dirfd: c_int,
+        link: *const c_char,
+    ) -> Option<FsResult> {
+        unsafe { self.made(dirfd, link, || libc::symlinkat(target, dirfd, link)) }
+    }
+
+    unsafe fn unlink(&self, path: *const c_char) -> Option<FsResult> {
+        unsafe { self.unlinked(libc::AT_FDCWD, path, || libc::unlink(path)) }
+    }
+
+    unsafe fn unlinkat(&self, dirfd: c_int, path: *const c_char, flags: c_int) -> Option<FsResult> {
+        unsafe { self.unlinked(dirfd, path, || libc::unlinkat(dirfd, path, flags)) }
+    }
+
+    unsafe fn rmdir(&self, path: *const c_char) -> Option<FsResult> {
+        unsafe { self.unlinked(libc::AT_FDCWD, path, || libc::rmdir(path)) }
+    }
+
+    unsafe fn rename(&self, from: *const c_char, to: *const c_char) -> Option<FsResult> {
+        unsafe {
+            self.relinked(libc::AT_FDCWD, from, libc::AT_FDCWD, to, true, || {
+                libc::rename(from, to)
+            })
+        }
+    }
+
+    unsafe fn renameat(
+        &self,
+        fromfd: c_int,
+        from: *const c_char,
+        tofd: c_int,
+        to: *const c_char,
+    ) -> Option<FsResult> {
+        unsafe {
+            self.relinked(fromfd, from, tofd, to, true, || {
+                libc::renameat(fromfd, from, tofd, to)
+            })
+        }
+    }
+
+    unsafe fn link(&self, from: *const c_char, to: *const c_char) -> Option<FsResult> {
+        unsafe {
+            self.relinked(libc::AT_FDCWD, from, libc::AT_FDCWD, to, false, || {
+                libc::link(from, to)
+            })
+        }
+    }
+
+    unsafe fn linkat(
+        &self,
+        fromfd: c_int,
+        from: *const c_char,
+        tofd: c_int,
+        to: *const c_char,
+        flags: c_int,
+    ) -> Option<FsResult> {
+        unsafe {
+            self.relinked(fromfd, from, tofd, to, false, || {
+                libc::linkat(fromfd, from, tofd, to, flags)
+            })
+        }
+    }
+
+    unsafe fn write(&self, fd: c_int, _buf: *const u8, len: usize) -> Option<FsResult> {
+        if len > 0 {
+            self.written(fd);
+        }
+        None
+    }
+
+    unsafe fn pwrite(
+        &self,
+        fd: c_int,
+        _buf: *const u8,
+        len: usize,
+        _offset: i64,
+    ) -> Option<FsResult> {
+        if len > 0 {
+            self.written(fd);
+        }
+        None
+    }
+
+    unsafe fn ftruncate(&self, fd: c_int, _len: i64) -> Option<FsResult> {
+        self.written(fd);
+        None
+    }
+
+    unsafe fn close(&self, fd: c_int) -> Option<FsResult> {
+        self.unwatch(fd);
+        None
+    }
+
+    unsafe fn fd_replaced(&self, fd: c_int) -> Option<FsResult> {
+        self.unwatch(fd);
+        None
+    }
+
+    unsafe fn dup(&self, oldfd: c_int, newfd: c_int) -> Option<FsResult> {
+        if !self.owns(oldfd) {
+            return None;
+        }
+        self.alias(oldfd, newfd);
+        ok(newfd as i64)
+    }
+
+    unsafe fn dup_to(&self, oldfd: c_int, newfd: c_int, flags: Option<c_int>) -> Option<FsResult> {
+        if !self.owns(oldfd) {
+            return None;
+        }
+        let result = crate::fabric::duplicate_to(oldfd, newfd, flags);
+        if result < 0 {
+            return err(last_error());
+        }
+        if oldfd != newfd {
+            self.unwatch(newfd);
+            self.alias(oldfd, newfd);
+        }
+        ok(result as i64)
+    }
+
+    unsafe fn fcntl(&self, fd: c_int, cmd: c_int, arg: i64) -> Option<FsResult> {
+        if cmd != libc::F_DUPFD && cmd != libc::F_DUPFD_CLOEXEC || !self.owns(fd) {
+            return None;
+        }
+        let result = descriptor_fcntl(fd, cmd, arg)?;
+        if let FsResult::Ok(newfd) = result {
+            self.alias(fd, newfd as c_int);
+        }
+        Some(result)
+    }
+
+    unsafe fn host_times_set(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        times: &SetTimes,
+        flags: c_int,
+    ) {
+        let follow = flags & libc::AT_SYMLINK_NOFOLLOW == 0;
+        let Some(st) = (unsafe { Self::host_stat(dirfd, path, follow) }) else {
+            return;
+        };
+        let host = stat_times_of(&st);
+        let host = [host.accessed, host.modified, host.changed, host.born];
+        let offset = self.offset;
+        self.record(&st, |file, now| {
+            let was: [Stamp; 4] =
+                std::array::from_fn(|index| file.sim[index].unwrap_or(host[index] - offset));
+            let mut current = Times {
+                accessed: was[ACCESSED],
+                modified: was[MODIFIED],
+                changed: was[CHANGED],
+                born: was[BORN],
+            };
+            current.set(times, now);
+            let after = [
+                current.accessed,
+                current.modified,
+                current.changed,
+                current.born,
+            ];
+            for (index, time) in after.into_iter().enumerate() {
+                if time != was[index] {
+                    file.sim[index] = Some(time);
+                }
+            }
+        });
+    }
+
+    unsafe fn host_metadata(&self, buf: *mut u8, statx: bool) {
+        #[cfg(target_os = "linux")]
+        let (key, host) = if statx {
+            let dev = unsafe {
+                libc::makedev(
+                    buf.add(136).cast::<u32>().read_unaligned(),
+                    buf.add(140).cast::<u32>().read_unaligned(),
+                )
+            };
+            let ino = unsafe { buf.add(32).cast::<u64>().read_unaligned() };
+            ((dev as u64, ino), unsafe { statx_times_of(buf) })
+        } else {
+            let st = unsafe { &*buf.cast::<libc::stat>() };
+            let times = stat_times_of(st);
+            (
+                Self::key(st),
+                [
+                    Some(times.accessed),
+                    Some(times.modified),
+                    Some(times.changed),
+                    None,
+                ],
+            )
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (key, host) = {
+            let _ = statx;
+            let st = unsafe { &*buf.cast::<libc::stat>() };
+            let times = stat_times_of(st);
+            (
+                Self::key(st),
+                [
+                    Some(times.accessed),
+                    Some(times.modified),
+                    Some(times.changed),
+                    Some(times.born),
+                ],
+            )
+        };
+        let mut shown =
+            host.map(|time| time.map(|time| if time == 0 { 0 } else { time - self.offset }));
+        if let Some(sim) = self.observe(key, host) {
+            for (shown, sim) in shown.iter_mut().zip(sim) {
+                if let (Some(shown), Some(sim)) = (shown.as_mut(), sim) {
+                    *shown = sim;
+                }
+            }
+        }
+        if statx {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                for ((offset, _), time) in STATX_TIMES.into_iter().zip(shown) {
+                    if let Some(time) = time {
+                        let (secs, nanos) = split(time);
+                        buf.add(offset).cast::<i64>().write_unaligned(secs);
+                        buf.add(offset + 8)
+                            .cast::<u32>()
+                            .write_unaligned(nanos as u32);
+                    }
+                }
+            }
+        } else {
+            let st = unsafe { &mut *buf.cast::<libc::stat>() };
+            let born = stat_times_of(st).born;
+            stat_times(
+                st,
+                &Times {
+                    accessed: shown[ACCESSED].unwrap_or_default(),
+                    modified: shown[MODIFIED].unwrap_or_default(),
+                    changed: shown[CHANGED].unwrap_or_default(),
+                    born: shown[BORN].unwrap_or(born),
+                },
+            );
+        }
+    }
+}
+
+impl HostTimes {
+    /// The sim's times for the file `key` names, given what the host reports for it now. A host
+    /// time that moved since last seen, with no write of the sim's pending to explain it, takes
+    /// the sim's current time; a different birth time means the inode was freed and reused, and
+    /// the record goes.
+    fn observe(&self, key: (u64, u64), host: [Option<Stamp>; 4]) -> Option<[Option<Stamp>; 4]> {
+        let mut files = self.files.lock().unwrap();
+        let file = files.get_mut(&key)?;
+        let Some(seen) = file.seen else {
+            file.seen = Some(Times {
+                accessed: host[ACCESSED].unwrap_or_default(),
+                modified: host[MODIFIED].unwrap_or_default(),
+                changed: host[CHANGED].unwrap_or_default(),
+                born: host[BORN].unwrap_or_default(),
+            });
+            file.pending = false;
+            return Some(file.sim);
+        };
+        if let Some(born) = host[BORN]
+            && born != 0
+            && seen.born != 0
+            && born != seen.born
+        {
+            files.remove(&key);
+            return None;
+        }
+        let was = [seen.accessed, seen.modified, seen.changed, seen.born];
+        let moved: [bool; 3] =
+            std::array::from_fn(|index| host[index].is_some_and(|time| time != was[index]));
+        if moved.contains(&true) {
+            if !file.pending {
+                let now = self.now();
+                for (index, moved) in moved.into_iter().enumerate() {
+                    if moved {
+                        file.sim[index] = Some(now);
+                    }
+                }
+            }
+            file.pending = false;
+        }
+        let mut seen = seen;
+        let fields = [
+            &mut seen.accessed,
+            &mut seen.modified,
+            &mut seen.changed,
+            &mut seen.born,
+        ];
+        for (field, host) in fields.into_iter().zip(host) {
+            if let Some(host) = host.filter(|host| *host != 0) {
+                *field = host;
+            }
+        }
+        file.seen = Some(seen);
+        Some(file.sim)
     }
 }

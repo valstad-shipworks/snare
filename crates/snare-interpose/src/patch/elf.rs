@@ -7,6 +7,14 @@
 //! Linux default of full RELRO), so most calls from Rust code use `GLOB_DAT`; both kinds are
 //! rewritten.
 //!
+//! A function's address stored in data (a C table such as SQLite's `aSyscall[]`, or a Rust
+//! `static F: unsafe extern "C" fn(..) = libc::fstat`) is not a GOT slot: in a PIE or DSO the
+//! linker leaves an absolute word relocation against the symbol (`R_X86_64_64`, x86-64 psABI
+//! table "Relocation Types"; `R_AARCH64_ABS64`, AArch64 ELF ABI §5.7.2 "Static Data
+//! Relocations") in `.data.rel.ro` or `.data`, and those words are rewritten too. A non-PIE
+//! executable has no such relocation: the linker points the word at a canonical PLT entry, whose
+//! `JUMP_SLOT` is rewritten like any other.
+//!
 //! Objects are found with `dl_iterate_phdr(3)`, and each object's `PT_DYNAMIC` segment gives its
 //! symbol and string tables and its two `Elf64_Rela` tables (`DT_RELA`, `DT_JMPREL`). Every
 //! constant and struct below is the System V gABI's, as spelled in glibc's `elf/elf.h`. The
@@ -55,6 +63,17 @@ const GOT_RELOCATIONS: [u32; 2] = [6, 7];
 /// `R_AARCH64_GLOB_DAT` (1025) and `R_AARCH64_JUMP_SLOT` (1026), glibc `elf/elf.h`.
 #[cfg(target_arch = "aarch64")]
 const GOT_RELOCATIONS: [u32; 2] = [1025, 1026];
+
+/// The absolute 64-bit data relocations, whose slot holds `S + A`: `R_X86_64_64` (1), glibc
+/// `elf/elf.h`.
+#[cfg(target_arch = "x86_64")]
+const DATA_RELOCATION: u32 = 1;
+/// `R_AARCH64_ABS64` (257), glibc `elf/elf.h`.
+#[cfg(target_arch = "aarch64")]
+const DATA_RELOCATION: u32 = 257;
+
+/// Writable-segment flag of a program header (glibc `elf/elf.h`, `PF_W`).
+const PF_W: u32 = 2;
 
 /// Path prefixes of distribution-installed libraries, which are never patched (see
 /// [`Object::is_system`]). A snare choice: the FHS library directories.
@@ -212,8 +231,13 @@ unsafe extern "C" fn collect(
     0
 }
 
-/// Rewrites every `GLOB_DAT`/`JUMP_SLOT` slot of `object` that names a resolved hook, and returns
-/// the hooks patched and the names of every other symbol those relocations import.
+/// Rewrites every `GLOB_DAT`/`JUMP_SLOT` slot and every data word relocated to a function of
+/// `object` that names a resolved hook, and returns the hooks patched and the names of every
+/// other symbol those relocations import.
+///
+/// Only `DT_RELA` and `DT_JMPREL` are read. `DT_REL` is never emitted on x86_64 or AArch64 (see
+/// [`DT_JMPREL`]), and `DT_RELR` packs only relative relocations, which name no symbol (gABI
+/// "Dynamic Section", `DT_RELR`).
 ///
 /// An object without a dynamic section, or without symbol or string tables, imports nothing and
 /// is skipped. A slot already holding the replacement is left alone and not reported again.
@@ -225,15 +249,21 @@ unsafe fn patch_object(object: &Object) -> (Vec<&'static str>, Vec<String>) {
         let Some(dynamic) = phdrs.iter().find(|p| p.p_type == PT_DYNAMIC) else {
             return Default::default();
         };
+        let span = |p: &libc::Elf64_Phdr| {
+            (
+                object.base + p.p_vaddr as usize,
+                object.base + (p.p_vaddr + p.p_memsz) as usize,
+            )
+        };
         let relro: Vec<(usize, usize)> = phdrs
             .iter()
             .filter(|p| p.p_type == PT_GNU_RELRO)
-            .map(|p| {
-                (
-                    object.base + p.p_vaddr as usize,
-                    object.base + (p.p_vaddr + p.p_memsz) as usize,
-                )
-            })
+            .map(span)
+            .collect();
+        let writable: Vec<(usize, usize)> = phdrs
+            .iter()
+            .filter(|p| p.p_type == libc::PT_LOAD && p.p_flags & PF_W != 0)
+            .map(span)
             .collect();
 
         // glibc relocates these entries in place (`elf_get_dynamic_info` in
@@ -279,10 +309,16 @@ unsafe fn patch_object(object: &Object) -> (Vec<&'static str>, Vec<String>) {
             let relocations =
                 std::slice::from_raw_parts(table as *const Rela, size / size_of::<Rela>());
             for relocation in relocations {
-                if !GOT_RELOCATIONS.contains(&((relocation.info & 0xffff_ffff) as u32)) {
+                let kind = (relocation.info & 0xffff_ffff) as u32;
+                let data = kind == DATA_RELOCATION;
+                if !data && !GOT_RELOCATIONS.contains(&kind) {
                     continue;
                 }
-                let symbol = &*(symtab as *const Sym).add((relocation.info >> 32) as usize);
+                let index = (relocation.info >> 32) as usize;
+                if index == 0 {
+                    continue;
+                }
+                let symbol = &*(symtab as *const Sym).add(index);
                 let name = CStr::from_ptr((strtab + symbol.name as usize) as *const _).to_bytes();
                 let Some(hook) = hooks::find(name) else {
                     if !name.is_empty() {
@@ -294,11 +330,28 @@ unsafe fn patch_object(object: &Object) -> (Vec<&'static str>, Vec<String>) {
                     continue;
                 }
                 let slot = (object.base + relocation.offset as usize) as *mut usize;
-                let read_only = relro
-                    .iter()
-                    .any(|&(start, end)| (start..end).contains(&(slot as usize)));
+                let within = |spans: &[(usize, usize)]| {
+                    spans
+                        .iter()
+                        .any(|&(start, end)| (start..end).contains(&(slot as usize)))
+                };
+                // A data word is only a pointer to the function when it holds `S + 0` and the
+                // loader stored exactly the address the hook resolved: a nonzero addend points
+                // into or past the function, and a different value means another symbol version
+                // (`sym@VERSION`), whose ABI the replacement may not share. A word outside every
+                // writable segment belongs to a text relocation (`DT_TEXTREL`), whose page is
+                // code that other threads may be running; rustc never emits one. An unaligned
+                // word (a packed struct) may straddle two pages and is left alone.
+                if data
+                    && (relocation.addend != 0
+                        || !(slot as usize).is_multiple_of(align_of::<usize>())
+                        || !within(&writable)
+                        || slot.read_volatile() != hook.original.load(Ordering::Acquire))
+                {
+                    continue;
+                }
                 if slot.read_volatile() != hook.replacement
-                    && write_slot(slot, hook.replacement, read_only)
+                    && write_slot(slot, hook.replacement, within(&relro))
                 {
                     patched.push(hook.name);
                 }
@@ -318,7 +371,7 @@ unsafe fn patch_object(object: &Object) -> (Vec<&'static str>, Vec<String>) {
 /// The page is briefly writable to every thread; a concurrent call through another slot on it
 /// is unaffected, since only this one word changes.
 unsafe fn write_slot(slot: *mut usize, value: usize, read_only: bool) -> bool {
-    // SAFETY (whole function): `slot` is an aligned GOT entry of a loaded object; the page
+    // SAFETY (whole function): `slot` is an aligned relocated word of a loaded object; the page
     // arithmetic stays within the page that contains it.
     unsafe {
         if !read_only {

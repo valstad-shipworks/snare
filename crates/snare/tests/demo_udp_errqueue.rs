@@ -112,6 +112,7 @@ fn errno() -> i32 {
 fn tx_completion_carries_a_timestamp_on_the_error_queue() {
     Sim::builder()
         .host(HostProfile::new().build())
+        .fixed_epoch()
         .build()
         .run(|| {
             let tx = udp_socket();
@@ -136,6 +137,7 @@ fn error_queue_is_empty_without_tx_timestamping() {
     // No SOF_TIMESTAMPING_TX_SOFTWARE means no completion is queued; MSG_ERRQUEUE sees EAGAIN.
     Sim::builder()
         .host(HostProfile::new().build())
+        .fixed_epoch()
         .build()
         .run(|| {
             let tx = udp_socket();
@@ -155,6 +157,7 @@ fn one_completion_is_queued_per_send() {
     // stamps and then EAGAIN.
     Sim::builder()
         .host(HostProfile::new().build())
+        .fixed_epoch()
         .build()
         .run(|| {
             let tx = udp_socket();
@@ -189,6 +192,7 @@ fn error_queue_and_receive_queue_are_independent() {
     // completion must never appear on the normal path (Documentation/networking/timestamping.rst).
     Sim::builder()
         .host(HostProfile::new().build())
+        .fixed_epoch()
         .build()
         .run(|| {
             // rx receives real traffic; tx wants its own tx completions.
@@ -249,6 +253,7 @@ fn both_rx_and_tx_timestamping_coexist_on_one_socket() {
     // and the tx stamp rides MSG_ERRQUEUE.
     Sim::builder()
         .host(HostProfile::new().build())
+        .fixed_epoch()
         .build()
         .run(|| {
             let a = udp_socket();

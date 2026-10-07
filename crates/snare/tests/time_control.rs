@@ -15,7 +15,11 @@ fn host_sim() -> Sim {
 
 #[test]
 fn clock_reads_the_fixed_virtual_epoch() {
-    host_sim().run(|| {
+    let sim = Sim::builder()
+        .host(HostProfile::new().build())
+        .fixed_epoch()
+        .build();
+    sim.run(|| {
         // The fixed epoch (2023-11-14) proves this is the virtual clock, not the wall clock.
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         assert!(now.as_secs() >= 1_700_000_000);

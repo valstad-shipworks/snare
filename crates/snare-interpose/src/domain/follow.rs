@@ -23,9 +23,14 @@
 //! * A descriptor of a sim whose run is in progress, reached from another running sim, is shared
 //!   by two live worlds at once, which no model of one process can serve: the caller waits, busy
 //!   in its own sim, until that run ends.
-//! * Anything else of another sim (a socket reached from a running sim, or of a sim with no run in
-//!   progress, a descriptor of a sim that is gone) fails with `EBADF`, as an fd this world never
-//!   opened would, rather than reaching the OS's placeholder.
+//! * A socket of another sim (reached from a running sim, or of a sim with no run in progress, or
+//!   gone with its sim) has no instance in this world unless it is a socketpair end: it is served
+//!   as a connection that is gone ([`Net::mirror`](crate::Net::mirror)), so code that kept it
+//!   sees a dropped connection. Closing it, from any thread, closes it in the sim that made it,
+//!   as its peer would see, and gives its number back to the OS ([`close_foreign`]).
+//! * Anything else of another sim (a descriptor of a sim that is gone, where no backend serves
+//!   it) fails with `EBADF`, as an fd this world never opened would, rather than reaching the
+//!   OS's placeholder.
 
 use std::cell::Cell;
 use std::ffi::c_int;
@@ -33,12 +38,13 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 #[cfg(unix)]
 use std::time::Duration;
 
-use super::{
-    Arc, Inherited, Inner, SendInherited, ThreadClass, accounting, offer_idle_skip, release, state,
-    thread_lineage, wake_if_quiescent,
-};
 #[cfg(unix)]
-use super::{Domain, Flow, Lineage, Ordering, dispatch, end_spin, mix_lineage, swap_lineage};
+use super::end_spin;
+use super::{
+    Arc, Domain, Flow, Inherited, Inner, Lineage, Ordering, SendInherited, ThreadClass, accounting,
+    dispatch, mix_lineage, offer_idle_skip, release, state, swap_lineage, thread_lineage,
+    wake_if_quiescent,
+};
 #[cfg(unix)]
 use crate::owners::{self, Owner};
 use crate::state::Passthrough;
@@ -51,7 +57,6 @@ thread_local! {
 
 /// Mixed with a following thread's lineage in the domain it leaves to give its lineage in the one
 /// it joins. A snare choice: the ASCII bytes of `"FOLLOWER"`.
-#[cfg(unix)]
 const FOLLOW_SALT: u64 = 0x464f_4c4c_4f57_4552;
 
 /// How long a thread waiting for another sim's run to end sleeps between checks; an ending run
@@ -74,6 +79,11 @@ static IDLE: Condvar = Condvar::new();
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether the calling thread may follow a descriptor or a wake to another domain.
+pub(super) fn followable() -> bool {
+    FOLLOWABLE.try_with(Cell::get).unwrap_or(false)
 }
 
 /// Sets whether the calling thread may follow a descriptor, returning what it was.
@@ -342,6 +352,90 @@ fn mirrored(me: &Inner, fd: c_int) -> Elsewhere {
     }
 }
 
+/// Whether `fd` is a socket of a network other than the calling thread's: one another sim minted
+/// that does not belong to the process, or one gone with its sim.
+#[cfg(unix)]
+fn foreign_socket(fd: c_int) -> bool {
+    if state::passthrough() {
+        return false;
+    }
+    let here = state::domain();
+    match owners::owner(fd) {
+        Owner::Gone => true,
+        // SAFETY: the calling thread's domain is live while it is installed.
+        Owner::Sim { serial, local: false } => {
+            here.is_null() || serial != unsafe { &*here }.accounting.serial.0
+        }
+        _ => false,
+    }
+}
+
+/// Settles `fd`, if it is another sim's socket, before a call that offers a whole set of
+/// descriptors to the calling thread's sim (`poll`, `select`): the sim then serves it as
+/// [`elsewhere`] arranges, as a call on the descriptor alone would find it.
+#[cfg(unix)]
+pub(crate) fn settle_foreign(fd: c_int) {
+    if !state::domain().is_null() && foreign_socket(fd) {
+        let _ = elsewhere(fd);
+    }
+}
+
+/// What a thread's call on `fd`, which no backend of its own sim served, does when `fd` is
+/// another sim's socket: `Some` to offer the call again or fail it, as [`elsewhere`] decides.
+#[cfg(unix)]
+pub(crate) fn elsewhere_if_foreign(fd: c_int) -> Option<Elsewhere> {
+    foreign_socket(fd).then(|| elsewhere(fd))
+}
+
+/// Closes `fd` when it is another sim's socket (or one gone with its sim), from any thread: the
+/// calling thread's sim lets go of its own instance of it, the sim that made it closes it as its
+/// own code would, so its peer sees the connection end, and the number goes back to the OS. A
+/// process has one descriptor table: whichever world closes a descriptor, it is closed. `None`
+/// for any other descriptor; `real` closes the number's placeholder through the OS.
+#[cfg(unix)]
+pub(crate) fn close_foreign(fd: c_int, real: impl FnOnce() -> i64) -> Option<i64> {
+    if !foreign_socket(fd) {
+        return None;
+    }
+    let owner = owners::owner(fd);
+    let here = state::domain();
+    if !here.is_null() {
+        end_spin();
+    }
+    let _passthrough = Passthrough::enter();
+    if !here.is_null() {
+        // SAFETY: the calling thread's domain is live while it is installed.
+        let me = unsafe { &*here };
+        if let Some(net) = me.net.iter().find(|net| net.owns(fd)) {
+            // SAFETY: no pointers are involved.
+            let _ = unsafe { net.close(fd) };
+        }
+    }
+    if let Owner::Sim { serial, .. } = owner {
+        match crate::census::find(serial) {
+            Some(theirs) => {
+                let closed = theirs.0.net.iter().find_map(|net| {
+                    // SAFETY: no pointers are involved.
+                    net.owns(fd).then(|| unsafe { net.close(fd) }).flatten()
+                });
+                if let Some(closed) = closed {
+                    if !theirs.0.dormant.load(Ordering::SeqCst)
+                        && let Some(sched) = theirs.0.sched.as_ref()
+                    {
+                        sched.wake_readiness(crate::ReadinessWake::All);
+                    }
+                    return Some(closed.into_raw());
+                }
+            }
+            None => {
+                owner_moves_on(fd, owner);
+            }
+        }
+    }
+    owners::forget_real(fd);
+    Some(real())
+}
+
 /// The sim holding `fd`, a process-local descriptor, when that is another sim than the calling
 /// thread's and its run is in progress.
 #[cfg(unix)]
@@ -493,8 +587,12 @@ fn hand_over(from: &Inner, to: &Inner) {
 /// in the domain it leaves, that follows a descriptor there: counted live and queued in a
 /// deterministic schedule as a spawned thread is. Its lineage there is mixed from its old one, so
 /// it is the same whether the place was made ready at a hand-over or as the thread arrived.
-#[cfg(unix)]
-fn place_in(to: &Inner, class: ThreadClass, label: Option<&'static str>, from: u64) -> Inherited {
+pub(super) fn place_in(
+    to: &Inner,
+    class: ThreadClass,
+    label: Option<&'static str>,
+    from: u64,
+) -> Inherited {
     let mut lineage = mix_lineage(FOLLOW_SALT, from);
     while to.accounting.core().rows.contains_key(&lineage) {
         lineage = mix_lineage(FOLLOW_SALT, lineage);
@@ -524,8 +622,7 @@ fn place_in(to: &Inner, class: ThreadClass, label: Option<&'static str>, from: u
 /// leaves its domain as an exiting thread does and joins `to` as an adopted one, taking the place
 /// `to` made ready for it if there is one. `false`, changing nothing, for a thread that cannot
 /// move (one that entered its domain itself, or is inside a nested entry).
-#[cfg(unix)]
-fn follow(to: &Domain) -> bool {
+pub(super) fn follow(to: &Domain) -> bool {
     if !FOLLOWABLE.try_with(Cell::get).unwrap_or(false) {
         return false;
     }

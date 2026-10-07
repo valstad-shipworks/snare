@@ -1682,6 +1682,8 @@ pub struct SimBuilder {
     /// `deterministic`.
     wall_clock: bool,
     time_rate: Option<f64>,
+    /// See [`fixed_epoch`](Self::fixed_epoch).
+    fixed_epoch: bool,
     seed: u64,
     deterministic: bool,
     /// The inverse of [`record_events`](Self::record_events), so `Default` records.
@@ -1779,8 +1781,16 @@ impl SimBuilder {
         self
     }
 
+    /// Starts the virtual clock at the fixed epoch (`QueryPerformanceCounter` and
+    /// `GetTickCount64` at zero, the system time at 2023-11-14T22:13:20Z) instead of where the
+    /// process's earlier sims left off; see the unix `SimBuilder::fixed_epoch`.
+    pub fn fixed_epoch(mut self) -> Self {
+        self.fixed_epoch = true;
+        self
+    }
+
     /// Runs the sim's threads deterministically, one at a time in a fixed order; see the unix
-    /// `SimBuilder::deterministic`. Implies the virtual clock.
+    /// `SimBuilder::deterministic`. Implies the virtual clock and the fixed epoch.
     pub fn deterministic(mut self) -> Self {
         self.deterministic = true;
         self.wall_clock = false;
@@ -1882,6 +1892,7 @@ impl SimBuilder {
         if let Some(clock) = &clock {
             clock.set_discrete(true);
             clock.set_deterministic(self.deterministic);
+            clock.begin(self.deterministic || self.fixed_epoch);
             if let Some(rate) = self.time_rate {
                 clock.check_rate(rate);
                 clock.set_rate(rate);

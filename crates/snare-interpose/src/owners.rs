@@ -67,23 +67,32 @@ fn slot_in(table: &'static Table, fd: c_int, grow: bool) -> Option<&'static Atom
         if !grow {
             return None;
         }
-        let fresh = Box::into_raw(Box::new([const { AtomicU64::new(0) }; CHUNK]));
-        table = match cell.compare_exchange(
-            ptr::null_mut(),
-            fresh,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => fresh,
-            Err(installed) => {
-                // SAFETY: `fresh` came from `Box::into_raw` above and was never shared.
-                drop(unsafe { Box::from_raw(fresh) });
-                installed
-            }
-        };
+        table = install_chunk(cell);
     }
     // SAFETY: an installed chunk is never freed.
     Some(unsafe { &(*table)[index] })
+}
+
+/// Installs a fresh chunk in `cell`, or returns the one another thread installed first. Kept out of
+/// line and the chunk built on the heap, so a hook's frame never holds a chunk's 32 KiB.
+#[cold]
+#[inline(never)]
+fn install_chunk(cell: &'static AtomicPtr<Chunk>) -> *mut Chunk {
+    let layout = std::alloc::Layout::new::<Chunk>();
+    // SAFETY: a chunk has a nonzero size, and an all-zero `AtomicU64` is a valid zero.
+    let fresh = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<Chunk>();
+    if fresh.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    match cell.compare_exchange(ptr::null_mut(), fresh, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => fresh,
+        Err(installed) => {
+            // SAFETY: `fresh` was allocated above with the global allocator and a chunk's layout,
+            // as a `Box<Chunk>` is, and was never shared.
+            drop(unsafe { Box::from_raw(fresh) });
+            installed
+        }
+    }
 }
 
 /// Who owns `fd`.
@@ -102,6 +111,12 @@ pub(crate) fn owner(fd: c_int) -> Owner {
 /// Whether a sim minted `fd`, live or not: a placeholder, not a descriptor of the OS's own.
 pub fn minted(fd: c_int) -> bool {
     owner(fd) != Owner::None
+}
+
+/// Whether `fd` is a socket a sim minted, live or gone with its sim: a descriptor of a network
+/// rather than of the process, which no other sim can take over.
+pub fn minted_socket(fd: c_int) -> bool {
+    matches!(owner(fd), Owner::Gone | Owner::Sim { local: false, .. })
 }
 
 /// Records that `sim` minted `fd` (see [`Owner::Sim`] for `local`).
@@ -208,8 +223,9 @@ pub(crate) fn claim_file(fd: c_int, serial: u64) {
     }
 }
 
-/// Forgets which file plane minted `fd`: closed, or replaced by another descriptor.
-pub(crate) fn release_file(fd: c_int) {
+/// Forgets which file plane minted `fd`: closed, or replaced by another descriptor, or a real file
+/// a plane watched, which outlives the sim that opened it.
+pub fn release_file(fd: c_int) {
     if let Some(entry) = slot_in(&FILES, fd, false) {
         entry.store(0, Ordering::Release);
     }

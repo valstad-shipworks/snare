@@ -1,5 +1,5 @@
-//! The Unix hooks for clocks, sleeps, threads, randomness, the environment, user ids and symbol
-//! lookup, plus the table of every Unix hook (see [`hooks()`]).
+//! The Unix hooks for clocks, local time, sleeps, threads, randomness, the environment, user ids,
+//! processor counts and symbol lookup, plus the table of every Unix hook (see [`hooks()`]).
 //!
 //! Each replacement offers its call to the managed thread's layers through `domain::dispatch` and
 //! its relatives, and makes the real call through the saved original when no layer handles it, or
@@ -32,6 +32,15 @@ static UNSETENV: AtomicUsize = AtomicUsize::new(0);
 static GETEUID: AtomicUsize = AtomicUsize::new(0);
 static GETUID: AtomicUsize = AtomicUsize::new(0);
 static UNAME: AtomicUsize = AtomicUsize::new(0);
+static TIME: AtomicUsize = AtomicUsize::new(0);
+static SYSCONF: AtomicUsize = AtomicUsize::new(0);
+static LOCALTIME_R: AtomicUsize = AtomicUsize::new(0);
+static LOCALTIME: AtomicUsize = AtomicUsize::new(0);
+static MKTIME: AtomicUsize = AtomicUsize::new(0);
+static TIMELOCAL: AtomicUsize = AtomicUsize::new(0);
+static TZSET: AtomicUsize = AtomicUsize::new(0);
+static CTIME_R: AtomicUsize = AtomicUsize::new(0);
+static CTIME: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(target_os = "linux")]
 static CLOCK_NANOSLEEP: AtomicUsize = AtomicUsize::new(0);
@@ -58,7 +67,7 @@ static ARC4RANDOM_BUF: AtomicUsize = AtomicUsize::new(0);
 static ARC4RANDOM: AtomicUsize = AtomicUsize::new(0);
 
 /// Every hook on this Unix target: those defined here, then the observed ones, DNS, sockets,
-/// synchronization, signals, files and host queries.
+/// synchronization, signals, files, host queries and, on macOS, CoreFoundation's time zone.
 static CLOCK_GETRES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "macos")]
 static NS_GET_ENVIRON: AtomicUsize = AtomicUsize::new(0);
@@ -68,6 +77,15 @@ pub(crate) fn hooks() -> Vec<Hook> {
         hook!("clock_gettime", clock_gettime, CLOCK_GETTIME),
         hook!("clock_getres", clock_getres, CLOCK_GETRES),
         hook!("gettimeofday", gettimeofday, GETTIMEOFDAY),
+        hook!("time", time, TIME),
+        hook!("localtime_r", localtime_r, LOCALTIME_R),
+        hook!("localtime", localtime, LOCALTIME),
+        hook!("mktime", mktime, MKTIME),
+        hook!("timelocal", timelocal, TIMELOCAL),
+        hook!("tzset", tzset, TZSET),
+        hook!("ctime_r", ctime_r, CTIME_R),
+        hook!("ctime", ctime, CTIME),
+        hook!("sysconf", sysconf, SYSCONF),
         hook!("nanosleep", nanosleep, NANOSLEEP),
         hook!("usleep", usleep, USLEEP),
         hook!("pthread_create", pthread_create, PTHREAD_CREATE),
@@ -120,10 +138,13 @@ pub(crate) fn hooks() -> Vec<Hook> {
     hooks.extend(crate::os::sync::hooks());
     hooks.extend(crate::os::signal_hooks::hooks());
     hooks.extend(crate::os::files::hooks());
+    hooks.extend(crate::os::vectored::hooks());
     #[cfg(target_os = "linux")]
     hooks.extend(crate::os::host::hooks());
     #[cfg(target_os = "macos")]
     hooks.extend(crate::os::host_macos::hooks());
+    #[cfg(target_os = "macos")]
+    hooks.extend(crate::os::tz_macos::hooks());
     hooks
 }
 
@@ -287,6 +308,181 @@ unsafe extern "C" fn gettimeofday(tv: *mut timeval, tz: *mut c_void) -> c_int {
     unsafe {
         original::<unsafe extern "C" fn(*mut timeval, *mut c_void) -> c_int>(&GETTIMEOFDAY)(tv, tz)
     }
+}
+
+/// `time` (man 2 time): the realtime clock in whole seconds, also stored through a non-null
+/// `tloc`.
+unsafe extern "C" fn time(tloc: *mut libc::time_t) -> libc::time_t {
+    if let Some(now) = virtual_now(ClockKind::Realtime) {
+        let secs = now.as_secs() as libc::time_t;
+        if !tloc.is_null() {
+            // SAFETY: the caller passed a writable time_t.
+            unsafe { tloc.write(secs) };
+        }
+        return secs;
+    }
+    // SAFETY: TIME holds libc's time.
+    unsafe { original::<unsafe extern "C" fn(*mut libc::time_t) -> libc::time_t>(&TIME)(tloc) }
+}
+
+/// `sysconf` (man 3 sysconf): the processor counts, `_SC_NPROCESSORS_CONF` and
+/// `_SC_NPROCESSORS_ONLN`, as the domain's host models them. Every other name, and the counts
+/// without a host that models them, go to libc, which reads them from the kernel itself (glibc
+/// from `/sys/devices/system/cpu`, macOS from the `hw.ncpu` and `hw.activecpu` sysctls) where no
+/// hook sees it.
+unsafe extern "C" fn sysconf(name: c_int) -> libc::c_long {
+    if (name == libc::_SC_NPROCESSORS_CONF || name == libc::_SC_NPROCESSORS_ONLN)
+        && let Some(r) = domain::dispatch_host(|h| h.sysconf(name))
+    {
+        return crate::os::sockets::finish(r) as libc::c_long;
+    }
+    // SAFETY: SYSCONF holds libc's sysconf.
+    unsafe { original::<unsafe extern "C" fn(c_int) -> libc::c_long>(&SYSCONF)(name) }
+}
+
+/// `localtime_r` (man 3 localtime_r): `t` broken down in the local zone. A sim that decides its
+/// own zone gets it from [`crate::os::tz`]; a year that does not fit `tm_year` is `EOVERFLOW`.
+unsafe extern "C" fn localtime_r(t: *const libc::time_t, tm: *mut libc::tm) -> *mut libc::tm {
+    if !t.is_null()
+        && !tm.is_null()
+        && let Some(zone) = crate::os::tz::current(false)
+    {
+        // SAFETY: the caller passed a readable time_t and a writable struct tm.
+        return unsafe { local_tm(&zone.zone, *t, &mut *tm) };
+    }
+    // SAFETY: LOCALTIME_R holds libc's localtime_r.
+    unsafe {
+        original::<unsafe extern "C" fn(*const libc::time_t, *mut libc::tm) -> *mut libc::tm>(
+            &LOCALTIME_R,
+        )(t, tm)
+    }
+}
+
+/// Breaks `t` down into `tm`, returning `tm`, or null with `EOVERFLOW`.
+fn local_tm(zone: &crate::os::tz::Zone, t: libc::time_t, tm: &mut libc::tm) -> *mut libc::tm {
+    if crate::os::tz::break_down(zone, t, tm) {
+        return tm;
+    }
+    // SAFETY: setting the calling thread's errno.
+    unsafe { crate::os::sockets::set_errno(libc::EOVERFLOW) };
+    std::ptr::null_mut()
+}
+
+thread_local! {
+    /// The `struct tm` `localtime` returns. POSIX lets it be one static object; one per thread
+    /// keeps threads from overwriting each other's.
+    static LOCAL_TM: std::cell::UnsafeCell<libc::tm> =
+        // SAFETY: all-zero is a valid struct tm (a null tm_zone included).
+        const { std::cell::UnsafeCell::new(unsafe { std::mem::zeroed() }) };
+}
+
+/// `localtime` (man 3 localtime): as `localtime_r` into storage of its own, after resolving the
+/// zone again, since it behaves as if it called tzset(3).
+unsafe extern "C" fn localtime(t: *const libc::time_t) -> *mut libc::tm {
+    if !t.is_null()
+        && let Some(zone) = crate::os::tz::current(true)
+        && let Ok(tm) = LOCAL_TM.try_with(std::cell::UnsafeCell::get)
+    {
+        // SAFETY: the caller passed a readable time_t; `tm` is this thread's.
+        return unsafe { local_tm(&zone.zone, *t, &mut *tm) };
+    }
+    // SAFETY: LOCALTIME holds libc's localtime.
+    unsafe {
+        original::<unsafe extern "C" fn(*const libc::time_t) -> *mut libc::tm>(&LOCALTIME)(t)
+    }
+}
+
+/// `mktime` (man 3 mktime): the local time `tm` names, normalizing and completing `tm`, or `-1`;
+/// see [`crate::os::tz::make_time`].
+unsafe extern "C" fn mktime(tm: *mut libc::tm) -> libc::time_t {
+    if let Some(r) = sim_mktime(tm) {
+        return r;
+    }
+    // SAFETY: MKTIME holds libc's mktime.
+    unsafe { original::<unsafe extern "C" fn(*mut libc::tm) -> libc::time_t>(&MKTIME)(tm) }
+}
+
+/// `timelocal`, the BSD and glibc name for `mktime` (man 3 timelocal).
+unsafe extern "C" fn timelocal(tm: *mut libc::tm) -> libc::time_t {
+    if let Some(r) = sim_mktime(tm) {
+        return r;
+    }
+    // SAFETY: TIMELOCAL holds libc's timelocal.
+    unsafe { original::<unsafe extern "C" fn(*mut libc::tm) -> libc::time_t>(&TIMELOCAL)(tm) }
+}
+
+fn sim_mktime(tm: *mut libc::tm) -> Option<libc::time_t> {
+    if tm.is_null() {
+        return None;
+    }
+    let zone = crate::os::tz::current(true)?;
+    // SAFETY: the caller passed a readable and writable struct tm.
+    match crate::os::tz::make_time(&zone.zone, unsafe { &mut *tm }) {
+        Ok(t) => Some(t),
+        Err(errno) => {
+            if let Some(errno) = errno {
+                // SAFETY: setting the calling thread's errno.
+                unsafe { crate::os::sockets::set_errno(errno) };
+            }
+            Some(-1)
+        }
+    }
+}
+
+/// `tzset` (man 3 tzset): makes every thread resolve its sim zone again, then lets libc reread
+/// the process's own setting.
+unsafe extern "C" fn tzset() {
+    crate::os::tz::invalidate();
+    // SAFETY: TZSET holds libc's tzset.
+    unsafe { original::<unsafe extern "C" fn()>(&TZSET)() }
+}
+
+/// `ctime_r` (man 3 ctime_r): `asctime_r(localtime_r(t))`, which libc would do with its own zone.
+unsafe extern "C" fn ctime_r(t: *const libc::time_t, buf: *mut c_char) -> *mut c_char {
+    if !t.is_null()
+        && !buf.is_null()
+        && let Some(zone) = crate::os::tz::current(false)
+    {
+        // SAFETY: all-zero is a valid struct tm.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        // SAFETY: the caller passed a readable time_t.
+        if local_tm(&zone.zone, unsafe { *t }, &mut tm).is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: `buf` holds at least 26 bytes, as ctime_r requires.
+        return unsafe { libc::asctime_r(&tm, buf) };
+    }
+    // SAFETY: CTIME_R holds libc's ctime_r.
+    unsafe {
+        original::<unsafe extern "C" fn(*const libc::time_t, *mut c_char) -> *mut c_char>(&CTIME_R)(
+            t, buf,
+        )
+    }
+}
+
+thread_local! {
+    /// The string `ctime` returns, one per thread as for [`LOCAL_TM`].
+    static CTIME_BUF: std::cell::UnsafeCell<[c_char; 26]> =
+        const { std::cell::UnsafeCell::new([0; 26]) };
+}
+
+/// `ctime` (man 3 ctime): `asctime(localtime(t))`.
+unsafe extern "C" fn ctime(t: *const libc::time_t) -> *mut c_char {
+    if !t.is_null()
+        && let Some(zone) = crate::os::tz::current(true)
+        && let Ok(buf) = CTIME_BUF.try_with(std::cell::UnsafeCell::get)
+    {
+        // SAFETY: all-zero is a valid struct tm.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        // SAFETY: the caller passed a readable time_t.
+        if local_tm(&zone.zone, unsafe { *t }, &mut tm).is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: `buf` is this thread's 26 bytes.
+        return unsafe { libc::asctime_r(&tm, buf.cast()) };
+    }
+    // SAFETY: CTIME holds libc's ctime.
+    unsafe { original::<unsafe extern "C" fn(*const libc::time_t) -> *mut c_char>(&CTIME)(t) }
 }
 
 /// `nanosleep` (man 2 nanosleep): relative sleep; on early return (`EINTR`) the unslept time is
@@ -785,6 +981,12 @@ unsafe extern "C" fn syscall(
     if let Some(r) = net_syscall(number, [a, b, c, d, e, f]) {
         return crate::os::sockets::finish(r);
     }
+    if let Some(r) = clock_syscall(number, [a, b, c, d]) {
+        return r;
+    }
+    if number == libc::SYS_sched_yield {
+        domain::yield_point();
+    }
     // A managed host may model this number (fast-talker reaches the sched policy family only here,
     // since musl stubs the named wrappers). It diverts only numbers it recognises; the rest forward.
     // SYS_sched_setscheduler / SYS_sched_getscheduler etc.: man 2 sched_setscheduler.
@@ -812,6 +1014,97 @@ unsafe extern "C" fn syscall(
                 usize,
             ) -> libc::c_long,
         >(&SYSCALL)(number, a, b, c, d, e, f)
+    }
+}
+
+/// The raw-syscall forms of the clock, sleep, entropy and thread-id calls hooked by name, modelled
+/// as their wrappers are: getrandom 0.2 fills buffers with `syscall(SYS_getrandom, ..)`, and the
+/// kernel entry is the same whichever way it is called. `None` forwards the call. The result is
+/// the `syscall(2)` wrapper's, `-1` with errno on failure; the success values of these calls are
+/// their wrappers' (man 2 getrandom, clock_gettime, gettimeofday, time, nanosleep,
+/// clock_nanosleep, gettid). `SYS_time` exists on x86_64 only (`<asm/unistd_64.h>`).
+#[cfg(target_os = "linux")]
+fn clock_syscall(number: libc::c_long, [a, b, c, d]: [usize; 4]) -> Option<libc::c_long> {
+    use crate::os::sockets::finish;
+    match number {
+        libc::SYS_getrandom => virtual_random(a as *mut c_void, b).then_some(b as libc::c_long),
+        libc::SYS_clock_gettime | libc::SYS_clock_getres if (a as clockid_t) < 0 => {
+            let (id, buf) = (a as clockid_t, b as *mut u8);
+            domain::dispatch_host(|host| unsafe {
+                if number == libc::SYS_clock_gettime {
+                    host.clock_gettime(id, buf)
+                } else {
+                    host.clock_getres(id, buf)
+                }
+            })
+            .map(finish)
+        }
+        libc::SYS_clock_gettime => {
+            let tp = b as *mut timespec;
+            if tp.is_null() {
+                return None;
+            }
+            let now = clock_kind(a as clockid_t).and_then(virtual_now)?;
+            // SAFETY: the caller passed a writable timespec.
+            unsafe { tp.write(to_timespec(now)) };
+            Some(0)
+        }
+        libc::SYS_gettimeofday => {
+            let tv = a as *mut timeval;
+            if tv.is_null() {
+                return None;
+            }
+            let now = virtual_now(ClockKind::Realtime)?;
+            // SAFETY: the caller passed a writable timeval.
+            unsafe {
+                tv.write(timeval {
+                    tv_sec: now.as_secs() as _,
+                    tv_usec: now.subsec_micros() as _,
+                })
+            };
+            Some(0)
+        }
+        #[cfg(target_arch = "x86_64")]
+        libc::SYS_time => {
+            let secs = virtual_now(ClockKind::Realtime)?.as_secs() as libc::time_t;
+            let tloc = a as *mut libc::time_t;
+            if !tloc.is_null() {
+                // SAFETY: the caller passed a writable time_t.
+                unsafe { tloc.write(secs) };
+            }
+            Some(secs)
+        }
+        libc::SYS_nanosleep => {
+            // SAFETY: a non-null request points to a readable timespec.
+            let duration = unsafe { (a as *const timespec).as_ref() }.and_then(from_timespec)?;
+            dispatch(|layer| layer.sleep(SleepRequest::For(duration)))?;
+            let remaining = b as *mut timespec;
+            if !remaining.is_null() {
+                // SAFETY: the caller passed a writable timespec.
+                unsafe { remaining.write(to_timespec(Duration::ZERO)) };
+            }
+            Some(0)
+        }
+        libc::SYS_clock_nanosleep => {
+            let (kind, flags) = (clock_kind(a as clockid_t)?, b as c_int);
+            // SAFETY: a non-null request points to a readable timespec.
+            let time = unsafe { (c as *const timespec).as_ref() }.and_then(from_timespec)?;
+            let absolute = flags & libc::TIMER_ABSTIME != 0;
+            let sleep = if absolute {
+                SleepRequest::Until(kind, time)
+            } else {
+                SleepRequest::For(time)
+            };
+            dispatch(|layer| layer.sleep(sleep))?;
+            let remaining = d as *mut timespec;
+            if !remaining.is_null() && !absolute {
+                // SAFETY: the caller passed a writable timespec.
+                unsafe { remaining.write(to_timespec(Duration::ZERO)) };
+            }
+            Some(0)
+        }
+        libc::SYS_gettid => domain::dispatch_host(|h| h.gettid()).map(finish),
+        _ => None,
     }
 }
 

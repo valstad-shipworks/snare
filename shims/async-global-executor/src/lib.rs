@@ -28,7 +28,6 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 
-
 pub use async_executor::Task;
 pub use config::GlobalExecutorConfig;
 pub use executor::{block_on, spawn, spawn_blocking, spawn_local};

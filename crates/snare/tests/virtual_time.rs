@@ -18,7 +18,7 @@ fn vsim() -> Sim {
 
 #[test]
 fn reads_a_fixed_epoch_without_ticking() {
-    vsim().run(|| {
+    Sim::builder().fixed_epoch().build().run(|| {
         // Discrete: successive reads do not advance time on their own.
         let a = Instant::now();
         let b = Instant::now();
@@ -45,7 +45,7 @@ fn lone_sleep_skips_virtual_time() {
 
 #[test]
 fn advance_time_steps_the_clock() {
-    let sim = vsim();
+    let sim = Sim::builder().fixed_epoch().build();
     sim.run(|| {
         let start = Instant::now();
         assert!(start.elapsed() < Duration::from_millis(1));

@@ -1,6 +1,6 @@
 use crate::Task;
-use async_executor::{Executor, LocalExecutor};
 use async_channel::{Receiver, Sender};
+use async_executor::{Executor, LocalExecutor};
 use async_lock::Mutex;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};

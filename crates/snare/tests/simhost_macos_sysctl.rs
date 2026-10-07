@@ -99,3 +99,157 @@ fn too_small_a_buffer_is_enomem() {
         );
     });
 }
+
+/// `sysctlbyname(name)` as an `int`, or the errno.
+fn hw_int(name: &std::ffi::CStr) -> Result<i32, i32> {
+    let mut value: i32 = 0;
+    let mut len = size_of::<i32>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&raw mut value).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().raw_os_error().unwrap());
+    }
+    assert_eq!(len, size_of::<i32>());
+    Ok(value)
+}
+
+#[test]
+fn hw_cpu_counts_follow_the_profile() {
+    let host = HostProfile::new().cpus(6).online([0, 1, 2, 3]).build();
+    Sim::builder().host(host).build().run(|| {
+        assert_eq!(hw_int(c"hw.ncpu"), Ok(6));
+        assert_eq!(hw_int(c"hw.logicalcpu_max"), Ok(6));
+        assert_eq!(hw_int(c"hw.physicalcpu_max"), Ok(6));
+        assert_eq!(hw_int(c"hw.activecpu"), Ok(4));
+        assert_eq!(hw_int(c"hw.logicalcpu"), Ok(4));
+        assert_eq!(hw_int(c"hw.physicalcpu"), Ok(4));
+        if cfg!(target_arch = "aarch64") {
+            assert_eq!(hw_int(c"hw.nperflevels"), Ok(1));
+            assert_eq!(hw_int(c"hw.perflevel0.logicalcpu_max"), Ok(6));
+            assert_eq!(hw_int(c"hw.perflevel0.physicalcpu"), Ok(4));
+            assert_eq!(hw_int(c"hw.perflevel1.logicalcpu"), Err(libc::ENOENT));
+            let mut mib = [0 as libc::c_int; 4];
+            let mut len = mib.len();
+            let rc = unsafe {
+                libc::sysctlnametomib(c"hw.perflevel1.name".as_ptr(), mib.as_mut_ptr(), &mut len)
+            };
+            assert_eq!(rc, -1);
+            let mut name = [0u8; 32];
+            let mut len = name.len();
+            let rc = unsafe {
+                libc::sysctlbyname(
+                    c"hw.perflevel0.name".as_ptr(),
+                    name.as_mut_ptr().cast(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(rc, 0);
+            assert_eq!(&name[..len], b"Performance\0");
+        }
+    });
+}
+
+#[test]
+fn hw_cpu_counts_by_mib() {
+    let host = HostProfile::new().cpus(3).build();
+    Sim::builder().host(host).build().run(|| {
+        let read = |mib: &mut [libc::c_int]| {
+            let mut value: i32 = 0;
+            let mut len = size_of::<i32>();
+            let rc = unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    mib.len() as u32,
+                    (&raw mut value).cast(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(rc, 0);
+            value
+        };
+        assert_eq!(read(&mut [libc::CTL_HW, libc::HW_NCPU]), 3);
+        let mut mib = [0 as libc::c_int; 4];
+        let mut len = mib.len();
+        let rc = unsafe {
+            libc::sysctlnametomib(c"hw.physicalcpu".as_ptr(), mib.as_mut_ptr(), &mut len)
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(read(&mut mib[..len]), 3);
+    });
+}
+
+/// The calling conventions of a read-only `int` node, as `(rc, errno, len)` for: a size query, a
+/// short buffer, a long buffer, a write, and a null length pointer.
+fn hw_ncpu_conventions() -> Vec<(i32, i32, usize)> {
+    let name = c"hw.ncpu".as_ptr();
+    let errno = || std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    let mut out = Vec::new();
+    unsafe {
+        let mut len = 0usize;
+        let rc = libc::sysctlbyname(
+            name,
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        );
+        out.push((rc, if rc == 0 { 0 } else { errno() }, len));
+        let mut short = [0u8; 2];
+        let mut len = short.len();
+        let rc = libc::sysctlbyname(
+            name,
+            short.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        );
+        out.push((rc, if rc == 0 { 0 } else { errno() }, len));
+        let mut long = [0u8; 8];
+        let mut len = long.len();
+        let rc = libc::sysctlbyname(
+            name,
+            long.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        );
+        out.push((rc, if rc == 0 { 0 } else { errno() }, len));
+        let mut value: i32 = 2;
+        let rc = libc::sysctlbyname(
+            name,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            (&raw mut value).cast(),
+            4,
+        );
+        out.push((rc, if rc == 0 { 0 } else { errno() }, 0));
+        let rc = libc::sysctlbyname(
+            name,
+            long.as_mut_ptr().cast(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        );
+        out.push((rc, if rc == 0 { 0 } else { errno() }, 0));
+    }
+    out
+}
+
+#[test]
+fn hw_ncpu_conventions_os_truth() {
+    let real = hw_ncpu_conventions();
+    let host = HostProfile::new().cpus(3).build();
+    let sim = Sim::builder().host(host).build().run(hw_ncpu_conventions);
+    assert_eq!(sim, real);
+}

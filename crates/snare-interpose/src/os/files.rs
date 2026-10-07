@@ -23,6 +23,7 @@ use std::sync::atomic::AtomicUsize;
 use libc::{mode_t, off_t};
 
 use crate::domain::{self, FilePlane, dispatch_fs, dispatch_fs_fd, fs_owns};
+use crate::fs::{SetTimes, TimeSet};
 use crate::hooks::{Hook, hook, original};
 use crate::os::sockets::{finish, finish_ptr};
 use crate::state::Passthrough;
@@ -142,6 +143,7 @@ slot!(PREAD);
 slot!(PWRITE);
 slot!(FTRUNCATE);
 slot!(FSYNC);
+slot!(FLOCK);
 slot!(UNLINK);
 slot!(UNLINKAT);
 slot!(RMDIR);
@@ -188,6 +190,14 @@ slot!(OPENAT64);
 slot!(CREAT64);
 #[cfg(target_os = "linux")]
 slot!(LSEEK64);
+slot!(UTIMENSAT);
+slot!(FUTIMENS);
+slot!(UTIMES);
+slot!(FUTIMES);
+#[cfg(target_os = "macos")]
+slot!(SETATTRLIST);
+#[cfg(target_os = "macos")]
+slot!(FSETATTRLIST);
 
 /// The file hooks for this target, under each OS's exported symbol names.
 pub(crate) fn hooks() -> Vec<Hook> {
@@ -206,6 +216,7 @@ pub(crate) fn hooks() -> Vec<Hook> {
         hook!("pwrite", pwrite, PWRITE),
         hook!("ftruncate", ftruncate, FTRUNCATE),
         hook!("fsync", fsync, FSYNC),
+        hook!("flock", flock, FLOCK),
         hook!("unlink", unlink, UNLINK),
         hook!("unlinkat", unlinkat, UNLINKAT),
         hook!("rmdir", rmdir, RMDIR),
@@ -317,6 +328,14 @@ pub(crate) fn hooks() -> Vec<Hook> {
         hook!("creat64", creat64, CREAT64),
         #[cfg(target_os = "linux")]
         hook!("lseek64", lseek64, LSEEK64),
+        hook!("utimensat", utimensat, UTIMENSAT),
+        hook!("futimens", futimens, FUTIMENS),
+        hook!("utimes", utimes, UTIMES),
+        hook!("futimes", futimes, FUTIMES),
+        #[cfg(target_os = "macos")]
+        hook!("setattrlist", setattrlist, SETATTRLIST),
+        #[cfg(target_os = "macos")]
+        hook!("fsetattrlist", fsetattrlist, FSETATTRLIST),
     ]
 }
 
@@ -568,9 +587,10 @@ unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_int {
     }
     // SAFETY: STAT holds libc's stat.
     path_fallback!(resolved_path);
-    unsafe {
+    let result = unsafe {
         original::<unsafe extern "C" fn(*const c_char, *mut libc::stat) -> c_int>(&STAT)(path, buf)
-    }
+    };
+    host_metadata(result, buf.cast(), false)
 }
 
 /// Hook for `lstat(2)`.
@@ -583,9 +603,10 @@ unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_int {
     }
     // SAFETY: LSTAT holds libc's lstat.
     path_fallback!(resolved_path);
-    unsafe {
+    let result = unsafe {
         original::<unsafe extern "C" fn(*const c_char, *mut libc::stat) -> c_int>(&LSTAT)(path, buf)
-    }
+    };
+    host_metadata(result, buf.cast(), false)
 }
 
 /// Hook for `fstat(2)`, offered only for an fd the backend owns.
@@ -595,7 +616,9 @@ unsafe extern "C" fn fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
         return finish(r) as c_int;
     }
     // SAFETY: FSTAT holds libc's fstat.
-    unsafe { original::<unsafe extern "C" fn(c_int, *mut libc::stat) -> c_int>(&FSTAT)(fd, buf) }
+    let result =
+        unsafe { original::<unsafe extern "C" fn(c_int, *mut libc::stat) -> c_int>(&FSTAT)(fd, buf) };
+    host_metadata(result, buf.cast(), false)
 }
 
 unsafe extern "C" fn pread(fd: c_int, buf: *mut libc::c_void, len: usize, offset: off_t) -> isize {
@@ -637,6 +660,13 @@ unsafe extern "C" fn fsync(fd: c_int) -> c_int {
         return finish(r) as c_int;
     }
     unsafe { original::<unsafe extern "C" fn(c_int) -> c_int>(&FSYNC)(fd) }
+}
+
+unsafe extern "C" fn flock(fd: c_int, operation: c_int) -> c_int {
+    if let Some(r) = dispatch_fs_fd(fd, |fs| unsafe { fs.flock(fd, operation) }) {
+        return finish(r) as c_int;
+    }
+    unsafe { original::<unsafe extern "C" fn(c_int, c_int) -> c_int>(&FLOCK)(fd, operation) }
 }
 
 unsafe extern "C" fn unlink(path: *const c_char) -> c_int {
@@ -688,11 +718,12 @@ unsafe extern "C" fn fstatat(
     }
     // SAFETY: FSTATAT holds libc's fstatat.
     path_fallback!(resolved_path);
-    unsafe {
+    let result = unsafe {
         original::<unsafe extern "C" fn(c_int, *const c_char, *mut libc::stat, c_int) -> c_int>(
             &FSTATAT,
         )(dirfd, path, buf, flags)
-    }
+    };
+    host_metadata(result, buf.cast(), false)
 }
 
 /// Hook for `statx(2)` (Linux), which Rust's `std::fs::metadata` tries first on Linux.
@@ -717,11 +748,12 @@ unsafe extern "C" fn statx(
     }
     // SAFETY: STATX holds libc's statx.
     path_fallback!(resolved_path);
-    unsafe {
+    let result = unsafe {
         original::<unsafe extern "C" fn(c_int, *const c_char, c_int, u32, *mut libc::statx) -> c_int>(
             &STATX,
         )(dirfd, path, flags, mask, buf)
-    }
+    };
+    host_metadata(result, buf.cast(), true)
 }
 
 unsafe extern "C" fn rmdir(path: *const c_char) -> c_int {
@@ -1185,5 +1217,274 @@ unsafe extern "C" fn faccessat(
         original::<unsafe extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int>(&FACCESSAT)(
             dirfd, path, mode, flags,
         )
+    }
+}
+
+/// Shows the domain's file plane a `struct stat` (or `struct statx`) the OS filled successfully,
+/// so it may restate the timestamps on the sim's clock ([`Fs::host_metadata`](crate::Fs)).
+fn host_metadata(result: c_int, buf: *mut u8, statx: bool) -> c_int {
+    if result == 0 && !buf.is_null() {
+        dispatch_fs(|fs| {
+            // SAFETY: the OS just filled `buf` as the structure `statx` names.
+            unsafe { fs.host_metadata(buf, statx) };
+            None
+        });
+    }
+    result
+}
+
+/// man 2 utimensat: `UTIME_NOW` and `UTIME_OMIT` in `tv_nsec` select the current time or leave
+/// the timestamp alone; any other `tv_nsec` outside `0..1e9` is `EINVAL`.
+fn timespec_time(time: &libc::timespec) -> Option<TimeSet> {
+    match time.tv_nsec {
+        libc::UTIME_OMIT => Some(TimeSet::Omit),
+        libc::UTIME_NOW => Some(TimeSet::Now),
+        nanos @ 0..1_000_000_000 => Some(TimeSet::At(
+            i128::from(time.tv_sec) * 1_000_000_000 + i128::from(nanos),
+        )),
+        _ => None,
+    }
+}
+
+/// The access and modification times of a `utimensat`/`futimens` call; a null `times` sets both
+/// to the current time (man 2 utimensat). `None` for an invalid `timespec`.
+unsafe fn timespec_times(times: *const libc::timespec) -> Option<SetTimes> {
+    if times.is_null() {
+        return Some(SetTimes {
+            accessed: TimeSet::Now,
+            modified: TimeSet::Now,
+            created: TimeSet::Omit,
+        });
+    }
+    // SAFETY: a non-null `times` points to two timespecs (man 2 utimensat).
+    let [accessed, modified] = unsafe { times.cast::<[libc::timespec; 2]>().read() };
+    Some(SetTimes {
+        accessed: timespec_time(&accessed)?,
+        modified: timespec_time(&modified)?,
+        created: TimeSet::Omit,
+    })
+}
+
+/// The times of a `utimes`/`futimes` call: a null `times` is the current time for both, and a
+/// `tv_usec` outside `0..1e6` is `EINVAL` (man 2 utimes; POSIX `utimes`).
+unsafe fn timeval_times(times: *const libc::timeval) -> Option<SetTimes> {
+    if times.is_null() {
+        return Some(SetTimes {
+            accessed: TimeSet::Now,
+            modified: TimeSet::Now,
+            created: TimeSet::Omit,
+        });
+    }
+    // SAFETY: a non-null `times` points to two timevals (man 2 utimes).
+    let [accessed, modified] = unsafe { times.cast::<[libc::timeval; 2]>().read() };
+    let at = |time: libc::timeval| {
+        (0..1_000_000).contains(&time.tv_usec).then(|| {
+            TimeSet::At(
+                i128::from(time.tv_sec) * 1_000_000_000 + i128::from(time.tv_usec) * 1_000,
+            )
+        })
+    };
+    Some(SetTimes {
+        accessed: at(accessed)?,
+        modified: at(modified)?,
+        created: TimeSet::Omit,
+    })
+}
+
+/// The body of every timestamp-setting hook: offers the call to the plane serving the file, else
+/// runs `real` (with the path resolved against a virtual working directory) and, if the OS set
+/// the times, tells the domain's plane. A null `path` names the descriptor `dirfd`.
+unsafe fn set_times(
+    dirfd: c_int,
+    path: *const c_char,
+    times: SetTimes,
+    flags: c_int,
+    real: impl FnOnce(*const c_char) -> c_int,
+) -> c_int {
+    let served = if path.is_null() {
+        dispatch_fs_fd(dirfd, |fs| unsafe { fs.set_times(dirfd, path, &times, flags) })
+    } else {
+        None
+    };
+    if let Some(r) = served {
+        return finish(r) as c_int;
+    }
+    path_argument!(path, resolved_path, dirfd);
+    if !path.is_null()
+        && let Some(r) = dispatch_fs(|fs| unsafe { fs.set_times(dirfd, path, &times, flags) })
+    {
+        return finish(r) as c_int;
+    }
+    path_fallback!(resolved_path);
+    let result = real(path);
+    if result == 0 {
+        dispatch_fs(|fs| {
+            unsafe { fs.host_times_set(dirfd, path, &times, flags) };
+            None
+        });
+    }
+    result
+}
+
+/// Hook for `utimensat(2)`. glibc rejects a null `path` itself (`EINVAL`), so only a named file is
+/// offered to the planes.
+unsafe extern "C" fn utimensat(
+    dirfd: c_int,
+    path: *const c_char,
+    times: *const libc::timespec,
+    flags: c_int,
+) -> c_int {
+    let real = |path| unsafe {
+        original::<unsafe extern "C" fn(c_int, *const c_char, *const libc::timespec, c_int) -> c_int>(
+            &UTIMENSAT,
+        )(dirfd, path, times, flags)
+    };
+    match unsafe { timespec_times(times) } {
+        Some(set) if !path.is_null() => unsafe { set_times(dirfd, path, set, flags, real) },
+        _ => real(path),
+    }
+}
+
+/// Hook for `futimens(3)`, `utimensat` on the descriptor itself.
+unsafe extern "C" fn futimens(fd: c_int, times: *const libc::timespec) -> c_int {
+    let real = |_| unsafe {
+        original::<unsafe extern "C" fn(c_int, *const libc::timespec) -> c_int>(&FUTIMENS)(
+            fd, times,
+        )
+    };
+    match unsafe { timespec_times(times) } {
+        Some(set) => unsafe { set_times(fd, std::ptr::null(), set, 0, real) },
+        None => real(std::ptr::null()),
+    }
+}
+
+/// Hook for `utimes(2)`: microsecond times, following a final symlink.
+unsafe extern "C" fn utimes(path: *const c_char, times: *const libc::timeval) -> c_int {
+    let real = |path| unsafe {
+        original::<unsafe extern "C" fn(*const c_char, *const libc::timeval) -> c_int>(&UTIMES)(
+            path, times,
+        )
+    };
+    match unsafe { timeval_times(times) } {
+        Some(set) if !path.is_null() => unsafe {
+            set_times(libc::AT_FDCWD, path, set, 0, real)
+        },
+        _ => real(path),
+    }
+}
+
+/// Hook for `futimes(3)`.
+unsafe extern "C" fn futimes(fd: c_int, times: *const libc::timeval) -> c_int {
+    let real = |_| unsafe {
+        original::<unsafe extern "C" fn(c_int, *const libc::timeval) -> c_int>(&FUTIMES)(fd, times)
+    };
+    match unsafe { timeval_times(times) } {
+        Some(set) => unsafe { set_times(fd, std::ptr::null(), set, 0, real) },
+        None => real(std::ptr::null()),
+    }
+}
+
+/// The times a macOS `setattrlist(2)` call sets, when it sets nothing but the creation,
+/// modification and access times and takes no option beyond `FSOPT_NOFOLLOW`, as std's
+/// `set_times` calls it; `(times, at_flags)`. The buffer packs the requested attributes as
+/// `timespec`s in attribute-bit order (`<sys/attr.h>`; man 2 getattrlist, "attribute buffer").
+#[cfg(target_os = "macos")]
+unsafe fn attrlist_times(
+    list: *const libc::attrlist,
+    buf: *const libc::c_void,
+    size: usize,
+    options: u32,
+) -> Option<(SetTimes, c_int)> {
+    if list.is_null() || options & !libc::FSOPT_NOFOLLOW != 0 {
+        return None;
+    }
+    // SAFETY: a non-null `list` is the caller's attrlist.
+    let list = unsafe { list.read() };
+    let settable = libc::ATTR_CMN_CRTIME | libc::ATTR_CMN_MODTIME | libc::ATTR_CMN_ACCTIME;
+    if list.bitmapcount != libc::ATTR_BIT_MAP_COUNT
+        || list.commonattr & !settable != 0
+        || list.volattr | list.dirattr | list.fileattr | list.forkattr != 0
+    {
+        return None;
+    }
+    let count = list.commonattr.count_ones() as usize;
+    let size_needed = count * std::mem::size_of::<libc::timespec>();
+    if buf.is_null() || size < size_needed {
+        return None;
+    }
+    let mut next = buf.cast::<libc::timespec>();
+    let mut take = |bit| {
+        if list.commonattr & bit == 0 {
+            return Some(TimeSet::Omit);
+        }
+        // SAFETY: `size` covers one timespec per requested attribute, read unaligned.
+        let time = unsafe { next.read_unaligned() };
+        next = unsafe { next.add(1) };
+        (0..1_000_000_000).contains(&time.tv_nsec).then(|| {
+            TimeSet::At(i128::from(time.tv_sec) * 1_000_000_000 + i128::from(time.tv_nsec))
+        })
+    };
+    let created = take(libc::ATTR_CMN_CRTIME)?;
+    let modified = take(libc::ATTR_CMN_MODTIME)?;
+    let accessed = take(libc::ATTR_CMN_ACCTIME)?;
+    let flags = if options & libc::FSOPT_NOFOLLOW != 0 {
+        libc::AT_SYMLINK_NOFOLLOW
+    } else {
+        0
+    };
+    Some((
+        SetTimes {
+            accessed,
+            modified,
+            created,
+        },
+        flags,
+    ))
+}
+
+/// Hook for macOS `setattrlist(2)`, offered to the planes only as a pure timestamp call (see
+/// [`attrlist_times`]).
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn setattrlist(
+    path: *const c_char,
+    list: *mut libc::attrlist,
+    buf: *mut libc::c_void,
+    size: usize,
+    options: u32,
+) -> c_int {
+    type SetattrlistFn = unsafe extern "C" fn(
+        *const c_char,
+        *mut libc::attrlist,
+        *mut libc::c_void,
+        usize,
+        u32,
+    ) -> c_int;
+    let real = |path| unsafe {
+        original::<SetattrlistFn>(&SETATTRLIST)(path, list, buf, size, options)
+    };
+    match unsafe { attrlist_times(list, buf, size, options) } {
+        Some((set, flags)) if !path.is_null() => unsafe {
+            set_times(libc::AT_FDCWD, path, set, flags, real)
+        },
+        _ => real(path),
+    }
+}
+
+/// Hook for macOS `fsetattrlist(2)`, which std's `File::set_times` calls.
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn fsetattrlist(
+    fd: c_int,
+    list: *mut libc::attrlist,
+    buf: *mut libc::c_void,
+    size: usize,
+    options: u32,
+) -> c_int {
+    type FsetattrlistFn =
+        unsafe extern "C" fn(c_int, *mut libc::attrlist, *mut libc::c_void, usize, u32) -> c_int;
+    let real =
+        |_| unsafe { original::<FsetattrlistFn>(&FSETATTRLIST)(fd, list, buf, size, options) };
+    match unsafe { attrlist_times(list, buf, size, options) } {
+        Some((set, _)) => unsafe { set_times(fd, std::ptr::null(), set, 0, real) },
+        None => real(std::ptr::null()),
     }
 }

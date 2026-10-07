@@ -264,10 +264,10 @@ fn getrandom_ignores_its_flags_and_has_no_length_cap() {
         (n, buf)
     });
     assert_eq!(raw.0, 8);
-    assert_ne!(
+    assert_eq!(
         raw.1.to_vec(),
         want[0],
-        "the raw syscall is not served from the stream"
+        "the raw syscall draws the same stream as the wrapper"
     );
 }
 

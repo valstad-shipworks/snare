@@ -5,8 +5,8 @@
 //! TCP connections to one listener with an explicit large backlog are accepted in connect
 //! order, each from the next ephemeral port. The ephemeral range filling up is pinned too.
 //!
-//! The descriptors themselves are real ones `dup`ed from `/dev/null`, so their numbers belong to
-//! the process (other tests in the binary hold some) and only their distinctness is pinned. Each
+//! The descriptors themselves are real ones `dup`ed from one placeholder, so their numbers belong
+//! to the process (other tests in the binary hold some) and only their distinctness is pinned. Each
 //! test raises the soft `RLIMIT_NOFILE` to the hard limit first, so the default macOS limit of 256
 //! does not end a run early.
 

@@ -185,7 +185,7 @@ fn rate_change_never_goes_backwards() {
 
 #[test]
 fn set_time_value_jumps_forward() {
-    let sim = Sim::new();
+    let sim = Sim::builder().fixed_epoch().build();
     let v = Duration::from_millis(1_234_500);
     sim.set_time_value(v);
     assert_eq!(sim.time_value(), v);

@@ -629,7 +629,7 @@ impl LinkState {
                 #[cfg(target_os = "macos")]
                 let ago = shared
                     .stamp()
-                    .saturating_sub(at.timeline_at(shared.real_origin()));
+                    .saturating_sub(at.timeline_at(shared.real_origin(), shared.clock.as_deref()));
                 #[cfg(not(target_os = "macos"))]
                 let ago = at.overdue();
                 shared.record_ago(

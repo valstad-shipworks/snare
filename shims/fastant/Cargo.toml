@@ -1,0 +1,63 @@
+[package]
+edition = "2021"
+name = "fastant"
+version = "0.1.11"
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+description = "snare drop-in shim for fastant: under cfg(snare) the TSC is never used, so time comes from the OS clock"
+publish = false
+homepage = "https://github.com/fast/fastant"
+documentation = "https://docs.rs/fastant"
+keywords = [
+    "TSC",
+    "clock",
+    "rdtsc",
+    "timing",
+    "nanosecond",
+]
+license = "MIT"
+repository = "https://github.com/fast/fastant"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = [
+    "--cfg",
+    "docsrs",
+]
+
+[features]
+atomic = []
+fallback-coarse = ["coarsetime"]
+
+[lib]
+name = "fastant"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies.coarsetime]
+version = "0.1"
+optional = true
+
+[dependencies.small_ctor]
+version = "0.1.2"
+
+[dependencies.web-time]
+version = "1.1.0"
+
+[dev-dependencies.rand]
+version = "0.9.0"
+
+[dev-dependencies.wasm-bindgen-test]
+version = "0.3.50"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies.getrandom]
+version = "0.3"
+features = ["wasm_js"]
+
+[target.'cfg(snare)'.dev-dependencies.snare]
+path = "../../crates/snare"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(snare)"] }

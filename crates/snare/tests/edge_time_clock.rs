@@ -40,7 +40,7 @@ type NamedBuilder = (&'static str, fn() -> SimBuilder);
 
 fn builders() -> [NamedBuilder; 2] {
     [
-        ("discrete", Sim::builder as fn() -> SimBuilder),
+        ("discrete", || Sim::builder().fixed_epoch()),
         ("deterministic", || Sim::builder().deterministic().seed(7)),
     ]
 }
@@ -58,7 +58,11 @@ fn pin_each<T: PartialEq + std::fmt::Debug>(
     deterministic: T,
     scenario: impl Fn() -> T + Sync,
 ) {
-    assert_eq!(Sim::new().run(&scenario), discrete, "discrete");
+    assert_eq!(
+        Sim::builder().fixed_epoch().build().run(&scenario),
+        discrete,
+        "discrete"
+    );
     let det = || {
         Sim::builder()
             .deterministic()

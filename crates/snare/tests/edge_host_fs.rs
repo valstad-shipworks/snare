@@ -24,7 +24,7 @@ fn errno() -> i32 {
 }
 
 fn sim(fs: Arc<VirtualFs>) -> Sim {
-    Sim::builder().fs(fs).build()
+    Sim::builder().fs(fs).fixed_epoch().build()
 }
 
 fn owned() -> FsBuilder {
@@ -162,9 +162,12 @@ fn stat_fields_are_fixed() {
         assert_eq!(st.st_blocks as i64, 8);
         assert_eq!((st.st_uid, st.st_gid), (uid, gid));
         assert_eq!(st.st_ino as u64 & 1, 1);
+        // Declared nodes carry the instant the sim was built, Unix time 1_700_000_000 on a
+        // fixed-epoch clock, in all three times (tests/fs_times.rs covers how they move); the device
+        // stays 0.
         assert_eq!(
             (st.st_mtime, st.st_atime, st.st_ctime, st.st_dev as i64),
-            (0, 0, 0, 0)
+            (1_700_000_000, 1_700_000_000, 1_700_000_000, 0)
         );
         assert_eq!(
             raw_stat("/o/f").unwrap().st_ino,
@@ -180,7 +183,10 @@ fn stat_fields_are_fixed() {
         assert_ne!(d.st_ino, st.st_ino);
 
         let m = std::fs::metadata("/o/f").unwrap();
-        assert_eq!(m.modified().unwrap(), std::time::UNIX_EPOCH);
+        assert_eq!(
+            m.modified().unwrap(),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000)
+        );
         assert_eq!(m.ino(), st.st_ino as u64);
 
         let f = std::fs::File::open("/o/f").unwrap();

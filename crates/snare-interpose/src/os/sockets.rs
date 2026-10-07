@@ -127,6 +127,8 @@ pub(crate) fn hooks() -> Vec<Hook> {
         hook!("write", write, WRITE),
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         hook!("fcntl", fcntl, FCNTL),
+        #[cfg(target_os = "linux")]
+        hook!("fcntl64", fcntl, FCNTL),
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         hook!("fcntl", crate::os::variadic::fcntl, FCNTL),
         hook!("if_nametoindex", if_nametoindex, IF_NAMETOINDEX),
@@ -1009,8 +1011,21 @@ unsafe extern "C" fn shutdown(fd: c_int, how: c_int) -> c_int {
 }
 
 /// Hook for `close(2)`. The file plane is asked first, then the network plane, each only for an
-/// fd it owns; a real fd closes without being observed.
+/// fd it owns; another sim's socket is closed in the sim that made it (`domain::close_foreign`);
+/// a real fd closes without being observed.
 unsafe extern "C" fn close(fd: c_int) -> c_int {
+    let real = || {
+        let result = unsafe { original::<unsafe extern "C" fn(c_int) -> c_int>(&CLOSE)(fd) };
+        if result < 0 {
+            -i64::from(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EBADF),
+            )
+        } else {
+            i64::from(result)
+        }
+    };
     let handled = domain::descriptor_transaction(|| {
         if let Some(FilePlane::Served(fs, serial)) = domain::file_plane(fd) {
             crate::owners::release_file_of(fd, serial);
@@ -1018,6 +1033,10 @@ unsafe extern "C" fn close(fd: c_int) -> c_int {
             if let Some(result) = unsafe { fs.close(fd) } {
                 return Some(result.into_raw());
             }
+        }
+        if let Some(result) = domain::close_foreign(fd, real) {
+            domain::note_effect("close");
+            return Some(result);
         }
         if let Some(result) =
             domain::dispatch_owned_effect("close", fd, |net| unsafe { net.close(fd) })
@@ -1028,16 +1047,7 @@ unsafe extern "C" fn close(fd: c_int) -> c_int {
             return None;
         }
         crate::owners::forget_real(fd);
-        let result = unsafe { original::<unsafe extern "C" fn(c_int) -> c_int>(&CLOSE)(fd) };
-        Some(if result < 0 {
-            -i64::from(
-                std::io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EBADF),
-            )
-        } else {
-            i64::from(result)
-        })
+        Some(real())
     });
     if let Some(result) = handled {
         return finish(result) as c_int;
@@ -1136,6 +1146,12 @@ unsafe extern "C" fn getsockopt(
 #[allow(clippy::unnecessary_cast)]
 unsafe extern "C" fn poll(fds: *mut pollfd, nfds: nfds_t, timeout: c_int) -> c_int {
     // man 2 poll: struct pollfd {fd, events, revents}; timeout in ms, -1 blocks; POLLIN/POLLOUT.
+    if !fds.is_null() {
+        for i in 0..nfds as usize {
+            // SAFETY: `fds` points to `nfds` pollfd structs.
+            domain::settle_foreign(unsafe { (*fds.add(i)).fd });
+        }
+    }
     // SAFETY: `fds` points to `nfds` pollfd structs.
     if let Some(r) = dispatch_net(|net| unsafe { net.poll(fds.cast(), nfds as u64, timeout) }) {
         return finish(r) as c_int;
@@ -1219,6 +1235,17 @@ unsafe extern "C" fn select(
     except: *mut libc::fd_set,
     timeout: *mut libc::timeval,
 ) -> c_int {
+    for set in [read, write, except] {
+        if set.is_null() {
+            continue;
+        }
+        for fd in 0..nfds.clamp(0, libc::FD_SETSIZE as c_int) {
+            // SAFETY: a non-null set is the caller's fd_set, holding descriptors below `nfds`.
+            if unsafe { libc::FD_ISSET(fd, set) } {
+                domain::settle_foreign(fd);
+            }
+        }
+    }
     if let Some(r) = dispatch_net(|net| unsafe {
         net.select(
             nfds,
@@ -1300,7 +1327,7 @@ type FcntlFn = unsafe extern "C" fn(c_int, c_int, ...) -> c_int;
 type FcntlFn = unsafe extern "C" fn(c_int, c_int, i64) -> c_int;
 
 /// Hook for `fcntl(2)`: the owning plane's `fcntl`, else the OS, unobserved. `arg` is the third
-/// word as an integer; the commands a backend models take no pointer.
+/// word as an integer; a file plane reads it as the `struct flock *` of a record-lock command.
 ///
 /// On macOS aarch64 the third word reaches here via the naked trampoline in `crate::os::variadic`.
 // The trampoline tail-branches here from another codegen unit, so the symbol must have external
@@ -1318,8 +1345,9 @@ pub(crate) unsafe extern "C" fn fcntl(fd: c_int, cmd: c_int, arg: i64) -> c_int 
 
 unsafe fn fcntl_inner(fd: c_int, cmd: c_int, arg: i64) -> c_int {
     // man 2 fcntl: the modeled commands are F_GETFL/F_SETFL (O_NONBLOCK), F_GETFD/F_SETFD
-    // (FD_CLOEXEC) and F_DUPFD/F_DUPFD_CLOEXEC.
-    // SAFETY: no pointer args for the fcntl commands a socket/file sees (flags, dup).
+    // (FD_CLOEXEC), F_DUPFD/F_DUPFD_CLOEXEC and, on files, the record locks.
+    // SAFETY: the file plane reads `arg` as a pointer only for the record-lock commands, whose
+    // third argument is a `struct flock *`.
     match domain::file_plane(fd) {
         Some(FilePlane::Served(fs, serial)) => {
             let handled = {

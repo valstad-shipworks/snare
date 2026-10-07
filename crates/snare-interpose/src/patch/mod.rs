@@ -2,7 +2,8 @@
 //!
 //! Each OS has one image-format module (`elf`, `macho`, `pe`) exposing the same three functions,
 //! reached through the `image` alias: `resolve` finds a hook's real implementation, `patch_all`
-//! rewrites every loaded image's import slots (and arranges for later images to be patched), and
+//! rewrites every loaded image's import slots and data pointers bound to hooked functions (and
+//! arranges for later images to be patched), and
 //! `name_of` names an image from its key. This module owns the one-time install sequence and the
 //! [`RECORDS`] log that [`install`] reports from.
 //!

@@ -114,7 +114,7 @@ fn so_timestamping_rx_stamps_follow_the_landing_and_the_phc_follows_the_driven_c
         .ptp_clock_offset(0, PHC_OFFSET)
         .ptp_clock_caps(0, caps)
         .build();
-    let sim = Sim::builder().host(host).build();
+    let sim = Sim::builder().host(host).fixed_epoch().build();
     thread::scope(|s| {
         let exec = sim.executive(ExecutiveConfig::default()).unwrap();
         let run = s.spawn(|| {

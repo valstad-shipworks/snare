@@ -339,11 +339,12 @@ fn replay(sim: Sim) -> Vec<Vec<String>> {
 
 #[test]
 fn replays_read_identical_absolute_monotonic_values() {
-    let first = replay(Sim::new());
+    let fixed = || Sim::builder().fixed_epoch().build();
+    let first = replay(fixed());
     assert_eq!(
-        replay(Sim::new()),
+        replay(fixed()),
         first,
-        "a discrete sim starts at a fixed instant"
+        "a sim on the fixed epoch starts at a fixed instant"
     );
     #[cfg(unix)]
     assert!(
@@ -363,7 +364,7 @@ fn replays_read_identical_absolute_monotonic_values() {
 }
 
 #[test]
-fn an_instant_kept_from_an_earlier_sim_is_on_another_timeline() {
+fn an_instant_kept_from_an_earlier_sim_is_never_ahead_of_a_later_one() {
     let kept = Sim::new().run(|| {
         std::thread::sleep(Duration::from_secs(3_600));
         Instant::now()
@@ -371,8 +372,24 @@ fn an_instant_kept_from_an_earlier_sim_is_on_another_timeline() {
     let second = Sim::new();
     second.run(|| {
         assert!(
+            Instant::now() >= kept,
+            "a plain sim continues the process's time"
+        )
+    });
+    assert_eq!(second.time_value(), Duration::ZERO);
+}
+
+#[test]
+fn an_instant_kept_from_an_earlier_sim_is_on_another_timeline_on_the_fixed_epoch() {
+    let kept = Sim::new().run(|| {
+        std::thread::sleep(Duration::from_secs(3_600));
+        Instant::now()
+    });
+    let second = Sim::builder().fixed_epoch().build();
+    second.run(|| {
+        assert!(
             Instant::now() < kept,
-            "each sim starts its own timeline again"
+            "a fixed-epoch sim starts its own timeline again"
         )
     });
     assert_eq!(second.time_value(), Duration::ZERO);

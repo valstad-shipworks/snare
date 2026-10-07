@@ -24,10 +24,16 @@ pub(crate) use nested::startup as thread_startup;
 mod signal_hooks;
 #[cfg(unix)]
 mod sockets;
+#[cfg(unix)]
+mod vectored;
 #[cfg(target_os = "linux")]
 pub(crate) use sockets::{recvmmsg_each, sendmmsg_each};
 #[cfg(unix)]
 pub(crate) mod sync;
+#[cfg(unix)]
+pub(crate) mod tz;
+#[cfg(target_os = "macos")]
+mod tz_macos;
 #[cfg(unix)]
 mod unix;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

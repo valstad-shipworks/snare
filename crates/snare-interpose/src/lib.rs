@@ -143,7 +143,7 @@ on_supported_targets! {
     #[cfg(unix)]
     pub use domain::{defer_descriptor_cleanup, descriptor_transaction};
     pub use env::Env;
-    pub use fs::Fs;
+    pub use fs::{Fs, SetTimes, TimeSet};
     #[cfg(windows)]
     pub use host::DevCall;
     pub use host::Host;
@@ -154,7 +154,7 @@ on_supported_targets! {
     pub use net::{CompletionCall, CompletionPost, CompletionQuery};
     pub use net::{HandOver, Net, NetResult};
     #[cfg(unix)]
-    pub use owners::{bury_fd, claim_fd, minted, orphan, release_fd};
+    pub use owners::{bury_fd, claim_fd, minted, minted_socket, orphan, release_fd, release_file};
     #[doc(hidden)]
     pub use os::joined_lists;
     #[cfg(windows)]

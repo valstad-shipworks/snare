@@ -95,14 +95,44 @@ jobs:
             --skip multicast_all_matches_real_os \
             --skip unicast_bound_member_matches_real_os
 
+  # Run from the repository root so `.cargo/config.toml` builds each shim with `--cfg snare`.
+  # `rustflags` replaces that config's list, so it repeats its cfgs. Shims whose own tests are
+  # gated on `cfg(snare)` are also tested without it (`plain`), where they must act as upstream.
+  # quanta 0.12's own `test_recent` races its other tests on the shared recent-time global.
   shims:
-    runs-on: ubuntu-latest
-    name: shims
+    runs-on: ${{ matrix.os }}
+    name: shims (${{ matrix.shim }}${{ matrix.rustflags && ', parallel' || '' }}, ${{ matrix.os }})
 
     strategy:
       fail-fast: false
       matrix:
-        shim: [io-uring, sc, syscalls, xsk-rs]
+        include:
+          - { shim: io-uring, os: ubuntu-latest }
+          - { shim: sc, os: ubuntu-latest }
+          - { shim: syscalls, os: ubuntu-latest }
+          - { shim: xsk-rs, os: ubuntu-latest }
+          - { shim: async-io, os: ubuntu-latest }
+          - { shim: async-io, os: macos-latest }
+          - { shim: async-global-executor, os: ubuntu-latest }
+          - { shim: blocking, os: ubuntu-latest }
+          - { shim: smol, os: ubuntu-latest, plain: true }
+          - { shim: smol, os: macos-latest }
+          - { shim: quanta-0.12, os: ubuntu-latest, plain: true, test_args: --test-threads=1 }
+          - { shim: quanta-0.12, os: macos-latest, test_args: --test-threads=1 }
+          - { shim: quanta-0.13, os: ubuntu-latest, plain: true }
+          - { shim: quanta-0.13, os: macos-latest }
+          - { shim: minstant, os: ubuntu-latest, plain: true }
+          - { shim: fastant, os: ubuntu-latest, plain: true }
+          - { shim: fastrand, os: ubuntu-latest, plain: true }
+          - { shim: fastrand, os: macos-latest }
+          - { shim: rayon-core, os: ubuntu-latest, plain: true }
+          - { shim: rayon-core, os: macos-latest }
+          - shim: rayon-core
+            os: ubuntu-latest
+            rustflags: --cfg snare --cfg rustix_use_libc --check-cfg=cfg(rustix_use_libc) --cfg snare_parallel_rayon
+          - shim: rayon-core
+            os: macos-latest
+            rustflags: --cfg snare --cfg rustix_use_libc --check-cfg=cfg(rustix_use_libc) --cfg snare_parallel_rayon
 
     steps:
       - uses: actions/checkout@v4
@@ -114,4 +144,15 @@ jobs:
           workspaces: shims/${{ matrix.shim }}
 
       - name: Tests
-        run: cargo test --manifest-path shims/${{ matrix.shim }}/Cargo.toml
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        shell: bash
+        run: |
+          [ -n "$RUSTFLAGS" ] || unset RUSTFLAGS
+          cargo test --manifest-path shims/${{ matrix.shim }}/Cargo.toml -- ${{ matrix.test_args }}
+
+      - name: Tests without cfg(snare)
+        if: matrix.plain
+        env:
+          RUSTFLAGS: ""
+        run: cargo test --manifest-path shims/${{ matrix.shim }}/Cargo.toml -- ${{ matrix.test_args }}

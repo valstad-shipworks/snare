@@ -16,6 +16,11 @@ use snare_interpose::Domain;
 /// The sim's realtime epoch, in Unix seconds.
 const SIM_EPOCH: u64 = 1_700_000_000;
 
+/// A sim on the fixed epoch, whose realtime starts at [`SIM_EPOCH`] whatever ran before it.
+fn sim() -> Sim {
+    Sim::builder().fixed_epoch().build()
+}
+
 fn realtime() -> Duration {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
 }
@@ -24,7 +29,7 @@ fn realtime() -> Duration {
 fn a_thousand_sims_each_start_at_zero_end_alike_and_free_their_domain() {
     let mut ends = Vec::new();
     for i in 0..1000u64 {
-        let sim = Sim::builder().seed(i).build();
+        let sim = Sim::builder().seed(i).fixed_epoch().build();
         assert_eq!(sim.time_value(), Duration::ZERO, "sim {i} starts at zero");
         let (weak, started) = sim.run(|| {
             let started = realtime();
@@ -44,8 +49,8 @@ fn a_thousand_sims_each_start_at_zero_end_alike_and_free_their_domain() {
 
 #[test]
 fn runs_of_two_sims_nest_on_one_thread() {
-    let outer = Sim::new();
-    let inner = Sim::new();
+    let outer = sim();
+    let inner = sim();
     let (outer_id, inner_id) = (outer.id(), inner.id());
     let seen = outer.run(|| {
         std::thread::sleep(Duration::from_secs(10));
@@ -99,9 +104,9 @@ fn a_run_nested_in_a_run_of_the_same_sim_is_a_later_entry() {
 
 #[test]
 fn two_sims_in_turn_on_one_thread_keep_separate_clocks() {
-    let first = Sim::new();
+    let first = sim();
     first.run(|| std::thread::sleep(Duration::from_secs(3600)));
-    let second = Sim::new();
+    let second = sim();
     let at = second.run(realtime);
     assert_eq!(at, Duration::from_secs(SIM_EPOCH));
     assert!(first.time_value() >= Duration::from_secs(3600));
@@ -113,7 +118,7 @@ fn two_sims_in_turn_on_one_thread_keep_separate_clocks() {
 #[test]
 fn a_sim_built_on_one_thread_runs_on_another() {
     fn send<T: Send>(_: &T) {}
-    let sim = Sim::new();
+    let sim = sim();
     send(&sim);
     let id = sim.id();
     let sim = std::thread::spawn(move || {
@@ -240,8 +245,8 @@ fn the_topology_is_per_sim_and_kept_across_runs() {
 
 #[test]
 fn a_clock_moved_in_one_sim_leaves_another_alone() {
-    let a = Sim::new();
-    let b = Sim::new();
+    let a = sim();
+    let b = sim();
     a.set_time_value(Duration::from_secs(86_400));
     a.pause_time();
     let start = Instant::now();

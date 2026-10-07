@@ -58,7 +58,9 @@ fn smol_exercise() -> Duration {
         })
         .await;
         let udp = smol::net::UdpSocket::bind(any).await.unwrap();
-        udp.send_to(b"self", udp.local_addr().unwrap()).await.unwrap();
+        udp.send_to(b"self", udp.local_addr().unwrap())
+            .await
+            .unwrap();
         let mut buf = [0u8; 8];
         assert_eq!(udp.recv(&mut buf).await.unwrap(), 4);
         smol::Timer::after(Duration::from_millis(50)).await;

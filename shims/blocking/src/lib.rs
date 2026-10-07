@@ -92,8 +92,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::panic;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 use std::thread;
@@ -273,10 +273,9 @@ impl Executor {
     /// Returns a [`Task`] handle for the spawned task.
     fn spawn<T: Send + 'static>(future: impl Future<Output = T> + Send + 'static) -> Task<T> {
         let executor = Self::get();
-        let (runnable, task) = async_task::Builder::new().propagate_panic(true).spawn(
-            move |()| future,
-            move |r| executor.schedule(r),
-        );
+        let (runnable, task) = async_task::Builder::new()
+            .propagate_panic(true)
+            .spawn(move |()| future, move |r| executor.schedule(r));
         runnable.schedule();
         task
     }

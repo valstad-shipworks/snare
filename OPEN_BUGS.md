@@ -26,6 +26,25 @@ rg -n 'ignore = "bug' crates
   inside libc, macOS from `sysctl` `kern.hostname`), and neither are the macOS `kern.ostype`,
   `kern.osrelease`, `kern.version` and `kern.hostname` sysctls.
 
+- **Local time** (`local_time.rs`, `local_time_os_truth.rs`): a sim that decides its zone serves
+  `localtime_r`, `localtime`, `mktime`, `timelocal`, `ctime_r`, `ctime` and macOS's
+  `CFTimeZoneCopySystem`/`CopyDefault`, but the `tzname`, `timezone` and `daylight` globals that
+  `tzset` fills stay the process's, and libc functions that convert inside themselves (`strftime`
+  with a `struct tm` lacking `tm_zone`, `getdate`, glibc's `__localtime64_r` aliases) see the
+  machine's zone. `CFTimeZoneSetDefault` is process-wide; a sim that decides its zone answers
+  `CFTimeZoneCopyDefault` with its own regardless. Leap-second records of `right/` zones are not
+  applied. With a negative `tm_isdst`, `mktime` of a local time that occurs twice takes the
+  earlier instant; glibc's choice depends on the offset left by the process's previous `mktime`
+  call and tzcode's on its binary search, so the host can pick the later one. On Windows the
+  UCRT's local time (`_localtime64_s`, `_mktime64`, `_tzset`) and `GetTimeZoneInformation` read
+  the machine's zone.
+
+- **CPU count** (`simhost_cpus.rs`): `sysconf`, Linux `sched_getaffinity` and macOS's `hw.*`
+  counts follow `HostProfile::cpus`, but per-CPU listings do not: Linux `/proc/stat` and
+  `/proc/cpuinfo` and macOS `host_processor_info` (what sysinfo's CPU list reads) report the
+  machine's CPUs, and a `WinHost`'s `GetSystemInfo`, `GetActiveProcessorCount` and
+  `GetLogicalProcessorInformation(Ex)` the real ones.
+
 - **Environment** (`edge_host_env.rs`): on Linux, `std::env::vars` in an isolated sim lists the
   real process environment. It accesses the process-global `environ` variable directly, outside
   function interposition. Swapping `environ` would expose simulated values to concurrent sims and
@@ -196,9 +215,35 @@ are real model gaps:
 - SimHost rejects positional writes to virtual device nodes with `EOPNOTSUPP`;
   device-specific parity is unmeasured.
 - Mutable file flags cover append/nonblocking, not every host `fcntl` operation.
+- Advisory locks on a `VirtualFs` file keep Linux's separation of `flock` locks from record
+  locks; on macOS the two share one lock list and conflict (even a description's own `flock`
+  against its OFD lock), which the model does not reproduce. A blocked `F_SETLKW`/`flock` is not
+  interrupted by a signal (`EINTR`), `F_SETLKWTIMEOUT`/`F_OFD_SETLKWTIMEOUT` (macOS) are not
+  modelled, and a directory stream's descriptor (`opendir`) cannot be locked (`EINVAL`).
+  `SimHost` files (`/dev`, `/proc`, `/sys`) take no locks: lock commands fail with `EINVAL` and
+  `flock` reaches the `/dev/null` placeholder.
+- `mmap` of a virtual file maps its `/dev/null` placeholder, so SQLite's WAL index (`-shm`) cannot
+  be mapped: `PRAGMA journal_mode=WAL` succeeds, the first write in WAL mode fails with
+  `SQLITE_IOERR_SHMMAP`.
 - A file another sim's plane opened is served by that plane for I/O and descriptor calls from any
   thread, but the working directory stays per sim: `fchdir` through such a directory descriptor
   reaches its `/dev/null` placeholder and fails with `ENOTDIR`.
+- File timestamps follow the sim's clock (README, "File timestamps"), with these limits:
+  - `chmod`, `chown` and their relatives are not modelled on a `VirtualFs` (modes are fixed), so
+    they never stamp a change time there.
+  - On real files the sim records only what it does through the hooked calls. Path `truncate(2)`,
+    `fallocate`, `copy_file_range`, `sendfile`, writes through a mapping, writes through a descriptor
+    opened before the sim or duplicated outside the hooks, `chmod`, and another process's changes
+    show at the time of the first `stat` in the sim that sees the host's times move; so do access
+    times, which the sim takes from the host's (its mount's `relatime`/`noatime`), not from its own
+    reads. Records are per (device, inode); an inode freed and reused outside the sim is noticed
+    through a different birth time, which Linux reports only through `statx`, so a reused inode
+    seen first through plain `stat` keeps the old record's times. A file system without birth
+    times (no `STATX_BTIME`) still reports none for a file the sim created.
+  - A `VirtualFs` handed to several sims keeps the clock of the first one built.
+  - Windows has no file plane: `GetFileTime`, `GetFileInformationByHandle(Ex)` and directory
+    enumeration report host times next to the sim's clock. Following it there needs hooks on those
+    calls and per-handle bookkeeping that do not exist yet.
 
 ## Ignored validation
 
@@ -256,7 +301,9 @@ Supported model boundaries and unverified approximations. These do not establish
   Under `deterministic()` such a wait keeps the baton for 50 ms of real time before it passes it,
   after which the run's order depends on how long the outside holder took; std's thread-start lock,
   which parallel tests' spawning threads hold, otherwise broke replay under load
-  (`edge_scale_testers`). A holder inside the domain costs a deterministic wait those 50 ms. macOS pthread mutexes name their owner and keep the baton for an outside holder.
+  (`edge_scale_testers`). A holder inside the domain costs a deterministic wait those 50 ms. macOS pthread mutexes name their owner; a
+  deterministic wait on one held outside the schedule keeps the baton for the same 50 ms, then waits
+  in the schedule for the unlock, so its order too depends on how long the holder took.
   std's one-time Windows Winsock startup, which holds its `Once` far longer, is run outside every
   domain before the first one is installed. macOS std `RwLock` and `Once` can park on ownerless
   semaphores. An external holder's `sim.busy()` lease prevents the incorrect skip; an
@@ -273,11 +320,65 @@ Supported model boundaries and unverified approximations. These do not establish
   for a single address. Shared waits on different virtual addresses mapping the same backing
   object offset do not share a modeled key. Native kernel wakes still occur, but census wake
   attribution and deterministic wake selection do not resolve that backing-object identity.
-- **smol's global executor:** `smol::spawn` keeps its executor and "smol-N" threads in a static
-  inside smol, made under the first sim that spawns. Later sims run in turn on those threads, but
-  two sims spawning onto it at once share them, and one sim's threads poll the other's tasks.
-  Run tasks on a `smol::Executor` the test owns, or take turns. async-std's global executor and
-  `smol::unblock`'s pool are per sim through the `async-global-executor` and `blocking` shims.
+- **Process statics across fixed-epoch sims:** a plain sim's clocks continue where the process's
+  earlier sims left off, but a `deterministic()` or `fixed_epoch()` sim starts at monotonic zero
+  and 2023-11-14T22:13:20Z so its absolute readings replay. A timestamp a library kept in a static
+  from a sim that ran further (a static tokio runtime's timer wheel, a `#[cached(time = ..)]` memo,
+  a global resolver or moka cache, jiff's time-zone cache, a UUIDv7 context) is then ahead of its
+  clocks: short sleeps return at once and cache entries never expire. Make such runtimes and
+  caches inside the sim. A thread-local cache goes stale the same way when one thread runs a
+  fixed-epoch sim after another sim (chrono's 1 s `TZ_INFO` recheck window, kept per thread
+  across `Sim::run`s), and a static that mixes readings
+  from a sim with real ones (taken outside every sim or in a `wall_clock()` sim) sees two
+  timelines.
+- **Runtimes' process-wide state without `--parallel`:** smol's global executor (`smol::spawn`
+  and its "smol-N" threads), async-io's reactor, async-std's global executor, `blocking`'s pool
+  and rayon's global pool live in statics, made under the first sim that uses them. Later sims
+  run in turn on those threads, each in the world of the sim that woke them ("Pool threads
+  following a later sim" below), but two sims using one at once share it, and one sim's threads
+  run the other's tasks. `cargo snare test --parallel <smol|async-std|rayon|all>` (or
+  `parallel = [...]` in `[package.metadata.snare]`) patches in the shims that keep one per sim;
+  otherwise take turns (a static `Mutex` held across the test, or `--test-threads=1`). With
+  `--parallel smol`, tasks still pending on a sim's global executor are dropped when the sim
+  ends, where smol keeps them forever.
+- **rayon's global pool and deterministic replay:** without `--parallel rayon` the global pool's
+  workers, and their steal-order generators, carry over from one sim to the next, so a
+  deterministic sim using `par_iter` or `rayon::join` outside an `install` replays only when it
+  runs at the same point of the process's history. Pools built with `ThreadPoolBuilder::build`
+  inside a sim replay regardless (the rayon-core shim seeds each worker by its index). A
+  `rayon::join` of two sleeps can take the sum of the sleeps rather than the longer of them,
+  when the idle worker has not yet been woken to steal the second half.
+- **quanta's recent time:** `quanta::Instant::recent()` reads one process-wide value that an
+  `Upkeep` thread refreshes. The quanta shim makes every clock read the sim's clock, but an
+  upkeep thread started in one sim keeps writing that sim's time, which another sim's `recent()`
+  then reads. Start the `Upkeep` in the sim that reads `recent()`, or read `Instant::now()`.
+- **Shimmed crates outside the shims' versions:** each shim replaces one release line (`quanta`
+  0.12 and 0.13, `fastrand` 2, `rayon-core` 1, `minstant`/`fastant` 0.1, see
+  `shims/README.md`). Older lines in the graph (`fastrand` 1.x, `quanta` 0.11 and earlier) are
+  left unpatched: their TSC reads and thread-id seeds behave as upstream.
+- **A thread pool kept across sims:** a multi-thread runtime made in one sim and kept in a
+  static (tokio's, beside a global `reqwest::Client`) runs the next sim's tasks on workers that
+  stay in the first sim's world until one of them reaches a descriptor of the running sim. Work
+  they take over a channel, with no descriptor between, such as a request on a connection pooled
+  in the first sim, is served from that world. Build the runtime in each sim.
+- **Pool threads following a later sim:** a participant left over from an ended run follows a
+  running sim that wakes it through a condition variable, futex, semaphore, parker or
+  `WaitOnAddress` (README, "Process-wide pools"). Work it picks up with no wake stays in its old
+  world: a worker still spinning when the later sim posts work (a run's end waits up to 200 ms of
+  real time with no thread coming to rest, 5 s in all, for its leftovers to park), or one polling
+  an atomic. A yield gives nothing to tell which running sim, if any, posted the work it finds. Only
+  participants are listed as waiters, so background, helper and driver leftovers never move. A
+  futex word does not say whether it is a lock or a condition: on Linux a leftover parked on a
+  std `Mutex` that a running sim's thread unlocks follows that sim as well. A follower that reaches
+  a socket of its old sim finds a dead connection, as sockets never move: a client made in an
+  earlier sim and kept in a static (reqwest's pooled connections) drops that connection and
+  reconnects in the sim it now runs in instead of reaching the earlier sim's server. A wake the OS gives to a thread other than the
+  ones listed keeps the later sim from going quiescent for 200 ms of real time, until the place it
+  made is given back. Two sims running at once that share a pool still share its threads.
+- **Deterministic stalls on outside wakes:** a wake from outside a deterministic schedule now
+  reaches the waiter in it, but `stuck_after` still cannot tell a schedule cycling on timers (an
+  executor's driver ticking) while a participant waits on something that never comes from one
+  making progress: moving time counts as progress.
 - **Outside workers drained on behalf of a sim:** a sim thread in a timed wait on a thread that is
   busy outside the sim (a `tracing_appender::non_blocking` worker made outside it or in another
   sim, flushing when its `WorkerGuard` drops in this one) gives snare no wake and no lock to see,
@@ -287,6 +388,25 @@ Supported model boundaries and unverified approximations. These do not establish
 - **Real pipes in a sim poll:** `pipe`/`pipe2` stay real, so a `poll` over a pipe and sim
   sockets cannot block on the pipe; a loop waiting on both spins until `stuck_after` reports it.
   `socketpair(AF_UNIX)` is simulated and works as a wake-up channel.
+- **Hooks reached from inside an allocator:** a C allocator installed as the global allocator
+  (jemalloc, mimalloc) calls the hooked pthread, clock and thread functions from inside its own
+  critical sections, where a hook that allocates or waits on a lock whose holder allocates can
+  deadlock the allocator. Setting up a default mutex or condition variable records nothing, the
+  nested-wait record is fixed-size, the census keeps room for 64 watched mutexes, and a lock or
+  unlock takes the census lock only when a participant may be waiting for that mutex
+  (`alloc_jemalloc.rs`, `alloc_mimalloc.rs`). What remains: while a participant waits for one of
+  the allocator's own locks, that lock's holder takes the census lock to record letting go, and a
+  thread holding the census lock still allocates when it adds a thread's row or records a wake,
+  so the three can still meet. A deterministic schedule's lock records and the
+  clock layer's timer bookkeeping also allocate, on paths an allocator reaches only through a
+  contended lock or a caught clock spin.
+- **Long clock-reading loops:** a loop that reads the clock with no other hooked call between
+  reads is a clock spin whether it waits on time or works (README, "Clock spins"). Its first
+  65,536 reads cost 1 µs each, as calls that do not block do; past those its steps grow toward
+  one second, so a computation reading the clock that many times between hooked calls (an
+  allocator under sustained churn, a per-item timestamp over hundreds of thousands of items)
+  sees time run ahead of its work. Holding `busy()` across such a loop keeps the clock still,
+  and any hooked call in it other than a clock read or a yield starts the count again.
 - **Pure atomic spins** (`while !flag { spin_loop() }`) bypass function hooks and can prevent a
   virtual sleeper from waking. Block or yield cooperatively. A `busy()` lease around the spin
   does not solve that dependency and suppresses watchdog detection.

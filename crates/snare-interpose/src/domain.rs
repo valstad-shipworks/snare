@@ -47,15 +47,19 @@ use crate::resolve::Resolver;
 use crate::signals::Signals;
 use crate::state::{self, Passthrough};
 
+mod det_foreign;
 #[cfg_attr(not(unix), allow(dead_code))]
 mod follow;
+mod woken;
 #[cfg(unix)]
 use follow::running_elsewhere;
 #[cfg(unix)]
-pub(crate) use follow::{Elsewhere, elsewhere};
+pub(crate) use follow::{Elsewhere, close_foreign, elsewhere, settle_foreign};
 #[cfg(unix)]
-use follow::follow_owner;
+use follow::{elsewhere_if_foreign, follow_owner};
 pub use follow::{FdWait, fd_wait};
+#[cfg(target_os = "linux")]
+pub(crate) use woken::place_woken;
 
 #[cfg(windows)]
 pub(crate) type TimerWordWake = (usize, usize, Arc<dyn Send + Sync>);
@@ -1467,6 +1471,10 @@ impl Drop for Managed {
                 wake_if_quiescent(unsafe { &*domain });
                 offer_idle_skip(domain);
             }
+            if self.root {
+                // SAFETY: as above.
+                woken::settle(unsafe { &*domain });
+            }
             // SAFETY: `domain` came from `Arc::into_raw` in `enter`, `inherit` or `follow` and is
             // released exactly once, here.
             unsafe { drop(Arc::from_raw(domain)) };
@@ -1949,6 +1957,7 @@ pub(crate) fn note_release(key: usize, n: usize) {
     if state::passthrough() {
         return;
     }
+    woken::place_woken(key, n);
     release_elsewhere(key, n, |core, n| core.signal(key, n));
     let Some(domain) = here() else {
         return;
@@ -1969,6 +1978,7 @@ pub(crate) fn release_native<R>(key: usize, n: usize, release: impl FnOnce() -> 
     if state::passthrough() {
         return release();
     }
+    woken::place_woken(key, n);
     let Some(domain) = here() else {
         let result = release();
         release_elsewhere(key, n, |core, n| core.signal(key, n));
@@ -2030,6 +2040,7 @@ pub(crate) fn note_futex_pre_enrollment_return() {
 #[cfg(target_os = "linux")]
 pub(crate) fn release_native_futex(
     key: usize,
+    n: usize,
     mask: u32,
     private: bool,
     release: impl FnOnce() -> libc::c_long,
@@ -2038,6 +2049,7 @@ pub(crate) fn release_native_futex(
     if state::passthrough() {
         return release();
     }
+    woken::place_woken(key, n);
     let result = match here() {
         Some(domain) => {
             let _passthrough = Passthrough::enter();
@@ -2062,12 +2074,13 @@ pub(crate) fn release_native_futex(
 /// A participant's wait on the pthread mutex at `mutex`, watched so the census knows whether the
 /// waiter could take it, and whether a thread of the domain is what keeps it from doing so.
 ///
-/// Dropping it stops the watch and refreshes `Accounting::watching`, the count that lets
-/// [`note_mutex`] skip the census lock when nothing is watched.
+/// Dropping it stops the watch and refreshes `Accounting::watching` and `Accounting::watched`, the
+/// count that lets [`note_mutex`] skip the census lock for a mutex nobody watches.
 #[cfg(any(unix, windows))]
 pub(crate) struct MutexWatch {
-    /// The waiter's domain; `'static` because a managed thread's domain outlives its waits.
-    domain: &'static Inner,
+    /// The waiter's domain, held because a thread following a wake out of it during the wait
+    /// lets go of its own count before the watch drops.
+    domain: Option<Domain>,
     /// The watched mutex's address.
     mutex: usize,
 }
@@ -2076,12 +2089,23 @@ pub(crate) struct MutexWatch {
 impl Drop for MutexWatch {
     fn drop(&mut self) {
         let _passthrough = Passthrough::enter();
-        let mut core = self.domain.accounting.core();
+        let Some(domain) = self.domain.take() else {
+            return;
+        };
+        let mut core = domain.0.accounting.core();
         core.unwatch_mutex(self.mutex);
-        self.domain
+        domain
+            .0
             .accounting
             .watching
             .store(core.watching(), Ordering::SeqCst);
+        drop(core);
+        domain
+            .0
+            .accounting
+            .watched
+            .slot(self.mutex)
+            .fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -2104,6 +2128,11 @@ pub(crate) fn watch_mutex(mutex: usize, releasing: bool) -> Option<MutexWatch> {
     let _passthrough = Passthrough::enter();
     let mut core = domain.accounting.core();
     domain.accounting.watching.fetch_add(1, Ordering::SeqCst);
+    domain
+        .accounting
+        .watched
+        .slot(mutex)
+        .fetch_add(1, Ordering::SeqCst);
     core.watch_mutex(mutex, releasing);
     #[cfg(target_os = "macos")]
     if !releasing
@@ -2116,7 +2145,16 @@ pub(crate) fn watch_mutex(mutex: usize, releasing: bool) -> Option<MutexWatch> {
         .accounting
         .watching
         .store(core.watching(), Ordering::SeqCst);
-    Some(MutexWatch { domain, mutex })
+    drop(core);
+    // SAFETY: the calling thread holds a count on its domain.
+    let domain = unsafe {
+        Arc::increment_strong_count(ptr::from_ref(domain));
+        Domain(Arc::from_raw(ptr::from_ref(domain)))
+    };
+    Some(MutexWatch {
+        domain: Some(domain),
+        mutex,
+    })
 }
 
 /// The calling thread took the pthread mutex at `mutex`.
@@ -2170,8 +2208,9 @@ pub(crate) fn mutex_held_inside(mutex: usize) -> bool {
 
 /// [`note_mutex_taken`] and [`note_mutex_freed`]: records the hold in the calling thread's
 /// `accounting::Held`, then updates a watched mutex's owner in the census. Does nothing under
-/// passthrough or off a domain, and skips the census while no mutex is watched (checked without
-/// the lock, after the record, so a waiter that starts watching meanwhile reads the record).
+/// passthrough or off a domain, and skips the census unless a participant may be watching this
+/// mutex (checked without the lock, in `Accounting::watched`, after the record, so a waiter that
+/// starts watching meanwhile reads the record).
 #[cfg(any(unix, windows))]
 fn note_mutex(mutex: usize, taken: bool) {
     if state::passthrough() {
@@ -2188,7 +2227,13 @@ fn note_mutex(mutex: usize, taken: bool) {
     let Some(domain) = here() else {
         return;
     };
-    if domain.accounting.watching.load(Ordering::SeqCst) == 0 {
+    if domain
+        .accounting
+        .watched
+        .slot(mutex)
+        .load(Ordering::SeqCst)
+        == 0
+    {
         return;
     }
     let _passthrough = Passthrough::enter();
@@ -2760,6 +2805,7 @@ fn native_wait_parked<R>(wait: impl FnOnce() -> R, woken: impl FnOnce(&R) -> boo
     if let Some(domain) = here() {
         drain_signals(domain);
     }
+    woken::follow_woken(None);
     result
 }
 
@@ -2800,6 +2846,7 @@ pub(crate) fn native_cond_wait<R>(relock: &dyn Fn(bool), wait: impl FnOnce() -> 
     let result = wait();
     leave_cond_wait(relock, true);
     rejoin_schedule();
+    woken::follow_woken(Some(relock));
     result
 }
 
@@ -2999,6 +3046,9 @@ fn timed_native_wait_inner<R>(
         rejoin_schedule();
     }
     unregister_timer(key);
+    if counted {
+        woken::follow_woken(relock);
+    }
     outcome
 }
 
@@ -3096,15 +3146,28 @@ pub(crate) fn yield_point() {
 /// How many clock reads and yields in a row, with no other hooked call between them, make a
 /// participant's loop a *clock spin*: a thread waiting on time by polling it
 /// (`while Instant::now() < deadline {}`, spin_sleep's final spin, a yield loop on a flag a timer
-/// sets). A snare choice. Code that reads the clock for a timestamp or an elapsed time takes one
-/// to a few reads between calls the sim sees (std's `Instant::now` and `SystemTime::now` read it
-/// once), so it never gets near 64; a read-and-yield loop is caught after 32 turns, a few
-/// microseconds of real time.
+/// sets). A snare choice. Code that reads the clock for a timestamp or an elapsed time usually
+/// takes one to a few reads between calls the sim sees (std's `Instant::now` and `SystemTime::now`
+/// read it once); a read-and-yield loop is caught after 32 turns, a few microseconds of real time.
+/// Work the sim does not see (uncontended locks and atomics, allocation, computing) can still
+/// read the clock 64 times in a row, and is caught as a spin too: [`SPIN_EVEN_READS`] keeps that
+/// cheap.
 const SPIN_AFTER: u32 = 64;
 
-/// The fraction of a clock spin's length each of its steps moves virtual time: 1/64 of the
-/// virtual time since the spin was caught, between [`CALL_LATENCY`] and one second. The cap
-/// keeps sustained clock polling from rapidly exhausting the clock's representable range.
+/// How many clock reads of a caught spin each move virtual time [`CALL_LATENCY`], what a call that
+/// returns without blocking costs, before its steps start to grow. A snare choice: a loop that
+/// reads the clock once per item of work and makes no other hooked call (an `Instant::now()` per
+/// log record or cache insert, an allocator's decay clock read every few allocations; jemalloc
+/// reads it about 18,000 times in 20,000 large allocations) is caught as a spin too, and this
+/// keeps what it costs in line with what its work would cost in hooked calls: about 65 ms of
+/// virtual time for its first 65,536 reads. A spin on a deadline further off gets there in about
+/// 4,000 more reads, an hour-long one included, a fraction of a second of real time.
+const SPIN_EVEN_READS: u32 = 1 << 16;
+
+/// The fraction of a clock spin's length each of its steps moves virtual time once its first
+/// [`SPIN_EVEN_READS`] reads have passed: 1/64 of the virtual time since the spin was caught,
+/// between [`CALL_LATENCY`] and one second. The cap keeps sustained clock polling from rapidly
+/// exhausting the clock's representable range.
 const SPIN_STEP_DIVISOR: u32 = 64;
 
 /// The longest a spin's step waits, in real time, for waiters already woken to run (see
@@ -3117,6 +3180,8 @@ const SPIN_SETTLE: std::time::Duration = std::time::Duration::from_millis(5);
 struct Spin {
     /// Clock reads and yields in a row, saturating.
     events: u32,
+    /// The clock reads among `events`, saturating.
+    reads: u32,
     /// Whether the thread read the clock since its last yield: it polls the clock, waiting on a
     /// deadline of its own rather than only on what another thread does.
     polling: bool,
@@ -3133,6 +3198,7 @@ impl Spin {
     /// No spin.
     const IDLE: Spin = Spin {
         events: 0,
+        reads: 0,
         polling: false,
         origin: None,
         counted: ptr::null(),
@@ -3153,6 +3219,7 @@ fn note_spin(read: bool) -> (bool, bool) {
     SPIN.try_with(|cell| {
         let mut spin = cell.get();
         spin.events = spin.events.saturating_add(1);
+        spin.reads = spin.reads.saturating_add(u32::from(read));
         let polling = read || spin.polling;
         spin.polling = read;
         cell.set(spin);
@@ -3201,10 +3268,11 @@ pub fn end_spin() {
 }
 
 /// Counts the calling thread's caught spin in `domain`'s `spinning`, and in `clock_spinning` while
-/// it polls the clock (`clock`), noting where it started; returns where its steps grow from.
-fn count_spin(domain: &Inner, clock: bool) -> Option<std::time::Duration> {
+/// it polls the clock (`clock`), noting where it started; returns where its steps grow from and
+/// how many clock reads it has made.
+fn count_spin(domain: &Inner, clock: bool) -> (Option<std::time::Duration>, u32) {
     let Ok(mut spin) = SPIN.try_with(std::cell::Cell::get) else {
-        return None;
+        return (None, 0);
     };
     if spin.counted.is_null() {
         domain.spinning.fetch_add(1, Ordering::SeqCst);
@@ -3220,7 +3288,7 @@ fn count_spin(domain: &Inner, clock: bool) -> Option<std::time::Duration> {
         spin.counted_clock = clock;
     }
     let _ = SPIN.try_with(|cell| cell.set(spin));
-    spin.origin
+    (spin.origin, spin.reads)
 }
 
 /// One step of the calling participant's caught spin, `clock` when the event polls the clock (a
@@ -3233,7 +3301,8 @@ fn count_spin(domain: &Inner, clock: bool) -> Option<std::time::Duration> {
 /// and no participant waits on a lock no thread of the domain holds (`Inner::lock_unheld`): any
 /// other running thread may have work to do at the current instant, which comes first. Then:
 ///
-/// - A clock read of the spin moves time one step (see [`Layer::spin_step`]): 1/64 of the
+/// - A clock read of the spin moves time one step (see [`Layer::spin_step`]): 1 µs for its first
+///   [`SPIN_EVEN_READS`] reads, then 1/64 of the
 ///   virtual time since the spin was caught, between 1 µs and 1 s, landing 1 ns short of the earliest
 ///   timer it would reach and past it on the next step, so the threads woken there run at their
 ///   own instants and in order with the spinner. A yield-only spin, which waits on another
@@ -3250,11 +3319,11 @@ fn clock_spin(clock: bool) {
     let Some(domain) = here() else {
         return;
     };
-    let origin = count_spin(domain, clock);
+    let (origin, reads) = count_spin(domain, clock);
     if let Some(sched) = domain.sched.as_ref().filter(|sched| !sched.detached()) {
         sched.spin(thread_lineage(), clock, || {
             if clock {
-                spin_advance(domain, origin)
+                spin_advance(domain, origin, reads)
             } else {
                 time_skip()
             }
@@ -3287,15 +3356,15 @@ fn clock_spin(clock: bool) {
         }
         return;
     }
-    if spin_advance(domain, origin) {
+    if spin_advance(domain, origin, reads) {
         wake_waiters();
     }
 }
 
-/// Moves `domain`'s clock one step of a spin caught at `origin` (see [`clock_spin`]), returning
-/// whether the step reached a pending timer. Yields the CPU for real when the clock is held or a
-/// waiter it reached has yet to run.
-fn spin_advance(domain: &Inner, origin: Option<std::time::Duration>) -> bool {
+/// Moves `domain`'s clock one step of a spin caught at `origin` that has made `reads` clock reads
+/// (see [`clock_spin`]), returning whether the step reached a pending timer. Yields the CPU for
+/// real when the clock is held or a waiter it reached has yet to run.
+fn spin_advance(domain: &Inner, origin: Option<std::time::Duration>, reads: u32) -> bool {
     let _passthrough = Passthrough::enter();
     let Some(_gate) = domain.accounting.skip_gate() else {
         return false;
@@ -3303,10 +3372,14 @@ fn spin_advance(domain: &Inner, origin: Option<std::time::Duration>) -> bool {
     let Some(now) = domain.virtual_now() else {
         return false;
     };
-    let spun = now.saturating_sub(origin.unwrap_or(now));
-    let step = (spun / SPIN_STEP_DIVISOR)
-        .max(CALL_LATENCY)
-        .min(std::time::Duration::from_secs(1));
+    let step = if reads < SPIN_AFTER + SPIN_EVEN_READS {
+        CALL_LATENCY
+    } else {
+        let spun = now.saturating_sub(origin.unwrap_or(now));
+        (spun / SPIN_STEP_DIVISOR)
+            .max(CALL_LATENCY)
+            .min(std::time::Duration::from_secs(1))
+    };
     for layer in &domain.layers {
         match layer.spin_step(step) {
             crate::layer::SpinStep::Moved { fired } => return fired,
@@ -3716,10 +3789,13 @@ pub(crate) fn dispatch_owned(
     mut op: impl FnMut(&dyn Net) -> Option<crate::net::NetResult>,
 ) -> Option<i64> {
     loop {
-        if net_owns(fd)
-            && let Some(r) = dispatch_net(&mut op)
-        {
-            return Some(r);
+        if net_owns(fd) {
+            if let Some(r) = dispatch_net(&mut op) {
+                return Some(r);
+            }
+            if net_owns(fd) {
+                return None;
+            }
         }
         match elsewhere(fd) {
             Elsewhere::Real => return None,
@@ -3741,10 +3817,13 @@ pub(crate) fn dispatch_wake(
     mut op: impl FnMut(&dyn Net) -> Option<crate::net::NetResult>,
 ) -> Option<i64> {
     loop {
-        if net_owns(fd)
-            && let Some(r) = dispatch_net(&mut op)
-        {
-            return Some(r);
+        if net_owns(fd) {
+            if let Some(r) = dispatch_net(&mut op) {
+                return Some(r);
+            }
+            if net_owns(fd) {
+                return None;
+            }
         }
         if let Some(theirs) = running_elsewhere(fd) {
             end_spin();
@@ -3774,6 +3853,9 @@ pub(crate) fn dispatch_on(
     loop {
         if let Some(r) = dispatch_net(&mut op) {
             return Some(r);
+        }
+        if net_owns(fd) {
+            return None;
         }
         match elsewhere(fd) {
             Elsewhere::Real => return None,
@@ -3815,7 +3897,8 @@ pub(crate) fn dispatch_owned_effect(
 
 /// [`dispatch_net`] for a call on socket `fd`. A thread left over from an ended run that reaches
 /// a socket of a running sim first follows it there ([`follow_owner`]), so the call is served by
-/// the sim that made the socket rather than reaching the OS's placeholder for it.
+/// the sim that made the socket rather than reaching the OS's placeholder for it; another sim's
+/// socket the thread cannot follow is settled by [`elsewhere`].
 #[cfg(unix)]
 pub(crate) fn dispatch_net_on(
     fd: core::ffi::c_int,
@@ -3825,8 +3908,16 @@ pub(crate) fn dispatch_net_on(
         if let Some(r) = dispatch_net(&mut op) {
             return Some(r);
         }
-        if !follow_owner(fd) {
+        if net_owns(fd) {
             return None;
+        }
+        if follow_owner(fd) {
+            continue;
+        }
+        match elsewhere_if_foreign(fd) {
+            Some(Elsewhere::Retry) => continue,
+            Some(Elsewhere::Fail(errno)) => return Some(-i64::from(errno)),
+            Some(Elsewhere::Real) | None => return None,
         }
     }
 }
@@ -4014,6 +4105,48 @@ pub(crate) fn dispatch_env<T>(op: impl FnOnce(&dyn Env) -> T) -> Option<T> {
     let domain = unsafe { &*domain };
     let env = domain.env.as_deref()?;
     Some(op(env))
+}
+
+/// The calling managed thread's time-zone setting, when its domain decides its own local time:
+/// its environment is isolated, or its file plane serves `/etc/localtime`. `None` leaves local
+/// time to the C library, which reads the process environment and the real `/etc/localtime`.
+#[cfg(unix)]
+pub(crate) fn time_zone_setting() -> Option<crate::os::tz::Setting> {
+    if state::passthrough() {
+        return None;
+    }
+    let domain = state::domain();
+    if domain.is_null() {
+        return None;
+    }
+    let _passthrough = Passthrough::enter();
+    // SAFETY: see `Domain::current`.
+    let domain = unsafe { &*domain };
+    let models_localtime = domain.fs.as_deref().is_some_and(|fs| {
+        // SAFETY: an all-zero `struct stat` is a valid buffer for lstat to fill.
+        let mut buf: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a C string and a writable `struct stat`.
+        unsafe { fs.lstat(c"/etc/localtime".as_ptr(), (&raw mut buf).cast()) }.is_some()
+    });
+    let env = domain.env.as_deref();
+    if env.is_none() && !models_localtime {
+        return None;
+    }
+    let var = |name: &std::ffi::CStr| {
+        let value = match env {
+            // SAFETY: a C string.
+            Some(env) => unsafe { env.getenv(name.as_ptr()) },
+            // SAFETY: as above; under passthrough this is the process environment.
+            None => unsafe { libc::getenv(name.as_ptr()) },
+        };
+        // SAFETY: a non-null result is a C string valid until the next mutation, copied here.
+        (!value.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(value) }.to_bytes().to_vec())
+    };
+    Some(crate::os::tz::Setting {
+        serial: domain.accounting.serial.0,
+        tz: var(c"TZ"),
+        tzdir: var(c"TZDIR"),
+    })
 }
 
 /// What a thread being created takes from its creator: a strong reference to the domain, its
@@ -4293,6 +4426,10 @@ fn det_block_with_timer(
         let mask = accounting::wait_mask_value();
         #[cfg(not(target_os = "linux"))]
         let mask = u32::MAX;
+        let _listed = match key {
+            crate::sched::DetKey::Addr(addr) => Some(det_foreign::listen(addr, domain)),
+            _ => None,
+        };
         let why = sched.block(lineage, key, deadline, register_timer, mask, readiness);
         let _passthrough = Passthrough::enter();
         let stamp = domain.row_stamp();
@@ -4319,6 +4456,39 @@ pub(crate) fn det_wait_begins(deadline: Option<std::time::Duration>) {
 /// it hands the baton on. Off a deterministic domain it does nothing.
 pub fn det_wake(key: crate::sched::DetKey, n: usize) -> usize {
     with_sched(|sched| sched.wake(key, n)).unwrap_or(0)
+}
+
+/// A wake the code under test makes on the native object at `addr` for up to `n` waiters, as it
+/// reaches deterministic schedules: the calling thread's own, through [`det_wake`], and that of
+/// every other deterministic domain with a thread waiting there (see `det_foreign`). Returns how
+/// many waiters it made runnable.
+pub(crate) fn det_wake_addr(addr: usize, n: usize) -> usize {
+    let own = if det_wakes() {
+        det_wake(crate::sched::DetKey::Addr(addr), n)
+    } else {
+        0
+    };
+    own + det_foreign::wake_foreign(addr, n, u32::MAX, None)
+}
+
+/// As [`det_wake_addr`], for a Linux futex wake with bitset `mask` in the given scope.
+#[cfg(target_os = "linux")]
+pub(crate) fn det_wake_futex_addr(addr: usize, n: usize, mask: u32, private: bool) -> usize {
+    let own = if det_wakes() {
+        det_wake_futex(crate::sched::DetKey::Addr(addr), n, mask, private)
+    } else {
+        0
+    };
+    own + det_foreign::wake_foreign(addr, n, mask, Some(private))
+}
+
+/// Lists the calling participant as about to wait on `addr` in its deterministic schedule, until
+/// the guard drops, for a wait that checks a count it takes (a semaphore's) before it blocks: a
+/// wake from outside the schedule between that check and the block is kept for it (see
+/// `det_foreign`). `None` off a deterministic schedule.
+pub(crate) fn det_listen(addr: usize) -> Option<det_foreign::DetAddrWait> {
+    let domain = here()?;
+    with_det(|_| det_foreign::listen(addr, domain))
 }
 
 #[cfg(target_os = "linux")]

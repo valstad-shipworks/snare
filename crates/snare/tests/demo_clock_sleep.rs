@@ -132,7 +132,7 @@ fn an_absolute_deadline_in_the_past_returns_at_once() {
 #[test]
 fn absolute_realtime_deadline_is_honored() {
     let host = HostProfile::new().build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         // Pace against CLOCK_REALTIME: a deadline one second past the fixed epoch.
         let deadline = ts(1_700_000_001, 0);
         let rc = unsafe {

@@ -15,7 +15,7 @@ fn secs(ts: libc::timespec) -> libc::time_t {
 #[test]
 fn realtime_is_virtual_and_deterministic() {
     let host = HostProfile::new().build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         // The fixed virtual epoch, not the real wall clock.
         let t = clock_gettime(libc::CLOCK_REALTIME);
         assert_eq!(secs(t), 1_700_000_000, "virtual realtime epoch");
