@@ -2910,21 +2910,14 @@ impl SimHost {
 
 impl Drop for SimHost {
     fn drop(&mut self) {
-        // Close every fd still reserved in the tables (each is a live dup of /dev/null), then the
-        // devnull template itself, so a dropped sim leaks no descriptors.
+        // Close every socket still reserved in the tables (each is a live dup of /dev/null), then
+        // the devnull template itself. Open files stay reserved, as `VirtualFs` leaves its own: the
+        // code may still hold one, and the interposer fails calls on it with `EBADF`.
+        #[cfg(target_os = "linux")]
         if let Ok(state) = self.state.lock() {
-            for &fd in state.open.keys() {
-                unsafe { libc::close(fd) };
-            }
-            #[cfg(target_os = "linux")]
-            for &fd in state.dirs.keys() {
-                unsafe { libc::close(fd) };
-            }
-            #[cfg(target_os = "linux")]
             for &fd in state.udp.keys() {
                 unsafe { libc::close(fd) };
             }
-            #[cfg(target_os = "linux")]
             for &fd in state.netlinks.keys() {
                 unsafe { libc::close(fd) };
             }

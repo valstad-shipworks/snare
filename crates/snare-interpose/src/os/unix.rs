@@ -753,8 +753,7 @@ unsafe extern "C" fn syscall(
     // std's and parking_lot's blocking edge on Linux: a futex wait counted toward quiescence and
     // timed in the domain's clock (see `os::sync`).
     if number == libc::SYS_getdents64
-        && domain::fs_owns(a as c_int)
-        && let Some(result) = domain::dispatch_fs(|fs| unsafe {
+        && let Some(result) = domain::dispatch_fs_fd(a as c_int, |fs| unsafe {
             fs.getdents64(a as c_int, b as *mut u8, c as u32 as usize)
         })
     {
@@ -767,9 +766,9 @@ unsafe extern "C" fn syscall(
         return crate::os::sockets::finish(result);
     }
     if number == libc::SYS_fstatfs
-        && domain::fs_owns(a as c_int)
-        && let Some(result) =
-            domain::dispatch_fs(|fs| unsafe { fs.fstatfs(a as c_int, b as *mut u8) })
+        && let Some(result) = domain::dispatch_fs_fd(a as c_int, |fs| unsafe {
+            fs.fstatfs(a as c_int, b as *mut u8)
+        })
     {
         return crate::os::sockets::finish(result);
     }
@@ -929,8 +928,8 @@ pub(crate) unsafe extern "C" fn ioctl(fd: c_int, request: libc::c_ulong, argumen
     // man 2 ioctl: variadic in C (`ioctl(fd, request, ...)`), but every request we model takes a
     // single third word. For SIOC* that word is a `struct ifreq *` (man 7 netdevice).
     // SAFETY: `argument` is the ioctl's third word (a pointer for FIONBIO/FIONREAD/SIOC*).
-    if domain::fs_owns(fd)
-        && let Some(r) = domain::dispatch_fs(|fs| unsafe { fs.ioctl(fd, request, argument as i64) })
+    if let Some(r) =
+        domain::dispatch_fs_fd(fd, |fs| unsafe { fs.ioctl(fd, request, argument as i64) })
     {
         return crate::os::sockets::finish(r) as c_int;
     }

@@ -14,7 +14,8 @@
 //! unique process-wide, `close` on it is safe, and any call the backend does not model degrades to
 //! `/dev/null` behaviour instead of hitting someone else's fd. Opens of one file share its
 //! contents. Each open-file description has its own offset and status flags; descriptor aliases
-//! share the description.
+//! share the description. A descriptor is the process's, like any open file: a thread of another
+//! sim, or of none, that reaches one is served here too, by whichever plane opened it.
 //!
 //! Locks: `tree` is never held together with `open` or `dirs`; `open` precedes `dirs` when both
 //! tables are needed. File contents are locked after either table. Locks are plain `std`
@@ -59,9 +60,6 @@ impl<T> OpenFiles<T> {
         self.descriptions
             .get_mut(self.handles.get(fd)?)
             .map(|(_, value)| value)
-    }
-    pub(crate) fn keys(&self) -> impl Iterator<Item = &c_int> {
-        self.handles.keys()
     }
     pub(crate) fn insert(&mut self, fd: c_int, value: T) {
         self.remove(&fd);
@@ -922,21 +920,14 @@ impl VirtualFs {
     }
 }
 
+/// Descriptors still open when the plane goes are left open: the code holding one may still use
+/// it, and a closed number would be the OS's to hand out again, so a later call through it would
+/// reach some other file. The interposer fails such calls with `EBADF` until the holder closes it.
 impl Drop for VirtualFs {
     fn drop(&mut self) {
-        snare_interpose::real(|| unsafe {
-            for &fd in self.open.get_mut().unwrap().keys() {
-                libc::close(fd);
-            }
-            for &fd in self.dirs.get_mut().unwrap().keys() {
-                if !self.open.get_mut().unwrap().contains_key(&fd) {
-                    libc::close(fd);
-                }
-            }
-            if self.devnull >= 0 {
-                libc::close(self.devnull);
-            }
-        });
+        if self.devnull >= 0 {
+            snare_interpose::real(|| unsafe { libc::close(self.devnull) });
+        }
     }
 }
 
@@ -2680,4 +2671,317 @@ pub(crate) fn fill_statx(
         put_u64(48, size.div_ceil(512)); // stx_blocks
     }
     ok(0)
+}
+
+/// File planes consulted in order, the first answer winning, so several can serve one domain.
+pub(crate) struct FsChain(pub(crate) Vec<Arc<dyn Fs>>);
+
+/// Forwards each call to the planes in order until one answers.
+macro_rules! first {
+    ($self:ident, |$fs:ident| $call:expr) => {
+        $self.0.iter().find_map(|$fs| unsafe { $call })
+    };
+}
+
+impl Fs for FsChain {
+    fn owns(&self, fd: c_int) -> bool {
+        self.0.iter().any(|fs| fs.owns(fd))
+    }
+
+    fn cwd_path(&self) -> Option<Result<Vec<u8>, c_int>> {
+        self.0.iter().find_map(|fs| fs.cwd_path())
+    }
+
+    fn cwd_changed(&self) {
+        for fs in &self.0 {
+            fs.cwd_changed();
+        }
+    }
+
+    unsafe fn open(&self, path: *const c_char, flags: c_int, mode: u32) -> Option<FsResult> {
+        first!(self, |fs| fs.open(path, flags, mode))
+    }
+
+    unsafe fn openat(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        flags: c_int,
+        mode: u32,
+    ) -> Option<FsResult> {
+        first!(self, |fs| fs.openat(dirfd, path, flags, mode))
+    }
+
+    unsafe fn stat(&self, path: *const c_char, buf: *mut u8) -> Option<FsResult> {
+        first!(self, |fs| fs.stat(path, buf))
+    }
+
+    unsafe fn lstat(&self, path: *const c_char, buf: *mut u8) -> Option<FsResult> {
+        first!(self, |fs| fs.lstat(path, buf))
+    }
+
+    unsafe fn fstatat(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        buf: *mut u8,
+        flags: c_int,
+    ) -> Option<FsResult> {
+        first!(self, |fs| fs.fstatat(dirfd, path, buf, flags))
+    }
+
+    unsafe fn statx(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        flags: c_int,
+        mask: u32,
+        buf: *mut u8,
+    ) -> Option<FsResult> {
+        first!(self, |fs| fs.statx(dirfd, path, flags, mask, buf))
+    }
+
+    unsafe fn access(&self, path: *const c_char, mode: c_int) -> Option<FsResult> {
+        first!(self, |fs| fs.access(path, mode))
+    }
+
+    unsafe fn faccessat(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        mode: c_int,
+        flags: c_int,
+    ) -> Option<FsResult> {
+        first!(self, |fs| fs.faccessat(dirfd, path, mode, flags))
+    }
+
+    unsafe fn readlink(&self, path: *const c_char, buf: *mut u8, len: usize) -> Option<FsResult> {
+        first!(self, |fs| fs.readlink(path, buf, len))
+    }
+
+    unsafe fn readlinkat(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        buf: *mut u8,
+        len: usize,
+    ) -> Option<FsResult> {
+        first!(self, |fs| fs.readlinkat(dirfd, path, buf, len))
+    }
+
+    unsafe fn symlink(&self, target: *const c_char, link: *const c_char) -> Option<FsResult> {
+        first!(self, |fs| fs.symlink(target, link))
+    }
+
+    unsafe fn symlinkat(
+        &self,
+        target: *const c_char,
+        dirfd: c_int,
+        link: *const c_char,
+    ) -> Option<FsResult> {
+        first!(self, |fs| fs.symlinkat(target, dirfd, link))
+    }
+
+    unsafe fn chdir(&self, path: *const c_char) -> Option<FsResult> {
+        for (index, fs) in self.0.iter().enumerate() {
+            if let Some(result) = unsafe { fs.chdir(path) } {
+                if matches!(result, FsResult::Ok(_)) {
+                    for other in self
+                        .0
+                        .iter()
+                        .enumerate()
+                        .filter(|(other, _)| *other != index)
+                    {
+                        other.1.cwd_changed();
+                    }
+                }
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    unsafe fn fchdir(&self, fd: c_int) -> Option<FsResult> {
+        for (index, fs) in self.0.iter().enumerate() {
+            if let Some(result) = unsafe { fs.fchdir(fd) } {
+                if matches!(result, FsResult::Ok(_)) {
+                    for other in self
+                        .0
+                        .iter()
+                        .enumerate()
+                        .filter(|(other, _)| *other != index)
+                    {
+                        other.1.cwd_changed();
+                    }
+                }
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    unsafe fn getcwd(&self, buf: *mut c_char, len: usize) -> Option<FsResult> {
+        first!(self, |fs| fs.getcwd(buf, len))
+    }
+
+    unsafe fn unlink(&self, path: *const c_char) -> Option<FsResult> {
+        first!(self, |fs| fs.unlink(path))
+    }
+
+    unsafe fn unlinkat(&self, fd: c_int, path: *const c_char, flags: c_int) -> Option<FsResult> {
+        first!(self, |fs| fs.unlinkat(fd, path, flags))
+    }
+
+    unsafe fn rmdir(&self, path: *const c_char) -> Option<FsResult> {
+        first!(self, |fs| fs.rmdir(path))
+    }
+
+    unsafe fn mkdir(&self, path: *const c_char, mode: u32) -> Option<FsResult> {
+        first!(self, |fs| fs.mkdir(path, mode))
+    }
+
+    unsafe fn mkdirat(&self, fd: c_int, path: *const c_char, mode: u32) -> Option<FsResult> {
+        first!(self, |fs| fs.mkdirat(fd, path, mode))
+    }
+
+    unsafe fn rename(&self, from: *const c_char, to: *const c_char) -> Option<FsResult> {
+        first!(self, |fs| fs.rename(from, to))
+    }
+
+    unsafe fn renameat(
+        &self,
+        fromfd: c_int,
+        from: *const c_char,
+        tofd: c_int,
+        to: *const c_char,
+    ) -> Option<FsResult> {
+        first!(self, |fs| fs.renameat(fromfd, from, tofd, to))
+    }
+
+    unsafe fn realpath(&self, path: *const c_char, resolved: *mut c_char) -> Option<FsResult> {
+        first!(self, |fs| fs.realpath(path, resolved))
+    }
+
+    unsafe fn link(&self, from: *const c_char, to: *const c_char) -> Option<FsResult> {
+        first!(self, |fs| fs.link(from, to))
+    }
+
+    unsafe fn linkat(
+        &self,
+        fromfd: c_int,
+        from: *const c_char,
+        tofd: c_int,
+        to: *const c_char,
+        flags: c_int,
+    ) -> Option<FsResult> {
+        first!(self, |fs| fs.linkat(fromfd, from, tofd, to, flags))
+    }
+
+    unsafe fn statfs(&self, path: *const c_char, buf: *mut u8) -> Option<FsResult> {
+        first!(self, |fs| fs.statfs(path, buf))
+    }
+
+    unsafe fn fstatfs(&self, fd: c_int, buf: *mut u8) -> Option<FsResult> {
+        first!(self, |fs| fs.fstatfs(fd, buf))
+    }
+
+    unsafe fn fstat(&self, fd: c_int, buf: *mut u8) -> Option<FsResult> {
+        first!(self, |fs| fs.fstat(fd, buf))
+    }
+
+    unsafe fn lseek(&self, fd: c_int, offset: i64, whence: c_int) -> Option<FsResult> {
+        first!(self, |fs| fs.lseek(fd, offset, whence))
+    }
+
+    unsafe fn pread(&self, fd: c_int, buf: *mut u8, len: usize, offset: i64) -> Option<FsResult> {
+        first!(self, |fs| fs.pread(fd, buf, len, offset))
+    }
+
+    unsafe fn pwrite(
+        &self,
+        fd: c_int,
+        buf: *const u8,
+        len: usize,
+        offset: i64,
+    ) -> Option<FsResult> {
+        first!(self, |fs| fs.pwrite(fd, buf, len, offset))
+    }
+
+    unsafe fn ftruncate(&self, fd: c_int, len: i64) -> Option<FsResult> {
+        first!(self, |fs| fs.ftruncate(fd, len))
+    }
+
+    unsafe fn fsync(&self, fd: c_int) -> Option<FsResult> {
+        first!(self, |fs| fs.fsync(fd))
+    }
+
+    unsafe fn getdents64(&self, fd: c_int, buf: *mut u8, len: usize) -> Option<FsResult> {
+        first!(self, |fs| fs.getdents64(fd, buf, len))
+    }
+
+    unsafe fn opendir(&self, path: *const c_char) -> Option<FsResult> {
+        first!(self, |fs| fs.opendir(path))
+    }
+
+    unsafe fn fdopendir(&self, fd: c_int) -> Option<FsResult> {
+        first!(self, |fs| fs.fdopendir(fd))
+    }
+
+    unsafe fn readdir(&self, fd: c_int) -> Option<FsResult> {
+        first!(self, |fs| fs.readdir(fd))
+    }
+
+    unsafe fn readdir_r(
+        &self,
+        fd: c_int,
+        entry: *mut u8,
+        result: *mut *mut u8,
+    ) -> Option<FsResult> {
+        first!(self, |fs| fs.readdir_r(fd, entry, result))
+    }
+
+    unsafe fn closedir(&self, fd: c_int) -> Option<FsResult> {
+        first!(self, |fs| fs.closedir(fd))
+    }
+
+    unsafe fn read(&self, fd: c_int, buf: *mut u8, len: usize) -> Option<FsResult> {
+        first!(self, |fs| fs.read(fd, buf, len))
+    }
+
+    unsafe fn write(&self, fd: c_int, buf: *const u8, len: usize) -> Option<FsResult> {
+        first!(self, |fs| fs.write(fd, buf, len))
+    }
+
+    unsafe fn close(&self, fd: c_int) -> Option<FsResult> {
+        first!(self, |fs| fs.close(fd))
+    }
+
+    unsafe fn fcntl(&self, fd: c_int, cmd: c_int, arg: i64) -> Option<FsResult> {
+        first!(self, |fs| fs.fcntl(fd, cmd, arg))
+    }
+
+    unsafe fn ioctl(&self, fd: c_int, request: u64, arg: i64) -> Option<FsResult> {
+        first!(self, |fs| fs.ioctl(fd, request, arg))
+    }
+
+    unsafe fn fd_replaced(&self, fd: c_int) -> Option<FsResult> {
+        first!(self, |fs| fs.fd_replaced(fd))
+    }
+
+    unsafe fn dup(&self, oldfd: c_int, newfd: c_int) -> Option<FsResult> {
+        first!(self, |fs| fs.dup(oldfd, newfd))
+    }
+
+    unsafe fn dup_to(&self, oldfd: c_int, newfd: c_int, flags: Option<c_int>) -> Option<FsResult> {
+        let source = self.0.iter().position(|fs| fs.owns(oldfd))?;
+        let target = self.0.iter().position(|fs| fs.owns(newfd));
+        let result = unsafe { self.0[source].dup_to(oldfd, newfd, flags) }?;
+        if matches!(result, FsResult::Ok(_))
+            && oldfd != newfd
+            && let Some(target) = target.filter(|target| *target != source)
+        {
+            unsafe { self.0[target].fd_replaced(newfd) };
+        }
+        Some(result)
+    }
 }

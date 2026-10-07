@@ -3,17 +3,19 @@
 //! the socket calls record themselves as observed and forward; the generic fd calls forward
 //! untouched.
 //!
-//! Every hook follows one shape: offer the call through [`dispatch_net`] (or
-//! [`domain::dispatch_net_effect`] for calls other threads can see, so an executive's audit notes
-//! them), turn a handled result into the C convention with [`finish`], and otherwise call the
-//! original through its slot. The dispatchers return `None` without consulting anything when the
-//! thread is already in passthrough or belongs to no domain, and they enter passthrough for the
-//! backend's duration, so a backend's own libc calls reach the OS rather than recursing here.
+//! Every hook follows one shape: offer the call through [`dispatch_net`], or for a call on a
+//! socket through [`domain::dispatch_net_on`] (or [`domain::dispatch_net_on_effect`] for calls
+//! other threads can see, so an executive's audit notes them), which first moves a thread left
+//! over from an ended run into the running sim that made the socket; turn a handled result into
+//! the C convention with [`finish`], and otherwise call the original through its slot. The
+//! dispatchers return `None` without consulting anything when the thread is already in passthrough
+//! or belongs to no domain, and they enter passthrough for the backend's duration, so a backend's
+//! own libc calls reach the OS rather than recursing here.
 //!
 //! The generic fd calls (`read`, `write`, `close`, `fcntl`) are shared with the file backend.
-//! They ask [`fs_owns`] first and then [`net_owns`](domain::net_owns), and offer the call only to
-//! the plane that owns the fd: an fd is minted by at most one backend, and a real fd must never be
-//! handed to one.
+//! They ask the file plane that minted the fd ([`file_plane`](domain::file_plane), whichever sim's
+//! it is) first and then [`net_owns`](domain::net_owns), and offer the call only to the plane that
+//! owns the fd: an fd is minted by at most one backend, and a real fd must never be handed to one.
 //! Unowned fds forward without being observed, since every program does this I/O on real fds.
 
 use std::ffi::{c_char, c_int, c_void};
@@ -21,8 +23,9 @@ use std::sync::atomic::AtomicUsize;
 
 use libc::{nfds_t, pollfd, size_t, sockaddr, socklen_t, ssize_t};
 
-use crate::domain::{self, dispatch_fs, dispatch_net, fs_owns};
+use crate::domain::{self, FilePlane, dispatch_fs_fd, dispatch_net};
 use crate::hooks::{Hook, hook, original};
+use crate::state::Passthrough;
 
 /// Declares the `AtomicUsize` that holds one hooked function's original address, filled when the
 /// hook is installed and read through [`original`].
@@ -396,17 +399,32 @@ unsafe extern "C" fn kevent(
 ) -> c_int {
     // man 2 kevent: applies `changelist` then returns up to `nevents` ready events; `timeout`
     // is a timespec (null blocks). SAFETY: the caller's change/event arrays and timeout.
-    if let Some(r) = domain::dispatch_owned(kq, |net| unsafe {
-            net.kevent(
-                kq,
-                changelist.cast(),
-                nchanges,
-                eventlist.cast(),
-                nevents,
-                timeout.cast(),
-            )
-        })
-    {
+    let wakes_only = nchanges > 0
+        && !changelist.is_null()
+        && (0..nchanges as usize).all(|i| {
+            // SAFETY: `changelist` holds `nchanges` entries.
+            let ch = unsafe { changelist.add(i).read_unaligned() };
+            ch.filter == libc::EVFILT_USER
+                && ch.fflags & libc::NOTE_TRIGGER != 0
+                && ch.flags & (libc::EV_DELETE | libc::EV_DISABLE) == 0
+                && (nevents == 0 || ch.flags & libc::EV_RECEIPT != 0)
+        });
+    let op = |net: &dyn crate::net::Net| unsafe {
+        net.kevent(
+            kq,
+            changelist.cast(),
+            nchanges,
+            eventlist.cast(),
+            nevents,
+            timeout.cast(),
+        )
+    };
+    let handled = if wakes_only {
+        domain::dispatch_wake(kq, op)
+    } else {
+        domain::dispatch_owned(kq, op)
+    };
+    if let Some(r) = handled {
         return finish(r) as c_int;
     }
     domain::observe("kevent", None);
@@ -794,7 +812,7 @@ unsafe extern "C" fn socketpair(
 unsafe extern "C" fn connect(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c_int {
     // man 2 connect: `len` is the sockaddr size; a nonblocking connect returns EINPROGRESS.
     // SAFETY: `addr` points to `len` bytes.
-    if let Some(r) = domain::dispatch_net_effect("connect", |net| unsafe {
+    if let Some(r) = domain::dispatch_net_on_effect("connect", fd, |net| unsafe {
         net.connect(fd, addr.cast(), len)
     }) {
         return finish(r) as c_int;
@@ -812,7 +830,7 @@ unsafe extern "C" fn connect(fd: c_int, addr: *const sockaddr, len: socklen_t) -
 unsafe extern "C" fn bind(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c_int {
     // man 2 bind: assigns the local address; a busy port yields EADDRINUSE.
     // SAFETY: `addr` points to `len` bytes.
-    if let Some(r) = dispatch_net(|net| unsafe { net.bind(fd, addr.cast(), len) }) {
+    if let Some(r) = domain::dispatch_net_on(fd, |net| unsafe { net.bind(fd, addr.cast(), len) }) {
         return finish(r) as c_int;
     }
     domain::observe("bind", None);
@@ -828,7 +846,7 @@ unsafe extern "C" fn bind(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c
 unsafe extern "C" fn listen(fd: c_int, backlog: c_int) -> c_int {
     // man 2 listen: `backlog` bounds the pending-connection queue (capped by SOMAXCONN).
     // SAFETY: no pointers.
-    if let Some(r) = dispatch_net(|net| unsafe { net.listen(fd, backlog) }) {
+    if let Some(r) = domain::dispatch_net_on(fd, |net| unsafe { net.listen(fd, backlog) }) {
         return finish(r) as c_int;
     }
     domain::observe("listen", None);
@@ -840,7 +858,7 @@ unsafe extern "C" fn listen(fd: c_int, backlog: c_int) -> c_int {
 unsafe extern "C" fn accept(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
     // man 2 accept: `len` is in/out (buffer capacity in, actual peer-addr size out).
     // SAFETY: `addr`/`len` receive the peer address.
-    if let Some(r) = domain::dispatch_net_effect("accept", |net| unsafe {
+    if let Some(r) = domain::dispatch_net_on_effect("accept", fd, |net| unsafe {
         net.accept(fd, addr.cast(), len.cast(), 0)
     }) {
         return finish(r) as c_int;
@@ -865,7 +883,7 @@ unsafe extern "C" fn accept4(
 ) -> c_int {
     // man 2 accept4: accept plus SOCK_NONBLOCK/SOCK_CLOEXEC on the new fd (Linux-specific).
     // SAFETY: `addr`/`len` receive the peer address.
-    if let Some(r) = domain::dispatch_net_effect("accept", |net| unsafe {
+    if let Some(r) = domain::dispatch_net_on_effect("accept", fd, |net| unsafe {
         net.accept(fd, addr.cast(), len.cast(), flags)
     }) {
         return finish(r) as c_int;
@@ -883,7 +901,7 @@ unsafe extern "C" fn accept4(
 unsafe extern "C" fn send(fd: c_int, buf: *const c_void, len: size_t, flags: c_int) -> ssize_t {
     // man 2 send: flags MSG_DONTWAIT/MSG_NOSIGNAL/MSG_MORE; a full buffer yields EAGAIN.
     // SAFETY: `buf` points to `len` bytes.
-    if let Some(r) = domain::dispatch_net_effect("send", |net| unsafe {
+    if let Some(r) = domain::dispatch_on_effect("send", fd, |net| unsafe {
         net.send(fd, buf.cast(), len, flags)
     }) {
         return finish(r) as ssize_t;
@@ -901,7 +919,7 @@ unsafe extern "C" fn send(fd: c_int, buf: *const c_void, len: size_t, flags: c_i
 unsafe extern "C" fn recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -> ssize_t {
     // man 2 recv: 0 means orderly shutdown; flags MSG_PEEK/MSG_WAITALL/MSG_DONTWAIT.
     // SAFETY: `buf` points to `len` writable bytes.
-    if let Some(r) = dispatch_net(|net| unsafe { net.recv(fd, buf.cast(), len, flags) }) {
+    if let Some(r) = domain::dispatch_on(fd, |net| unsafe { net.recv(fd, buf.cast(), len, flags) }) {
         return finish(r) as ssize_t;
     }
     domain::observe("recv", None);
@@ -924,7 +942,7 @@ unsafe extern "C" fn sendto(
 ) -> ssize_t {
     // man 2 sendto: like send but `addr`/`addr_len` name the datagram destination.
     // SAFETY: `buf` readable; `addr` a destination sockaddr.
-    if let Some(r) = domain::dispatch_net_effect("sendto", |net| unsafe {
+    if let Some(r) = domain::dispatch_on_effect("sendto", fd, |net| unsafe {
         net.sendto(fd, buf.cast(), len, flags, addr.cast(), addr_len)
     }) {
         return finish(r) as ssize_t;
@@ -956,7 +974,7 @@ unsafe extern "C" fn recvfrom(
 ) -> ssize_t {
     // man 2 recvfrom: like recv but `addr`/`addr_len` (in/out) receive the datagram source.
     // SAFETY: `buf` writable; `addr`/`addr_len` receive the source.
-    if let Some(r) = dispatch_net(|net| unsafe {
+    if let Some(r) = domain::dispatch_on(fd, |net| unsafe {
         net.recvfrom(fd, buf.cast(), len, flags, addr.cast(), addr_len.cast())
     }) {
         return finish(r) as ssize_t;
@@ -981,7 +999,7 @@ unsafe extern "C" fn recvfrom(
 unsafe extern "C" fn shutdown(fd: c_int, how: c_int) -> c_int {
     // man 2 shutdown: how is SHUT_RD(0)/SHUT_WR(1)/SHUT_RDWR(2).
     // SAFETY: no pointers.
-    if let Some(r) = domain::dispatch_net_effect("shutdown", |net| unsafe { net.shutdown(fd, how) })
+    if let Some(r) = domain::dispatch_on_effect("shutdown", fd, |net| unsafe { net.shutdown(fd, how) })
     {
         return finish(r) as c_int;
     }
@@ -994,10 +1012,12 @@ unsafe extern "C" fn shutdown(fd: c_int, how: c_int) -> c_int {
 /// fd it owns; a real fd closes without being observed.
 unsafe extern "C" fn close(fd: c_int) -> c_int {
     let handled = domain::descriptor_transaction(|| {
-        if fs_owns(fd)
-            && let Some(result) = dispatch_fs(|fs| unsafe { fs.close(fd) })
-        {
-            return Some(result);
+        if let Some(FilePlane::Served(fs, serial)) = domain::file_plane(fd) {
+            crate::owners::release_file_of(fd, serial);
+            let _passthrough = Passthrough::enter();
+            if let Some(result) = unsafe { fs.close(fd) } {
+                return Some(result.into_raw());
+            }
         }
         if let Some(result) =
             domain::dispatch_owned_effect("close", fd, |net| unsafe { net.close(fd) })
@@ -1030,7 +1050,9 @@ unsafe extern "C" fn close(fd: c_int) -> c_int {
 unsafe extern "C" fn getsockname(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
     // man 2 getsockname: reports the bound local address; `len` is in/out.
     // SAFETY: `addr`/`len` receive the local address.
-    if let Some(r) = dispatch_net(|net| unsafe { net.getsockname(fd, addr.cast(), len.cast()) }) {
+    if let Some(r) =
+        domain::dispatch_net_on(fd, |net| unsafe { net.getsockname(fd, addr.cast(), len.cast()) })
+    {
         return finish(r) as c_int;
     }
     domain::observe("getsockname", None);
@@ -1046,7 +1068,9 @@ unsafe extern "C" fn getsockname(fd: c_int, addr: *mut sockaddr, len: *mut sockl
 unsafe extern "C" fn getpeername(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
     // man 2 getpeername: reports the connected peer address; ENOTCONN if unconnected.
     // SAFETY: `addr`/`len` receive the peer address.
-    if let Some(r) = dispatch_net(|net| unsafe { net.getpeername(fd, addr.cast(), len.cast()) }) {
+    if let Some(r) =
+        domain::dispatch_net_on(fd, |net| unsafe { net.getpeername(fd, addr.cast(), len.cast()) })
+    {
         return finish(r) as c_int;
     }
     domain::observe("getpeername", None);
@@ -1069,8 +1093,9 @@ unsafe extern "C" fn setsockopt(
     // man 2 setsockopt, man 7 socket: `level` (SOL_SOCKET/IPPROTO_*) selects the option
     // namespace for `name` (SO_REUSEADDR, SO_RCVBUF, SO_TIMESTAMPING, ...).
     // SAFETY: `val` points to `len` bytes.
-    if let Some(r) = dispatch_net(|net| unsafe { net.setsockopt(fd, level, name, val.cast(), len) })
-    {
+    if let Some(r) = domain::dispatch_net_on(fd, |net| unsafe {
+        net.setsockopt(fd, level, name, val.cast(), len)
+    }) {
         return finish(r) as c_int;
     }
     domain::observe("setsockopt", None);
@@ -1092,9 +1117,9 @@ unsafe extern "C" fn getsockopt(
 ) -> c_int {
     // man 2 getsockopt: `len` is in/out; SO_ERROR retrieves and clears the pending error.
     // SAFETY: `val`/`len` receive the option value.
-    if let Some(r) =
-        dispatch_net(|net| unsafe { net.getsockopt(fd, level, name, val.cast(), len.cast()) })
-    {
+    if let Some(r) = domain::dispatch_net_on(fd, |net| unsafe {
+        net.getsockopt(fd, level, name, val.cast(), len.cast())
+    }) {
         return finish(r) as c_int;
     }
     domain::observe("getsockopt", None);
@@ -1133,9 +1158,18 @@ unsafe fn dup_inner(fd: c_int) -> c_int {
     {
         return finish(r) as c_int;
     }
+    let plane = domain::file_plane(fd);
+    if let Some(FilePlane::Gone) = plane {
+        return finish(-i64::from(libc::EBADF)) as c_int;
+    }
     let newfd = unsafe { original::<unsafe extern "C" fn(c_int) -> c_int>(&DUP)(fd) };
-    if newfd >= 0 && fs_owns(fd) {
-        let _ = dispatch_fs(|fs| unsafe { fs.dup(fd, newfd) });
+    if newfd >= 0
+        && let Some(FilePlane::Served(fs, serial)) = plane
+    {
+        let _passthrough = Passthrough::enter();
+        if unsafe { fs.dup(fd, newfd) }.is_some() {
+            crate::owners::claim_file(newfd, serial);
+        }
     }
     newfd
 }
@@ -1214,9 +1248,7 @@ unsafe extern "C" fn select(
 unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, len: size_t) -> ssize_t {
     // man 2 read: returns bytes read (0 at EOF); a stream socket fd reads like a byte stream.
     // SAFETY: `buf` points to `len` writable bytes.
-    if fs_owns(fd)
-        && let Some(r) = dispatch_fs(|fs| unsafe { fs.read(fd, buf.cast(), len) })
-    {
+    if let Some(r) = dispatch_fs_fd(fd, |fs| unsafe { fs.read(fd, buf.cast(), len) }) {
         return finish(r) as ssize_t;
     }
     // SAFETY: `buf` points to `len` writable bytes.
@@ -1235,16 +1267,18 @@ unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, len: size_t) -> ssize_t {
 unsafe extern "C" fn write(fd: c_int, buf: *const c_void, len: size_t) -> ssize_t {
     // man 2 write: may write fewer than `len` bytes (a short write) before returning.
     // SAFETY: `buf` points to `len` readable bytes.
-    if fs_owns(fd)
-        && let Some(r) = dispatch_fs(|fs| unsafe { fs.write(fd, buf.cast(), len) })
-    {
+    if let Some(r) = dispatch_fs_fd(fd, |fs| unsafe { fs.write(fd, buf.cast(), len) }) {
         return finish(r) as ssize_t;
     }
     // SAFETY: `buf` points to `len` readable bytes.
-    if let Some(r) = domain::dispatch_owned_effect("write", fd, |net| unsafe {
-        net.write(fd, buf.cast(), len)
-    })
-    {
+    let write = |net: &dyn crate::net::Net| unsafe { net.write(fd, buf.cast(), len) };
+    let handled = if cfg!(target_os = "linux") && len == 8 {
+        domain::dispatch_wake(fd, write)
+    } else {
+        domain::dispatch_owned(fd, write)
+    };
+    if let Some(r) = handled {
+        domain::note_effect("write");
         return finish(r) as ssize_t;
     }
     // SAFETY: WRITE holds libc's write.
@@ -1286,10 +1320,23 @@ unsafe fn fcntl_inner(fd: c_int, cmd: c_int, arg: i64) -> c_int {
     // man 2 fcntl: the modeled commands are F_GETFL/F_SETFL (O_NONBLOCK), F_GETFD/F_SETFD
     // (FD_CLOEXEC) and F_DUPFD/F_DUPFD_CLOEXEC.
     // SAFETY: no pointer args for the fcntl commands a socket/file sees (flags, dup).
-    if fs_owns(fd)
-        && let Some(r) = dispatch_fs(|fs| unsafe { fs.fcntl(fd, cmd, arg) })
-    {
-        return finish(r) as c_int;
+    match domain::file_plane(fd) {
+        Some(FilePlane::Served(fs, serial)) => {
+            let handled = {
+                let _passthrough = Passthrough::enter();
+                unsafe { fs.fcntl(fd, cmd, arg) }
+            };
+            if let Some(r) = handled {
+                if let crate::net::NetResult::Ok(newfd) = r
+                    && (cmd == libc::F_DUPFD || cmd == libc::F_DUPFD_CLOEXEC)
+                {
+                    crate::owners::claim_file(newfd as c_int, serial);
+                }
+                return finish(r.into_raw()) as c_int;
+            }
+        }
+        Some(FilePlane::Gone) => return finish(-i64::from(libc::EBADF)) as c_int,
+        None => {}
     }
     // SAFETY: no pointer args for the fcntl commands a socket sees (flags, dup).
     if let Some(r) = domain::dispatch_owned(fd, |net| unsafe { net.fcntl(fd, cmd, arg) })

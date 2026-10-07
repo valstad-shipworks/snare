@@ -31,7 +31,15 @@ const SHIMS_TAG: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 /// The crates.io packages `shims/` provides drop-in replacements for; each is a subdirectory of
 /// the same name.
-const SHIM_CRATES: [&str; 4] = ["io-uring", "xsk-rs", "sc", "syscalls"];
+const SHIM_CRATES: [&str; 7] = [
+    "io-uring",
+    "xsk-rs",
+    "sc",
+    "syscalls",
+    "async-io",
+    "async-global-executor",
+    "blocking",
+];
 
 /// Appended to `RUSTFLAGS`. `rustix_use_libc` is the cfg rustix's build script reads to select
 /// its libc backend (rustix README, "set the RUSTFLAGS environment variable to
@@ -82,8 +90,8 @@ enum Cmd {
 /// Options of `cargo snare test`.
 #[derive(Args)]
 struct TestArgs {
-    /// Directory holding the drop-in syscall shims (io-uring, xsk-rs, sc, syscalls), used instead
-    /// of the snare repository's tagged copy.
+    /// Directory holding the drop-in shims (io-uring, xsk-rs, sc, syscalls, async-io,
+    /// async-global-executor, blocking), used instead of the snare repository's tagged copy.
     #[arg(long, value_name = "DIR")]
     shims_dir: Option<PathBuf>,
 

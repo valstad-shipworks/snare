@@ -2318,10 +2318,11 @@ fn address_wakes(addr: usize) -> &'static AtomicU64 {
 /// winerror.h: ERROR_TIMEOUT (1460), what a timed-out WaitOnAddress leaves in GetLastError.
 const ERROR_TIMEOUT: u32 = 1460;
 
-/// How long a wait on a word in static data first waits in real time, for a holder outside the
-/// simulation, before it counts as a wait in the domain. A snare choice, as on Linux: long enough
-/// for an outside holder in a short critical section to let go, short enough not to slow a run that
-/// waits on an inside one.
+/// How long a wait on a word in static data, or one a lock's back-off spin leads into (see
+/// `domain::backing_off`), first waits in real time, for a holder outside the simulation, before
+/// it counts as a wait in the domain. A snare choice, as on Linux: long enough for an outside
+/// holder in a short critical section to let go, short enough not to slow a run that waits on an
+/// inside one.
 const OUTSIDE_HOLDER_GRACE_MS: u32 = 1;
 
 /// [`OUTSIDE_HOLDER_GRACE_MS`] for a wait under a deterministic schedule, which keeps the baton
@@ -2333,11 +2334,11 @@ const DET_OUTSIDE_HOLDER_GRACE_MS: u32 = 50;
 
 /// The first [`OUTSIDE_HOLDER_GRACE_MS`] of a `WaitOnAddress` on a word in static data, which may
 /// be a lock shared with threads outside the simulation (std's own statics: stdout's and stderr's
-/// locks, the `Once` around Winsock's startup), as a real wait the domain does not count. The word
-/// carries no owner, so whether a thread of the domain holds it cannot be told; a holder outside
-/// lets go in that time, and a holder inside merely delays the wait's counting by it. Returns the
-/// wait's result, with the last error as the OS left it, when it ended other than by timing out;
-/// `None` once the grace ran out.
+/// locks, the `Once` around Winsock's startup), or of one a lock's back-off spin leads into, as a
+/// real wait the domain does not count. The word carries no owner, so whether a thread of the
+/// domain holds it cannot be told; a holder outside lets go in that time, and a holder inside
+/// merely delays the wait's counting by it. Returns the wait's result, with the last error as the
+/// OS left it, when it ended other than by timing out; `None` once the grace ran out.
 ///
 /// # Safety
 /// As for `WaitOnAddress`.
@@ -2422,7 +2423,7 @@ unsafe fn wait_on_address_call(
         }
         // A holder inside the simulation is parked while this thread keeps the baton and cannot
         // release the word meanwhile, so whether this wait yields never depends on outside timing.
-        if domain::in_static_image(addr)
+        if (domain::in_static_image(addr) || domain::backing_off())
             && let Some(woke) =
                 unsafe { outside_grace(DET_OUTSIDE_HOLDER_GRACE_MS, address, compare, size) }
         {
@@ -2440,7 +2441,7 @@ unsafe fn wait_on_address_call(
     }
     if millis == INFINITE {
         if domain::counts_native_waits()
-            && domain::in_static_image(addr)
+            && (domain::in_static_image(addr) || domain::backing_off())
             && let Some(woke) =
                 unsafe { outside_grace(OUTSIDE_HOLDER_GRACE_MS, address, compare, size) }
         {

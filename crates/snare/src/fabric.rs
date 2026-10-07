@@ -269,6 +269,8 @@ pub(crate) struct Conn {
     hop: Option<Hop>,
     /// The two unnamed ends of a `socketpair`: no addresses, and no link policy between them.
     pair: bool,
+    /// The socketpair's process-wide identity (see [`ProcessPairs`]); 0 for a connection.
+    pair_id: u64,
     /// The pcapng capture this connection's segments are written to, when capture is on.
     tap: Option<TcpTap>,
     /// For each direction (by the writing end's [`End::index`]), the chunks written and not yet
@@ -1278,6 +1280,8 @@ enum Sock {
         peer: std::sync::Weak<DgramQueue>,
         nonblocking: bool,
         rec: Arc<SockRec>,
+        /// The socketpair's process-wide identity (see [`ProcessPairs`]) and which end this is.
+        pair: (u64, usize),
     },
     /// A counting eventfd (readiness wakeups), man 2 eventfd.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -1392,6 +1396,21 @@ struct Knote {
     disabled: bool,
     /// Its `EV_CLEAR` state.
     edge: Edge,
+    /// On a real descriptor the fabric does not serve, as [`EpollIdentity::Untracked`] is for
+    /// epoll; its readiness is the OS's ([`real_kevent`]).
+    untracked: bool,
+    /// Which addition this is ([`next_knote_generation`]): a scan reads the notes, lets go of the
+    /// kqueue's lock to look at the sockets and writes the edges back, and a note added again
+    /// meanwhile (the same descriptor re-registered, or reused after a close) keeps its fresh
+    /// edge.
+    generation: u64,
+}
+
+/// A fresh [`Knote::generation`].
+#[cfg(target_os = "macos")]
+fn next_knote_generation() -> u64 {
+    static GENERATIONS: AtomicU64 = AtomicU64::new(0);
+    GENERATIONS.fetch_add(1, Ordering::Relaxed)
 }
 
 /// An `EVFILT_USER` registration (mio's macOS `Waker`).
@@ -1405,6 +1424,63 @@ struct UserNote {
     /// (XNU bsd/kern/kern_event.c `filt_userprocess` resets it only under `EV_CLEAR`).
     triggered: bool,
 }
+
+/// One descriptor number naming a socketpair end, in the process-wide [`ProcessPairs`].
+#[derive(Clone, Copy)]
+struct PairEnd {
+    /// The pair's identity, the same in every sim's instance of it.
+    pair: u64,
+    /// Which end: 0 for the first descriptor `socketpair` returned, 1 for the second.
+    end: usize,
+    dgram: bool,
+    /// The end's `O_NONBLOCK` as the sim that minted the number last set it.
+    nonblocking: bool,
+}
+
+/// Every descriptor number that names a socketpair end, whichever sim minted it. A socketpair
+/// has no address and nothing of a network in it, so like an epoll set or an eventfd it is the
+/// process's, not a world's; unlike them it carries bytes, and two worlds must not see each
+/// other's, so instead of moving between sims each sim that reaches one gets an instance of its
+/// own ([`Net::mirror`]). A number stays here until the sim that minted it closes it: a sim that
+/// ends leaves its placeholders open, so a pair a library keeps in a static outlives its sim.
+#[derive(Default)]
+struct ProcessPairs {
+    ends: std::collections::BTreeMap<c_int, PairEnd>,
+}
+
+impl ProcessPairs {
+    fn get(&self, fd: c_int) -> Option<PairEnd> {
+        self.ends.get(&fd).copied()
+    }
+
+    fn insert(&mut self, fd: c_int, end: PairEnd) {
+        self.ends.insert(fd, end);
+    }
+
+    fn remove(&mut self, fd: c_int) {
+        self.ends.remove(&fd);
+    }
+
+    /// A number naming the other end of `end`'s pair.
+    fn peer_of(&self, end: PairEnd) -> Option<c_int> {
+        self.ends
+            .iter()
+            .find(|(_, other)| other.pair == end.pair && other.end != end.end)
+            .map(|(&fd, _)| fd)
+    }
+}
+
+static PROCESS_PAIRS: Mutex<ProcessPairs> = Mutex::new(ProcessPairs {
+    ends: std::collections::BTreeMap::new(),
+});
+
+/// The process's socketpair ends; a leaf lock, taken after a fabric's socket table.
+fn process_pairs() -> std::sync::MutexGuard<'static, ProcessPairs> {
+    PROCESS_PAIRS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Identities for socketpairs, unique in the process.
+static NEXT_PAIR: AtomicU64 = AtomicU64::new(1);
 
 struct SocketDescription {
     id: u64,
@@ -1433,6 +1509,12 @@ struct Sockets {
     /// thread of another sim reaching one is not sent to the OS's placeholder. Learnt from the
     /// first thread to mint one, which is always one of the sim's.
     owner: Option<snare_interpose::SimId>,
+    /// Descriptors another sim minted that name this sim's instance of a socketpair end (see
+    /// [`Net::mirror`]), with the pair's identity: never claimed, and closed without the OS.
+    mirrors: HashMap<c_int, u64>,
+    /// This sim's instance of each socketpair it mirrored, by the pair's identity: the ends not
+    /// yet reached under any descriptor.
+    replicas: HashMap<u64, [Option<Sock>; 2]>,
 }
 
 impl Sockets {
@@ -1482,6 +1564,81 @@ impl Sockets {
 
     fn insert(&mut self, fd: c_int, sock: Sock) {
         self.claim(fd, sock.process_local());
+        self.place(fd, sock);
+        self.publish_pair(fd);
+    }
+
+    /// Serves `fd`, another sim's number, as `sock`, an end of this sim's instance of the
+    /// socketpair `pair`.
+    fn insert_mirror(&mut self, fd: c_int, sock: Sock, pair: u64) {
+        self.mirrors.insert(fd, pair);
+        self.place(fd, sock);
+    }
+
+    /// Serves `fd`, another sim's number, as one more descriptor of `held`'s description.
+    fn alias_mirror(&mut self, held: c_int, fd: c_int, pair: u64) {
+        self.mirrors.insert(fd, pair);
+        let key = self.descriptors[&held];
+        self.descriptors.insert(fd, key);
+        self.descriptions[key.slot]
+            .as_mut()
+            .unwrap()
+            .descriptors
+            .insert(fd);
+    }
+
+    /// A descriptor of this sim serving end `end` of its instance of `pair` under another sim's
+    /// number.
+    fn mirror_holding(&self, pair: u64, end: usize) -> Option<c_int> {
+        self.mirrors
+            .iter()
+            .filter(|&(_, &of)| of == pair)
+            .map(|(&fd, _)| fd)
+            .find(|fd| {
+                self.get(fd)
+                    .and_then(Sock::pair_end)
+                    .is_some_and(|(_, at, _)| at == end)
+            })
+    }
+
+    /// Whether `fd` is a mirror whose pair the process no longer holds under that number: the
+    /// sim that minted it closed it, and the OS may have reused it.
+    fn stale_mirror(&self, fd: c_int) -> bool {
+        self.mirrors
+            .get(&fd)
+            .is_some_and(|&pair| process_pairs().get(fd).is_none_or(|end| end.pair != pair))
+    }
+
+    /// Records every descriptor of `fd`'s description, when it is a socketpair end this sim
+    /// minted, as naming that end, with its current `O_NONBLOCK`.
+    fn publish_pair(&self, fd: c_int) {
+        let Some(key) = self.descriptors.get(&fd) else {
+            return;
+        };
+        let Some(description) = self.descriptions[key.slot].as_ref() else {
+            return;
+        };
+        let Some((pair, end, nonblocking)) = description.sock.pair_end() else {
+            return;
+        };
+        let dgram = matches!(description.sock, Sock::UnixDgram { .. });
+        let mut pairs = process_pairs();
+        for &fd in &description.descriptors {
+            if !self.mirrors.contains_key(&fd) {
+                pairs.insert(
+                    fd,
+                    PairEnd {
+                        pair,
+                        end,
+                        dgram,
+                        nonblocking,
+                    },
+                );
+            }
+        }
+    }
+
+    fn place(&mut self, fd: c_int, sock: Sock) {
         self.timers += usize::from(matches!(sock, Sock::Timer { .. }));
         if let Some(description) = self.description_mut(&fd) {
             let replaced = std::mem::replace(&mut description.sock, sock);
@@ -1515,12 +1672,22 @@ impl Sockets {
             .unwrap()
             .descriptors
             .insert(new_fd);
+        self.publish_pair(new_fd);
     }
 
     fn remove(&mut self, fd: &c_int) -> Option<Option<Sock>> {
         let key = self.descriptors.remove(fd)?;
-        if let Some(owner) = self.owner {
-            snare_interpose::release_fd(*fd, owner);
+        if self.mirrors.remove(fd).is_none() {
+            if let Some(owner) = self.owner {
+                snare_interpose::release_fd(*fd, owner);
+            }
+            let mut pairs = process_pairs();
+            if let Some(description) = self.descriptions[key.slot].as_ref()
+                && let Some((pair, ..)) = description.sock.pair_end()
+                && pairs.get(*fd).is_some_and(|end| end.pair == pair)
+            {
+                pairs.remove(*fd);
+            }
         }
         let description = self.descriptions[key.slot].as_mut().unwrap();
         description.descriptors.remove(fd);
@@ -1784,6 +1951,69 @@ impl Fabric {
             regs: Arc::new(Registries::new(shared)),
             devnull,
         }
+    }
+
+    /// The two ends of socketpair `pair`, numbered `fds` in this sim's socket table: a `Conn`
+    /// with no addresses and no link policy for a stream pair, two queues pointing at each other
+    /// for a datagram one.
+    fn pair_ends(&self, dgram: bool, fds: [c_int; 2], nonblocking: bool, pair: u64) -> [Sock; 2] {
+        let (ra, rb) = (
+            self.shared().new_socket(SocketKind::Unix, fds[0]),
+            self.shared().new_socket(SocketKind::Unix, fds[1]),
+        );
+        // unix_create (net/unix/af_unix.c) keeps no protocol: SO_PROTOCOL reads 0 even for
+        // PF_UNIX.
+        #[cfg(target_os = "linux")]
+        for rec in [&ra, &rb] {
+            rec.set_family(libc::AF_UNIX, 0);
+        }
+        let (sa, sb) = if !dgram {
+            let conn = Arc::new(Conn {
+                a_to_b: Pipe::new(None, None, self.shared().domain_key()),
+                b_to_a: Pipe::new(None, None, self.shared().domain_key()),
+                client: UNNAMED,
+                server: UNNAMED,
+                regs: self.regs.clone(),
+                hop: None,
+                pair: true,
+                pair_id: pair,
+                tap: None,
+                stamps: Default::default(),
+                write_delays: Default::default(),
+                #[cfg(target_os = "macos")]
+                mac_shutdown: Default::default(),
+            });
+            conn.b_to_a.read_by(&ra);
+            conn.a_to_b.read_by(&rb);
+            conn.a_to_b.write_by(&ra);
+            conn.b_to_a.write_by(&rb);
+            let end = |end, rec| Sock::Stream {
+                conn: conn.clone(),
+                end,
+                nonblocking,
+                rec,
+            };
+            (end(End::A, ra), end(End::B, rb))
+        } else {
+            let (qa, qb) = (DgramQueue::for_socket(&ra), DgramQueue::for_socket(&rb));
+            (
+                Sock::UnixDgram {
+                    peer: Arc::downgrade(&qb),
+                    queue: qa.clone(),
+                    nonblocking,
+                    rec: ra,
+                    pair: (pair, 0),
+                },
+                Sock::UnixDgram {
+                    peer: Arc::downgrade(&qa),
+                    queue: qb,
+                    nonblocking,
+                    rec: rb,
+                    pair: (pair, 1),
+                },
+            )
+        };
+        [sa, sb]
     }
 
     fn detach_fd(&self, fd: c_int) -> Option<()> {
@@ -3053,7 +3283,67 @@ impl Fabric {
 impl Net for Fabric {
     /// Whether `fd` is one of the fabric's virtual descriptors.
     fn owns(&self, fd: c_int) -> bool {
-        self.socks.lock().unwrap().contains_key(&fd)
+        let socks = self.socks.lock().unwrap();
+        socks.contains_key(&fd) && !socks.stale_mirror(fd)
+    }
+
+    /// Serves `fd`, a number another sim minted for a socketpair end, as that end of this sim's
+    /// own instance of the pair (see [`ProcessPairs`]), made at the first such number reached:
+    /// bytes written in one world are never read in another, and each instance wakes only its
+    /// own sim's waiters, so neither sim's run touches the other's. Both ends of the instance
+    /// start open, as the process's pair is; a number of an end this sim has already reached
+    /// joins that end's description. `O_NONBLOCK` is the end's as its sim last set it.
+    unsafe fn mirror(&self, fd: c_int) -> bool {
+        let Some(end) = process_pairs().get(fd) else {
+            return false;
+        };
+        let fresh = {
+            let mut socks = self.socks.lock().unwrap();
+            if socks.stale_mirror(fd) {
+                let removed = socks.remove(&fd);
+                drop(socks);
+                if let Some(removed) = removed {
+                    self.retire_descriptor(fd, removed, None, None);
+                }
+                socks = self.socks.lock().unwrap();
+            }
+            if socks.contains_key(&fd) {
+                return true;
+            }
+            if let Some(held) = socks.mirror_holding(end.pair, end.end) {
+                socks.alias_mirror(held, fd, end.pair);
+                return true;
+            }
+            match socks.replicas.get_mut(&end.pair) {
+                Some(pending) => match pending[end.end].take() {
+                    Some(mut sock) => {
+                        sock.set_nonblocking(end.nonblocking);
+                        socks.insert_mirror(fd, sock, end.pair);
+                        return true;
+                    }
+                    None => return false,
+                },
+                None => {
+                    drop(socks);
+                    let peer = process_pairs().peer_of(end).unwrap_or(fd);
+                    let mut fds = [peer; 2];
+                    fds[end.end] = fd;
+                    self.pair_ends(end.dgram, fds, end.nonblocking, end.pair)
+                }
+            }
+        };
+        let [a, b] = fresh;
+        let mut ends = [Some(a), Some(b)];
+        let mut socks = self.socks.lock().unwrap();
+        if socks.contains_key(&fd) || socks.replicas.contains_key(&end.pair) {
+            drop(socks);
+            // SAFETY: as for this call.
+            return unsafe { self.mirror(fd) };
+        }
+        let sock = ends[end.end].take().unwrap();
+        socks.insert_mirror(fd, sock, end.pair);
+        socks.replicas.insert(end.pair, ends);
+        true
     }
 
     /// Gives up the fabric's epoll sets, kqueues, eventfds and timerfds. A timer keeps the time
@@ -3126,8 +3416,12 @@ impl Net for Fabric {
                 }
                 Sock::Kqueue { state } => {
                     let mut state = state.lock().unwrap();
-                    state.reads.retain(|fd, _| moved.contains(fd));
-                    state.writes.retain(|fd, _| moved.contains(fd));
+                    state
+                        .reads
+                        .retain(|fd, note| note.untracked || moved.contains(fd));
+                    state
+                        .writes
+                        .retain(|fd, note| note.untracked || moved.contains(fd));
                 }
                 _ => {}
             });
@@ -3250,59 +3544,8 @@ impl Net for Fabric {
                 return err(errno);
             }
         };
-        let (ra, rb) = (
-            self.shared().new_socket(SocketKind::Unix, a),
-            self.shared().new_socket(SocketKind::Unix, b),
-        );
-        // unix_create (net/unix/af_unix.c) keeps no protocol: SO_PROTOCOL reads 0 even for
-        // PF_UNIX.
-        #[cfg(target_os = "linux")]
-        for rec in [&ra, &rb] {
-            rec.set_family(libc::AF_UNIX, 0);
-        }
-        let (sa, sb) = if base == libc::SOCK_STREAM {
-            let conn = Arc::new(Conn {
-                a_to_b: Pipe::new(None, None, self.shared().domain_key()),
-                b_to_a: Pipe::new(None, None, self.shared().domain_key()),
-                client: UNNAMED,
-                server: UNNAMED,
-                regs: self.regs.clone(),
-                hop: None,
-                pair: true,
-                tap: None,
-                stamps: Default::default(),
-                write_delays: Default::default(),
-                #[cfg(target_os = "macos")]
-                mac_shutdown: Default::default(),
-            });
-            conn.b_to_a.read_by(&ra);
-            conn.a_to_b.read_by(&rb);
-            conn.a_to_b.write_by(&ra);
-            conn.b_to_a.write_by(&rb);
-            let end = |end, rec| Sock::Stream {
-                conn: conn.clone(),
-                end,
-                nonblocking,
-                rec,
-            };
-            (end(End::A, ra), end(End::B, rb))
-        } else {
-            let (qa, qb) = (DgramQueue::for_socket(&ra), DgramQueue::for_socket(&rb));
-            (
-                Sock::UnixDgram {
-                    peer: Arc::downgrade(&qb),
-                    queue: qa.clone(),
-                    nonblocking,
-                    rec: ra,
-                },
-                Sock::UnixDgram {
-                    peer: Arc::downgrade(&qa),
-                    queue: qb,
-                    nonblocking,
-                    rec: rb,
-                },
-            )
-        };
+        let pair = NEXT_PAIR.fetch_add(1, Ordering::Relaxed);
+        let [sa, sb] = self.pair_ends(base == libc::SOCK_DGRAM, [a, b], nonblocking, pair);
         let mut socks = self.socks.lock().unwrap();
         socks.insert(a, sa);
         socks.insert(b, sb);
@@ -3747,6 +3990,7 @@ impl Net for Fabric {
                 regs: self.regs.clone(),
                 hop: None,
                 pair: false,
+                pair_id: 0,
                 tap: None,
                 stamps: Default::default(),
                 write_delays: Default::default(),
@@ -4233,7 +4477,11 @@ impl Net for Fabric {
     /// and group registries, and a listener unregisters and resets its unaccepted connections.
     /// The real fd behind it is closed in every case.
     unsafe fn close(&self, fd: c_int) -> Option<NetResult> {
+        let mirror = self.socks.lock().unwrap().mirrors.contains_key(&fd);
         self.detach_fd(fd)?;
+        if mirror {
+            return ok(0);
+        }
         let ret = unsafe { libc::close(fd) };
         ok(ret as i64)
     }
@@ -4658,6 +4906,7 @@ impl Net for Fabric {
             }
             libc::F_SETFL => {
                 *nb = arg as c_int & libc::O_NONBLOCK != 0;
+                socks.publish_pair(fd);
                 ok(0)
             }
             _ => err(libc::EINVAL),
@@ -4709,6 +4958,7 @@ impl Net for Fabric {
         if request as libc::c_ulong == libc::FIONBIO {
             let on = unsafe { *(arg as *const c_int) };
             *nb = on != 0;
+            socks.publish_pair(fd);
             return ok(0);
         }
         let rec = socks.get(&fd).and_then(Sock::rec).cloned();
@@ -5288,7 +5538,9 @@ impl Net for Fabric {
     /// bsd/kern/kern_event.c `kevent_register` re-runs the filter's `f_touch` and activates the
     /// knote when that fires. With any `EV_RECEIPT` change the call
     /// returns only the receipts, without waiting: XNU bsd/kern/kern_event.c kevent_internal
-    /// scans for events only when `noutputs == 0`.
+    /// scans for events only when `noutputs == 0`. A real descriptor the fabric does not serve
+    /// registers with the errno the OS's kqueue would give it (`real_pollable`) and reports the
+    /// OS's readiness (`real_kevent`) until it is closed; another sim's descriptor is EBADF.
     #[cfg(target_os = "macos")]
     unsafe fn kevent(
         &self,
@@ -5307,13 +5559,25 @@ impl Net for Fabric {
             }
         };
         // Apply the changelist, collecting any EV_RECEIPT acknowledgements to return at once.
-        let valid_changes: Vec<bool> = {
+        let targets: Vec<Result<bool, c_int>> = {
             let socks = self.socks.lock().unwrap();
             (0..nchanges.max(0) as usize)
                 .map(|i| {
                     let ch = unsafe { changelist.cast::<libc::kevent>().add(i).read_unaligned() };
-                    !matches!(ch.filter, libc::EVFILT_READ | libc::EVFILT_WRITE)
-                        || socks.contains_key(&(ch.ident as c_int))
+                    let fd = ch.ident as c_int;
+                    if !matches!(ch.filter, libc::EVFILT_READ | libc::EVFILT_WRITE)
+                        || socks.contains_key(&fd)
+                    {
+                        Ok(false)
+                    } else if snare_interpose::minted(fd) {
+                        Err(libc::EBADF)
+                    } else if ch.flags & libc::EV_ADD != 0 {
+                        real_pollable(fd, ch.filter).map(|()| true)
+                    } else if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+                        Err(libc::ENOENT)
+                    } else {
+                        Ok(true)
+                    }
                 })
                 .collect()
         };
@@ -5327,7 +5591,7 @@ impl Net for Fabric {
                 writes,
                 users,
             } = &mut *guard;
-            for (i, &valid) in valid_changes.iter().enumerate() {
+            for (i, &target) in targets.iter().enumerate() {
                 // `kevent` is a packed struct (`#pragma pack(4)` in <sys/event.h>,
                 // `repr(packed(4))` in libc); read each entry by value to avoid unaligned refs.
                 let ch = unsafe { changelist.cast::<libc::kevent>().add(i).read_unaligned() };
@@ -5354,8 +5618,8 @@ impl Net for Fabric {
                     libc::EVFILT_USER => users.contains_key(&ident),
                     _ => false,
                 };
-                let change_error = if !valid {
-                    libc::EBADF
+                let change_error = if let Err(errno) = target {
+                    errno
                 } else if !adding && !exists {
                     libc::ENOENT
                 } else {
@@ -5388,14 +5652,23 @@ impl Net for Fabric {
                                 notes.remove(&fd);
                             } else {
                                 if adding {
+                                    let untracked = target == Ok(true);
                                     let note = notes.entry(fd).or_insert(Knote {
                                         udata,
                                         flags: kept,
                                         disabled: false,
                                         edge: Edge::default(),
+                                        untracked,
+                                        generation: 0,
                                     });
+                                    if note.untracked != untracked {
+                                        note.flags = kept;
+                                        note.disabled = false;
+                                        note.untracked = untracked;
+                                    }
                                     note.udata = udata;
                                     note.edge = Edge::default();
+                                    note.generation = next_knote_generation();
                                 }
                                 if let Some(note) = notes.get_mut(&fd) {
                                     toggle(&mut note.disabled);
@@ -5996,6 +6269,7 @@ impl Fabric {
             regs: self.regs.clone(),
             hop,
             pair: false,
+            pair_id: 0,
             tap: self.shared().tcp_tap(sender, client, server, server_in),
             stamps: Default::default(),
             write_delays: Default::default(),
@@ -6441,6 +6715,60 @@ fn real_ready(fd: c_int) -> Option<u32> {
     Some(u32::from(pfd.revents as u16))
 }
 
+/// Whether the OS's kqueue accepts `filter` on real descriptor `fd`, or the errno it refuses it
+/// with: EBADF once it is closed, or the filter's attach error (XNU bsd/kern/kern_event.c
+/// `kevent_register`), which only the OS can tell.
+#[cfg(target_os = "macos")]
+fn real_pollable(fd: c_int, filter: i16) -> Result<(), c_int> {
+    real_kevent(fd, filter).map(drop)
+}
+
+/// The readiness of a real descriptor registered in a simulated kqueue: what `filter` reports on
+/// a probe queue of its own with a zero-timeout `kevent`, its `data`, `EV_EOF` and `fflags`
+/// included; `Ok(None)` while not ready, and the errno the registration is refused with
+/// otherwise. XNU drops a descriptor's knotes when it closes (bsd/kern/kern_event.c
+/// `knote_fdclose`), so a closed one is EBADF here and its registration goes. Its readiness
+/// cannot wake a simulated wait; it is seen when the wait next looks.
+#[cfg(target_os = "macos")]
+fn real_kevent(fd: c_int, filter: i16) -> Result<Option<libc::kevent>, c_int> {
+    snare_interpose::real(|| unsafe {
+        if libc::fcntl(fd, libc::F_GETFD) < 0 {
+            return Err(libc::EBADF);
+        }
+        let probe = libc::kqueue();
+        if probe < 0 {
+            return Ok(None);
+        }
+        let change = libc::kevent {
+            ident: fd as usize,
+            filter,
+            flags: libc::EV_ADD | libc::EV_RECEIPT,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        let mut receipt = make_kevent(0, 0, 0);
+        let zero = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let n = libc::kevent(probe, &change, 1, &mut receipt, 1, &zero);
+        let result = if n < 0 {
+            Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EBADF))
+        } else if n == 1 && receipt.data != 0 {
+            Err(receipt.data as c_int)
+        } else {
+            let mut ready = make_kevent(0, 0, 0);
+            let n = libc::kevent(probe, std::ptr::null(), 0, &mut ready, 1, &zero);
+            Ok((n == 1).then_some(ready))
+        };
+        libc::close(probe);
+        result
+    })
+}
+
 /// The readiness of `sock` apart from a pending error. A stream is writable while its window has
 /// room and readable once data, end of stream or a reset is there; datagram, eventfd and raw
 /// endpoints are always writable (sends never block on them here, bar a stalled link); a
@@ -6639,6 +6967,30 @@ impl Sock {
     /// Whether this is a kernel object of the process rather than of a network: an epoll set, a
     /// kqueue, an eventfd or a timerfd. These may move to another sim of the process (see
     /// [`Net::hand_over`]).
+    fn set_nonblocking(&mut self, on: bool) {
+        if let Sock::Stream { nonblocking, .. } | Sock::UnixDgram { nonblocking, .. } = self {
+            *nonblocking = on;
+        }
+    }
+
+    /// For a socketpair end: its pair's identity, which end it is, and its `O_NONBLOCK`.
+    fn pair_end(&self) -> Option<(u64, usize, bool)> {
+        match self {
+            Sock::Stream {
+                conn,
+                end,
+                nonblocking,
+                ..
+            } if conn.pair => Some((conn.pair_id, end.index(), *nonblocking)),
+            Sock::UnixDgram {
+                pair: (pair, end),
+                nonblocking,
+                ..
+            } => Some((*pair, *end, *nonblocking)),
+            _ => None,
+        }
+    }
+
     fn process_local(&self) -> bool {
         matches!(
             self,
@@ -7118,12 +7470,12 @@ impl Fabric {
                 _ => return Vec::new(),
             }
         };
-        type Watch = (c_int, u64, u16, Edge);
+        type Watch = (c_int, u64, u16, Edge, bool, u64);
         let live = |notes: &HashMap<c_int, Knote>| -> Vec<Watch> {
             notes
                 .iter()
                 .filter(|(_, n)| !n.disabled)
-                .map(|(fd, n)| (*fd, n.udata, n.flags, n.edge))
+                .map(|(fd, n)| (*fd, n.udata, n.flags, n.edge, n.untracked, n.generation))
                 .collect()
         };
         let g = state.lock().unwrap();
@@ -7136,9 +7488,22 @@ impl Fabric {
             .map(|(id, n)| (*id, n.udata))
             .collect();
         drop(g);
+        let real: HashMap<(i16, c_int), Option<libc::kevent>> =
+            [(libc::EVFILT_READ, &reads), (libc::EVFILT_WRITE, &writes)]
+                .into_iter()
+                .flat_map(|(filter, watched)| {
+                    watched
+                        .iter()
+                        .filter(|watch| watch.4)
+                        .filter_map(move |watch| {
+                            Some(((filter, watch.0), real_kevent(watch.0, filter).ok()?))
+                        })
+                })
+                .collect();
         let socks = self.socks.lock().unwrap();
         let mut out = Vec::new();
-        let mut seen: Vec<(i16, c_int, Edge, bool)> = Vec::new();
+        let mut seen: Vec<(i16, c_int, u64, Edge, bool)> = Vec::new();
+        let mut gone = Vec::new();
         for (filter, watched) in [(libc::EVFILT_READ, reads), (libc::EVFILT_WRITE, writes)] {
             if out.len() >= max {
                 break;
@@ -7149,7 +7514,32 @@ impl Fabric {
                 EPOLLOUT
             };
             let mut pending = Vec::new();
-            for (fd, udata, flags, mut edge) in watched {
+            for (fd, udata, flags, mut edge, untracked, generation) in watched {
+                if untracked {
+                    let Some(&polled) = real.get(&(filter, fd)) else {
+                        gone.push((filter, fd, generation));
+                        continue;
+                    };
+                    let got = if polled.is_some() { bit } else { 0 };
+                    let now = Wakes::default();
+                    let edged = edge.pending(got, now);
+                    let fire = got != 0 && (flags & libc::EV_CLEAR == 0 || edged);
+                    let seen_index = seen.len();
+                    seen.push((filter, fd, generation, edge, false));
+                    if fire {
+                        pending.push((
+                            (Duration::ZERO, fd as u64),
+                            fd,
+                            udata,
+                            flags,
+                            got,
+                            now,
+                            seen_index,
+                            polled,
+                        ));
+                    }
+                    continue;
+                }
                 let Some(sock) = socks.get(&fd) else {
                     continue;
                 };
@@ -7168,7 +7558,7 @@ impl Fabric {
                 let edged = edge.pending(got, now);
                 let fire = got != 0 && (flags & libc::EV_CLEAR == 0 || edged);
                 let seen_index = seen.len();
-                seen.push((filter, fd, edge, false));
+                seen.push((filter, fd, generation, edge, false));
                 if fire {
                     pending.push((
                         readiness_order(sock, fd as u64),
@@ -7178,14 +7568,25 @@ impl Fabric {
                         got,
                         now,
                         seen_index,
+                        None,
                     ));
                 }
             }
             pending.sort_by_key(|p| (p.0, p.1));
-            for (_, fd, udata, flags, got, now, seen_index) in
+            for (_, fd, udata, flags, got, now, seen_index, polled) in
                 pending.into_iter().take(max - out.len())
             {
-                if let Some(sock) = socks.get(&fd) {
+                if let Some(polled) = polled {
+                    let mut ev = make_kevent(fd as usize, filter, udata);
+                    ev.flags = flags | (polled.flags & libc::EV_EOF);
+                    ev.fflags = polled.fflags;
+                    ev.data = polled.data;
+                    out.push(ev);
+                    if take {
+                        seen[seen_index].3.report(got, now);
+                        seen[seen_index].4 = true;
+                    }
+                } else if let Some(sock) = socks.get(&fd) {
                     let mut ev = make_kevent(fd as usize, filter, udata);
                     ev.flags = flags;
                     if let Sock::Fresh { rec, .. } = sock
@@ -7240,8 +7641,8 @@ impl Fabric {
                     }
                     out.push(ev);
                     if take {
-                        seen[seen_index].2.report(got, now);
-                        seen[seen_index].3 = true;
+                        seen[seen_index].3.report(got, now);
+                        seen[seen_index].4 = true;
                     }
                 }
             }
@@ -7258,13 +7659,29 @@ impl Fabric {
             users_taken.push(id);
         }
         let mut g = state.lock().unwrap();
-        for (filter, fd, edge, reported) in seen {
+        for (filter, fd, generation) in gone {
             let notes = if filter == libc::EVFILT_READ {
                 &mut g.reads
             } else {
                 &mut g.writes
             };
-            let Some(note) = notes.get_mut(&fd) else {
+            if notes
+                .get(&fd)
+                .is_some_and(|note| note.generation == generation)
+            {
+                notes.remove(&fd);
+            }
+        }
+        for (filter, fd, generation, edge, reported) in seen {
+            let notes = if filter == libc::EVFILT_READ {
+                &mut g.reads
+            } else {
+                &mut g.writes
+            };
+            let Some(note) = notes
+                .get_mut(&fd)
+                .filter(|note| note.generation == generation)
+            else {
                 continue;
             };
             note.edge = edge;

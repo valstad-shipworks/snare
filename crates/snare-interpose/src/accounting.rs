@@ -984,9 +984,31 @@ pub(crate) struct Core {
     /// Every managed thread's [`Held`], by lineage; the census owns them so a thread that never
     /// leaves its domain cleanly leaves nothing dangling.
     held: HashMap<u64, Arc<Held>>,
+    /// Wakes on each address made by a thread outside the domain (another sim's, or one no sim
+    /// manages) that its released waiters have yet to take: a waiter they woke was woken from
+    /// outside, though the release is counted like any other.
+    foreign: HashMap<usize, u32>,
 }
 
 impl Core {
+    /// A wake on `key` made outside the domain (see `domain::release_elsewhere`), noted as well as
+    /// counted as a release.
+    pub(crate) fn note_foreign_release(&mut self, key: usize) {
+        *self.foreign.entry(key).or_default() += 1;
+    }
+
+    /// Takes one wake made outside the domain on `key`, if one is pending.
+    fn take_foreign_release(&mut self, key: usize) -> bool {
+        let Some(pending) = self.foreign.get_mut(&key) else {
+            return false;
+        };
+        *pending -= 1;
+        if *pending == 0 {
+            self.foreign.remove(&key);
+        }
+        true
+    }
+
     pub(crate) fn clear_quiet(&mut self) {
         self.quiet = None;
     }
@@ -1677,6 +1699,15 @@ impl Core {
         if let Some(key) = previous.and_then(|wait| wait.key) {
             self.prune_releases(key);
         }
+        if let Some(key) = previous.and_then(|wait| wait.key)
+            && self.foreign.contains_key(&key)
+            && !self
+                .rows
+                .values()
+                .any(|row| row.wait.is_some_and(|wait| wait.key == Some(key)))
+        {
+            self.foreign.remove(&key);
+        }
         previous
     }
 }
@@ -1901,6 +1932,8 @@ impl Accounting {
                 .get(&crate::thread_lineage())
                 .and_then(|row| row.wait)
                 .is_some_and(|wait| wait.woken || core.timer_released(wait));
+        let owned =
+            owned && !current_wait_key().is_some_and(|key| core.take_foreign_release(key));
         if owned
             || current_wait_label() == Some("mutex")
             || JOIN_TARGET.try_with(Cell::get).ok().flatten().is_some()

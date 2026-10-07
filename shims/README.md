@@ -10,11 +10,20 @@ The snare test harness applies these together with `--cfg rustix_use_libc` (whic
 own backend onto libc). With that flag plus these patches, the raw-syscall sources found across the
 top networking crates are covered.
 
+`async-io/`, `async-global-executor/` and `blocking/` are the exception: they reach the OS through
+libc already, but keep a reactor, an executor or a thread pool in process-wide statics, which one
+sim would otherwise create and every later sim inherit. Threads of one running sim then poll tasks
+and fire wakers of another, which neither sim's quiescence can account for. These shims keep one
+per sim instead.
+
 | shim | replaces | how |
 |------|----------|-----|
 | `sc/`       | `sc` 0.2        | `syscallN` and the `syscall!` macro forward to `libc::syscall`; `nr` tables vendored |
 | `syscalls/` | `syscalls` 0.8  | vendored crate; only the raw `syscall/mod.rs` layer is rerouted to `libc::syscall` |
 | `io-uring/` | `io-uring` 0.7  | vendored crate; the ring is emulated in-process and each SQE is executed via libc |
+| `async-io/` | `async-io` 2.6  | vendored crate; one reactor and "async-io" thread per sim (`snare_interpose::sim_local`), shut down as the sim drops; the process-wide one only outside every sim |
+| `async-global-executor/` | `async-global-executor` 2.4 | vendored crate; async-std's global executor and its worker threads, one set per sim |
+| `blocking/` | `blocking` 1.7 | vendored crate; the `unblock` thread pool, one per sim |
 | `xsk-rs/`   | `xsk-rs` 0.8    | rewritten drop-in; the AF_XDP UMEM and its four rings are emulated in-process and every frame crosses a real fd via libc `send`/`recv` |
 
 `cargo snare test` patches them in from this repository at its release tag. To apply them by hand
@@ -26,6 +35,9 @@ sc        = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0"
 syscalls  = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0" }
 io-uring  = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0" }
 xsk-rs    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0" }
+async-io  = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0" }
+async-global-executor = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0" }
+blocking  = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0" }
 ```
 
 These are for **test/simulation builds only**, never release. Each `syscallN` returns the kernel's

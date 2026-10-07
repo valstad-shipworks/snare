@@ -2,13 +2,14 @@
 //! timerfd, an epoll set, a kqueue) belongs to the process, which a test binary keeps across the
 //! sims it builds: a later sim that reaches one takes it over, timers keeping the time they had
 //! left. A socket belongs to its sim's network, so another sim reaching it gets `EBADF`, as for
-//! a descriptor its world never opened, never the OS's placeholder behind it. Once such a
+//! a descriptor its world never opened, never the OS's placeholder behind it; a socketpair end has
+//! no network, so another sim reaching it gets an instance of the pair of its own. Once such a
 //! descriptor is closed, its number is the OS's again, for whatever real file it hands out next.
 
 #![cfg(unix)]
 
 use std::net::UdpSocket;
-use std::os::fd::IntoRawFd;
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
 
 use snare::Sim;
@@ -76,8 +77,25 @@ fn a_socket_closed_outside_its_sim_frees_its_number() {
 fn another_sims_socket_is_ebadf() {
     let _turn = one_at_a_time();
     let first = Sim::new();
+    let fd = first.run(|| UdpSocket::bind("127.0.0.1:0").unwrap().into_raw_fd());
+    let check = || {
+        Sim::new().run(|| {
+            let written = unsafe { libc::write(fd, b"hello".as_ptr().cast(), 5) };
+            (written, errno())
+        })
+    };
+    assert_eq!(check(), (-1, libc::EBADF));
+    drop(first);
+    assert_eq!(check(), (-1, libc::EBADF));
+}
+
+#[test]
+fn another_sims_socketpair_is_this_sims_own() {
+    let _turn = one_at_a_time();
+    let first = Sim::new();
     let (a, b) = first.run(|| {
         let (a, b) = UnixStream::pair().unwrap();
+        unsafe { libc::write(a.as_raw_fd(), b"first".as_ptr().cast(), 5) };
         (a.into_raw_fd(), b.into_raw_fd())
     });
     let check = || {
@@ -86,11 +104,11 @@ fn another_sims_socket_is_ebadf() {
             let written = (written, errno());
             let mut buf = [0u8; 8];
             let read = unsafe { libc::read(b, buf.as_mut_ptr().cast(), 8) };
-            (written, (read, errno()))
+            (written.0, read, buf[..read.max(0) as usize].to_vec())
         })
     };
-    let expected = ((-1, libc::EBADF), (-1, libc::EBADF));
-    assert_eq!(check(), expected);
+    let expected = (5, 5, b"hello".to_vec());
+    assert_eq!(check(), expected, "the first sim's bytes stay in its world");
     drop(first);
     assert_eq!(check(), expected);
 }

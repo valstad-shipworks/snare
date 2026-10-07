@@ -24,7 +24,14 @@ const CHUNKS: usize = 1024;
 
 type Chunk = [AtomicU64; CHUNK];
 
-static TABLE: [AtomicPtr<Chunk>; CHUNKS] = [const { AtomicPtr::new(ptr::null_mut()) }; CHUNKS];
+type Table = [AtomicPtr<Chunk>; CHUNKS];
+
+static TABLE: Table = [const { AtomicPtr::new(ptr::null_mut()) }; CHUNKS];
+
+/// The serial of the sim whose file plane ([`Fs`](crate::Fs)) minted each descriptor, kept apart
+/// from [`TABLE`]: an open file description is the process's, so a file is served by the plane
+/// that opened it whichever thread reaches it, and never moves.
+static FILES: Table = [const { AtomicPtr::new(ptr::null_mut()) }; CHUNKS];
 
 /// The entry of a descriptor whose sim is gone: its placeholder stays open, but it names nothing.
 const GONE: u64 = u64::MAX;
@@ -48,9 +55,13 @@ pub(crate) enum Owner {
 }
 
 fn slot(fd: c_int, grow: bool) -> Option<&'static AtomicU64> {
+    slot_in(&TABLE, fd, grow)
+}
+
+fn slot_in(table: &'static Table, fd: c_int, grow: bool) -> Option<&'static AtomicU64> {
     let fd = usize::try_from(fd).ok()?;
     let (chunk, index) = (fd / CHUNK, fd % CHUNK);
-    let cell = TABLE.get(chunk)?;
+    let cell = table.get(chunk)?;
     let mut table = cell.load(Ordering::Acquire);
     if table.is_null() {
         if !grow {
@@ -86,6 +97,11 @@ pub(crate) fn owner(fd: c_int) -> Owner {
             local: value & 1 != 0,
         },
     }
+}
+
+/// Whether a sim minted `fd`, live or not: a placeholder, not a descriptor of the OS's own.
+pub fn minted(fd: c_int) -> bool {
+    owner(fd) != Owner::None
 }
 
 /// Records that `sim` minted `fd` (see [`Owner::Sim`] for `local`).
@@ -155,6 +171,7 @@ pub(crate) fn adopt_orphan(
 /// or replaced by the OS: the number then names nothing of any sim, and the OS may hand it out
 /// again. An orphaned descriptor leaves its set, so no later sim takes it over.
 pub(crate) fn forget_real(fd: c_int) {
+    release_file(fd);
     let Some(entry) = slot(fd, false) else {
         return;
     };
@@ -182,6 +199,35 @@ pub(crate) fn forget_real(fd: c_int) {
         orphans[i].0.is_empty().then(|| orphans.swap_remove(i))
     };
     drop(emptied);
+}
+
+/// Records that the file plane of sim `serial` minted `fd`.
+pub(crate) fn claim_file(fd: c_int, serial: u64) {
+    if let Some(entry) = slot_in(&FILES, fd, true) {
+        entry.store(serial, Ordering::Release);
+    }
+}
+
+/// Forgets which file plane minted `fd`: closed, or replaced by another descriptor.
+pub(crate) fn release_file(fd: c_int) {
+    if let Some(entry) = slot_in(&FILES, fd, false) {
+        entry.store(0, Ordering::Release);
+    }
+}
+
+/// The serial of the sim whose file plane minted `fd`, if one did.
+pub(crate) fn file_owner(fd: c_int) -> Option<u64> {
+    match slot_in(&FILES, fd, false)?.load(Ordering::Acquire) {
+        0 => None,
+        serial => Some(serial),
+    }
+}
+
+/// Forgets `fd` as a file of sim `serial`, if it still is one.
+pub(crate) fn release_file_of(fd: c_int, serial: u64) {
+    if let Some(entry) = slot_in(&FILES, fd, false) {
+        let _ = entry.compare_exchange(serial, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
 }
 
 fn lock_orphans() -> std::sync::MutexGuard<'static, Vec<Orphaned>> {

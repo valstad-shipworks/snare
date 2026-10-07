@@ -204,6 +204,14 @@ operate on the virtual tree, preserve inode identity across moves, and keep unli
 through open descriptors. Creation requires a declared directory parent, and pathname traversal
 checks intermediate components before resolving `.` and `..`. Relative path mutations,
 `rmdir`, `getdents64`, `fdopendir`, permissions and sparse storage need additional modelling.
+
+An open file belongs to the process, as a descriptor does in a real one: a file opened in one sim
+and kept past its run (a log file behind a global `tracing` subscriber) is the same open file when
+another sim's thread, or a thread outside every sim, writes to it, and the bytes land in the file
+system that opened it. Paths stay per sim. Once that sim is gone, calls through the descriptor fail
+with `EBADF`, and its number stays reserved until the holder closes it, so it never reaches a file
+the OS opened in the meantime. With a `SimHost` as well, the host serves the paths it models
+(`/sys`, `/proc`, `/dev`) first, the `VirtualFs` the rest.
 See [OPEN_BUGS.md](OPEN_BUGS.md) for the file-plane boundaries.
 
 ## Determinism and quiescence
@@ -399,12 +407,20 @@ When a running sim reaches such a descriptor of a dormant (or dropped) sim, it t
 one that sim holds, and the leftover threads blocked on them join it, as threads it had spawned:
 they run on its clock, in its schedule, and count toward its quiescence. A timerfd keeps the time
 it had left. One closed outside every sim is gone, and its number is the OS's to reuse for a real
-file. Sockets never move: another sim's socket fails with `EBADF`, as a descriptor its world
-never opened would. Two sims running at the same time cannot share one such object: a sim that
+file. Network sockets never move: another sim's socket fails with `EBADF`, as a descriptor its
+world never opened would. A `socketpair` end has no network in it either, but it carries bytes, so
+instead of moving it is mirrored: each sim that reaches one another sim made (tokio keeps its
+signal self-pipe in a static and every runtime with I/O dups it) gets an instance of the pair of
+its own under the same numbers, both ends open, and bytes written in one world are never read in
+another. A wake of another running sim's reactor (an eventfd write, a kqueue `EVFILT_USER`
+trigger) is delivered to it as a wake from outside its world. Two sims running at the same time
+cannot otherwise share one such object: a sim that
 reaches a descriptor another running sim holds waits until that run ends, but one that only
 touches the library's memory (a timer queued while the reactor's notifier is already pending)
 gives snare nothing to wait at, so tests that share a process-wide reactor must take turns (a
-static `Mutex` held across the test, or `--test-threads=1`).
+static `Mutex` held across the test, or `--test-threads=1`). `cargo snare test` patches in the
+`async-io`, `async-global-executor` and `blocking` shims, which give each sim its own reactor,
+executor and thread pool and lift this for async-io, smol and async-std.
 
 ## Controlling time
 
@@ -1399,6 +1415,13 @@ SOCK_STREAM | SOCK_DGRAM)`, served by the fabric like any socket (`poll`, `epoll
 `deterministic()`, once every root thread of a run has left and nothing can run, the schedule lets
 leftover daemon threads (the `ctrlc` thread) go; they wait outside it until the sim runs again.
 
+A library that installs its dispatcher once per process and remembers that in a static
+(signal-hook-registry, and so `tokio::signal`, `signal-hook`, `async-signal`) calls `sigaction`
+only in the first sim whose code registers with it. `SimBuilder::process_signal_handlers()` lets a
+signal the sim's own code never set an action for reach the handler the code under test last
+installed in any sim of the process, so such a library works in every sim; tokio delivers a signal
+to the listeners of every runtime, as one process would.
+
 `SimBuilder::forward_real_signals()` opts a sim in to the real `SIGINT`/`SIGTERM`/`SIGHUP` (a console
 control handler on Windows): while any sim forwards, a process-wide forwarder delivers each real
 signal into every forwarding sim, and one that no sim handled or ignored is raised for real against
@@ -1483,6 +1506,10 @@ Some crates bypass libc in ways an import-table hook cannot see — raw `io_urin
   interposer sees ordinary I/O.
 - **`xsk-rs`** (AF_XDP) — routes frame TX/RX through libc `send`/`recv`.
 - **`sc`, `syscalls`** — route raw syscalls through libc so the `syscall` hook catches them.
+- **`async-io`** — keeps one reactor and "async-io" thread per sim instead of per process, shut down
+  when the sim drops, so sims using async-io can run in parallel.
+- **`async-global-executor`, `blocking`** — async-std's global executor and the `unblock` thread pool,
+  one per sim, so async-std tasks and blocking jobs of one sim never run on another's threads.
 
 The shims honor `snare::real`: each resource is tagged with the passthrough mode it was created in, and
 using it in the other mode panics rather than silently mixing an emulated ring with real-OS I/O.
@@ -1523,7 +1550,7 @@ crates/snare-interpose/   the engine: patchers, hooks, Domain, backend traits, r
 crates/snare/             Sim, SimHost, HostProfile, EasyBuilder, Fabric, VirtualFs, testers
 crates/cargo-snare/       the `cargo snare` subcommand
 probes/interpose-probe/   test-fixture DLL for the Windows module-loading test (unpublished)
-shims/                    io-uring, xsk-rs, sc, syscalls drop-ins ([patch.crates-io])
+shims/                    io-uring, xsk-rs, sc, syscalls, async-io, async-global-executor, blocking drop-ins ([patch.crates-io])
 scripts/                  Windows VM and hardware test runners, socket-buffer and runtime measurements
 ```
 

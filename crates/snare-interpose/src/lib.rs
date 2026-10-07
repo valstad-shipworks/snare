@@ -137,7 +137,7 @@ on_supported_targets! {
         mark_sim_waiting, mark_waiting, note_effect, now, parked_on_shared_word, pass_gate, quiescent,
         real, real_span,
         recorded_thread_class, register_event_timer, register_timer, register_wake, set_thread_class,
-        set_thread_name, stalled, thread_class, thread_lineage, thread_name, time_skip,
+        set_thread_name, SimLocals, sim_local, stalled, thread_class, thread_lineage, thread_name, time_skip,
         try_leave_sim_wait, unregister_event_timer, unregister_timer, virtual_now,
     };
     #[cfg(unix)]
@@ -154,7 +154,7 @@ on_supported_targets! {
     pub use net::{CompletionCall, CompletionPost, CompletionQuery};
     pub use net::{HandOver, Net, NetResult};
     #[cfg(unix)]
-    pub use owners::{bury_fd, claim_fd, orphan, release_fd};
+    pub use owners::{bury_fd, claim_fd, minted, orphan, release_fd};
     #[doc(hidden)]
     pub use os::joined_lists;
     #[cfg(windows)]

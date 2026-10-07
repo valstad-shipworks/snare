@@ -13,7 +13,10 @@
 //! it, so its waiter must not let the domain look quiescent. The pthread mutex hooks record each
 //! managed thread's holds (`accounting::Held`), which tells a contended lock's holder apart; a
 //! futex word carries no owner, so a Linux wait on one in static data, where std's process-wide
-//! locks live, first waits out a short real-time grace uncounted (`outside_grace`).
+//! locks live, first waits out a short real-time grace uncounted (`outside_grace`). So does a wait
+//! a lock's back-off spin leads into (`domain::backing_off`), which may be on a lock the domain
+//! shares with other threads wherever it lives: parking_lot's process-wide bucket locks are on
+//! the heap, and parked behind with a futex on Linux or a condition variable on macOS.
 //!
 //! Each hook takes one of three paths. Under a deterministic schedule (`det_*`) the wait parks in
 //! the schedule on the object's address, and the matching wake moves waiters there to the run
@@ -602,6 +605,15 @@ unsafe extern "C" fn pthread_cond_wait(
     cond: *mut pthread_cond_t,
     mutex: *mut pthread_mutex_t,
 ) -> c_int {
+    if domain::backing_off() {
+        let grace = if deterministic() {
+            DET_OUTSIDE_HOLDER_GRACE
+        } else {
+            OUTSIDE_HOLDER_GRACE
+        };
+        // SAFETY: the caller's condvar and held mutex.
+        return unsafe { cond_outside_grace(cond, mutex, grace) };
+    }
     if deterministic() {
         // SAFETY: the caller's condvar and held mutex.
         return unsafe { det_cond_wait(cond, mutex, None) };
@@ -616,6 +628,56 @@ unsafe extern "C" fn pthread_cond_wait(
     let r = domain::native_cond_wait(&relock, || unsafe { wait(cond, mutex) });
     domain::note_mutex_taken(mutex as usize);
     r
+}
+
+/// A condition-variable wait that a back-off spin leads into (see [`domain::backing_off`]), for
+/// its first `grace` ([`OUTSIDE_HOLDER_GRACE`], or [`DET_OUTSIDE_HOLDER_GRACE`] under a
+/// deterministic schedule, which keeps the baton meanwhile) as a real wait the domain does not
+/// count, as [`outside_grace`] waits on a futex word in static data: a lock's slow path parks on
+/// it, and the lock's holder, which will wake it, may be outside the domain. Ends the spin, so the
+/// caller's next wait counts, and returns the wait's result, or zero once the grace ran out: a
+/// spurious wakeup, which every condvar caller must tolerate (POSIX pthread_cond_wait).
+///
+/// # Safety
+/// `cond` and `mutex` are as for `pthread_cond_wait`, with `mutex` held by the caller.
+unsafe fn cond_outside_grace(
+    cond: *mut pthread_cond_t,
+    mutex: *mut pthread_mutex_t,
+    grace: Duration,
+) -> c_int {
+    domain::end_spin();
+    // SAFETY: PTHREAD_COND_TIMEDWAIT_RELATIVE_NP holds libc's function.
+    #[cfg(target_os = "macos")]
+    let (wait, timeout) = unsafe {
+        (
+            original::<CondTimedWaitFn>(&PTHREAD_COND_TIMEDWAIT_RELATIVE_NP),
+            to_timespec(grace),
+        )
+    };
+    // SAFETY: PTHREAD_COND_TIMEDWAIT holds libc's function.
+    #[cfg(target_os = "linux")]
+    let (wait, timeout) = unsafe {
+        (
+            original::<CondTimedWaitFn>(&PTHREAD_COND_TIMEDWAIT),
+            to_timespec(crate::real(|| {
+                let mut ts = timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                let clock = match cond_clock(cond) {
+                    ClockKind::Monotonic => libc::CLOCK_MONOTONIC,
+                    _ => libc::CLOCK_REALTIME,
+                };
+                libc::clock_gettime(clock, &mut ts);
+                span(&ts) + grace
+            })),
+        )
+    };
+    domain::note_mutex_freed(mutex as usize);
+    // SAFETY: the caller's condvar and held mutex, with the grace as the timeout.
+    let r = unsafe { wait(cond, mutex, &timeout) };
+    domain::note_mutex_taken(mutex as usize);
+    if r == libc::ETIMEDOUT { 0 } else { r }
 }
 
 /// A condition-variable wait is about to let go of `mutex` inside libc, where no hook sees it.
@@ -982,8 +1044,8 @@ unsafe extern "C" fn dispatch_semaphore_signal(semaphore: *mut libc::c_void) -> 
 }
 
 /// `sched_yield` (man 2 sched_yield): a spinner's way of waiting. Under the schedule it hands the
-/// other runnable threads a turn; otherwise, if every other participant is parked, it offers the
-/// domain a time skip. The real yield follows either way.
+/// other runnable threads a turn; otherwise, once the yields make a caught spin and every other
+/// participant is parked, it offers the domain a time skip. The real yield follows either way.
 unsafe extern "C" fn sched_yield() -> c_int {
     domain::yield_point();
     // SAFETY: SCHED_YIELD holds libc's sched_yield.
@@ -1311,7 +1373,7 @@ unsafe fn futex_call(args: [usize; 6], real: impl Fn([usize; 6]) -> c_long) -> O
     };
     if timeout == 0 {
         if domain::counts_native_waits()
-            && domain::in_static_image(word)
+            && (domain::in_static_image(word) || domain::backing_off())
             && let Some(r) = outside_grace(OUTSIDE_HOLDER_GRACE, op, command, args, &real)
         {
             return Some(r);
@@ -1404,12 +1466,11 @@ fn real_monotonic() -> Duration {
 #[cfg(target_os = "linux")]
 const MATCH_ANY: usize = 0xffff_ffff;
 
-/// How long a wait on a futex word or semaphore in static data first waits in real time, for a
-/// holder or poster outside the simulation, before it counts as a wait in the domain: keeping the
-/// baton under a deterministic schedule, or counted running otherwise. A snare choice: long enough
-/// for an outside holder in a short critical section to let go, short enough not to slow a run that
-/// waits on an inside one.
-#[cfg(target_os = "linux")]
+/// How long a wait on a futex word or semaphore in static data, or one a lock's back-off spin leads
+/// into, first waits in real time, for a holder or poster outside the simulation, before it counts
+/// as a wait in the domain: keeping the baton under a deterministic schedule, or counted running
+/// otherwise. A snare choice: long enough for an outside holder in a short critical section to let
+/// go, short enough not to slow a run that waits on an inside one.
 const OUTSIDE_HOLDER_GRACE: Duration = Duration::from_millis(1);
 
 /// [`OUTSIDE_HOLDER_GRACE`] for a wait under a deterministic schedule, which keeps the baton
@@ -1418,17 +1479,16 @@ const OUTSIDE_HOLDER_GRACE: Duration = Duration::from_millis(1);
 /// threads hold, stays held for a few milliseconds on a loaded machine. A snare choice: long enough
 /// to outlast such a holder, at the cost of that much real time per wait on a word a parked thread
 /// of the domain holds.
-#[cfg(target_os = "linux")]
 const DET_OUTSIDE_HOLDER_GRACE: Duration = Duration::from_millis(50);
 
 /// The first [`OUTSIDE_HOLDER_GRACE`] of a futex wait on a word in static data, which may be a lock
 /// shared with threads outside the simulation (std's own statics: the stack-overflow handler's
-/// thread-info lock every thread start and exit takes, stdout's lock), as a real wait the domain
-/// does not count. A futex word carries no owner, so whether a thread of the domain holds it cannot
-/// be told; a holder outside lets go in that time, and a holder inside merely delays the wait's
-/// counting by it. Returns the futex call's result, with errno as the kernel left it, when it ended
-/// other than by timing out (woken, or the word no longer held `value`); `None` once the grace ran
-/// out.
+/// thread-info lock every thread start and exit takes, stdout's lock), or of one a lock's back-off
+/// spin leads into (see [`domain::backing_off`]), as a real wait the domain does not count. A futex
+/// word carries no owner, so whether a thread of the domain holds it cannot be told; a holder
+/// outside lets go in that time, and a holder inside merely delays the wait's counting by it.
+/// Returns the futex call's result, with errno as the kernel left it, when it ended other than by
+/// timing out (woken, or the word no longer held `value`); `None` once the grace ran out.
 ///
 /// `args` are as for [`futex`]: the wait uses the caller's word, value and, for
 /// `FUTEX_WAIT_BITSET`, bitset, with an absolute deadline on `CLOCK_MONOTONIC` (man 2 futex).
@@ -1518,7 +1578,7 @@ unsafe fn det_futex(
             // A holder inside the simulation is parked while this thread keeps the baton and
             // cannot release the word meanwhile, so whether this wait yields never depends on
             // outside timing.
-            if domain::in_static_image(word)
+            if (domain::in_static_image(word) || domain::backing_off())
                 && let Some(r) = outside_grace(DET_OUTSIDE_HOLDER_GRACE, op, command, args, real)
             {
                 return Some(r);
@@ -1559,7 +1619,13 @@ unsafe fn det_futex(
                 u32::MAX
             };
             note_wait_signal_masked(word, mask, Some(op & libc::FUTEX_PRIVATE_FLAG != 0));
-            domain::note_futex_release(word, n, mask, op & libc::FUTEX_PRIVATE_FLAG != 0);
+            domain::note_futex_release(
+                word,
+                n,
+                mask,
+                op & libc::FUTEX_PRIVATE_FLAG != 0,
+                || futex_word(word),
+            );
             let woken = domain::det_wake_futex(
                 crate::DetKey::Addr(word),
                 n,

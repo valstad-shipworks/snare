@@ -17,11 +17,15 @@
 //!   as quiescent before they arrive.
 //! * A thread left over from a run that has ended, reaching a descriptor that moved, follows it:
 //!   it leaves its sim as an exiting thread does and joins the descriptor's sim as an adopted one.
+//!   So does one reaching a socket of a sim whose run is in progress ([`follow_owner`]): a
+//!   process-wide thread pool (an executor's workers) started under an earlier sim picks up work
+//!   the running sim handed it, and that work belongs to the running sim's world.
 //! * A descriptor of a sim whose run is in progress, reached from another running sim, is shared
 //!   by two live worlds at once, which no model of one process can serve: the caller waits, busy
 //!   in its own sim, until that run ends.
-//! * Anything else of another sim (a socket, a descriptor of a sim that is gone) fails with
-//!   `EBADF`, as an fd this world never opened would, rather than reaching the OS's placeholder.
+//! * Anything else of another sim (a socket reached from a running sim, or of a sim with no run in
+//!   progress, a descriptor of a sim that is gone) fails with `EBADF`, as an fd this world never
+//!   opened would, rather than reaching the OS's placeholder.
 
 use std::cell::Cell;
 use std::ffi::c_int;
@@ -244,7 +248,10 @@ pub(crate) fn elsewhere(fd: c_int) -> Elsewhere {
                 Elsewhere::Fail(libc::EBADF)
             };
         }
-        _ => return Elsewhere::Fail(libc::EBADF),
+        _ => {
+            end_spin();
+            return mirrored(me, fd);
+        }
     };
     if serial == me.accounting.serial.0 {
         return Elsewhere::Real;
@@ -252,7 +259,10 @@ pub(crate) fn elsewhere(fd: c_int) -> Elsewhere {
     end_spin();
     let _passthrough = Passthrough::enter();
     if !local {
-        return Elsewhere::Fail(libc::EBADF);
+        if follow_running(me, serial) && mine(fd) {
+            return Elsewhere::Retry;
+        }
+        return mirrored(me, fd);
     }
     let Some(theirs) = crate::census::find(serial) else {
         return if owner_moves_on(fd, owner) {
@@ -277,6 +287,83 @@ pub(crate) fn elsewhere(fd: c_int) -> Elsewhere {
     } else {
         Elsewhere::Fail(libc::EBADF)
     }
+}
+
+/// Moves the calling thread, left over from a run of its domain that has ended, into the sim that
+/// minted `fd` if that sim has a run in progress. `true` when the thread now belongs to the sim
+/// that owns `fd`, so a call on it should be offered again. Anything else is left to the call's
+/// own handling.
+#[cfg(unix)]
+pub(crate) fn follow_owner(fd: c_int) -> bool {
+    let Owner::Sim { serial, .. } = owners::owner(fd) else {
+        return false;
+    };
+    if state::passthrough() {
+        return false;
+    }
+    let here = state::domain();
+    if here.is_null() {
+        return false;
+    }
+    // SAFETY: the calling thread's domain is live while it is installed.
+    let me = unsafe { &*here };
+    if serial == me.accounting.serial.0 {
+        return false;
+    }
+    end_spin();
+    let _passthrough = Passthrough::enter();
+    follow_running(me, serial) && mine(fd)
+}
+
+/// Moves the calling thread into sim `serial` if the thread is left over from an ended run of its
+/// own sim `me` and `serial` has a run in progress.
+#[cfg(unix)]
+fn follow_running(me: &Inner, serial: u64) -> bool {
+    if !me.dormant.load(Ordering::SeqCst) {
+        return false;
+    }
+    match crate::census::find(serial) {
+        Some(theirs) if !theirs.0.dormant.load(Ordering::SeqCst) => follow(&theirs),
+        _ => false,
+    }
+}
+
+/// A descriptor of another sim (or of one that is gone) that is not process-local: served by
+/// this sim's own instance of it if a backend has one to give (see
+/// [`Net::mirror`](crate::Net::mirror)), and otherwise `EBADF`, as an fd this world never opened.
+#[cfg(unix)]
+fn mirrored(me: &Inner, fd: c_int) -> Elsewhere {
+    let _passthrough = Passthrough::enter();
+    // SAFETY: no pointers are involved.
+    if me.net.iter().any(|net| unsafe { net.mirror(fd) }) {
+        Elsewhere::Retry
+    } else {
+        Elsewhere::Fail(libc::EBADF)
+    }
+}
+
+/// The sim holding `fd`, a process-local descriptor, when that is another sim than the calling
+/// thread's and its run is in progress.
+#[cfg(unix)]
+pub(crate) fn running_elsewhere(fd: c_int) -> Option<Domain> {
+    let Owner::Sim {
+        serial,
+        local: true,
+    } = owners::owner(fd)
+    else {
+        return None;
+    };
+    if state::passthrough() {
+        return None;
+    }
+    let here = state::domain();
+    // SAFETY: the calling thread's domain is live while it is installed.
+    if here.is_null() || serial == unsafe { &*here }.accounting.serial.0 {
+        return None;
+    }
+    let _passthrough = Passthrough::enter();
+    let theirs = crate::census::find(serial)?;
+    (!theirs.0.dormant.load(Ordering::SeqCst)).then_some(theirs)
 }
 
 /// Whether the calling thread's sim owns `fd`.

@@ -278,7 +278,10 @@ pub(crate) struct SignalTable {
     /// [`forward::inherited`]) so an inherited `SIG_IGN` survives, as across exec(2) (man 7
     /// signal, "Signal dispositions": ignored signals stay ignored across execve).
     #[cfg(unix)]
-    actions: Mutex<std::collections::HashMap<i32, libc::sigaction>>,
+    actions: Mutex<Actions>,
+    /// See `SimBuilder::process_signal_handlers`.
+    #[cfg(unix)]
+    process_handlers: std::sync::atomic::AtomicBool,
     /// Console control handlers, the ignore-CTRL+C flag and the CRT's signal table.
     #[cfg(windows)]
     console: Mutex<console::Console>,
@@ -292,15 +295,54 @@ impl SignalTable {
     pub(crate) fn new() -> Self {
         SignalTable {
             #[cfg(unix)]
-            actions: Mutex::new(
-                [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+            actions: Mutex::new(Actions {
+                by_signal: [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
                     .into_iter()
                     .map(|sig| (sig, forward::inherited(sig)))
                     .collect(),
-            ),
+                set: std::collections::HashSet::new(),
+            }),
+            #[cfg(unix)]
+            process_handlers: std::sync::atomic::AtomicBool::new(false),
             #[cfg(windows)]
             console: Mutex::default(),
         }
+    }
+}
+
+/// A sim's `sigaction` table.
+#[cfg(unix)]
+struct Actions {
+    by_signal: std::collections::HashMap<i32, libc::sigaction>,
+    /// The signals the sim's own code has set an action for.
+    set: std::collections::HashSet<i32>,
+}
+
+#[cfg(unix)]
+type Handlers = std::collections::BTreeMap<i32, libc::sigaction>;
+
+/// The handler the code under test last installed for each signal, in whichever sim: what a sim
+/// built with `SimBuilder::process_signal_handlers` falls back to for a signal its own code never
+/// set an action for.
+#[cfg(unix)]
+static PROCESS_HANDLERS: Mutex<Handlers> = Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(unix)]
+fn process_handlers() -> std::sync::MutexGuard<'static, Handlers> {
+    PROCESS_HANDLERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(unix)]
+fn is_handler(action: &libc::sigaction) -> bool {
+    action.sa_sigaction != libc::SIG_DFL && action.sa_sigaction != libc::SIG_IGN
+}
+
+#[cfg(unix)]
+impl SignalTable {
+    /// Whether a signal the sim's code never set an action for reaches the process's handler.
+    pub(crate) fn reach_process_handlers(&self, on: bool) {
+        self.process_handlers
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -320,11 +362,22 @@ impl Signals for SimSignals {
     fn sigaction(&self, sig: i32, act: Option<&libc::sigaction>) -> libc::sigaction {
         let mut actions = self.table().actions.lock().unwrap();
         let previous = actions
+            .by_signal
             .get(&sig)
             .copied()
             .unwrap_or_else(|| forward::inherited(sig));
         if let Some(act) = act {
-            actions.insert(sig, *act);
+            actions.by_signal.insert(sig, *act);
+            actions.set.insert(sig);
+            let mut process = process_handlers();
+            if is_handler(act) {
+                process.insert(sig, *act);
+            } else if process
+                .get(&sig)
+                .is_some_and(|installed| installed.sa_sigaction == previous.sa_sigaction)
+            {
+                process.remove(&sig);
+            }
         }
         previous
     }
@@ -336,7 +389,17 @@ impl Signals for SimSignals {
     fn take_disposition(&self, sig: i32) -> snare_interpose::Disposition {
         use snare_interpose::Disposition;
         let mut actions = self.table().actions.lock().unwrap();
-        let Some(action) = actions.get_mut(&sig) else {
+        if !actions.set.contains(&sig)
+            && self
+                .table()
+                .process_handlers
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(installed) = process_handlers().get(&sig).copied()
+        {
+            actions.by_signal.insert(sig, installed);
+            actions.set.insert(sig);
+        }
+        let Some(action) = actions.by_signal.get_mut(&sig) else {
             return Disposition::Default;
         };
         match action.sa_sigaction {

@@ -1197,10 +1197,15 @@ impl std::fmt::Debug for Sim {
     }
 }
 
-/// Writes out the frames still due and closes the capture file: threads that outlive the sim
-/// may still hold its registries.
+/// Drops the sim's [`snare_interpose::sim_local`] values inside a last run, so a shim's per-sim
+/// reactor shuts down in the sim that made it. Then writes out the frames still due and closes
+/// the capture file: threads that outlive the sim may still hold its registries.
 impl Drop for Sim {
     fn drop(&mut self) {
+        let locals = self.domain.take_locals();
+        if !locals.is_empty() {
+            self.run(move || drop(locals));
+        }
         if let Some(capture) = self.shared.capture() {
             capture.finish();
         }

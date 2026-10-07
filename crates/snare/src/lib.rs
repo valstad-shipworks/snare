@@ -185,7 +185,7 @@ fn with_proc_net(
     fs: Arc<dyn snare_interpose::Fs>,
 ) -> Arc<dyn snare_interpose::Fs> {
     #[cfg(target_os = "linux")]
-    return Arc::new(procnet::FsChain(vec![
+    return Arc::new(fs_sim::FsChain(vec![
         Arc::new(procnet::ProcNetFs::new(shared)),
         fs,
     ]));
@@ -193,6 +193,16 @@ fn with_proc_net(
     {
         let _ = shared;
         fs
+    }
+}
+
+/// The file plane of a sim with a `SimHost`: the host's synthetic `/sys`, `/proc` and `/dev`
+/// first, then `fs` for every path the host declines.
+#[cfg(unix)]
+fn host_files(host: &Arc<SimHost>, fs: Option<&Arc<VirtualFs>>) -> Arc<dyn snare_interpose::Fs> {
+    match fs {
+        Some(fs) => Arc::new(fs_sim::FsChain(vec![host.clone(), fs.clone()])),
+        None => host.clone(),
     }
 }
 
@@ -255,11 +265,16 @@ impl std::fmt::Debug for Sim {
     }
 }
 
-/// Writes out the frames still due and closes the capture file: threads that outlive the sim
-/// may still hold its registries.
+/// Drops the sim's [`snare_interpose::sim_local`] values inside a last run, so a shim's per-sim
+/// reactor shuts down in the sim that made it. Then writes out the frames still due and closes
+/// the capture file: threads that outlive the sim may still hold its registries.
 #[cfg(unix)]
 impl Drop for Sim {
     fn drop(&mut self) {
+        let locals = self.domain.take_locals();
+        if !locals.is_empty() {
+            self.run(move || drop(locals));
+        }
         if let Some(capture) = self.shared.capture() {
             capture.finish();
         }
@@ -749,6 +764,8 @@ pub struct SimBuilder {
     /// Names, real-resolver snapshots and the real-DNS fallback, applied at `build`.
     dns: dns::DnsSetup,
     forward_signals: bool,
+    /// See [`process_signal_handlers`](Self::process_signal_handlers).
+    process_signal_handlers: bool,
     /// `None` keeps the default (or the host profile's), `Some` overrides it at `build`.
     privileges: Option<Privileges>,
     sys_limits: Option<SysLimits>,
@@ -864,9 +881,9 @@ impl SimBuilder {
     }
 
     /// Serves scheduling, CPU-topology, NIC and socket-tuning calls from a [`SimHost`]. The host
-    /// also serves its own synthetic `/sys`, `/proc` and `/dev` reads, so it occupies the file
-    /// plane and takes precedence over any [`fs`](Self::fs) set alongside it; every path it does
-    /// not model is declined and reaches the real OS.
+    /// also serves its own synthetic `/sys`, `/proc` and `/dev` reads, ahead of any
+    /// [`fs`](Self::fs) set alongside it: a path the host does not model goes on to that
+    /// [`VirtualFs`], and one neither serves reaches the real OS.
     pub fn host(mut self, host: Arc<SimHost>) -> Self {
         self.host = Some(host);
         self
@@ -912,6 +929,18 @@ impl SimBuilder {
     /// real against the process's own disposition. The last sim to drop puts them back.
     pub fn forward_real_signals(mut self) -> Self {
         self.forward_signals = true;
+        self
+    }
+
+    /// Lets a signal this sim's code never set an action for (`sigaction`, `signal`) reach the
+    /// handler the code under test last installed for it in any sim of the process. A library
+    /// that installs its dispatcher once per process and remembers that in a static
+    /// (signal-hook-registry, and so `tokio::signal`, `signal-hook` and `async-signal`) never
+    /// calls `sigaction` again in a later sim, or in one running alongside the sim whose code
+    /// first registered, so without this only that sim's signals reach it. The dispatcher runs
+    /// whatever every sim registered with it, as one process's would.
+    pub fn process_signal_handlers(mut self) -> Self {
+        self.process_signal_handlers = true;
         self
     }
 
@@ -1034,6 +1063,9 @@ impl SimBuilder {
         shared
             .strict_sockopts
             .store(self.strict_sockopts, std::sync::atomic::Ordering::Relaxed);
+        shared
+            .signals
+            .reach_process_handlers(self.process_signal_handlers);
         crate::pcapng::attach(&shared, self.pcapng, self.pcapng_wall_comment);
         let (host_nics, host_routes) = match &self.host {
             Some(host) => host.topology_facts(),
@@ -1072,16 +1104,17 @@ impl SimBuilder {
         if let Some(host) = &self.host {
             // The host owns the NIC/scheduling/synthetic-fs planes: its `Net` handles the
             // ethtool and timestamping ioctls, netlink and UDP; its `Fs` the synthetic
-            // `/sys`·`/proc`; its `Host` the scheduling calls; and its clock layer makes
-            // `clock_gettime` (incl. `CLOCK_TAI`) deterministic. The fabric sits behind it on the
-            // net plane so the socket families the host declines — TCP streams, raw L2 — are still
-            // simulated, and the interface queries it declines are answered from the topology: a
-            // test gets host-modelled UDP and fabric-modelled TCP at once.
+            // `/sys`·`/proc`, in front of a `VirtualFs` if one is set; its `Host` the scheduling
+            // calls; and its clock layer makes `clock_gettime` (incl. `CLOCK_TAI`) deterministic.
+            // The fabric sits behind it on the net plane so the socket families the host declines
+            // — TCP streams, raw L2 — are still simulated, and the interface queries it declines
+            // are answered from the topology: a test gets host-modelled UDP and fabric-modelled
+            // TCP at once.
             builder = builder
                 .layers([host.clock_layer()])
                 .net(host.clone())
                 .net(fabric.clone())
-                .fs(with_proc_net(&shared, host.clone()))
+                .fs(with_proc_net(&shared, host_files(host, self.fs.as_ref())))
                 .host(host.clone());
             // Only isolate the environment when the test asked to (see `HostProfile::env`), so
             // hosts that do not configure env keep reading the real one.

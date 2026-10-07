@@ -1,8 +1,9 @@
 //! File-path and file-descriptor hooks that consult the calling thread's [`Fs`](crate::Fs) before
 //! the OS. Path-keyed calls (`open`, `openat`, `creat`) offer the path to the backend, which may
 //! mint a virtual fd or decline (passthrough). The generic fd calls (`read`, `write`, `close`,
-//! `fcntl`, `ioctl`) are handled by the shared hooks in `sockets.rs` (`ioctl` in `unix.rs`), gated
-//! on `fs_owns`; this module adds `lseek`, which is file-specific.
+//! `fcntl`, `ioctl`) are handled by the shared hooks in `sockets.rs` (`ioctl` in `unix.rs`), offered
+//! to the plane that minted the fd (`domain::file_plane`); this module adds `lseek`, which is
+//! file-specific.
 //!
 //! `open`/`openat` are variadic in C (`..., mode_t`); `creat` is not. On Linux (x86_64 and AArch64 both
 //! pass the first variadic word in a register) and on macOS x86_64 a fixed-arity hook reads it
@@ -21,9 +22,10 @@ use std::sync::atomic::AtomicUsize;
 
 use libc::{mode_t, off_t};
 
-use crate::domain::{dispatch_fs, fs_owns};
+use crate::domain::{self, FilePlane, dispatch_fs, dispatch_fs_fd, fs_owns};
 use crate::hooks::{Hook, hook, original};
 use crate::os::sockets::{finish, finish_ptr};
+use crate::state::Passthrough;
 
 struct PathArgument {
     original: *const c_char,
@@ -329,6 +331,7 @@ unsafe fn do_open(slot: &AtomicUsize, path: *const c_char, flags: c_int, mode: m
     // SAFETY: `path` is the caller's C string.
     if let Some(r) = crate::domain::descriptor_transaction(|| {
         dispatch_fs(|fs| unsafe { fs.open(path, flags, mode_u32(mode)) })
+            .inspect(|&fd| domain::file_opened(fd as c_int))
     }) {
         return finish(r) as c_int;
     }
@@ -389,6 +392,7 @@ unsafe fn do_openat(
     // SAFETY: `path` is the caller's C string.
     if let Some(r) = crate::domain::descriptor_transaction(|| {
         dispatch_fs(|fs| unsafe { fs.openat(dirfd, path, flags, mode_u32(mode)) })
+            .inspect(|&fd| domain::file_opened(fd as c_int))
     }) {
         return finish(r) as c_int;
     }
@@ -476,6 +480,7 @@ unsafe extern "C" fn creat(path: *const c_char, mode: mode_t) -> c_int {
             mode_u32(mode),
         )
     }) {
+        domain::file_opened(r as c_int);
         return finish(r) as c_int;
     }
     // SAFETY: CREAT holds libc's creat.
@@ -488,10 +493,8 @@ unsafe extern "C" fn creat(path: *const c_char, mode: mode_t) -> c_int {
 /// man 2 lseek: `whence` is SEEK_SET/SEEK_CUR/SEEK_END (Linux also SEEK_DATA/SEEK_HOLE); returns
 /// the resulting absolute offset. The backend owns the position for fds it minted.
 unsafe extern "C" fn lseek(fd: c_int, offset: off_t, whence: c_int) -> off_t {
-    if fs_owns(fd)
-        // SAFETY: no pointers.
-        && let Some(r) = dispatch_fs(|fs| unsafe { fs.lseek(fd, offset, whence) })
-    {
+    // SAFETY: no pointers.
+    if let Some(r) = dispatch_fs_fd(fd, |fs| unsafe { fs.lseek(fd, offset, whence) }) {
         return finish(r) as off_t;
     }
     // SAFETY: LSEEK holds libc's lseek.
@@ -532,6 +535,7 @@ unsafe extern "C" fn creat64(path: *const c_char, mode: mode_t) -> c_int {
             mode_u32(mode),
         )
     }) {
+        domain::file_opened(r as c_int);
         return finish(r) as c_int;
     }
     // SAFETY: CREAT64 holds libc's creat64.
@@ -544,10 +548,8 @@ unsafe extern "C" fn creat64(path: *const c_char, mode: mode_t) -> c_int {
 #[cfg(target_os = "linux")]
 /// Hook for glibc's `lseek64`, the LFS alias of `lseek` (`off64_t` is `i64`).
 unsafe extern "C" fn lseek64(fd: c_int, offset: i64, whence: c_int) -> i64 {
-    if fs_owns(fd)
-        // SAFETY: no pointers.
-        && let Some(r) = dispatch_fs(|fs| unsafe { fs.lseek(fd, offset, whence) })
-    {
+    // SAFETY: no pointers.
+    if let Some(r) = dispatch_fs_fd(fd, |fs| unsafe { fs.lseek(fd, offset, whence) }) {
         return finish(r);
     }
     // SAFETY: LSEEK64 holds libc's lseek64.
@@ -588,10 +590,8 @@ unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_int {
 
 /// Hook for `fstat(2)`, offered only for an fd the backend owns.
 unsafe extern "C" fn fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
-    if fs_owns(fd)
-        // SAFETY: `buf` a writable struct stat.
-        && let Some(r) = dispatch_fs(|fs| unsafe { fs.fstat(fd, buf.cast()) })
-    {
+    // SAFETY: `buf` a writable struct stat.
+    if let Some(r) = dispatch_fs_fd(fd, |fs| unsafe { fs.fstat(fd, buf.cast()) }) {
         return finish(r) as c_int;
     }
     // SAFETY: FSTAT holds libc's fstat.
@@ -599,9 +599,7 @@ unsafe extern "C" fn fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
 }
 
 unsafe extern "C" fn pread(fd: c_int, buf: *mut libc::c_void, len: usize, offset: off_t) -> isize {
-    if fs_owns(fd)
-        && let Some(r) = dispatch_fs(|fs| unsafe { fs.pread(fd, buf.cast(), len, offset) })
-    {
+    if let Some(r) = dispatch_fs_fd(fd, |fs| unsafe { fs.pread(fd, buf.cast(), len, offset) }) {
         return finish(r) as isize;
     }
     unsafe {
@@ -617,9 +615,7 @@ unsafe extern "C" fn pwrite(
     len: usize,
     offset: off_t,
 ) -> isize {
-    if fs_owns(fd)
-        && let Some(r) = dispatch_fs(|fs| unsafe { fs.pwrite(fd, buf.cast(), len, offset) })
-    {
+    if let Some(r) = dispatch_fs_fd(fd, |fs| unsafe { fs.pwrite(fd, buf.cast(), len, offset) }) {
         return finish(r) as isize;
     }
     unsafe {
@@ -630,18 +626,14 @@ unsafe extern "C" fn pwrite(
 }
 
 unsafe extern "C" fn ftruncate(fd: c_int, len: off_t) -> c_int {
-    if fs_owns(fd)
-        && let Some(r) = dispatch_fs(|fs| unsafe { fs.ftruncate(fd, len) })
-    {
+    if let Some(r) = dispatch_fs_fd(fd, |fs| unsafe { fs.ftruncate(fd, len) }) {
         return finish(r) as c_int;
     }
     unsafe { original::<unsafe extern "C" fn(c_int, off_t) -> c_int>(&FTRUNCATE)(fd, len) }
 }
 
 unsafe extern "C" fn fsync(fd: c_int) -> c_int {
-    if fs_owns(fd)
-        && let Some(r) = dispatch_fs(|fs| unsafe { fs.fsync(fd) })
-    {
+    if let Some(r) = dispatch_fs_fd(fd, |fs| unsafe { fs.fsync(fd) }) {
         return finish(r) as c_int;
     }
     unsafe { original::<unsafe extern "C" fn(c_int) -> c_int>(&FSYNC)(fd) }
@@ -757,9 +749,7 @@ unsafe extern "C" fn statfs(path: *const c_char, buf: *mut libc::statfs) -> c_in
 }
 
 unsafe extern "C" fn fstatfs(fd: c_int, buf: *mut libc::statfs) -> c_int {
-    if fs_owns(fd)
-        && let Some(result) = dispatch_fs(|fs| unsafe { fs.fstatfs(fd, buf.cast()) })
-    {
+    if let Some(result) = dispatch_fs_fd(fd, |fs| unsafe { fs.fstatfs(fd, buf.cast()) }) {
         return finish(result) as c_int;
     }
     unsafe {
@@ -816,9 +806,7 @@ unsafe extern "C" fn renameat(
 }
 
 unsafe extern "C" fn fdopendir(fd: c_int) -> *mut libc::DIR {
-    if fs_owns(fd)
-        && let Some(result) = dispatch_fs(|fs| unsafe { fs.fdopendir(fd) })
-    {
+    if let Some(result) = dispatch_fs_fd(fd, |fs| unsafe { fs.fdopendir(fd) }) {
         return finish_dir(result);
     }
     unsafe { original::<unsafe extern "C" fn(c_int) -> *mut libc::DIR>(&FDOPENDIR)(fd) }
@@ -860,10 +848,9 @@ unsafe extern "C" fn linkat(
 
 #[cfg(target_os = "linux")]
 unsafe extern "C" fn getdents64(fd: c_int, buf: *mut u8, len: usize) -> libc::ssize_t {
-    if fs_owns(fd)
-        && let Some(result) =
-            dispatch_fs(|fs| unsafe { fs.getdents64(fd, buf, len.min(c_int::MAX as usize)) })
-    {
+    if let Some(result) = dispatch_fs_fd(fd, |fs| unsafe {
+        fs.getdents64(fd, buf, len.min(c_int::MAX as usize))
+    }) {
         return finish(result) as libc::ssize_t;
     }
     unsafe {
@@ -880,9 +867,7 @@ unsafe extern "C" fn getdirentries(
     len: usize,
     base: *mut off_t,
 ) -> libc::ssize_t {
-    if fs_owns(fd)
-        && let Some(result) = dispatch_fs(|fs| unsafe { fs.getdents64(fd, buf, len) })
-    {
+    if let Some(result) = dispatch_fs_fd(fd, |fs| unsafe { fs.getdents64(fd, buf, len) }) {
         if result >= 0 && !base.is_null() {
             unsafe { base.write(0) };
         }
@@ -916,6 +901,7 @@ unsafe extern "C" fn opendir(path: *const c_char) -> *mut libc::DIR {
 
     // SAFETY: `path` is the caller's C string.
     if let Some(r) = dispatch_fs(|fs| unsafe { fs.opendir(path) }) {
+        domain::file_opened(r as c_int);
         return finish_dir(r);
     }
     // SAFETY: OPENDIR holds libc's opendir.
@@ -928,12 +914,13 @@ unsafe extern "C" fn opendir(path: *const c_char) -> *mut libc::DIR {
 /// Returns the backend's `struct dirent64`, or NULL at end of stream without touching errno.
 unsafe extern "C" fn readdir(dirp: *mut libc::DIR) -> *mut libc::dirent64 {
     if let Some(fd) = dir_fd(dirp) {
-        let result =
-            dispatch_fs(|fs| unsafe { fs.readdir(fd) }).unwrap_or(-i64::from(if fs_owns(fd) {
+        let result = dispatch_fs_fd(fd, |fs| unsafe { fs.readdir(fd) }).unwrap_or(-i64::from(
+            if domain::file_plane(fd).is_some() {
                 libc::EOPNOTSUPP
             } else {
                 libc::EBADF
-            }));
+            },
+        ));
         return finish_ptr(result).cast();
     }
     // SAFETY: READDIR holds libc's readdir64.
@@ -954,7 +941,8 @@ unsafe extern "C" fn readdir_r(
 ) -> c_int {
     if let Some(fd) = dir_fd(dirp)
         // SAFETY: `entry`/`result` are the caller's dirent and result slots.
-        && let Some(r) = dispatch_fs(|fs| unsafe { fs.readdir_r(fd, entry.cast(), result.cast()) })
+        && let Some(r) =
+            dispatch_fs_fd(fd, |fs| unsafe { fs.readdir_r(fd, entry.cast(), result.cast()) })
     {
         return if r < 0 { (-r) as c_int } else { r as c_int };
     }
@@ -964,7 +952,7 @@ unsafe extern "C" fn readdir_r(
                 *result = std::ptr::null_mut();
             }
         }
-        return if fs_owns(fd) {
+        return if domain::file_plane(fd).is_some() {
             libc::EOPNOTSUPP
         } else {
             libc::EBADF
@@ -985,10 +973,14 @@ unsafe extern "C" fn readdir_r(
 /// Hook for `closedir(3)`, offered only for a stream fd the backend owns.
 unsafe extern "C" fn closedir(dirp: *mut libc::DIR) -> c_int {
     if let Some(fd) = dir_fd(dirp) {
-        let result = if fs_owns(fd) {
-            dispatch_fs(|fs| unsafe { fs.closedir(fd) }).unwrap_or(-i64::from(libc::EOPNOTSUPP))
-        } else {
-            -i64::from(libc::EBADF)
+        let result = match domain::file_plane(fd) {
+            Some(FilePlane::Served(fs, serial)) => {
+                crate::owners::release_file_of(fd, serial);
+                let _passthrough = Passthrough::enter();
+                unsafe { fs.closedir(fd) }
+                    .map_or(-i64::from(libc::EOPNOTSUPP), crate::fs::FsResult::into_raw)
+            }
+            _ => -i64::from(libc::EBADF),
         };
         return finish(result) as c_int;
     }
@@ -999,7 +991,7 @@ unsafe extern "C" fn closedir(dirp: *mut libc::DIR) -> c_int {
 /// Hook for `dirfd(3)`.
 unsafe extern "C" fn dirfd(dirp: *mut libc::DIR) -> c_int {
     if let Some(fd) = dir_fd(dirp) {
-        return if fs_owns(fd) {
+        return if matches!(domain::file_plane(fd), Some(FilePlane::Served(..))) {
             fd
         } else {
             finish(-i64::from(libc::EBADF)) as c_int
@@ -1014,12 +1006,13 @@ unsafe extern "C" fn dirfd(dirp: *mut libc::DIR) -> c_int {
 /// dereferences our fake `DIR*`.
 unsafe extern "C" fn readdir_plain(dirp: *mut libc::DIR) -> *mut libc::dirent {
     if let Some(fd) = dir_fd(dirp) {
-        let result =
-            dispatch_fs(|fs| unsafe { fs.readdir(fd) }).unwrap_or(-i64::from(if fs_owns(fd) {
+        let result = dispatch_fs_fd(fd, |fs| unsafe { fs.readdir(fd) }).unwrap_or(-i64::from(
+            if domain::file_plane(fd).is_some() {
                 libc::EOPNOTSUPP
             } else {
                 libc::EBADF
-            }));
+            },
+        ));
         return finish_ptr(result).cast();
     }
     // SAFETY: READDIR2 holds libc's readdir.

@@ -196,6 +196,9 @@ are real model gaps:
 - SimHost rejects positional writes to virtual device nodes with `EOPNOTSUPP`;
   device-specific parity is unmeasured.
 - Mutable file flags cover append/nonblocking, not every host `fcntl` operation.
+- A file another sim's plane opened is served by that plane for I/O and descriptor calls from any
+  thread, but the working directory stays per sim: `fchdir` through such a directory descriptor
+  reaches its `/dev/null` placeholder and fails with `ENOTDIR`.
 
 ## Ignored validation
 
@@ -270,10 +273,17 @@ Supported model boundaries and unverified approximations. These do not establish
   for a single address. Shared waits on different virtual addresses mapping the same backing
   object offset do not share a modeled key. Native kernel wakes still occur, but census wake
   attribution and deterministic wake selection do not resolve that backing-object identity.
-- **async-io reactors:** the reactor thread async-io starts under the first `Sim` that uses it
-  lives for the rest of the process, so a second `Sim` in the same process that uses async-io
-  (ethercrab's timers, for one) hangs; on Linux that reactor also spins under snare. fieldhand
-  runs all such cases in turn inside one `Sim`, on macOS only.
+- **smol's global executor:** `smol::spawn` keeps its executor and "smol-N" threads in a static
+  inside smol, made under the first sim that spawns. Later sims run in turn on those threads, but
+  two sims spawning onto it at once share them, and one sim's threads poll the other's tasks.
+  Run tasks on a `smol::Executor` the test owns, or take turns. async-std's global executor and
+  `smol::unblock`'s pool are per sim through the `async-global-executor` and `blocking` shims.
+- **Outside workers drained on behalf of a sim:** a sim thread in a timed wait on a thread that is
+  busy outside the sim (a `tracing_appender::non_blocking` worker made outside it or in another
+  sim, flushing when its `WorkerGuard` drops in this one) gives snare no wake and no lock to see,
+  so time skips to the timeout: the guard waits its 1 s of sim time in a few real milliseconds and
+  returns before the worker has flushed. Make the writer and drop its guard in the same sim, or
+  drop the guard outside every sim.
 - **Real pipes in a sim poll:** `pipe`/`pipe2` stay real, so a `poll` over a pipe and sim
   sockets cannot block on the pipe; a loop waiting on both spins until `stuck_after` reports it.
   `socketpair(AF_UNIX)` is simulated and works as a wake-up channel.
