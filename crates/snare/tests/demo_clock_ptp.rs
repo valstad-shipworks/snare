@@ -49,7 +49,7 @@ fn sample(path: &std::ffi::CStr) -> [i128; 3] {
 #[test]
 fn a_zero_offset_phc_tracks_realtime_exactly() {
     let host = HostProfile::new().ptp_clock_caps(0, CROSS).build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         let [device, realtime, _] = sample(c"/dev/ptp0");
         assert_eq!(
             device, realtime,
@@ -64,7 +64,7 @@ fn a_positive_offset_phc_leads_realtime() {
         .ptp_clock_offset(2, 12_000)
         .ptp_clock_caps(2, CROSS)
         .build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         let [device, realtime, _] = sample(c"/dev/ptp2");
         assert_eq!(
             device - realtime,
@@ -80,7 +80,7 @@ fn a_negative_offset_phc_trails_realtime() {
         .ptp_clock_offset(0, -9_000)
         .ptp_clock_caps(0, CROSS)
         .build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         let [device, realtime, _] = sample(c"/dev/ptp0");
         assert_eq!(
             device - realtime,
@@ -93,7 +93,7 @@ fn a_negative_offset_phc_trails_realtime() {
 #[test]
 fn monotonic_raw_is_the_monotonic_raw_clock() {
     let host = HostProfile::new().ptp_clock_caps(0, CROSS).build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts) };
         let before = ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128;
@@ -113,7 +113,7 @@ fn monotonic_raw_is_the_monotonic_raw_clock() {
 #[test]
 fn realtime_in_the_sample_sits_at_the_virtual_epoch() {
     let host = HostProfile::new().ptp_clock_caps(0, CROSS).build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         let [_, realtime, _] = sample(c"/dev/ptp0");
         assert_eq!(
             realtime / 1_000_000_000,
@@ -131,7 +131,7 @@ fn two_phcs_carry_independent_offsets() {
         .ptp_clock_caps(0, CROSS)
         .ptp_clock_caps(1, CROSS)
         .build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         let [d0, r0, _] = sample(c"/dev/ptp0");
         let [d1, r1, _] = sample(c"/dev/ptp1");
         assert_eq!(d0 - r0, 1_000, "ptp0 leads by 1µs");
@@ -144,7 +144,7 @@ fn a_nic_ptp_index_exposes_its_phc() {
     // A NIC that advertises a PHC index makes /dev/ptp<index> appear, tracking realtime exactly.
     let nic = Nic::new("eth0", 2).ptp_index(4);
     let host = HostProfile::new().nic(nic).ptp_clock_caps(4, CROSS).build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         let [device, realtime, _] = sample(c"/dev/ptp4");
         assert_eq!(
             device, realtime,
@@ -156,7 +156,7 @@ fn a_nic_ptp_index_exposes_its_phc() {
 #[test]
 fn an_unconfigured_ptp_node_does_not_exist() {
     let host = HostProfile::new().ptp_clock_caps(0, CROSS).build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         let fd = unsafe { libc::open(c"/dev/ptp9".as_ptr(), libc::O_RDWR) };
         assert!(fd < 0, "only configured PHCs are present");
     });

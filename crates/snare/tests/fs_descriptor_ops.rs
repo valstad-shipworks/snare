@@ -384,3 +384,20 @@ fn zero_length_reads_accept_null_and_do_not_snapshot_proc_counters() {
         assert_eq!(actual, expected);
     });
 }
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn fcntl64_reaches_the_file_plane() {
+    unsafe extern "C" {
+        fn fcntl64(fd: libc::c_int, cmd: libc::c_int, ...) -> libc::c_int;
+    }
+    let fs = FsBuilder::new().file("/fcntl64/f", "x").build();
+    Sim::builder().fs(fs).build().run(|| {
+        let file = OpenOptions::new().append(true).open("/fcntl64/f").unwrap();
+        let flags = unsafe { fcntl64(file.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(
+            flags & (libc::O_ACCMODE | libc::O_APPEND),
+            libc::O_WRONLY | libc::O_APPEND
+        );
+    });
+}

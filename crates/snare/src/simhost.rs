@@ -36,7 +36,8 @@ use snare_interpose::{Env, Fs, Host, Layer, Net, NetResult as FsResult};
 #[cfg(target_os = "linux")]
 use crate::fs_sim::{DirEntry, DirStream, fill_statx};
 use crate::fs_sim::{
-    OpenFiles, descriptor_fcntl, err, fill_stat, ino_of, ok, path_of, set_cloexec, status_flags,
+    OpenFiles, Stamp, Times, descriptor_fcntl, err, fill_stat, ino_of, ok, path_of, set_cloexec,
+    status_flags, with_times,
 };
 
 use crate::clock::{Clock, ClockLayer};
@@ -1632,6 +1633,15 @@ pub(crate) struct HostState {
 }
 
 impl HostState {
+    /// How many CPUs are online: the online set's members below the CPU count, at least one.
+    fn online_count(&self) -> usize {
+        self.online
+            .iter()
+            .filter(|&&c| c < self.cpu_count)
+            .count()
+            .max(1)
+    }
+
     #[cfg(target_os = "linux")]
     fn socket_rec(&self, fd: c_int) -> Option<Arc<SockRec>> {
         self.udp
@@ -2844,6 +2854,11 @@ impl SimHost {
         self.clock.clone()
     }
 
+    /// `CLOCK_REALTIME` at the sim's boot, monotonic zero: the time its synthesized files carry.
+    fn boot(&self) -> Stamp {
+        self.clock.base_realtime().as_nanos() as Stamp
+    }
+
     /// The CPU latency cap, in microseconds, the code under test currently requests through
     /// `/dev/cpu_dma_latency`, or `None` while no descriptor on it is open. Opening the file starts
     /// the request at the kernel's no-constraint default of 2000 s (`PM_QOS_CPU_LATENCY_DEFAULT_VALUE`),
@@ -2910,21 +2925,14 @@ impl SimHost {
 
 impl Drop for SimHost {
     fn drop(&mut self) {
-        // Close every fd still reserved in the tables (each is a live dup of /dev/null), then the
-        // devnull template itself, so a dropped sim leaks no descriptors.
+        // Close every socket still reserved in the tables (each is a live dup of /dev/null), then
+        // the devnull template itself. Open files stay reserved, as `VirtualFs` leaves its own: the
+        // code may still hold one, and the interposer fails calls on it with `EBADF`.
+        #[cfg(target_os = "linux")]
         if let Ok(state) = self.state.lock() {
-            for &fd in state.open.keys() {
-                unsafe { libc::close(fd) };
-            }
-            #[cfg(target_os = "linux")]
-            for &fd in state.dirs.keys() {
-                unsafe { libc::close(fd) };
-            }
-            #[cfg(target_os = "linux")]
             for &fd in state.udp.keys() {
                 unsafe { libc::close(fd) };
             }
-            #[cfg(target_os = "linux")]
             for &fd in state.netlinks.keys() {
                 unsafe { libc::close(fd) };
             }
@@ -2979,14 +2987,19 @@ fn host_file_metadata(path: &Path, length: usize) -> (u32, u64) {
     (0o100444, length as u64)
 }
 
+/// Fills a `struct stat` for a synthesized file. Every time is `boot`, the sim's boot: Linux
+/// stamps a procfs or sysfs inode when it is first looked up, and devtmpfs nodes when the device
+/// appears, so a fixed instant at or after boot is what a test can rely on.
 pub(crate) fn host_stat(
     buf: *mut u8,
     path: &Path,
     mode: u32,
     size: u64,
     links: u64,
+    boot: Stamp,
 ) -> Option<FsResult> {
     let result = fill_stat(buf, mode, size, ino_of(path), links);
+    let result = with_times(buf, result, &Times::at(boot), false);
     #[cfg(target_os = "linux")]
     if matches!(result, Some(FsResult::Ok(_))) {
         unsafe {
@@ -3007,16 +3020,25 @@ pub(crate) fn host_stat(
 }
 
 #[cfg(target_os = "linux")]
+/// [`host_stat`] for `statx`. procfs and sysfs report no birth time (their `getattr` leaves
+/// `STATX_BTIME` out), so neither does a synthesized file under `/proc` or `/sys`.
 pub(crate) fn host_statx(
     buf: *mut u8,
     path: &Path,
     mode: u32,
     size: u64,
     links: u64,
+    boot: Stamp,
 ) -> Option<FsResult> {
     let result = fill_statx(buf, mode, size, ino_of(path), links);
+    let result = with_times(buf, result, &Times::at(boot), true);
     if matches!(result, Some(FsResult::Ok(_))) {
         unsafe {
+            if path.starts_with("/proc") || path.starts_with("/sys") {
+                let mask = buf.cast::<u32>().read_unaligned();
+                buf.cast::<u32>().write_unaligned(mask & !libc::STATX_BTIME);
+                buf.add(80).write_bytes(0, 16);
+            }
             buf.add(48).cast::<u64>().write_unaligned(0);
             if path.starts_with("/proc") {
                 buf.add(4).cast::<u32>().write_unaligned(1024);
@@ -3337,11 +3359,11 @@ impl Fs for SimHost {
         if let Some(stream) = state.dirs.get(&fd) {
             let path = stream.path.as_ref()?;
             let links = directory_links(&stream.entries);
-            return host_stat(buf, path, 0o040755, 0, links);
+            return host_stat(buf, path, 0o040755, 0, links, self.boot());
         }
         let file = state.open.get(&fd)?;
         let (mode, size) = host_file_metadata(&file.path, file.data.len());
-        host_stat(buf, &file.path, mode, size, 1)
+        host_stat(buf, &file.path, mode, size, 1, self.boot())
     }
 
     unsafe fn stat(&self, path: *const c_char, buf: *mut u8) -> Option<FsResult> {
@@ -3350,7 +3372,7 @@ impl Fs for SimHost {
         #[cfg(target_os = "linux")]
         if let Some(entries) = state.dir_entries(&path) {
             let links = directory_links(&entries);
-            return host_stat(buf, &path, 0o040755, 0, links);
+            return host_stat(buf, &path, 0o040755, 0, links, self.boot());
         }
         let Some(data) = state.render(&path) else {
             return if state.owns_path(&path) {
@@ -3360,7 +3382,7 @@ impl Fs for SimHost {
             };
         };
         let (mode, size) = host_file_metadata(&path, data.len());
-        host_stat(buf, &path, mode, size, 1)
+        host_stat(buf, &path, mode, size, 1, self.boot())
     }
 
     /// The same as `stat`: no rendered file is a symlink.
@@ -3430,17 +3452,17 @@ impl Fs for SimHost {
             if let Some(stream) = state.dirs.get(&dirfd) {
                 let path = stream.path.as_ref()?;
                 let links = directory_links(&stream.entries);
-                return host_statx(buf, path, 0o040755, 0, links);
+                return host_statx(buf, path, 0o040755, 0, links, self.boot());
             }
             let file = state.open.get(&dirfd)?;
             let (mode, size) = host_file_metadata(&file.path, file.data.len());
-            return host_statx(buf, &file.path, mode, size, 1);
+            return host_statx(buf, &file.path, mode, size, 1, self.boot());
         }
         let path = unsafe { path_of(path) }?;
         let state = self.state.lock().unwrap();
         if let Some(entries) = state.dir_entries(&path) {
             let links = directory_links(&entries);
-            return host_statx(buf, &path, 0o040755, 0, links);
+            return host_statx(buf, &path, 0o040755, 0, links, self.boot());
         }
         let Some(data) = state.render(&path) else {
             return if state.owns_path(&path) {
@@ -3450,7 +3472,7 @@ impl Fs for SimHost {
             };
         };
         let (mode, size) = host_file_metadata(&path, data.len());
-        host_statx(buf, &path, mode, size, 1)
+        host_statx(buf, &path, mode, size, 1, self.boot())
     }
 
     /// Succeeds for any known file whatever `mode` asks (including `W_OK` on a read-only
@@ -3970,6 +3992,18 @@ impl Host for SimHost {
         self.geteuid()
     }
 
+    /// `_SC_NPROCESSORS_CONF` is the profile's CPU count and `_SC_NPROCESSORS_ONLN` its online
+    /// CPUs, as glibc reads them from `/sys/devices/system/cpu/possible` and `online` and macOS from
+    /// `hw.ncpu` and `hw.activecpu` (man 3 sysconf).
+    fn sysconf(&self, name: c_int) -> Option<HostResult> {
+        let state = self.state.lock().unwrap();
+        match name {
+            libc::_SC_NPROCESSORS_CONF => ok(state.cpu_count as i64),
+            libc::_SC_NPROCESSORS_ONLN => ok(state.online_count() as i64),
+            _ => None,
+        }
+    }
+
     /// Fills the `struct utsname` from the profile, each field cut to fit with its NUL. Linux's
     /// `domainname` reads `(none)`, the kernel's `UTS_DOMAINNAME` default
     /// (include/linux/uts.h).
@@ -4329,9 +4363,9 @@ impl Host for SimHost {
         ok(0)
     }
 
-    /// Serves `{CTL_NET, PF_ROUTE, 0, family, NET_RT_IFLIST2, ...}` from the topology and the
-    /// protocol-counter nodes from the sim's counters (`netstats::macos`); every other
-    /// MIB is declined. The usual two-step protocol (man 3 sysctl): a NULL `oldp` reports the
+    /// Serves `{CTL_NET, PF_ROUTE, 0, family, NET_RT_IFLIST2, ...}` from the topology, the
+    /// protocol-counter nodes from the sim's counters (`netstats::macos`) and the CPU-count `hw.*`
+    /// nodes from the profile (see [`hw_node`]); every other MIB is declined. The usual two-step protocol (man 3 sysctl): a NULL `oldp` reports the
     /// size needed, a short buffer fails with `ENOMEM`. The address family and interface index
     /// words (`mib[3]`, `mib[5]`) are not used to filter.
     #[cfg(target_os = "macos")]
@@ -4354,6 +4388,12 @@ impl Host for SimHost {
             && let Some(r) = unsafe { macos::read(&shared, mib, oldp, oldlenp, newp) }
         {
             return Some(r);
+        }
+        if let Some(name) = hw_name_of(mib) {
+            return match hw_node(&self.state.lock().unwrap(), name)? {
+                Ok(value) => unsafe { read_hw(&value, oldp, oldlenp, newp) },
+                Err(errno) => err(errno),
+            };
         }
         if namelen < 5 {
             return None;
@@ -4392,12 +4432,21 @@ impl Host for SimHost {
         _newlen: usize,
     ) -> Option<HostResult> {
         use crate::netstats::macos;
-        let mib = macos::mib_of(unsafe { macos::name_str(name) }?)?;
+        let name = unsafe { macos::name_str(name) }?;
+        if let Some(node) = hw_node(&self.state.lock().unwrap(), name) {
+            return match node {
+                Ok(value) => unsafe { read_hw(&value, oldp, oldlenp, newp) },
+                Err(errno) => err(errno),
+            };
+        }
+        let mib = macos::mib_of(name)?;
         let shared = self.state.lock().unwrap().shared.upgrade()?;
         unsafe { macos::read(&shared, &mib, oldp, oldlenp, newp) }
     }
 
-    /// `sysctlnametomib` for the protocol-counter nodes; every other name is declined.
+    /// `sysctlnametomib` for the protocol-counter nodes, and `ENOENT` for the `hw.*` nodes the
+    /// profile has none of (see [`hw_node`]); every other name is declined, so the `hw.*` nodes
+    /// it has keep their real MIBs.
     #[cfg(target_os = "macos")]
     unsafe fn sysctlnametomib(
         &self,
@@ -4405,9 +4454,11 @@ impl Host for SimHost {
         mib: *mut c_int,
         sizep: *mut usize,
     ) -> Option<HostResult> {
-        unsafe {
-            crate::netstats::macos::name_to_mib(crate::netstats::macos::name_str(name)?, mib, sizep)
+        let name = unsafe { crate::netstats::macos::name_str(name) }?;
+        if let Some(Err(errno)) = hw_node(&self.state.lock().unwrap(), name) {
+            return err(errno);
         }
+        unsafe { crate::netstats::macos::name_to_mib(name, mib, sizep) }
     }
 
     /// Routes raw `syscall(2)` scheduling calls to the same handlers as their wrappers; every
@@ -5576,6 +5627,24 @@ impl Net for SimHost {
         state.udp.contains_key(&fd) || state.netlinks.contains_key(&fd)
     }
 
+    /// `read(2)` on one of the host's sockets: a `recv` with no flags (man 2 recv).
+    #[cfg(target_os = "linux")]
+    unsafe fn read(&self, fd: c_int, buf: *mut u8, len: usize) -> Option<NetResult> {
+        if !Net::owns(self, fd) {
+            return None;
+        }
+        unsafe { Net::recv(self, fd, buf, len, 0) }
+    }
+
+    /// `write(2)` on one of the host's sockets: a `send` with no flags (man 2 send).
+    #[cfg(target_os = "linux")]
+    unsafe fn write(&self, fd: c_int, buf: *const u8, len: usize) -> Option<NetResult> {
+        if !Net::owns(self, fd) {
+            return None;
+        }
+        unsafe { Net::send(self, fd, buf, len, 0) }
+    }
+
     /// Creates a netlink socket (any protocol) or an IPv4/IPv6 datagram socket. The socket type is
     /// taken from the type's low byte (the kernel masks with `SOCK_TYPE_MASK` = 0xf,
     /// include/linux/net.h); `SOCK_NONBLOCK`/`SOCK_CLOEXEC` are flags OR'd above it.
@@ -6673,6 +6742,132 @@ impl Net for SimHost {
     unsafe fn dup(&self, fd: c_int) -> Option<NetResult> {
         unsafe { Net::fcntl(self, fd, libc::F_DUPFD, 0) }
     }
+}
+
+/// A read-only `hw.*` node's value: a C `int`, or a string read with its NUL.
+#[cfg(target_os = "macos")]
+enum HwValue {
+    Int(i32),
+    Str(&'static str),
+}
+
+/// The CPU-count nodes a macOS program reads its processor count from, as a profile of `cpus`
+/// CPUs, `online` of them online, with one thread per core: `hw.ncpu`, `hw.logicalcpu_max` and
+/// `hw.physicalcpu_max` count every CPU; `hw.activecpu`, `hw.logicalcpu` and `hw.physicalcpu`
+/// the available ones (xnu bsd/kern/kern_mib.c). On arm64 the CPUs form one performance level,
+/// `hw.nperflevels` 1 and `hw.perflevel0.*` the same counts, named "Performance" (Apple Developer
+/// Documentation, "Tuning your code's performance for Apple silicon"), and the nodes of further
+/// levels do not exist (`ENOENT`); x86_64 Macs have no `hw.perflevel` nodes. `None` for any other
+/// name.
+#[cfg(target_os = "macos")]
+fn hw_node(state: &HostState, name: &str) -> Option<Result<HwValue, c_int>> {
+    let all = state.cpu_count as i32;
+    let online = state.online_count() as i32;
+    let count = |field: &str| match field {
+        "logicalcpu_max" | "physicalcpu_max" => Some(Ok(HwValue::Int(all))),
+        "logicalcpu" | "physicalcpu" => Some(Ok(HwValue::Int(online))),
+        _ => None,
+    };
+    match name.strip_prefix("hw.")? {
+        "ncpu" => Some(Ok(HwValue::Int(all))),
+        "activecpu" => Some(Ok(HwValue::Int(online))),
+        "nperflevels" if cfg!(target_arch = "aarch64") => Some(Ok(HwValue::Int(1))),
+        level if cfg!(target_arch = "aarch64") && level.starts_with("perflevel") => {
+            let (index, field) = level["perflevel".len()..].split_once('.')?;
+            match (index, field) {
+                ("0", "name") => Some(Ok(HwValue::Str("Performance"))),
+                ("0", field) => count(field),
+                _ if index.parse::<u32>().is_ok() => Some(Err(libc::ENOENT)),
+                _ => None,
+            }
+        }
+        field => count(field),
+    }
+}
+
+/// The `hw.*` names [`hw_node`] answers.
+#[cfg(target_os = "macos")]
+const HW_NAMES: [&std::ffi::CStr; 22] = [
+    c"hw.ncpu",
+    c"hw.activecpu",
+    c"hw.logicalcpu",
+    c"hw.logicalcpu_max",
+    c"hw.physicalcpu",
+    c"hw.physicalcpu_max",
+    c"hw.nperflevels",
+    c"hw.perflevel0.name",
+    c"hw.perflevel0.logicalcpu",
+    c"hw.perflevel0.logicalcpu_max",
+    c"hw.perflevel0.physicalcpu",
+    c"hw.perflevel0.physicalcpu_max",
+    c"hw.perflevel1.name",
+    c"hw.perflevel1.logicalcpu",
+    c"hw.perflevel1.logicalcpu_max",
+    c"hw.perflevel1.physicalcpu",
+    c"hw.perflevel1.physicalcpu_max",
+    c"hw.perflevel2.name",
+    c"hw.perflevel2.logicalcpu",
+    c"hw.perflevel2.logicalcpu_max",
+    c"hw.perflevel2.physicalcpu",
+    c"hw.perflevel2.physicalcpu_max",
+];
+
+/// The [`hw_node`] name a `CTL_HW` MIB names. Most of these nodes are `OID_AUTO`, numbered when
+/// the kernel registers them, so a MIB is matched against the one the real `sysctlnametomib`
+/// gives for each name; host calls run under passthrough, so that call reaches the OS.
+#[cfg(target_os = "macos")]
+fn hw_name_of(mib: &[c_int]) -> Option<&'static str> {
+    if mib.first() != Some(&libc::CTL_HW) {
+        return None;
+    }
+    HW_NAMES.iter().find_map(|name| {
+        let mut words = [0 as c_int; 4];
+        let mut len = words.len();
+        let r = unsafe { libc::sysctlnametomib(name.as_ptr(), words.as_mut_ptr(), &mut len) };
+        (r == 0 && words[..len] == *mib).then(|| name.to_str().unwrap())
+    })
+}
+
+/// Reads a `hw.*` node as the kernel does, measured on macOS 26: a null `oldp` reports the size,
+/// a short buffer or a null `oldlenp` is `ENOMEM` (with the length reset to 0), and a write is
+/// `EPERM`.
+///
+/// # Safety
+/// `oldp` is null or writable for `*oldlenp` bytes; `oldlenp` is null or valid.
+#[cfg(target_os = "macos")]
+unsafe fn read_hw(
+    value: &HwValue,
+    oldp: *mut u8,
+    oldlenp: *mut usize,
+    newp: *const u8,
+) -> Option<HostResult> {
+    if !newp.is_null() {
+        return err(libc::EPERM);
+    }
+    let bytes: Vec<u8> = match value {
+        HwValue::Int(v) => v.to_ne_bytes().to_vec(),
+        HwValue::Str(s) => [s.as_bytes(), b"\0"].concat(),
+    };
+    if oldlenp.is_null() {
+        return if oldp.is_null() {
+            ok(0)
+        } else {
+            err(libc::ENOMEM)
+        };
+    }
+    unsafe {
+        if oldp.is_null() {
+            *oldlenp = bytes.len();
+            return ok(0);
+        }
+        if *oldlenp < bytes.len() {
+            *oldlenp = 0;
+            return err(libc::ENOMEM);
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), oldp, bytes.len());
+        *oldlenp = bytes.len();
+    }
+    ok(0)
 }
 
 /// `CTL_NET` (4, `<sys/sysctl.h>`): the network top-level MIB (man 3 sysctl).

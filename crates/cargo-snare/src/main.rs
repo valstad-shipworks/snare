@@ -10,17 +10,24 @@
 //! `cargo snare test` runs `cargo test` with three changes: `--cfg snare` (so the crate's
 //! `#[cfg(snare)]` tests and helpers compile), `--cfg rustix_use_libc` (so rustix calls libc,
 //! whose imports snare interposes, instead of issuing raw syscalls), and a
-//! `--config patch.crates-io.<shim>…` for every drop-in syscall shim the dependency graph uses,
-//! replacing crates that would otherwise reach the kernel with inline syscall instructions the
-//! interposer cannot see (see `shims/README.md`). The shims come from the snare repository at the
-//! tag matching this binary's version, or from a local `--shims-dir`.
+//! `--config patch.crates-io.<shim>…` for every drop-in shim the dependency graph needs: crates
+//! that would otherwise reach the kernel or the CPU's counters where the interposer cannot see
+//! them, or seed from process-wide state a sim cannot replay (see `shims/README.md`). Shims that
+//! only give each sim its own copy of a crate's process-wide state are patched only when
+//! `--parallel` or the workspace's `[*.metadata.snare] parallel` asks for them (see [`shims`]).
+//! The shims come from the snare repository at the tag matching this binary's version, or from a
+//! local `--shims-dir`.
 
 mod init;
+mod shims;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
 
 use clap::{Args, Parser, Subcommand};
+use serde_json::Value;
+
+use shims::{Parallel, SHIMS, Shim};
 
 /// The repository holding `shims/`. Cargo finds a git dependency's package by name anywhere in
 /// the repository, so each shim resolves to its subdirectory.
@@ -29,22 +36,20 @@ const SHIMS_GIT: &str = "https://github.com/valstad-shipworks/snare";
 /// The release tag of this binary, whose `shims/` match the interposer it was released with.
 const SHIMS_TAG: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
-/// The crates.io packages `shims/` provides drop-in replacements for; each is a subdirectory of
-/// the same name.
-const SHIM_CRATES: [&str; 4] = ["io-uring", "xsk-rs", "sc", "syscalls"];
-
 /// Appended to `RUSTFLAGS`. `rustix_use_libc` is the cfg rustix's build script reads to select
 /// its libc backend (rustix README, "set the RUSTFLAGS environment variable to
 /// --cfg=rustix_use_libc"; rustix build.rs `CARGO_CFG_RUSTIX_USE_LIBC`). The `--check-cfg`
-/// entries declare both cfgs so `unexpected_cfgs` does not warn about them
+/// entries declare these cfgs and the parallel ones of [`shims::PARALLEL_CFGS`] so `unexpected_cfgs`
+/// does not warn about them
 /// ([The rustc book: Checking conditional configurations](https://doc.rust-lang.org/rustc/check-cfg.html)).
-const SNARE_RUSTFLAGS: [&str; 6] = [
+const SNARE_RUSTFLAGS: [&str; 7] = [
     "--cfg",
     "snare",
     "--cfg",
     "rustix_use_libc",
     "--check-cfg=cfg(snare)",
     "--check-cfg=cfg(rustix_use_libc)",
+    "--check-cfg=cfg(snare_parallel_rayon)",
 ];
 
 /// The command line after the `snare` argument is dropped.
@@ -82,8 +87,8 @@ enum Cmd {
 /// Options of `cargo snare test`.
 #[derive(Args)]
 struct TestArgs {
-    /// Directory holding the drop-in syscall shims (io-uring, xsk-rs, sc, syscalls), used instead
-    /// of the snare repository's tagged copy.
+    /// Directory holding the drop-in shims (the snare repository's `shims/`), used instead of the
+    /// snare repository's tagged copy.
     #[arg(long, value_name = "DIR")]
     shims_dir: Option<PathBuf>,
 
@@ -91,9 +96,18 @@ struct TestArgs {
     #[arg(long, value_name = "REF", default_value = SHIMS_TAG, conflicts_with = "shims_dir")]
     shims_rev: String,
 
-    /// Patch every shim, even ones not currently in the dependency graph.
+    /// Patch every default shim, and every parallel shim `--parallel` selects, even ones whose
+    /// crate is not in the dependency graph. Never selects a parallel shim by itself.
     #[arg(long)]
     all_shims: bool,
+
+    /// Give each sim its own copy of these crates' process-wide state, so sims using them can
+    /// run concurrently instead of taking turns: `async-std`, `smol`, `rayon`, `async-io`,
+    /// `async-global-executor`, `blocking`, `all`, or `none`. Comma-separated or repeated;
+    /// replaces `parallel = [...]` from `[workspace.metadata.snare]` and
+    /// `[package.metadata.snare]`.
+    #[arg(long, value_name = "NAMES", value_delimiter = ',')]
+    parallel: Option<Vec<String>>,
 
     /// Print the assembled cargo invocation instead of running it.
     #[arg(long)]
@@ -115,16 +129,32 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("snare") {
         args.remove(1);
     }
-    let cli = Cli::parse_from(args);
+    let cli = Cli::parse_from(&args);
     match cli.cmd {
-        Some(Cmd::Test(args)) => exit(run_test(args)),
+        Some(Cmd::Test(mut test)) => {
+            restore_separator(&args, &mut test.cargo_args);
+            exit(run_test(test))
+        }
         None => exit(init::run(cli.manifest_path)),
+    }
+}
+
+/// Puts back the `--` clap takes as the end of `cargo snare test`'s own options when it comes
+/// right before the forwarded arguments, so `cargo snare test -- --nocapture` passes
+/// `-- --nocapture` to `cargo test` rather than `--nocapture`. The forwarded arguments are always
+/// the tail of the command line.
+fn restore_separator(raw: &[String], cargo_args: &mut Vec<String>) {
+    let Some(before) = raw.len().checked_sub(cargo_args.len() + 1) else {
+        return;
+    };
+    if before > 0 && raw[before] == "--" {
+        cargo_args.insert(0, "--".to_string());
     }
 }
 
 /// Runs (or, with `--dry-run`, prints) `cargo test` with the shims patched in and the snare cfgs
 /// appended to `RUSTFLAGS`, returning the exit code to use: cargo's own, or 1 if it could not be
-/// started or died by a signal.
+/// started or died by a signal, or the selection could not be made.
 ///
 /// Any `RUSTFLAGS` already in the environment is kept and extended. Cargo takes extra flags
 /// from the first of `CARGO_ENCODED_RUSTFLAGS`, `RUSTFLAGS`, `target.*.rustflags` and
@@ -136,33 +166,69 @@ fn main() {
 /// and accepts `[patch]` tables ([The Cargo Book: Configuration, Command-line overrides and
 /// patch](https://doc.rust-lang.org/cargo/reference/config.html#command-line-overrides)).
 fn run_test(args: TestArgs) -> i32 {
-    let patches = match resolve_shims(args.shims_dir.as_deref(), args.all_shims) {
-        Ok(patches) => patches,
+    let metadata = match cargo_metadata() {
+        Ok(metadata) => metadata,
         Err(code) => return code,
     };
+    let parallel = match &args.parallel {
+        Some(names) => shims::expand(names).map(|crates| Parallel {
+            crates,
+            source: "--parallel".to_string(),
+        }),
+        None => shims::configured(&metadata),
+    };
+    let parallel = match parallel {
+        Ok(parallel) => parallel,
+        Err(e) => {
+            eprintln!("cargo-snare: {e}");
+            return 1;
+        }
+    };
+
+    let present: Vec<&Shim> = SHIMS
+        .iter()
+        .filter(|shim| {
+            args.shims_dir
+                .as_deref()
+                .is_none_or(|dir| dir.join(shim.dir).join("Cargo.toml").is_file())
+        })
+        .collect();
+    if present.is_empty() {
+        eprintln!(
+            "cargo-snare: no shims found under {}",
+            args.shims_dir.as_deref().unwrap_or(Path::new("")).display()
+        );
+        return 1;
+    }
+    let graph = shims::packages(&metadata);
+    let patches = shims::select(present, &graph, &parallel.crates, args.all_shims);
+    let cfgs = shims::cfgs(&patches, &parallel.crates);
 
     let mut cmd = Command::new("cargo");
     cmd.arg("test");
-    for name in &patches {
+    for shim in &patches {
+        let key = shim.patch_key();
+        let mut set = |field: &str, value: String| {
+            cmd.arg("--config")
+                .arg(format!("patch.crates-io.{key}.{field}={value}"));
+        };
         match &args.shims_dir {
-            Some(dir) => {
-                cmd.arg("--config").arg(format!(
-                    "patch.crates-io.{name}.path={}",
-                    toml_string(&dir.join(name))
-                ));
-            }
+            Some(dir) => set("path", toml_string(&dir.join(shim.dir))),
             None => {
-                cmd.arg("--config")
-                    .arg(format!("patch.crates-io.{name}.git=\"{SHIMS_GIT}\""))
-                    .arg("--config")
-                    .arg(format!("patch.crates-io.{name}.rev=\"{}\"", args.shims_rev));
+                set("git", format!("\"{SHIMS_GIT}\""));
+                set("rev", format!("\"{}\"", args.shims_rev));
             }
+        }
+        if shim.aliased() {
+            set("package", format!("\"{}\"", shim.krate));
+            set("version", format!("\"{}\"", shim.line));
         }
     }
     cmd.args(&args.cargo_args);
 
     let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
-    for flag in SNARE_RUSTFLAGS {
+    let parallel_flags = cfgs.iter().flat_map(|cfg| ["--cfg", cfg]);
+    for flag in SNARE_RUSTFLAGS.into_iter().chain(parallel_flags) {
         if !rustflags.is_empty() {
             rustflags.push(' ');
         }
@@ -171,7 +237,7 @@ fn run_test(args: TestArgs) -> i32 {
     cmd.env("RUSTFLAGS", rustflags);
 
     if args.dry_run {
-        print_invocation(&cmd, &patches);
+        print_invocation(&cmd, &patches, &parallel);
         return 0;
     }
 
@@ -184,41 +250,11 @@ fn run_test(args: TestArgs) -> i32 {
     }
 }
 
-/// The shims to patch: those available (all of [`SHIM_CRATES`] from git, or the subdirectories
-/// of `shims_dir` with a `Cargo.toml`) and, unless `all`, used somewhere in the current
-/// workspace's dependency graph. Patching an unused crate is harmless but makes cargo warn that
-/// the patch was not used. `Err` carries the exit code when no shim exists or `cargo metadata`
-/// fails.
-fn resolve_shims(shims_dir: Option<&Path>, all: bool) -> Result<Vec<&'static str>, i32> {
-    let present: Vec<&'static str> = SHIM_CRATES
-        .into_iter()
-        .filter(|name| shims_dir.is_none_or(|dir| dir.join(name).join("Cargo.toml").is_file()))
-        .collect();
-
-    if present.is_empty() {
-        eprintln!(
-            "cargo-snare: no shims found under {}",
-            shims_dir.unwrap_or(Path::new("")).display()
-        );
-        return Err(1);
-    }
-    if all {
-        return Ok(present);
-    }
-
-    let graph = dependency_names()?;
-    Ok(present
-        .into_iter()
-        .filter(|name| graph.iter().any(|dep| dep == name))
-        .collect())
-}
-
-/// The [`SHIM_CRATES`] that appear in `cargo metadata --format-version 1` for the current
-/// directory ([The Cargo Book: cargo metadata](https://doc.rust-lang.org/cargo/commands/cargo-metadata.html)).
-/// A textual match on `"name":"<crate>"` rather than a JSON parse: cargo prints compact JSON, and
-/// a false positive (another field named `name` with that value) only adds a harmless patch.
+/// `cargo metadata --format-version 1` for the current directory: the resolved packages, whose
+/// names and versions decide which shims apply, and the workspace's `metadata` tables
+/// ([The Cargo Book: cargo metadata](https://doc.rust-lang.org/cargo/commands/cargo-metadata.html)).
 /// `Err` carries the exit code if `cargo metadata` fails or cannot be run.
-fn dependency_names() -> Result<Vec<String>, i32> {
+fn cargo_metadata() -> Result<Value, i32> {
     let output = Command::new("cargo")
         .args(["metadata", "--format-version", "1"])
         .output();
@@ -236,12 +272,10 @@ fn dependency_names() -> Result<Vec<String>, i32> {
             return Err(1);
         }
     };
-    let json = String::from_utf8_lossy(&output.stdout);
-    Ok(SHIM_CRATES
-        .iter()
-        .filter(|name| json.contains(&format!("\"name\":\"{name}\"")))
-        .map(|name| name.to_string())
-        .collect())
+    serde_json::from_slice(&output.stdout).map_err(|e| {
+        eprintln!("cargo-snare: could not parse `cargo metadata` output: {e}");
+        1
+    })
 }
 
 /// `path` as a TOML basic string, escaping `\` and `"` (TOML v1.0.0, String, basic strings), so
@@ -255,13 +289,37 @@ fn toml_string(path: &Path) -> String {
     format!("\"{escaped}\"")
 }
 
-/// Prints which shims are patched and the command as a shell line, `RUSTFLAGS` included, for
-/// `--dry-run`. The arguments are not shell-quoted.
-fn print_invocation(cmd: &Command, patches: &[&'static str]) {
+/// Prints which shims are patched, which crates get per-sim state, and the command as a shell
+/// line, `RUSTFLAGS` included, for `--dry-run`. The arguments are not shell-quoted.
+fn print_invocation(cmd: &Command, patches: &[&Shim], parallel: &Parallel) {
     if patches.is_empty() {
         println!("cargo-snare: no shim crates in the dependency graph; none patched");
     } else {
-        println!("cargo-snare: patching {}", patches.join(", "));
+        let labels: Vec<String> = patches.iter().map(|shim| shim.label()).collect();
+        println!("cargo-snare: patching {}", labels.join(", "));
+    }
+    if parallel.crates.is_empty() {
+        println!(
+            "cargo-snare: parallel: none; sims sharing a runtime's global state take turns \
+             (select with --parallel or `parallel = [...]` in [package.metadata.snare])"
+        );
+    } else {
+        let (active, absent): (Vec<&str>, Vec<&str>) = parallel
+            .crates
+            .iter()
+            .partition(|krate| patches.iter().any(|shim| shim.krate == **krate));
+        let source = if parallel.source.is_empty() {
+            String::new()
+        } else {
+            format!(" (from {})", parallel.source)
+        };
+        println!("cargo-snare: parallel: {}{source}", active.join(", "));
+        if !absent.is_empty() {
+            println!(
+                "cargo-snare: parallel: not in the dependency graph: {}",
+                absent.join(", ")
+            );
+        }
     }
     print!("RUSTFLAGS='");
     if let Some(flags) = cmd
@@ -275,4 +333,51 @@ fn print_invocation(cmd: &Command, patches: &[&'static str]) {
         print!(" {}", arg.to_string_lossy());
     }
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(line: &str) -> Vec<String> {
+        let raw: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+        let Some(Cmd::Test(mut test)) = Cli::parse_from(&raw).cmd else {
+            panic!("not a test command: {line}");
+        };
+        restore_separator(&raw, &mut test.cargo_args);
+        test.cargo_args
+    }
+
+    #[test]
+    fn a_leading_separator_reaches_cargo() {
+        assert_eq!(
+            parse("cargo-snare test -- --test-threads=1"),
+            ["--", "--test-threads=1"]
+        );
+        assert_eq!(
+            parse("cargo-snare test --parallel smol -- --nocapture"),
+            ["--", "--nocapture"]
+        );
+    }
+
+    #[test]
+    fn forwarded_arguments_are_kept_verbatim() {
+        assert_eq!(
+            parse("cargo-snare test --test foo -- --nocapture"),
+            ["--test", "foo", "--", "--nocapture"]
+        );
+        assert!(parse("cargo-snare test --dry-run").is_empty());
+    }
+
+    #[test]
+    fn parallel_names_split_and_repeat() {
+        let raw: Vec<String> = "cargo-snare test --parallel smol,rayon --parallel async-io"
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let Some(Cmd::Test(test)) = Cli::parse_from(raw).cmd else {
+            panic!("not a test command");
+        };
+        assert_eq!(test.parallel.unwrap(), ["smol", "rayon", "async-io"]);
+    }
 }

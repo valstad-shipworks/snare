@@ -13,6 +13,17 @@
 
 use core::ffi::{c_char, c_int};
 
+/// Descriptors on their way from one sim's backend to another's (see [`Net::hand_over`]).
+pub struct HandOver {
+    /// The descriptors that move.
+    pub fds: Vec<c_int>,
+    /// The giving backend's state for them, for [`Net::take_over`].
+    pub state: Box<dyn std::any::Any + Send>,
+    /// Wakes the giving sim's threads blocked on them, so they find them gone and follow them;
+    /// run once the receiving sim is ready for those threads.
+    pub wake: Box<dyn FnOnce() + Send>,
+}
+
 /// The result of a handled call: a non-negative return, or an errno to fail with.
 #[derive(Debug)]
 pub enum NetResult {
@@ -278,6 +289,50 @@ pub trait Net: Send + Sync + 'static {
         None
     }
 
+    /// Gives up every descriptor this backend minted that belongs to the process rather than to
+    /// its network (an epoll set, a kqueue, an eventfd, a timerfd), for a backend of another sim
+    /// to [`take_over`](Self::take_over). Asked of a sim with no run in progress, when a thread of
+    /// a running sim reaches one of them: a real process keeps such objects across the worlds a
+    /// test builds around it. `None` when it has none.
+    ///
+    /// # Safety
+    /// Called with the domain's descriptor transaction held (`descriptor_transaction`).
+    unsafe fn hand_over(&self) -> Option<HandOver> {
+        None
+    }
+
+    /// Takes the descriptors another backend [handed over](Self::hand_over), giving the state
+    /// back if it is not this backend's kind. Only the numbers in `fds` are still open: any other
+    /// the state names was closed meanwhile, and the OS may have reused it, so it is dropped (and a
+    /// description left with no descriptor with it).
+    ///
+    /// # Safety
+    /// As for [`hand_over`](Self::hand_over).
+    unsafe fn take_over(
+        &self,
+        state: Box<dyn std::any::Any + Send>,
+        fds: &[c_int],
+    ) -> Result<(), Box<dyn std::any::Any + Send>> {
+        let _ = fds;
+        Err(state)
+    }
+
+    /// Starts serving `fd`, a descriptor another sim minted (or one gone with its sim) that does
+    /// not belong to the process. An object with no network identity, an `AF_UNIX` socketpair
+    /// end, gets this world's own instance: a library may make one once per process and keep it
+    /// in a static (tokio's signal self-pipe), so each sim that reaches it gets an instance of
+    /// the pair, under the same number. A network socket has no instance in this world, and is
+    /// served as a connection that is gone, so code that kept it (a connection pool in a static)
+    /// sees it fail as a dropped connection and opens another. `true` once this backend owns
+    /// `fd`.
+    ///
+    /// # Safety
+    /// No pointers are involved.
+    unsafe fn mirror(&self, fd: c_int) -> bool {
+        let _ = fd;
+        false
+    }
+
     /// Releases simulated ownership after another descriptor has replaced the kernel fd.
     /// The replacement's kernel descriptor must remain open.
     ///
@@ -448,6 +503,57 @@ pub trait Net: Send + Sync + 'static {
         timeout: c_int,
     ) -> Option<NetResult> {
         let _ = (epfd, events, maxevents, timeout);
+        None
+    }
+
+    /// `epoll_pwait2(epfd, events, maxevents, timeout)`: [`epoll_wait`](Self::epoll_wait) with a
+    /// `struct timespec` timeout (null blocks), so nanoseconds survive. Models `epoll_pwait2(2)`
+    /// (Linux 5.11); the signal mask does not reach a backend.
+    ///
+    /// # Safety
+    /// `events` points to `maxevents` `epoll_event` slots; `timeout` to a `timespec` or is null.
+    unsafe fn epoll_pwait2(
+        &self,
+        epfd: c_int,
+        events: *mut u8,
+        maxevents: c_int,
+        timeout: *const u8,
+    ) -> Option<NetResult> {
+        let _ = (epfd, events, maxevents, timeout);
+        None
+    }
+
+    /// `timerfd_create(clockid, flags)`: a timer that delivers expirations through a descriptor
+    /// (Linux). Models `timerfd_create(2)`; `flags` are `TFD_NONBLOCK`/`TFD_CLOEXEC`
+    /// (`<sys/timerfd.h>`). No pointers.
+    unsafe fn timerfd_create(&self, clockid: c_int, flags: c_int) -> Option<NetResult> {
+        let _ = (clockid, flags);
+        None
+    }
+
+    /// `timerfd_settime(fd, flags, new_value, old_value)`: arms or disarms the timer. Models
+    /// `timerfd_settime(2)`; `flags` may hold `TFD_TIMER_ABSTIME`/`TFD_TIMER_CANCEL_ON_SET`.
+    ///
+    /// # Safety
+    /// `new_value` points to a `struct itimerspec`; `old_value` is null or points to one.
+    unsafe fn timerfd_settime(
+        &self,
+        fd: c_int,
+        flags: c_int,
+        new_value: *const u8,
+        old_value: *mut u8,
+    ) -> Option<NetResult> {
+        let _ = (fd, flags, new_value, old_value);
+        None
+    }
+
+    /// `timerfd_gettime(fd, curr_value)`: the time to the next expiry and the interval. Models
+    /// `timerfd_gettime(2)`.
+    ///
+    /// # Safety
+    /// `curr_value` points to a writable `struct itimerspec`.
+    unsafe fn timerfd_gettime(&self, fd: c_int, curr_value: *mut u8) -> Option<NetResult> {
+        let _ = (fd, curr_value);
         None
     }
 

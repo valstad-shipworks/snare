@@ -125,6 +125,23 @@ impl SimShared {
         }
     }
 
+    /// `CLOCK_MONOTONIC` as the code under test reads it, without ticking: the virtual clock's
+    /// reading, or the host's on a sim with no virtual clock.
+    pub(crate) fn monotonic_now(&self) -> Duration {
+        match &self.clock {
+            Some(clock) => Duration::from_nanos(clock.monotonic()),
+            None => snare_interpose::real(|| {
+                let mut ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                // SAFETY: `ts` is a valid timespec to fill.
+                unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+                Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+            }),
+        }
+    }
+
     /// A stamp is being handed to the code under test: a clock that jumps (as-fast-as-possible)
     /// is moved up to it, so no clock read after the receive is earlier than its stamp.
     pub(crate) fn reach_stamp(&self, stamp: Stamp) {

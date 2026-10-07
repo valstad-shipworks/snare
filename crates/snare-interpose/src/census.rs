@@ -99,12 +99,35 @@ pub(crate) fn register(domain: &Domain) {
     domains.push((domain.id(), domain.downgrade()));
 }
 
+/// The live domain with serial `serial`.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn find(serial: u64) -> Option<Domain> {
+    let _passthrough = Passthrough::enter();
+    lock(&DOMAINS)
+        .iter()
+        .find(|(id, _)| id.0 == serial)
+        .and_then(|(_, weak)| weak.upgrade())
+}
+
+thread_local! {
+    /// Whether the calling thread is one of snare's service threads (see [`service_thread`]).
+    static SERVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the calling thread is one of snare's own service threads: what it wakes, it wakes on
+/// a sim's behalf (a clock's wakers), never as a thread outside it.
+pub(crate) fn serving() -> bool {
+    SERVING.try_with(std::cell::Cell::get).unwrap_or(false)
+}
+
 /// Returned by [`service_thread`]: the calling thread counts as snare's own until it drops.
 #[must_use]
 #[derive(Debug)]
 pub struct ServiceThread {
     /// The OS id registered; `None` where ids are not known.
     os_id: Option<u64>,
+    /// Whether the thread already counted as one when this guard was made.
+    was: bool,
 }
 
 /// Marks the calling thread as one of snare's own service threads for every census, until the
@@ -116,11 +139,13 @@ pub fn service_thread() -> ServiceThread {
         let _passthrough = Passthrough::enter();
         lock(&SERVICE).get_or_insert_with(HashSet::new).insert(id);
     }
-    ServiceThread { os_id }
+    let was = SERVING.try_with(|s| s.replace(true)).unwrap_or(false);
+    ServiceThread { os_id, was }
 }
 
 impl Drop for ServiceThread {
     fn drop(&mut self) {
+        let _ = SERVING.try_with(|s| s.set(self.was));
         if let Some(id) = self.os_id {
             let _passthrough = Passthrough::enter();
             if let Some(set) = lock(&SERVICE).as_mut() {
@@ -128,6 +153,19 @@ impl Drop for ServiceThread {
             }
         }
     }
+}
+
+/// Whether a thread some sim of the process manages, running or left over from an ended run,
+/// holds the pthread mutex at `mutex`; `false` when no sim's thread does, or the mutex names no
+/// holder.
+#[cfg(target_os = "macos")]
+pub(crate) fn mutex_held_by_managed(mutex: usize) -> bool {
+    let _passthrough = Passthrough::enter();
+    let domains: Vec<Domain> = lock(&DOMAINS)
+        .iter()
+        .filter_map(|(_, weak)| weak.upgrade())
+        .collect();
+    domains.iter().any(|domain| domain.holds_native_mutex(mutex))
 }
 
 /// Takes a census of every OS thread of the process, relative to `sim`; `None` where the OS's

@@ -13,7 +13,7 @@ fn concurrent_first_clock_reads_preserve_each_spins_count() {
         (1..=3_000)
             .map(|read| {
                 if read >= 64 {
-                    now += (now / 64).clamp(1_000, 1_000_000_000);
+                    now += 1_000;
                 }
                 now
             })

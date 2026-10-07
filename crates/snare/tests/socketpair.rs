@@ -57,15 +57,9 @@ fn observe() -> Vec<(c_int, Vec<u8>, c_int)> {
         .collect()
 }
 
-/// Whether `fd` is one of the sim's sockets rather than a real one: the sim backs each with a
-/// real descriptor of `/dev/null`.
+/// Whether `fd` is one of the sim's sockets rather than a real one.
 fn simulated(fd: c_int) -> bool {
-    snare::real(|| {
-        // SAFETY: fstat fills `st`.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { libc::fstat(fd, &mut st) }, 0);
-        st.st_mode & libc::S_IFMT != libc::S_IFSOCK
-    })
+    snare_interpose::minted(fd)
 }
 
 #[test]

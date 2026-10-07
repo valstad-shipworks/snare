@@ -63,6 +63,12 @@ pub trait Host: Send + Sync + 'static {
         None
     }
 
+    /// Models `sysconf(3)` for `_SC_NPROCESSORS_CONF` and `_SC_NPROCESSORS_ONLN`, the processors
+    /// configured and online; the Unix `sysconf` hook offers no other name.
+    fn sysconf(&self, name: c_int) -> Option<HostResult> {
+        None
+    }
+
     /// Models `uname(2)`; `buf` is a `struct utsname` (`<sys/utsname.h>`). Consulted by the Unix
     /// `uname` hook and, on Linux, reachable as `SYS_uname` through [`syscall`](Host::syscall).
     unsafe fn uname(&self, buf: *mut u8) -> Option<HostResult> {

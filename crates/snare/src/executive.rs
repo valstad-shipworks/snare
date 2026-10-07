@@ -287,20 +287,20 @@ pub fn with_driver_time<R>(t: Duration, f: impl FnOnce() -> R) -> R {
         }
     }
     let _restore = Restore(clock::set_driver_time(Some(
-        sim_clock.driver_time_at(nanos(t)),
+        sim_clock.driver_time_at(sim_clock.at_sim_time(t)),
     )));
     f()
 }
 
 impl Executive {
-    /// Sim time `t` as monotonic nanos on the clock; sim time is the monotonic reading.
+    /// Sim time `t` as monotonic nanos on the clock.
     fn at(&self, t: Duration) -> u64 {
-        nanos(t)
+        self.clock.at_sim_time(t)
     }
 
     /// A monotonic reading as sim time: the inverse of [`at`](Self::at).
     fn sim_time(&self, monotonic: Duration) -> Duration {
-        monotonic
+        self.clock.sim_time(nanos(monotonic))
     }
 
     /// The display name of the thread with lineage `owner`, or `"event"`.

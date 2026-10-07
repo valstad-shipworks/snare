@@ -1,8 +1,8 @@
       150100 sleeper 150
-      204655 yielder 200
-      301530 spinner 300
+      201993 yielder 200
+      300499 spinner 300
       400100 sleeper 400
-      562720 spinner 550
-      627226 yielder 600
+      558652 spinner 550
+      603711 yielder 600
       650100 sleeper 650
-      702498 spinner 700
+      700100 spinner 700

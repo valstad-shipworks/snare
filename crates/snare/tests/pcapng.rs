@@ -34,9 +34,11 @@ fn captured(name: &str, run: impl FnOnce()) -> reader::File {
     captured_with(name, Sim::builder(), run)
 }
 
+/// Runs `run` in a sim from `builder` on the fixed epoch, so frame stamps read from
+/// [`EPOCH_NS`], and reads back what it captured.
 fn captured_with(name: &str, builder: snare::SimBuilder, run: impl FnOnce()) -> reader::File {
     let path = scratch(name);
-    let sim = builder.pcapng(&path).build();
+    let sim = builder.fixed_epoch().pcapng(&path).build();
     assert_eq!(sim.pcapng_path(), Some(path.as_path()));
     sim.run(run);
     drop(sim);
@@ -192,7 +194,7 @@ fn syn_retransmits_follow_the_os_plan_and_stop_at_resolution() {
 
     let nic = NicSpec::new("eth0").address("192.168.60.2/24".parse::<IpNet>().unwrap());
     let path = scratch("syn_plan_absent");
-    let sim = Sim::builder().nic(nic).pcapng(&path).build();
+    let sim = Sim::builder().nic(nic).fixed_epoch().pcapng(&path).build();
     let failed_at = sim.run(|| {
         TcpStream::connect("192.168.60.77:80").unwrap_err();
         snare::time().value()
@@ -924,7 +926,7 @@ fn sut_listener_and_sut_client_both_outbound() {
 #[test]
 fn executive_driven_stamps_follow_jumps() {
     let path = scratch("executive");
-    let sim = Sim::builder().pcapng(&path).build();
+    let sim = Sim::builder().fixed_epoch().pcapng(&path).build();
     sim.run(|| {
         let exec = sched::attach(ExecutiveConfig::default()).unwrap();
         sched::mark_driver_thread();

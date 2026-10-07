@@ -28,7 +28,8 @@ fn real_sleep(d: Duration) {
     snare::real(|| thread::sleep(d));
 }
 
-/// The sim's fixed realtime epoch (2023-11-14T22:13:20Z), where sim time zero reads.
+/// The fixed realtime epoch (2023-11-14T22:13:20Z), where sim time zero reads in a sim built with
+/// `fixed_epoch()`.
 fn epoch() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(1_700_000_000)
 }
@@ -390,7 +391,7 @@ fn charged_latency_never_crosses_the_horizon() {
 #[test]
 fn timestamp_defers_wakes_until_leave() {
     let t = 7 * MS;
-    let sim = Sim::new();
+    let sim = Sim::builder().fixed_epoch().build();
     sim.run(|| {
         let exec = sched::attach(ExecutiveConfig::default()).unwrap();
         sched::mark_driver_thread();
@@ -560,7 +561,7 @@ fn time_controls_panic_while_owned() {
 
 #[test]
 fn driver_thread_reads_t_inside_a_timestamp_and_real_time_outside() {
-    Sim::new().run(|| {
+    Sim::builder().fixed_epoch().build().run(|| {
         let exec = sched::attach(ExecutiveConfig::default()).unwrap();
         exec.enter_timestamp(Duration::from_secs(3));
         assert_eq!(sched::thread_class(), ThreadClass::Driver);
@@ -589,7 +590,7 @@ fn driver_thread_reads_t_inside_a_timestamp_and_real_time_outside() {
 #[test]
 fn with_driver_time_pool_worker_reads_t_and_its_wakes_are_gated() {
     let t = 4 * MS;
-    Sim::new().run(|| {
+    Sim::builder().fixed_epoch().build().run(|| {
         let exec = sched::attach(ExecutiveConfig::default()).unwrap();
         sched::mark_driver_thread();
         let done = Arc::new(AtomicBool::new(false));
@@ -984,7 +985,7 @@ fn a_condvar_waiter_notified_inside_a_timestamp_waits_for_leave() {
 
 #[test]
 fn dropping_the_executive_inside_a_timestamp_lapses_the_driver_time() {
-    Sim::new().run(|| {
+    Sim::builder().fixed_epoch().build().run(|| {
         let exec = sched::attach(ExecutiveConfig::default()).unwrap();
         exec.enter_timestamp(7 * MS);
         assert_eq!(SystemTime::now(), epoch() + 7 * MS);

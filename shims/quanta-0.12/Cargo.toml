@@ -1,0 +1,80 @@
+[package]
+edition = "2021"
+rust-version = "1.70"
+name = "quanta"
+version = "0.12.6"
+authors = ["Toby Lawrence <toby@nuclearfurnace.com>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+description = "snare drop-in shim for quanta 0.12: under cfg(snare) the clock is always the OS monotonic clock, never the TSC or system counter"
+publish = false
+homepage = "https://github.com/metrics-rs/quanta"
+documentation = "https://docs.rs/quanta"
+keywords = [
+    "rdtsc",
+    "timing",
+    "nanosecond",
+]
+license = "MIT"
+repository = "https://github.com/metrics-rs/quanta"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = ["flaky_tests"]
+flaky_tests = []
+prost = ["prost-types"]
+
+[lib]
+name = "quanta"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies.crossbeam-utils]
+version = "0.8.5"
+
+[dependencies.once_cell]
+version = "1.4"
+
+[dependencies.prost-types]
+version = "0.11"
+optional = true
+default-features = false
+
+[dev-dependencies.average]
+version = "0.14"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies.web-sys]
+version = "0.3"
+features = [
+    "Window",
+    "Performance",
+]
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies.wasm-bindgen-test]
+version = "0.3"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "wasi"))'.dependencies.wasi]
+version = "0.11"
+
+[target.'cfg(not(any(target_os = "windows", target_arch = "wasm32")))'.dependencies.libc]
+version = "0.2"
+
+[target.'cfg(target_arch = "x86")'.dependencies.raw-cpuid]
+version = "11.0"
+
+[target.'cfg(target_arch = "x86_64")'.dependencies.raw-cpuid]
+version = "11.0"
+
+[target.'cfg(target_os = "windows")'.dependencies.winapi]
+version = "0.3"
+features = ["profileapi"]
+
+[target.'cfg(snare)'.dev-dependencies.snare]
+path = "../../crates/snare"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(snare)"] }

@@ -19,6 +19,24 @@ pub use crate::net::NetResult as FsResult;
 /// `u32` on Linux (glibc `__mode_t`, `unsigned int`); the hooks widen the real value into this.
 type Mode = u32;
 
+/// One timestamp a [`SetTimes`] call sets: left alone, the current time (`UTIME_NOW`), or an
+/// instant in nanoseconds since the Unix epoch, negative before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeSet {
+    Omit,
+    Now,
+    At(i128),
+}
+
+/// The timestamps a `utimensat`-family call sets. `created` is set only through macOS
+/// `setattrlist(2)` (`ATTR_CMN_CRTIME`); Linux has no call that sets a birth time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetTimes {
+    pub accessed: TimeSet,
+    pub modified: TimeSet,
+    pub created: TimeSet,
+}
+
 /// A file system the interposer routes a managed thread's file calls to.
 ///
 /// All methods default to declining. They fall into four groups:
@@ -232,6 +250,38 @@ pub trait Fs: Send + Sync + 'static {
     unsafe fn fsync(&self, fd: c_int) -> Option<FsResult> {
         None
     }
+    /// Models `flock(2)`; `operation` is `LOCK_SH`/`LOCK_EX`/`LOCK_UN`, optionally with `LOCK_NB`
+    /// (`<sys/file.h>`).
+    unsafe fn flock(&self, fd: c_int, operation: c_int) -> Option<FsResult> {
+        None
+    }
+    /// Models `utimensat(2)`, and through it `utimes(2)`, `futimens(3)`, `futimes(3)` and macOS
+    /// `setattrlist(2)`/`fsetattrlist(2)` restricted to the common time attributes. A null `path`
+    /// names `dirfd` itself, as Linux's `utimensat(fd, NULL, ...)` does (man 2 utimensat, NOTES);
+    /// such a call is offered only to the plane owning `dirfd`. `flags` may carry
+    /// `AT_SYMLINK_NOFOLLOW`.
+    unsafe fn set_times(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        times: &SetTimes,
+        flags: c_int,
+    ) -> Option<FsResult> {
+        None
+    }
+    /// Told after the OS itself set the timestamps of a file no plane served, with the call's
+    /// arguments as [`set_times`](Self::set_times) takes them.
+    unsafe fn host_times_set(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        times: &SetTimes,
+        flags: c_int,
+    ) {
+    }
+    /// Shown a `struct stat` (or, when `statx`, a Linux `struct statx`) the OS just filled for a
+    /// file no plane served, before the caller sees it; a plane may rewrite its timestamps.
+    unsafe fn host_metadata(&self, buf: *mut u8, statx: bool) {}
     /// Linux `getdents64` / macOS `getdirentries$INODE64` packing over a dir stream's snapshot.
     ///
     /// Models `getdents64(2)`; `buf` is packed with `struct linux_dirent64` records
@@ -285,7 +335,9 @@ pub trait Fs: Send + Sync + 'static {
     unsafe fn close(&self, fd: c_int) -> Option<FsResult> {
         None
     }
-    /// Models `fcntl(2)` on an owned file fd (see [`Net::fcntl`](crate::Net::fcntl)).
+    /// Models `fcntl(2)` on an owned file fd (see [`Net::fcntl`](crate::Net::fcntl)). For the
+    /// record-lock commands (`F_GETLK`, `F_SETLK`, `F_SETLKW` and their `F_OFD_*` forms) `arg` is
+    /// the caller's `struct flock *`.
     unsafe fn fcntl(&self, fd: c_int, cmd: c_int, arg: i64) -> Option<FsResult> {
         None
     }

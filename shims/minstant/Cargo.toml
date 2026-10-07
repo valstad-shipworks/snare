@@ -1,0 +1,58 @@
+[package]
+edition = "2021"
+name = "minstant"
+version = "0.1.7"
+authors = ["The TiKV Authors"]
+description = "snare drop-in shim for minstant: under cfg(snare) the TSC is never used, so time comes from the OS clock"
+publish = false
+homepage = "https://github.com/tikv/minstant"
+documentation = "https://docs.rs/minstant"
+keywords = [
+    "TSC",
+    "clock",
+    "rdtsc",
+    "timing",
+    "nanosecond",
+]
+license = "MIT"
+repository = "https://github.com/tikv/minstant"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = [
+    "--cfg",
+    "docsrs",
+]
+
+[lib]
+doctest = false
+
+[dependencies.coarsetime]
+version = "0.1"
+optional = true
+
+[dependencies.ctor]
+version = "0.1.20"
+
+[dependencies.web-time]
+version = "1.0"
+
+[dev-dependencies.getrandom]
+version = "0.2"
+features = ["js"]
+
+[dev-dependencies.rand]
+version = "0.8"
+
+[dev-dependencies.wasm-bindgen-test]
+version = "0.3"
+
+[features]
+atomic = []
+fallback-coarse = ["coarsetime"]
+
+[target.'cfg(snare)'.dev-dependencies.snare]
+path = "../../crates/snare"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(snare)"] }

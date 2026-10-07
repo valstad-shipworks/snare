@@ -18,7 +18,7 @@ fn gettimeofday() -> libc::timeval {
 #[test]
 fn reports_the_virtual_realtime_epoch() {
     let host = HostProfile::new().build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         let tv = gettimeofday();
         assert_eq!(
             tv.tv_sec, VIRTUAL_EPOCH_SECS,
@@ -34,7 +34,7 @@ fn reports_the_virtual_realtime_epoch() {
 #[test]
 fn a_null_timezone_pointer_is_accepted() {
     let host = HostProfile::new().build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         // The tz argument has been obsolete since 4.3BSD; passing NULL is the normal call.
         let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::gettimeofday(&mut tv, std::ptr::null_mut()) };
@@ -45,7 +45,7 @@ fn a_null_timezone_pointer_is_accepted() {
 #[test]
 fn successive_reads_do_not_regress() {
     let host = HostProfile::new().build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         let a = gettimeofday();
         let b = gettimeofday();
         let an = a.tv_sec as i128 * 1_000_000 + a.tv_usec as i128;
@@ -57,7 +57,7 @@ fn successive_reads_do_not_regress() {
 #[test]
 fn agrees_with_clock_gettime_realtime_to_the_second() {
     let host = HostProfile::new().build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         let tv = gettimeofday();
         let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };

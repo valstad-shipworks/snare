@@ -1,0 +1,90 @@
+[package]
+edition = "2021"
+rust-version = "1.87"
+name = "quanta"
+version = "0.13.0"
+authors = ["Toby Lawrence <toby@nuclearfurnace.com>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+description = "snare drop-in shim for quanta 0.13: under cfg(snare) the clock is always the OS monotonic clock, never the TSC or system counter"
+publish = false
+homepage = "https://github.com/metrics-rs/quanta"
+documentation = "https://docs.rs/quanta"
+keywords = [
+    "rdtsc",
+    "timing",
+    "nanosecond",
+]
+license = "MIT"
+repository = "https://github.com/metrics-rs/quanta"
+resolver = "3"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = [
+    "flaky_tests",
+    "mock",
+]
+flaky_tests = []
+mock = []
+prost = ["prost-types"]
+
+[lib]
+name = "quanta"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies.portable-atomic]
+version = "1"
+features = ["fallback"]
+default-features = false
+
+[dependencies.prost-types]
+version = "0.11"
+optional = true
+default-features = false
+
+[dev-dependencies.average]
+version = "0.14"
+
+[dev-dependencies.serial_test]
+version = "3"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies.web-sys]
+version = "0.3"
+features = [
+    "Window",
+    "Performance",
+]
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies.wasm-bindgen-test]
+version = "0.3"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "wasi", target_env = "p1"))'.dependencies.wasip1]
+version = "1"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2"))'.dependencies.wasip2]
+version = "1"
+
+[target.'cfg(any(target_os = "emscripten", not(any(target_os = "windows", target_arch = "wasm32"))))'.dependencies.libc]
+version = "0.2.183"
+
+[target.'cfg(target_arch = "x86")'.dependencies.raw-cpuid]
+version = "11.0"
+
+[target.'cfg(target_arch = "x86_64")'.dependencies.raw-cpuid]
+version = "11.0"
+
+[target.'cfg(target_os = "windows")'.dependencies.windows-sys]
+version = "0.61"
+features = ["Win32_System_Performance"]
+
+[target.'cfg(snare)'.dev-dependencies.snare]
+path = "../../crates/snare"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(snare)"] }

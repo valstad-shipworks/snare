@@ -13,7 +13,10 @@
 //! it, so its waiter must not let the domain look quiescent. The pthread mutex hooks record each
 //! managed thread's holds (`accounting::Held`), which tells a contended lock's holder apart; a
 //! futex word carries no owner, so a Linux wait on one in static data, where std's process-wide
-//! locks live, first waits out a short real-time grace uncounted (`outside_grace`).
+//! locks live, first waits out a short real-time grace uncounted (`outside_grace`). So does a wait
+//! a lock's back-off spin leads into (`domain::backing_off`), which may be on a lock the domain
+//! shares with other threads wherever it lives: parking_lot's process-wide bucket locks are on
+//! the heap, and parked behind with a futex on Linux or a condition variable on macOS.
 //!
 //! Each hook takes one of three paths. Under a deterministic schedule (`det_*`) the wait parks in
 //! the schedule on the object's address, and the matching wake moves waiters there to the run
@@ -28,7 +31,7 @@
 //! `crate::patch` before any import is redirected.
 
 use std::ffi::{c_int, c_long};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use libc::{pthread_cond_t, pthread_mutex_t, timespec};
@@ -149,11 +152,54 @@ fn note_wait_signal_masked(addr: usize, mask: u32, private: Option<bool>) {
     }
 }
 
-fn mutex_kinds() -> &'static std::sync::Mutex<std::collections::HashMap<usize, c_int>> {
-    static KINDS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, c_int>>> =
-        std::sync::OnceLock::new();
-    KINDS.get_or_init(Default::default)
+/// Mutexes or condition variables, by address, that were set up other than the default way: the
+/// few a hook must treat differently (an error-checking mutex, a condition variable on another
+/// clock). Default ones are never recorded, so an allocator that sets up its own locks while it
+/// holds others reaches no allocation and no lock here; while nothing is recorded a lookup or a
+/// removal takes no lock either.
+struct Unusual<V> {
+    /// How many entries `map` holds, read without its lock.
+    len: AtomicUsize,
+    map: std::sync::Mutex<Option<std::collections::HashMap<usize, V>>>,
 }
+
+impl<V: Copy> Unusual<V> {
+    const fn new() -> Self {
+        Self {
+            len: AtomicUsize::new(0),
+            map: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Records `addr` as set up with `value`, or forgets it when `value` is `None`, the default.
+    fn set(&self, addr: usize, value: Option<V>) {
+        if value.is_none() && self.len.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        crate::real(|| {
+            let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+            let map = map.get_or_insert_with(Default::default);
+            match value {
+                Some(value) => map.insert(addr, value),
+                None => map.remove(&addr),
+            };
+            self.len.store(map.len(), Ordering::Release);
+        });
+    }
+
+    fn get(&self, addr: usize) -> Option<V> {
+        if self.len.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        crate::real(|| {
+            let map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+            map.as_ref()?.get(&addr).copied()
+        })
+    }
+}
+
+/// The error-checking mutexes, whose relock by their holder must fail rather than deadlock.
+static ERRORCHECK_MUTEXES: Unusual<()> = Unusual::new();
 
 unsafe extern "C" fn pthread_mutex_init(
     mutex: *mut pthread_mutex_t,
@@ -167,9 +213,10 @@ unsafe extern "C" fn pthread_mutex_init(
         if !attr.is_null() {
             unsafe { pthread_mutexattr_gettype(attr, &mut kind) };
         }
-        crate::real(|| {
-            mutex_kinds().lock().unwrap().insert(mutex as usize, kind);
-        });
+        ERRORCHECK_MUTEXES.set(
+            mutex as usize,
+            (kind == libc::PTHREAD_MUTEX_ERRORCHECK).then_some(()),
+        );
     }
     r
 }
@@ -177,20 +224,14 @@ unsafe extern "C" fn pthread_mutex_init(
 unsafe extern "C" fn pthread_mutex_destroy(mutex: *mut pthread_mutex_t) -> c_int {
     let r = unsafe { original::<MutexFn>(&PTHREAD_MUTEX_DESTROY)(mutex) };
     if r == 0 && !crate::state::passthrough() {
-        crate::real(|| {
-            mutex_kinds().lock().unwrap().remove(&(mutex as usize));
-        });
+        ERRORCHECK_MUTEXES.set(mutex as usize, None);
     }
     r
 }
 
+/// The condition variables on a clock other than `CLOCK_REALTIME`, with that clock.
 #[cfg(target_os = "linux")]
-fn cond_clocks() -> &'static std::sync::Mutex<std::collections::HashMap<usize, libc::clockid_t>> {
-    static CLOCKS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<usize, libc::clockid_t>>,
-    > = std::sync::OnceLock::new();
-    CLOCKS.get_or_init(Default::default)
-}
+static COND_CLOCKS: Unusual<libc::clockid_t> = Unusual::new();
 
 #[cfg(target_os = "linux")]
 unsafe extern "C" fn pthread_cond_init(
@@ -204,9 +245,7 @@ unsafe extern "C" fn pthread_cond_init(
         if !attr.is_null() {
             unsafe { libc::pthread_condattr_getclock(attr, &mut clock) };
         }
-        crate::real(|| {
-            cond_clocks().lock().unwrap().insert(cond as usize, clock);
-        });
+        COND_CLOCKS.set(cond as usize, (clock != libc::CLOCK_REALTIME).then_some(clock));
     }
     r
 }
@@ -215,18 +254,14 @@ unsafe extern "C" fn pthread_cond_init(
 unsafe extern "C" fn pthread_cond_destroy(cond: *mut pthread_cond_t) -> c_int {
     let r = unsafe { original::<CondSignalFn>(&PTHREAD_COND_DESTROY)(cond) };
     if r == 0 && !crate::state::passthrough() {
-        crate::real(|| {
-            cond_clocks().lock().unwrap().remove(&(cond as usize));
-        });
+        COND_CLOCKS.set(cond as usize, None);
     }
     r
 }
 
 fn cond_clock(cond: *mut pthread_cond_t) -> ClockKind {
     #[cfg(target_os = "linux")]
-    if crate::real(|| cond_clocks().lock().unwrap().get(&(cond as usize)).copied())
-        == Some(libc::CLOCK_MONOTONIC)
-    {
+    if COND_CLOCKS.get(cond as usize) == Some(libc::CLOCK_MONOTONIC) {
         return ClockKind::Monotonic;
     }
     let _ = cond;
@@ -344,16 +379,29 @@ fn virtual_deadline(after: Duration) -> Option<Duration> {
 }
 
 /// Takes `mutex` under the deterministic schedule: a contended lock waits in the schedule on the
-/// mutex's address until an unlock there wakes it. A mutex held by a thread outside the simulation
-/// is waited for with the real lock instead, since no unlock in the schedule will come. Any other
-/// error from `pthread_mutex_trylock` (`EINVAL`, or `EAGAIN` once a recursive mutex's count is
-/// exhausted; POSIX pthread_mutex_lock, which also specifies trylock) is returned as is.
+/// mutex's address until an unlock there wakes it. A mutex held by a thread outside the schedule
+/// (another test's, a thread no sim manages, a pool's worker left over from an earlier sim) is
+/// first waited for in real time, keeping the baton, for [`DET_OUTSIDE_HOLDER_GRACE`], so a short
+/// hold cannot reorder this simulation's threads; a holder that keeps it longer and belongs to a
+/// sim (a pool's worker left over from an earlier run, blocked itself waiting for its next job
+/// while holding the queue's lock) is then waited for in the schedule, where its unlock reaches
+/// the waiter wherever it is made (`domain::det_wake_addr`). On macOS, where a mutex names its
+/// holder, one no sim manages keeps being waited for with the baton held, so time stands still
+/// until it lets go, as a lock held outside holds time still outside a schedule. Any other error from `pthread_mutex_trylock` (`EINVAL`, or `EAGAIN`
+/// once a recursive mutex's count is exhausted; POSIX pthread_mutex_lock, which also specifies
+/// trylock) is returned as is.
 ///
 /// # Safety
 /// As for `pthread_mutex_lock`.
 unsafe fn det_mutex_lock(mutex: *mut pthread_mutex_t) -> c_int {
     let addr = mutex as usize;
+    let mut grace = DET_OUTSIDE_HOLDER_GRACE;
     loop {
+        if !deterministic() {
+            // The schedule let this thread go while it waited.
+            // SAFETY: the caller's mutex.
+            return unsafe { pthread_mutex_lock(mutex) };
+        }
         // SAFETY: the caller's mutex.
         match unsafe { trylock(mutex) } {
             0 => {
@@ -363,8 +411,7 @@ unsafe fn det_mutex_lock(mutex: *mut pthread_mutex_t) -> c_int {
             }
             libc::EBUSY
                 if crate::accounting::held().is_some_and(|held| held.holds(addr))
-                    && crate::real(|| mutex_kinds().lock().unwrap().get(&addr).copied())
-                        == Some(libc::PTHREAD_MUTEX_ERRORCHECK) =>
+                    && ERRORCHECK_MUTEXES.get(addr).is_some() =>
             {
                 return unsafe { original::<MutexFn>(&PTHREAD_MUTEX_LOCK)(mutex) };
             }
@@ -373,19 +420,50 @@ unsafe fn det_mutex_lock(mutex: *mut pthread_mutex_t) -> c_int {
                 domain::det_block(crate::DetKey::Addr(addr), None);
             }
             libc::EBUSY => {
-                // Held outside the simulation (another test's threads, an unmanaged thread): wait
-                // for it in real time while keeping the baton, so when that holder lets go cannot
-                // reorder this simulation's threads.
                 domain::end_spin();
-                // SAFETY: PTHREAD_MUTEX_LOCK holds libc's pthread_mutex_lock; the caller's mutex.
-                let r = unsafe { original::<MutexFn>(&PTHREAD_MUTEX_LOCK)(mutex) };
-                if r == 0 {
-                    domain::det_took(addr);
+                let _listed = domain::det_listen(addr);
+                // SAFETY: the caller's mutex.
+                match unsafe { trylock_within(mutex, grace) } {
+                    Some(0) => {
+                        domain::det_took(addr);
+                        domain::note_mutex_taken(addr);
+                        return 0;
+                    }
+                    Some(r) => return r,
+                    #[cfg(target_os = "macos")]
+                    None if !crate::census::mutex_held_by_managed(addr) => {}
+                    None => {
+                        grace = Duration::ZERO;
+                        let _label = crate::wait_label("mutex");
+                        let _outside = crate::sched::outside_holder();
+                        domain::det_block(crate::DetKey::Addr(addr), None);
+                    }
                 }
-                return r;
             }
             r => return r,
         }
+    }
+}
+
+/// Retries `pthread_mutex_trylock` on `mutex` for up to `grace` of real time while it reports
+/// `EBUSY`: `None` if it still does, else what it last returned.
+///
+/// # Safety
+/// As for `pthread_mutex_trylock`.
+unsafe fn trylock_within(mutex: *mut pthread_mutex_t, grace: Duration) -> Option<c_int> {
+    // How often the mutex is tried meanwhile. A snare choice.
+    const POLL: Duration = Duration::from_micros(50);
+    let start = crate::real(std::time::Instant::now);
+    loop {
+        // SAFETY: as for this function.
+        match unsafe { trylock(mutex) } {
+            libc::EBUSY => {}
+            r => return Some(r),
+        }
+        if crate::real(|| start.elapsed()) >= grace {
+            return None;
+        }
+        crate::real(|| std::thread::sleep(POLL));
     }
 }
 
@@ -398,7 +476,7 @@ unsafe fn det_mutex_unlock(mutex: *mut pthread_mutex_t) -> c_int {
     domain::note_mutex_freed(mutex as usize);
     // SAFETY: PTHREAD_MUTEX_UNLOCK holds libc's pthread_mutex_unlock; the caller's mutex.
     let r = unsafe { original::<MutexFn>(&PTHREAD_MUTEX_UNLOCK)(mutex) };
-    domain::det_wake(crate::DetKey::Addr(mutex as usize), 1);
+    domain::det_wake_addr(mutex as usize, 1);
     r
 }
 
@@ -552,8 +630,8 @@ unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut pthread_mutex_t) -> c_int
     taken(mutex, unsafe { trylock(mutex) })
 }
 
-/// `pthread_mutex_unlock`: forwarded and recorded, and under the schedule it wakes one waiter
-/// parked on the mutex there.
+/// `pthread_mutex_unlock`: forwarded and recorded, and it wakes one waiter parked on the mutex in
+/// a deterministic schedule: its own thread's, or another's waiting on a holder outside it.
 unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut pthread_mutex_t) -> c_int {
     if deterministic() {
         // SAFETY: the caller's mutex.
@@ -563,6 +641,7 @@ unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut pthread_mutex_t) -> c_int 
     let r = unsafe { original::<MutexFn>(&PTHREAD_MUTEX_UNLOCK)(mutex) };
     if r == 0 {
         domain::note_mutex_freed(mutex as usize);
+        domain::det_wake_addr(mutex as usize, 1);
     }
     r
 }
@@ -576,9 +655,7 @@ unsafe extern "C" fn pthread_cond_signal(cond: *mut pthread_cond_t) -> c_int {
     note_wait_signal(cond as usize);
     domain::note_hook_effect("pthread_cond_signal");
     domain::note_release(cond as usize, 1);
-    if domain::det_wakes() {
-        domain::det_wake(crate::DetKey::Addr(cond as usize), 1);
-    }
+    domain::det_wake_addr(cond as usize, 1);
     // SAFETY: PTHREAD_COND_SIGNAL holds libc's pthread_cond_signal; argument forwarded.
     unsafe { original::<CondSignalFn>(&PTHREAD_COND_SIGNAL)(cond) }
 }
@@ -588,9 +665,7 @@ unsafe extern "C" fn pthread_cond_broadcast(cond: *mut pthread_cond_t) -> c_int 
     note_wait_signal(cond as usize);
     domain::note_hook_effect("pthread_cond_broadcast");
     domain::note_release(cond as usize, usize::MAX);
-    if domain::det_wakes() {
-        domain::det_wake(crate::DetKey::Addr(cond as usize), usize::MAX);
-    }
+    domain::det_wake_addr(cond as usize, usize::MAX);
     // SAFETY: PTHREAD_COND_BROADCAST holds libc's pthread_cond_broadcast; argument forwarded.
     unsafe { original::<CondSignalFn>(&PTHREAD_COND_BROADCAST)(cond) }
 }
@@ -602,6 +677,15 @@ unsafe extern "C" fn pthread_cond_wait(
     cond: *mut pthread_cond_t,
     mutex: *mut pthread_mutex_t,
 ) -> c_int {
+    if domain::backing_off() {
+        let grace = if deterministic() {
+            DET_OUTSIDE_HOLDER_GRACE
+        } else {
+            OUTSIDE_HOLDER_GRACE
+        };
+        // SAFETY: the caller's condvar and held mutex.
+        return unsafe { cond_outside_grace(cond, mutex, grace) };
+    }
     if deterministic() {
         // SAFETY: the caller's condvar and held mutex.
         return unsafe { det_cond_wait(cond, mutex, None) };
@@ -618,6 +702,56 @@ unsafe extern "C" fn pthread_cond_wait(
     r
 }
 
+/// A condition-variable wait that a back-off spin leads into (see [`domain::backing_off`]), for
+/// its first `grace` ([`OUTSIDE_HOLDER_GRACE`], or [`DET_OUTSIDE_HOLDER_GRACE`] under a
+/// deterministic schedule, which keeps the baton meanwhile) as a real wait the domain does not
+/// count, as [`outside_grace`] waits on a futex word in static data: a lock's slow path parks on
+/// it, and the lock's holder, which will wake it, may be outside the domain. Ends the spin, so the
+/// caller's next wait counts, and returns the wait's result, or zero once the grace ran out: a
+/// spurious wakeup, which every condvar caller must tolerate (POSIX pthread_cond_wait).
+///
+/// # Safety
+/// `cond` and `mutex` are as for `pthread_cond_wait`, with `mutex` held by the caller.
+unsafe fn cond_outside_grace(
+    cond: *mut pthread_cond_t,
+    mutex: *mut pthread_mutex_t,
+    grace: Duration,
+) -> c_int {
+    domain::end_spin();
+    // SAFETY: PTHREAD_COND_TIMEDWAIT_RELATIVE_NP holds libc's function.
+    #[cfg(target_os = "macos")]
+    let (wait, timeout) = unsafe {
+        (
+            original::<CondTimedWaitFn>(&PTHREAD_COND_TIMEDWAIT_RELATIVE_NP),
+            to_timespec(grace),
+        )
+    };
+    // SAFETY: PTHREAD_COND_TIMEDWAIT holds libc's function.
+    #[cfg(target_os = "linux")]
+    let (wait, timeout) = unsafe {
+        (
+            original::<CondTimedWaitFn>(&PTHREAD_COND_TIMEDWAIT),
+            to_timespec(crate::real(|| {
+                let mut ts = timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                let clock = match cond_clock(cond) {
+                    ClockKind::Monotonic => libc::CLOCK_MONOTONIC,
+                    _ => libc::CLOCK_REALTIME,
+                };
+                libc::clock_gettime(clock, &mut ts);
+                span(&ts) + grace
+            })),
+        )
+    };
+    domain::note_mutex_freed(mutex as usize);
+    // SAFETY: the caller's condvar and held mutex, with the grace as the timeout.
+    let r = unsafe { wait(cond, mutex, &timeout) };
+    domain::note_mutex_taken(mutex as usize);
+    if r == libc::ETIMEDOUT { 0 } else { r }
+}
+
 /// A condition-variable wait is about to let go of `mutex` inside libc, where no hook sees it.
 fn cond_watch(mutex: *mut pthread_mutex_t) -> Option<domain::MutexWatch> {
     let watch = domain::watch_mutex(mutex as usize, true);
@@ -626,14 +760,17 @@ fn cond_watch(mutex: *mut pthread_mutex_t) -> Option<domain::MutexWatch> {
 }
 
 /// Takes (`true`) or lets go of the mutex a condition-variable wait returned holding, with the
-/// real calls: the thread is still counted in its wait.
+/// real calls: the thread is still counted in its wait. A thread that followed a wake into a
+/// deterministic sim meanwhile takes it back in that sim's schedule.
 ///
 /// # Safety
 /// `mutex` is the caller's, held by it to let go.
 unsafe fn relock_mutex(mutex: *mut pthread_mutex_t, lock: bool) {
     // SAFETY: PTHREAD_MUTEX_LOCK and PTHREAD_MUTEX_UNLOCK hold libc's functions; the caller's mutex.
     unsafe {
-        if lock {
+        if lock && deterministic() {
+            det_mutex_lock(mutex);
+        } else if lock {
             taken(mutex, original::<MutexFn>(&PTHREAD_MUTEX_LOCK)(mutex));
         } else {
             original::<MutexFn>(&PTHREAD_MUTEX_UNLOCK)(mutex);
@@ -947,6 +1084,7 @@ unsafe fn det_semaphore_wait(
     // macOS SDK <mach/kern_return.h>, as in `dispatch_semaphore_wait`.
     const KERN_OPERATION_TIMED_OUT: c_long = 49;
     while domain::det_active() {
+        let _listed = domain::det_listen(semaphore as usize);
         // SAFETY: a non-blocking take on the caller's semaphore.
         if unsafe { wait(semaphore, DISPATCH_TIME_NOW) } == 0 {
             domain::det_wait_begins(deadline);
@@ -975,15 +1113,15 @@ unsafe extern "C" fn dispatch_semaphore_signal(semaphore: *mut libc::c_void) -> 
             semaphore,
         )
     };
-    if domain::det_wakes() && domain::det_wake(crate::DetKey::Addr(semaphore as usize), 1) > 0 {
+    if domain::det_wake_addr(semaphore as usize, 1) > 0 {
         return 1;
     }
     r
 }
 
 /// `sched_yield` (man 2 sched_yield): a spinner's way of waiting. Under the schedule it hands the
-/// other runnable threads a turn; otherwise, if every other participant is parked, it offers the
-/// domain a time skip. The real yield follows either way.
+/// other runnable threads a turn; otherwise, once the yields make a caught spin and every other
+/// participant is parked, it offers the domain a time skip. The real yield follows either way.
 unsafe extern "C" fn sched_yield() -> c_int {
     domain::yield_point();
     // SAFETY: SCHED_YIELD holds libc's sched_yield.
@@ -1234,6 +1372,7 @@ unsafe fn futex_call(args: [usize; 6], real: impl Fn([usize; 6]) -> c_long) -> O
         if !deterministic() {
             let native = domain::release_native_futex(
                 word,
+                n,
                 mask,
                 op & libc::FUTEX_PRIVATE_FLAG != 0,
                 || {
@@ -1252,16 +1391,9 @@ unsafe fn futex_call(args: [usize; 6], real: impl Fn([usize; 6]) -> c_long) -> O
             if native < 0 {
                 return Some(native);
             }
-            let woken = if domain::det_wakes() {
-                domain::det_wake_futex(
-                    crate::DetKey::Addr(word),
-                    n,
-                    mask,
-                    op & libc::FUTEX_PRIVATE_FLAG != 0,
-                ) as c_long
-            } else {
-                0
-            };
+            let woken =
+                domain::det_wake_futex_addr(word, n, mask, op & libc::FUTEX_PRIVATE_FLAG != 0)
+                    as c_long;
             return Some(native + woken);
         }
     }
@@ -1311,7 +1443,7 @@ unsafe fn futex_call(args: [usize; 6], real: impl Fn([usize; 6]) -> c_long) -> O
     };
     if timeout == 0 {
         if domain::counts_native_waits()
-            && domain::in_static_image(word)
+            && (domain::in_static_image(word) || domain::backing_off())
             && let Some(r) = outside_grace(OUTSIDE_HOLDER_GRACE, op, command, args, &real)
         {
             return Some(r);
@@ -1404,12 +1536,11 @@ fn real_monotonic() -> Duration {
 #[cfg(target_os = "linux")]
 const MATCH_ANY: usize = 0xffff_ffff;
 
-/// How long a wait on a futex word or semaphore in static data first waits in real time, for a
-/// holder or poster outside the simulation, before it counts as a wait in the domain: keeping the
-/// baton under a deterministic schedule, or counted running otherwise. A snare choice: long enough
-/// for an outside holder in a short critical section to let go, short enough not to slow a run that
-/// waits on an inside one.
-#[cfg(target_os = "linux")]
+/// How long a wait on a futex word or semaphore in static data, or one a lock's back-off spin leads
+/// into, first waits in real time, for a holder or poster outside the simulation, before it counts
+/// as a wait in the domain: keeping the baton under a deterministic schedule, or counted running
+/// otherwise. A snare choice: long enough for an outside holder in a short critical section to let
+/// go, short enough not to slow a run that waits on an inside one.
 const OUTSIDE_HOLDER_GRACE: Duration = Duration::from_millis(1);
 
 /// [`OUTSIDE_HOLDER_GRACE`] for a wait under a deterministic schedule, which keeps the baton
@@ -1418,17 +1549,16 @@ const OUTSIDE_HOLDER_GRACE: Duration = Duration::from_millis(1);
 /// threads hold, stays held for a few milliseconds on a loaded machine. A snare choice: long enough
 /// to outlast such a holder, at the cost of that much real time per wait on a word a parked thread
 /// of the domain holds.
-#[cfg(target_os = "linux")]
 const DET_OUTSIDE_HOLDER_GRACE: Duration = Duration::from_millis(50);
 
 /// The first [`OUTSIDE_HOLDER_GRACE`] of a futex wait on a word in static data, which may be a lock
 /// shared with threads outside the simulation (std's own statics: the stack-overflow handler's
-/// thread-info lock every thread start and exit takes, stdout's lock), as a real wait the domain
-/// does not count. A futex word carries no owner, so whether a thread of the domain holds it cannot
-/// be told; a holder outside lets go in that time, and a holder inside merely delays the wait's
-/// counting by it. Returns the futex call's result, with errno as the kernel left it, when it ended
-/// other than by timing out (woken, or the word no longer held `value`); `None` once the grace ran
-/// out.
+/// thread-info lock every thread start and exit takes, stdout's lock), or of one a lock's back-off
+/// spin leads into (see [`domain::backing_off`]), as a real wait the domain does not count. A futex
+/// word carries no owner, so whether a thread of the domain holds it cannot be told; a holder
+/// outside lets go in that time, and a holder inside merely delays the wait's counting by it.
+/// Returns the futex call's result, with errno as the kernel left it, when it ended other than by
+/// timing out (woken, or the word no longer held `value`); `None` once the grace ran out.
 ///
 /// `args` are as for [`futex`]: the wait uses the caller's word, value and, for
 /// `FUTEX_WAIT_BITSET`, bitset, with an absolute deadline on `CLOCK_MONOTONIC` (man 2 futex).
@@ -1518,7 +1648,7 @@ unsafe fn det_futex(
             // A holder inside the simulation is parked while this thread keeps the baton and
             // cannot release the word meanwhile, so whether this wait yields never depends on
             // outside timing.
-            if domain::in_static_image(word)
+            if (domain::in_static_image(word) || domain::backing_off())
                 && let Some(r) = outside_grace(DET_OUTSIDE_HOLDER_GRACE, op, command, args, real)
             {
                 return Some(r);
@@ -1549,6 +1679,7 @@ unsafe fn det_futex(
         }
         libc::FUTEX_WAKE | libc::FUTEX_WAKE_BITSET => {
             let n = (value as c_int).max(1) as usize;
+            domain::place_woken(word, n);
             let outside = real(args);
             if outside < 0 {
                 return Some(outside);
@@ -1559,13 +1690,15 @@ unsafe fn det_futex(
                 u32::MAX
             };
             note_wait_signal_masked(word, mask, Some(op & libc::FUTEX_PRIVATE_FLAG != 0));
-            domain::note_futex_release(word, n, mask, op & libc::FUTEX_PRIVATE_FLAG != 0);
-            let woken = domain::det_wake_futex(
-                crate::DetKey::Addr(word),
+            domain::note_futex_release(
+                word,
                 n,
                 mask,
                 op & libc::FUTEX_PRIVATE_FLAG != 0,
+                || futex_word(word),
             );
+            let woken =
+                domain::det_wake_futex_addr(word, n, mask, op & libc::FUTEX_PRIVATE_FLAG != 0);
             Some(woken as c_long + outside)
         }
         _ => None,
@@ -1594,6 +1727,7 @@ fn fail(e: c_int) -> c_int {
 /// # Safety
 /// `sem` is the caller's semaphore.
 unsafe fn det_sem_round(sem: *mut libc::sem_t, deadline: Option<Duration>) -> Option<c_int> {
+    let _listed = domain::det_listen(sem as usize);
     // SAFETY: SEM_TRYWAIT holds libc's sem_trywait; the caller's semaphore.
     if unsafe { original::<SemFn>(&SEM_TRYWAIT)(sem) } == 0 {
         domain::det_wait_begins(deadline);
@@ -1659,9 +1793,9 @@ unsafe extern "C" fn sem_post(sem: *mut libc::sem_t) -> c_int {
     domain::note_release(sem as usize, 1);
     // SAFETY: SEM_POST holds libc's sem_post; argument forwarded unchanged.
     let r = unsafe { original::<SemFn>(&SEM_POST)(sem) };
-    if r == 0 && domain::det_wakes() {
+    if r == 0 {
         let e = errno();
-        domain::det_wake(crate::DetKey::Addr(sem as usize), 1);
+        domain::det_wake_addr(sem as usize, 1);
         // SAFETY: setting the calling thread's errno back.
         unsafe { crate::os::sockets::set_errno(e) };
     }

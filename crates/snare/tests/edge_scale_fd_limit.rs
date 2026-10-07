@@ -1,5 +1,5 @@
 //! Behaviour pin for running out of descriptors at scale: a sim socket is a real descriptor
-//! `dup`ed from `/dev/null`, so the process's own `RLIMIT_NOFILE` bounds how many the code under
+//! `dup`ed from a placeholder, so the process's own `RLIMIT_NOFILE` bounds how many the code under
 //! test can open. With the soft limit lowered to a few hundred past what the process holds, UDP
 //! and TCP sockets open until exactly that limit, the next `socket` fails with `EMFILE`, a failed
 //! socket leaves no record in the socket table and takes no socket id, and closing one lets the

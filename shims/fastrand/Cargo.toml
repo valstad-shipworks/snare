@@ -1,0 +1,74 @@
+[package]
+edition = "2018"
+rust-version = "1.88"
+name = "fastrand"
+version = "2.5.0"
+authors = ["Stjepan Glavina <stjepang@gmail.com>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+description = "snare drop-in shim for fastrand: inside a snare sim, thread-local generators are seeded from the sim, so deterministic sims replay"
+publish = false
+keywords = [
+    "simple",
+    "fast",
+    "rand",
+    "random",
+    "wyrand",
+]
+categories = ["algorithms"]
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/smol-rs/fastrand"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = [
+    "--cfg",
+    "docsrs",
+]
+
+[features]
+alloc = []
+default = ["std"]
+js = [
+    "std",
+    "getrandom",
+]
+std = ["alloc"]
+
+[lib]
+name = "fastrand"
+path = "src/lib.rs"
+doctest = false
+
+[dev-dependencies.getrandom]
+version = "0.4"
+
+[dev-dependencies.rand]
+version = "0.10"
+
+[dev-dependencies.wyhash]
+version = "0.6"
+
+[target.'cfg(all(any(target_arch = "wasm32", target_arch = "wasm64"), target_os = "unknown"))'.dependencies.getrandom]
+version = "0.4"
+features = ["wasm_js"]
+optional = true
+
+[target.'cfg(all(any(target_arch = "wasm32", target_arch = "wasm64"), target_os = "unknown"))'.dev-dependencies.getrandom]
+version = "0.4"
+features = ["wasm_js"]
+
+[target.'cfg(all(any(target_arch = "wasm32", target_arch = "wasm64"), target_os = "unknown"))'.dev-dependencies.wasm-bindgen-test]
+version = "0.3"
+
+[target.'cfg(snare)'.dependencies.snare-interpose]
+version = "3.1.0"
+path = "../../crates/snare-interpose"
+
+[target.'cfg(snare)'.dev-dependencies.snare]
+path = "../../crates/snare"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(snare)"] }

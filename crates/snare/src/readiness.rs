@@ -166,10 +166,18 @@ impl Deadline {
         self.at.saturating_sub(self.now_on(clock))
     }
 
+    /// When the deadline falls on the sim's timeline (see `scope::timeline`): sim time on
+    /// `clock`, real time since `real_origin` off it.
     #[cfg(target_os = "macos")]
-    pub(crate) fn timeline_at(&self, real_origin: Duration) -> Duration {
+    pub(crate) fn timeline_at(
+        &self,
+        real_origin: Duration,
+        clock: Option<&crate::clock::Clock>,
+    ) -> Duration {
         if self.on_virtual {
-            self.at
+            clock.map_or(self.at, |clock| {
+                clock.sim_time(crate::clock::nanos(self.at))
+            })
         } else {
             self.at.saturating_sub(real_origin)
         }

@@ -23,7 +23,7 @@ const VIRTUAL_EPOCH_NANOS: i128 = 1_700_000_000i128 * 1_000_000_000;
 #[test]
 fn monotonic_starts_at_its_fixed_origin() {
     let host = HostProfile::new().build();
-    let sim = Sim::builder().host(host).build();
+    let sim = Sim::builder().host(host).fixed_epoch().build();
     sim.run(|| {
         let m = get(libc::CLOCK_MONOTONIC);
         assert_eq!(
@@ -41,7 +41,7 @@ fn monotonic_starts_at_its_fixed_origin() {
 #[test]
 fn realtime_starts_at_the_fixed_epoch() {
     let host = HostProfile::new().build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         let r = get(libc::CLOCK_REALTIME);
         assert_eq!(
             r.tv_sec, 1_700_000_000,
@@ -53,7 +53,7 @@ fn realtime_starts_at_the_fixed_epoch() {
 #[test]
 fn coarse_variants_track_their_base_clock() {
     let host = HostProfile::new().build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         // No tick granularity in the sim, so *_COARSE reads the same virtual clock as its base and
         // only ever differs by the per-read 1µs advance.
         let rt = get(libc::CLOCK_REALTIME);
@@ -75,7 +75,7 @@ fn coarse_variants_track_their_base_clock() {
 #[test]
 fn raw_and_boottime_are_monotonic_too() {
     let host = HostProfile::new().build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         // CLOCK_MONOTONIC_RAW skips NTP slewing and CLOCK_BOOTTIME includes suspend time on a real
         // kernel; the sim has neither, so both map onto the monotonic virtual clock.
         let mono = get(libc::CLOCK_MONOTONIC);
@@ -90,7 +90,7 @@ fn raw_and_boottime_are_monotonic_too() {
 #[test]
 fn reads_hold_still_and_sleeps_move_the_shared_clock() {
     let host = HostProfile::new().build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         let a = nanos(get(libc::CLOCK_MONOTONIC));
         let b = nanos(get(libc::CLOCK_MONOTONIC));
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -106,7 +106,7 @@ fn reads_hold_still_and_sleeps_move_the_shared_clock() {
 #[test]
 fn realtime_and_monotonic_share_one_counter() {
     let host = HostProfile::new().build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         // Realtime is sim time past the fixed epoch, and sim time is the monotonic counter, so the
         // two move in step.
         let (mono, rt) = (
@@ -134,7 +134,7 @@ fn realtime_and_monotonic_share_one_counter() {
 fn tai_leads_realtime_by_the_default_offset() {
     // HostProfile::new() carries the present-day 37s TAI-UTC offset.
     let host = HostProfile::new().build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         let rt = get(libc::CLOCK_REALTIME);
         let tai = get(libc::CLOCK_TAI);
         assert_eq!(
@@ -148,7 +148,7 @@ fn tai_leads_realtime_by_the_default_offset() {
 #[test]
 fn tai_offset_is_configurable() {
     let host = HostProfile::new().tai_offset(10).build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         let rt = get(libc::CLOCK_REALTIME);
         let tai = get(libc::CLOCK_TAI);
         assert_eq!(tai.tv_sec - rt.tv_sec, 10, "a custom offset is honored");
@@ -158,7 +158,7 @@ fn tai_offset_is_configurable() {
 #[test]
 fn a_zero_tai_offset_tracks_realtime() {
     let host = HostProfile::new().tai_offset(0).build();
-    Sim::builder().host(host).build().run(|| {
+    Sim::builder().host(host).fixed_epoch().build().run(|| {
         let rt = get(libc::CLOCK_REALTIME);
         let tai = get(libc::CLOCK_TAI);
         assert_eq!(

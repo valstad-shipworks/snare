@@ -221,6 +221,28 @@ unsafe fn try_take(lock: *mut c_void, mode: Mode) -> bool {
     acquired
 }
 
+/// Tries to take `lock`, retrying for up to the deterministic outside-holder grace of real time
+/// when `grace`.
+unsafe fn try_take_within(lock: *mut c_void, mode: Mode, grace: bool) -> bool {
+    // How often the lock is tried meanwhile. A snare choice.
+    const POLL: std::time::Duration = std::time::Duration::from_micros(50);
+    let grace = if grace {
+        std::time::Duration::from_millis(super::DET_OUTSIDE_HOLDER_GRACE_MS.into())
+    } else {
+        std::time::Duration::ZERO
+    };
+    let start = crate::real(std::time::Instant::now);
+    loop {
+        if unsafe { try_take(lock, mode) } {
+            return true;
+        }
+        if crate::real(|| start.elapsed()) >= grace {
+            return false;
+        }
+        crate::real(|| std::thread::sleep(POLL));
+    }
+}
+
 unsafe fn release(lock: *mut c_void, mode: Mode) {
     let last =
         mode != Mode::Critical || unsafe { (*lock.cast::<CRITICAL_SECTION>()).RecursionCount } == 1;
@@ -242,8 +264,8 @@ unsafe fn release(lock: *mut c_void, mode: Mode) {
             } else {
                 domain::det_released(lock as usize);
             }
-            domain::det_wake(crate::DetKey::Addr(lock as usize), usize::MAX);
         }
+        domain::det_wake_addr(lock as usize, usize::MAX);
         notify_lock_waiters(lock as usize);
     }
 }
@@ -267,18 +289,26 @@ unsafe fn acquire(lock: *mut c_void, mode: Mode) {
     }
     let addr = lock as usize;
     if domain::det_active() {
+        // A lock held outside the schedule is waited for in real time, keeping the baton, for a
+        // grace, then in the schedule, where its release reaches the waiter wherever it is made,
+        // as for a pthread mutex (`os::sync::det_mutex_lock`).
+        let mut graced = false;
         loop {
-            if domain::det_held_inside(addr) {
-                let _label = crate::accounting::wait_label_mutex("Windows lock", None, addr);
-                domain::det_block(crate::DetKey::Addr(addr), None);
-            } else {
-                domain::end_spin();
-                unsafe {
-                    native(lock);
-                    taken(lock, mode);
-                }
-                return;
+            if !domain::det_active() {
+                return unsafe { acquire(lock, mode) };
             }
+            let _listed = domain::det_listen(addr);
+            let outside = !domain::det_held_inside(addr);
+            if outside {
+                domain::end_spin();
+                if unsafe { try_take_within(lock, mode, !graced) } {
+                    return;
+                }
+                graced = true;
+            }
+            let _label = crate::accounting::wait_label_mutex("Windows lock", None, addr);
+            let _outside = outside.then(crate::sched::outside_holder);
+            domain::det_block(crate::DetKey::Addr(addr), None);
             if unsafe { try_take(lock, mode) } {
                 return;
             }

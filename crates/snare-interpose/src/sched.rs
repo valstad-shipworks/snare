@@ -134,6 +134,33 @@ thread_local! {
     static REPOLL_SELF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// Set while the calling thread waits in the schedule for a lock a thread outside it holds
+    /// (see [`outside_holder`]).
+    static OUTSIDE_HOLDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Returned by [`outside_holder`]; restores the flag when dropped.
+pub(crate) struct OutsideHolder(bool);
+
+impl Drop for OutsideHolder {
+    fn drop(&mut self) {
+        let _ = OUTSIDE_HOLDER.try_with(|o| o.set(self.0));
+    }
+}
+
+/// Marks the calling thread's waits in the schedule, until the guard drops, as waits for a lock
+/// held by a thread outside it: something only that thread does ends them, so they no more make the
+/// schedule deadlocked than a wait on a word in static data does (see
+/// [`Scheduler::blocked_on_shared_word`]).
+pub(crate) fn outside_holder() -> OutsideHolder {
+    OutsideHolder(
+        OUTSIDE_HOLDER
+            .try_with(|o| o.replace(true))
+            .unwrap_or(false),
+    )
+}
+
 /// Asks for the calling thread's wait in the schedule to be re-polled once the dispatch it is
 /// running is over (see [`Scheduler::repoll_if_spoiled`]).
 pub(crate) fn repoll_self() {
@@ -212,6 +239,8 @@ struct Blocked {
     address_value: Option<(usize, u64)>,
     #[cfg(windows)]
     timer_waker: bool,
+    /// Waiting for a lock a thread outside the schedule holds (see [`outside_holder`]).
+    outside_holder: bool,
 }
 
 impl Blocked {
@@ -249,6 +278,19 @@ impl Blocked {
             None => self.signal_version.is_none() || signalled,
         }
     }
+
+    /// Whether what the wait is for changed since it began, for a wait that records how to tell
+    /// (a condition variable's signal count, a futex word, a Windows address): a thread outside
+    /// the schedule acted between the waiter's last look and its listing (see
+    /// `domain::det_foreign`).
+    fn changed_outside(&self) -> bool {
+        #[cfg(windows)]
+        let recorded = self.address_value.is_some();
+        #[cfg(not(windows))]
+        let recorded = false;
+        (recorded || self.signal_version.is_some() || self.futex_value.is_some())
+            && self.should_repoll()
+    }
 }
 
 /// The holder of the baton while an executive runs a timestamp: no lineage, since lineages are
@@ -266,8 +308,10 @@ pub(crate) struct State {
     repolled: HashMap<u64, DetKey>,
     /// Threads ready to run, with why they were made ready.
     runnable: BTreeMap<u64, DetWake>,
-    /// Threads waiting, ordered by lineage id so timeouts wake in a fixed order.
-    blocked: BTreeMap<u64, Blocked>,
+    /// Threads waiting, ordered by lineage id so timeouts wake in a fixed order. Boxed: a debug
+    /// build gives each move of an entry inside the map's insert its own stack slot, on the stack
+    /// of a thread that may have only 16 KiB.
+    blocked: BTreeMap<u64, Box<Blocked>>,
     /// Each key's waiters, in the order they began to wait.
     queues: HashMap<DetKey, VecDeque<u64>>,
     /// Each thread's parker, created on first use and dropped when it leaves the schedule.
@@ -300,6 +344,9 @@ pub(crate) struct State {
     let_go: HashSet<u64>,
     /// Let-go threads now in a native wait, by the key a wake in the schedule releases them with.
     outside: HashMap<u64, DetKey>,
+    /// Keys a wake from outside the schedule reached while none of their waiters was blocked: the
+    /// next wait on one returns at once (see `domain::det_foreign`).
+    foreign: HashSet<DetKey>,
     /// Threads caught in a spin (see `domain::clock_spin`), with whether its last step polled the clock.
     /// A runnable thread in here waits on time rather than having work to do.
     spinners: BTreeMap<u64, bool>,
@@ -376,6 +423,9 @@ impl State {
     }
 }
 
+/// A wake from outside a schedule, queued for it: (key, count, futex mask, futex scope).
+type ForeignWake = (DetKey, usize, u32, Option<bool>);
+
 /// A domain's deterministic scheduler.
 #[derive(Default)]
 pub(crate) struct Scheduler {
@@ -386,6 +436,12 @@ pub(crate) struct Scheduler {
     /// Every root has left and nothing could run: the threads still alive (daemons the code under
     /// test left behind) run outside the schedule until a thread enters the domain again.
     detached: AtomicBool,
+    /// Wakes from outside the schedule made while [`state`](Self::state) was held, as (key, count,
+    /// futex mask, futex scope), for its holder to deliver: it may be waiting, holding it, on the
+    /// very thread that made them (a layer's time skip runs the code under test's wakers).
+    foreign_queue: Mutex<Vec<ForeignWake>>,
+    /// Whether `foreign_queue` may hold any, so delivering them skips its lock when not.
+    foreign_queued: AtomicBool,
 }
 
 /// How long the scheduler waits in real time, when every thread is blocked on a lock or address
@@ -606,7 +662,7 @@ impl Scheduler {
             st.waits += 1;
             st.blocked.insert(
                 me,
-                Blocked {
+                Box::new(Blocked {
                     key,
                     mask,
                     futex_private: crate::accounting::wait_futex_private(),
@@ -618,7 +674,10 @@ impl Scheduler {
                     address_value: address_wait_value(key),
                     #[cfg(windows)]
                     timer_waker: !register_timer,
-                },
+                    outside_holder: OUTSIDE_HOLDER
+                        .try_with(std::cell::Cell::get)
+                        .unwrap_or(false),
+                }),
             );
             st.queues.entry(key).or_default().push_back(me);
             let parker = st.parkers.entry(me).or_default().clone();
@@ -638,24 +697,33 @@ impl Scheduler {
             }
             return DetWake::Woken;
         }
+        let blocked = Box::new(Blocked {
+            key,
+            mask,
+            futex_private: crate::accounting::wait_futex_private(),
+            readiness,
+            deadline,
+            signal_version: wait_signal_version(key),
+            futex_value: futex_wait_value(key),
+            #[cfg(windows)]
+            address_value: address_wait_value(key),
+            #[cfg(windows)]
+            timer_waker: !register_timer,
+            outside_holder: OUTSIDE_HOLDER
+                .try_with(std::cell::Cell::get)
+                .unwrap_or(false),
+        });
+        self.take_foreign(&mut st);
+        if st.foreign.remove(&key) || blocked.changed_outside() {
+            drop(st);
+            if let Some(key) = timer {
+                crate::domain::unregister_timer(key);
+            }
+            return DetWake::Woken;
+        }
         st.settle_repoll(me, Some(key));
         st.waits += 1;
-        st.blocked.insert(
-            me,
-            Blocked {
-                key,
-                mask,
-                futex_private: crate::accounting::wait_futex_private(),
-                readiness,
-                deadline,
-                signal_version: wait_signal_version(key),
-                futex_value: futex_wait_value(key),
-                #[cfg(windows)]
-                address_value: address_wait_value(key),
-                #[cfg(windows)]
-                timer_waker: !register_timer,
-            },
-        );
+        st.blocked.insert(me, blocked);
         st.queues.entry(key).or_default().push_back(me);
         let parker = st.parkers.entry(me).or_default().clone();
         st.holder = None;
@@ -745,6 +813,64 @@ impl Scheduler {
             Self::grant_if_idle(st);
         }
         woken
+    }
+
+    /// As [`wake_masked`](Self::wake_masked), for a wake made by a thread outside the schedule (of
+    /// another domain, or of none) on an address one of its threads waits on. A wake that finds
+    /// no waiter blocked there is kept for the next wait on the key (see `domain::det_foreign`).
+    pub(crate) fn wake_foreign(
+        &self,
+        key: DetKey,
+        n: usize,
+        mask: u32,
+        private: Option<bool>,
+    ) -> usize {
+        let _passthrough = Passthrough::enter();
+        let mut st = match self.state.try_lock() {
+            Ok(st) => st,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.foreign_queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((key, n, mask, private));
+                self.foreign_queued.store(true, Ordering::SeqCst);
+                return 0;
+            }
+        };
+        let woken = Self::wake_foreign_locked(&mut st, key, n, mask, private);
+        if woken > 0 {
+            Self::grant_if_idle(st);
+        }
+        woken
+    }
+
+    fn wake_foreign_locked(
+        st: &mut State,
+        key: DetKey,
+        n: usize,
+        mask: u32,
+        private: Option<bool>,
+    ) -> usize {
+        let woken = Self::wake_key_matching(st, key, n, DetWake::Woken, |wait| {
+            wait.mask & mask != 0 && private.is_none_or(|scope| wait.futex_private == Some(scope))
+        });
+        if woken == 0 {
+            st.foreign.insert(key);
+        }
+        woken
+    }
+
+    /// Delivers the wakes [`wake_foreign`](Self::wake_foreign) queued while the state was held.
+    fn take_foreign(&self, st: &mut State) {
+        if !self.foreign_queued.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let queued =
+            std::mem::take(&mut *self.foreign_queue.lock().unwrap_or_else(|e| e.into_inner()));
+        for (key, n, mask, private) in queued {
+            Self::wake_foreign_locked(st, key, n, mask, private);
+        }
     }
 
     pub(crate) fn wake_readiness(&self, event: ReadinessWake<'_>) -> usize {
@@ -861,6 +987,7 @@ impl Scheduler {
             return;
         }
         st.settle_repoll(me, None);
+        self.take_foreign(&mut st);
         if st.runnable.is_empty() {
             // Nobody else can run: yielding changes nothing, so keep the baton.
             return;
@@ -1114,6 +1241,7 @@ impl Scheduler {
     fn dispatch_inner<'a>(&'a self, mut st: MutexGuard<'a, State>) -> bool {
         let mut skipped = false;
         loop {
+            self.take_foreign(&mut st);
             st = match Self::grant_next(st) {
                 Some(st) => st,
                 None => return skipped,
@@ -1198,17 +1326,15 @@ impl Scheduler {
 
     /// Whether a blocked thread waits on a word in a loaded image: a lock in static data (std's
     /// stdout and stderr locks, a `static` mutex) that a thread of another sim or of none may hold,
-    /// and which carries no owner to tell.
+    /// and which carries no owner to tell; or on a lock it knows such a thread holds.
     fn blocked_on_shared_word(st: &State) -> bool {
         #[cfg(any(target_os = "linux", windows))]
-        return st.blocked.values().any(
-            |b| matches!(b.key, DetKey::Addr(addr) if crate::domain::in_static_image(addr)),
-        );
+        return st.blocked.values().any(|b| {
+            b.outside_holder
+                || matches!(b.key, DetKey::Addr(addr) if crate::domain::in_static_image(addr))
+        });
         #[cfg(not(any(target_os = "linux", windows)))]
-        {
-            let _ = st;
-            false
-        }
+        st.blocked.values().any(|b| b.outside_holder)
     }
 
     /// Every root has left and nothing can run: lets every blocked thread go, to wait outside the
@@ -1218,6 +1344,7 @@ impl Scheduler {
         let blocked: Vec<u64> = std::mem::take(&mut st.blocked).into_keys().collect();
         st.queues.clear();
         st.repolled.clear();
+        st.foreign.clear();
         st.end_idle();
         let parkers: Vec<Arc<Parker>> = blocked
             .iter()

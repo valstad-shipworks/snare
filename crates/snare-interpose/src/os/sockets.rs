@@ -3,16 +3,19 @@
 //! the socket calls record themselves as observed and forward; the generic fd calls forward
 //! untouched.
 //!
-//! Every hook follows one shape: offer the call through [`dispatch_net`] (or
-//! [`domain::dispatch_net_effect`] for calls other threads can see, so an executive's audit notes
-//! them), turn a handled result into the C convention with [`finish`], and otherwise call the
-//! original through its slot. The dispatchers return `None` without consulting anything when the
-//! thread is already in passthrough or belongs to no domain, and they enter passthrough for the
-//! backend's duration, so a backend's own libc calls reach the OS rather than recursing here.
+//! Every hook follows one shape: offer the call through [`dispatch_net`], or for a call on a
+//! socket through [`domain::dispatch_net_on`] (or [`domain::dispatch_net_on_effect`] for calls
+//! other threads can see, so an executive's audit notes them), which first moves a thread left
+//! over from an ended run into the running sim that made the socket; turn a handled result into
+//! the C convention with [`finish`], and otherwise call the original through its slot. The
+//! dispatchers return `None` without consulting anything when the thread is already in passthrough
+//! or belongs to no domain, and they enter passthrough for the backend's duration, so a backend's
+//! own libc calls reach the OS rather than recursing here.
 //!
 //! The generic fd calls (`read`, `write`, `close`, `fcntl`) are shared with the file backend.
-//! They ask [`fs_owns`] first and then [`net_owns`], and offer the call only to the plane that owns
-//! the fd: an fd is minted by at most one backend, and a real fd must never be handed to one.
+//! They ask the file plane that minted the fd ([`file_plane`](domain::file_plane), whichever sim's
+//! it is) first and then [`net_owns`](domain::net_owns), and offer the call only to the plane that
+//! owns the fd: an fd is minted by at most one backend, and a real fd must never be handed to one.
 //! Unowned fds forward without being observed, since every program does this I/O on real fds.
 
 use std::ffi::{c_char, c_int, c_void};
@@ -20,8 +23,9 @@ use std::sync::atomic::AtomicUsize;
 
 use libc::{nfds_t, pollfd, size_t, sockaddr, socklen_t, ssize_t};
 
-use crate::domain::{self, dispatch_fs, dispatch_net, fs_owns, net_owns};
+use crate::domain::{self, FilePlane, dispatch_fs_fd, dispatch_net};
 use crate::hooks::{Hook, hook, original};
+use crate::state::Passthrough;
 
 /// Declares the `AtomicUsize` that holds one hooked function's original address, filled when the
 /// hook is installed and read through [`original`].
@@ -77,6 +81,14 @@ slot!(EPOLL_CTL);
 slot!(EPOLL_WAIT);
 #[cfg(target_os = "linux")]
 slot!(EPOLL_PWAIT);
+#[cfg(target_os = "linux")]
+slot!(EPOLL_PWAIT2);
+#[cfg(target_os = "linux")]
+slot!(TIMERFD_CREATE);
+#[cfg(target_os = "linux")]
+slot!(TIMERFD_SETTIME);
+#[cfg(target_os = "linux")]
+slot!(TIMERFD_GETTIME);
 #[cfg(target_os = "macos")]
 slot!(KQUEUE);
 #[cfg(target_os = "macos")]
@@ -115,6 +127,8 @@ pub(crate) fn hooks() -> Vec<Hook> {
         hook!("write", write, WRITE),
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         hook!("fcntl", fcntl, FCNTL),
+        #[cfg(target_os = "linux")]
+        hook!("fcntl64", fcntl, FCNTL),
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         hook!("fcntl", crate::os::variadic::fcntl, FCNTL),
         hook!("if_nametoindex", if_nametoindex, IF_NAMETOINDEX),
@@ -141,6 +155,14 @@ pub(crate) fn hooks() -> Vec<Hook> {
         hook!("epoll_wait", epoll_wait, EPOLL_WAIT),
         #[cfg(target_os = "linux")]
         hook!("epoll_pwait", epoll_pwait, EPOLL_PWAIT),
+        #[cfg(target_os = "linux")]
+        hook!("epoll_pwait2", epoll_pwait2, EPOLL_PWAIT2),
+        #[cfg(target_os = "linux")]
+        hook!("timerfd_create", timerfd_create, TIMERFD_CREATE),
+        #[cfg(target_os = "linux")]
+        hook!("timerfd_settime", timerfd_settime, TIMERFD_SETTIME),
+        #[cfg(target_os = "linux")]
+        hook!("timerfd_gettime", timerfd_gettime, TIMERFD_GETTIME),
         #[cfg(target_os = "macos")]
         hook!("kqueue", kqueue, KQUEUE),
         #[cfg(target_os = "macos")]
@@ -192,7 +214,9 @@ unsafe extern "C" fn epoll_ctl(
 ) -> c_int {
     // man 2 epoll_ctl: op is EPOLL_CTL_ADD/MOD/DEL; struct epoll_event {events, data}.
     // SAFETY: `event` points to an epoll_event for add/mod.
-    if let Some(r) = dispatch_net(|net| unsafe { net.epoll_ctl(epfd, op, fd, event.cast()) }) {
+    if let Some(r) =
+        domain::dispatch_on(epfd, |net| unsafe { net.epoll_ctl(epfd, op, fd, event.cast()) })
+    {
         return finish(r) as c_int;
     }
     domain::observe("epoll_ctl", None);
@@ -215,7 +239,9 @@ unsafe extern "C" fn epoll_wait(
     // man 2 epoll_wait: returns up to `maxevents` ready events; timeout in ms, -1 blocks.
     // SAFETY: `events` points to `maxevents` slots.
     if let Some(r) =
-        dispatch_net(|net| unsafe { net.epoll_wait(epfd, events.cast(), maxevents, timeout) })
+        domain::dispatch_on(epfd, |net| unsafe {
+            net.epoll_wait(epfd, events.cast(), maxevents, timeout)
+        })
     {
         return finish(r) as c_int;
     }
@@ -241,7 +267,9 @@ unsafe extern "C" fn epoll_pwait(
     // The signal mask does not affect a simulated wait; model it as `epoll_wait`.
     // SAFETY: `events` points to `maxevents` slots.
     if let Some(r) =
-        dispatch_net(|net| unsafe { net.epoll_wait(epfd, events.cast(), maxevents, timeout) })
+        domain::dispatch_on(epfd, |net| unsafe {
+            net.epoll_wait(epfd, events.cast(), maxevents, timeout)
+        })
     {
         return finish(r) as c_int;
     }
@@ -260,6 +288,91 @@ unsafe extern "C" fn epoll_pwait(
     }
 }
 
+#[cfg(target_os = "linux")]
+/// Hook for `epoll_pwait2(2)` (Linux 5.11, glibc 2.35): [`epoll_pwait`] with a timespec timeout.
+unsafe extern "C" fn epoll_pwait2(
+    epfd: c_int,
+    events: *mut libc::epoll_event,
+    maxevents: c_int,
+    timeout: *const libc::timespec,
+    sigmask: *const libc::sigset_t,
+) -> c_int {
+    // SAFETY: `events` points to `maxevents` slots; `timeout` is null or a timespec.
+    if let Some(r) = domain::dispatch_on(epfd, |net| unsafe {
+        net.epoll_pwait2(epfd, events.cast(), maxevents, timeout.cast())
+    }) {
+        return finish(r) as c_int;
+    }
+    domain::observe("epoll_pwait2", None);
+    type EpollPwait2Fn = unsafe extern "C" fn(
+        c_int,
+        *mut libc::epoll_event,
+        c_int,
+        *const libc::timespec,
+        *const libc::sigset_t,
+    ) -> c_int;
+    // SAFETY: EPOLL_PWAIT2 holds libc's epoll_pwait2.
+    unsafe { original::<EpollPwait2Fn>(&EPOLL_PWAIT2)(epfd, events, maxevents, timeout, sigmask) }
+}
+
+#[cfg(target_os = "linux")]
+/// Hook for `timerfd_create(2)` (Linux): a backend may mint a simulated timer on the sim's clock;
+/// otherwise observed and forwarded.
+unsafe extern "C" fn timerfd_create(clockid: libc::clockid_t, flags: c_int) -> c_int {
+    // SAFETY: no pointers.
+    if let Some(r) = domain::descriptor_transaction(|| {
+        dispatch_net(|net| unsafe { net.timerfd_create(clockid, flags) })
+    }) {
+        return finish(r) as c_int;
+    }
+    domain::observe("timerfd_create", None);
+    // SAFETY: TIMERFD_CREATE holds libc's timerfd_create.
+    unsafe {
+        original::<unsafe extern "C" fn(libc::clockid_t, c_int) -> c_int>(&TIMERFD_CREATE)(
+            clockid, flags,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// Hook for `timerfd_settime(2)` (Linux), offered only for an fd a backend owns.
+unsafe extern "C" fn timerfd_settime(
+    fd: c_int,
+    flags: c_int,
+    new_value: *const libc::itimerspec,
+    old_value: *mut libc::itimerspec,
+) -> c_int {
+    // SAFETY: `new_value` is the caller's itimerspec; `old_value` null or writable.
+    if let Some(r) = domain::dispatch_owned(fd, |net| unsafe {
+        net.timerfd_settime(fd, flags, new_value.cast(), old_value.cast())
+    }) {
+        return finish(r) as c_int;
+    }
+    domain::observe("timerfd_settime", None);
+    type TimerfdSettimeFn =
+        unsafe extern "C" fn(c_int, c_int, *const libc::itimerspec, *mut libc::itimerspec) -> c_int;
+    // SAFETY: TIMERFD_SETTIME holds libc's timerfd_settime.
+    unsafe { original::<TimerfdSettimeFn>(&TIMERFD_SETTIME)(fd, flags, new_value, old_value) }
+}
+
+#[cfg(target_os = "linux")]
+/// Hook for `timerfd_gettime(2)` (Linux), offered only for an fd a backend owns.
+unsafe extern "C" fn timerfd_gettime(fd: c_int, curr_value: *mut libc::itimerspec) -> c_int {
+    // SAFETY: `curr_value` is the caller's writable itimerspec.
+    if let Some(r) =
+        domain::dispatch_owned(fd, |net| unsafe { net.timerfd_gettime(fd, curr_value.cast()) })
+    {
+        return finish(r) as c_int;
+    }
+    domain::observe("timerfd_gettime", None);
+    // SAFETY: TIMERFD_GETTIME holds libc's timerfd_gettime.
+    unsafe {
+        original::<unsafe extern "C" fn(c_int, *mut libc::itimerspec) -> c_int>(&TIMERFD_GETTIME)(
+            fd, curr_value,
+        )
+    }
+}
+
 #[cfg(target_os = "macos")]
 /// Hook for `kqueue(2)` (macOS).
 unsafe extern "C" fn kqueue() -> c_int {
@@ -275,8 +388,9 @@ unsafe extern "C" fn kqueue() -> c_int {
 }
 
 #[cfg(target_os = "macos")]
-/// Hook for `kevent(2)` (macOS). Unlike the Linux epoll hooks this one is gated on [`net_owns`],
-/// so a kqueue the OS made (for libdispatch, say) never reaches a backend.
+/// Hook for `kevent(2)` (macOS). Unlike the Linux epoll hooks this one is gated on
+/// [`net_owns`](domain::net_owns), so a kqueue the OS made (for libdispatch, say) never reaches a
+/// backend.
 unsafe extern "C" fn kevent(
     kq: c_int,
     changelist: *const libc::kevent,
@@ -287,18 +401,32 @@ unsafe extern "C" fn kevent(
 ) -> c_int {
     // man 2 kevent: applies `changelist` then returns up to `nevents` ready events; `timeout`
     // is a timespec (null blocks). SAFETY: the caller's change/event arrays and timeout.
-    if net_owns(kq)
-        && let Some(r) = dispatch_net(|net| unsafe {
-            net.kevent(
-                kq,
-                changelist.cast(),
-                nchanges,
-                eventlist.cast(),
-                nevents,
-                timeout.cast(),
-            )
-        })
-    {
+    let wakes_only = nchanges > 0
+        && !changelist.is_null()
+        && (0..nchanges as usize).all(|i| {
+            // SAFETY: `changelist` holds `nchanges` entries.
+            let ch = unsafe { changelist.add(i).read_unaligned() };
+            ch.filter == libc::EVFILT_USER
+                && ch.fflags & libc::NOTE_TRIGGER != 0
+                && ch.flags & (libc::EV_DELETE | libc::EV_DISABLE) == 0
+                && (nevents == 0 || ch.flags & libc::EV_RECEIPT != 0)
+        });
+    let op = |net: &dyn crate::net::Net| unsafe {
+        net.kevent(
+            kq,
+            changelist.cast(),
+            nchanges,
+            eventlist.cast(),
+            nevents,
+            timeout.cast(),
+        )
+    };
+    let handled = if wakes_only {
+        domain::dispatch_wake(kq, op)
+    } else {
+        domain::dispatch_owned(kq, op)
+    };
+    if let Some(r) = handled {
         return finish(r) as c_int;
     }
     domain::observe("kevent", None);
@@ -367,8 +495,7 @@ unsafe extern "C" fn sendmsg(fd: c_int, msg: *const libc::msghdr, flags: c_int) 
     // man 2 sendmsg: struct msghdr {msg_name, msg_iov/msg_iovlen scatter-gather,
     // msg_control/msg_controllen ancillary cmsg(3)}; returns bytes sent.
     // SAFETY: `msg` is the caller's msghdr.
-    if net_owns(fd)
-        && let Some(r) = domain::dispatch_net_effect("sendmsg", |net| unsafe {
+    if let Some(r) = domain::dispatch_owned_effect("sendmsg", fd, |net| unsafe {
             net.sendmsg(fd, msg.cast(), flags)
         })
     {
@@ -387,8 +514,7 @@ unsafe extern "C" fn sendmsg(fd: c_int, msg: *const libc::msghdr, flags: c_int) 
 unsafe extern "C" fn recvmsg(fd: c_int, msg: *mut libc::msghdr, flags: c_int) -> ssize_t {
     // man 2 recvmsg: fills the msghdr's iovecs and sets msg_flags (e.g. MSG_TRUNC/MSG_CTRUNC).
     // SAFETY: `msg` is the caller's msghdr.
-    if net_owns(fd)
-        && let Some(r) = dispatch_net(|net| unsafe { net.recvmsg(fd, msg.cast(), flags) })
+    if let Some(r) = domain::dispatch_owned(fd, |net| unsafe { net.recvmsg(fd, msg.cast(), flags) })
     {
         return finish(r) as ssize_t;
     }
@@ -411,8 +537,7 @@ unsafe extern "C" fn recvmmsg(
     timeout: *mut libc::timespec,
 ) -> c_int {
     // SAFETY: `msgvec` holds `vlen` mmsghdrs and `timeout` is null or a timespec, the caller's.
-    if net_owns(fd)
-        && let Some(r) = dispatch_net(|net| unsafe {
+    if let Some(r) = domain::dispatch_owned(fd, |net| unsafe {
             net.recvmmsg(fd, msgvec.cast(), vlen, flags, timeout.cast())
         })
     {
@@ -434,9 +559,8 @@ unsafe extern "C" fn sendmmsg(
     flags: c_int,
 ) -> c_int {
     // SAFETY: `msgvec` holds `vlen` mmsghdrs, the caller's.
-    if net_owns(fd)
-        && let Some(r) =
-            dispatch_net(|net| unsafe { net.sendmmsg(fd, msgvec.cast(), vlen, flags) })
+    if let Some(r) =
+        domain::dispatch_owned(fd, |net| unsafe { net.sendmmsg(fd, msgvec.cast(), vlen, flags) })
     {
         return finish(r) as c_int;
     }
@@ -690,7 +814,7 @@ unsafe extern "C" fn socketpair(
 unsafe extern "C" fn connect(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c_int {
     // man 2 connect: `len` is the sockaddr size; a nonblocking connect returns EINPROGRESS.
     // SAFETY: `addr` points to `len` bytes.
-    if let Some(r) = domain::dispatch_net_effect("connect", |net| unsafe {
+    if let Some(r) = domain::dispatch_net_on_effect("connect", fd, |net| unsafe {
         net.connect(fd, addr.cast(), len)
     }) {
         return finish(r) as c_int;
@@ -708,7 +832,7 @@ unsafe extern "C" fn connect(fd: c_int, addr: *const sockaddr, len: socklen_t) -
 unsafe extern "C" fn bind(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c_int {
     // man 2 bind: assigns the local address; a busy port yields EADDRINUSE.
     // SAFETY: `addr` points to `len` bytes.
-    if let Some(r) = dispatch_net(|net| unsafe { net.bind(fd, addr.cast(), len) }) {
+    if let Some(r) = domain::dispatch_net_on(fd, |net| unsafe { net.bind(fd, addr.cast(), len) }) {
         return finish(r) as c_int;
     }
     domain::observe("bind", None);
@@ -724,7 +848,7 @@ unsafe extern "C" fn bind(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c
 unsafe extern "C" fn listen(fd: c_int, backlog: c_int) -> c_int {
     // man 2 listen: `backlog` bounds the pending-connection queue (capped by SOMAXCONN).
     // SAFETY: no pointers.
-    if let Some(r) = dispatch_net(|net| unsafe { net.listen(fd, backlog) }) {
+    if let Some(r) = domain::dispatch_net_on(fd, |net| unsafe { net.listen(fd, backlog) }) {
         return finish(r) as c_int;
     }
     domain::observe("listen", None);
@@ -736,7 +860,7 @@ unsafe extern "C" fn listen(fd: c_int, backlog: c_int) -> c_int {
 unsafe extern "C" fn accept(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
     // man 2 accept: `len` is in/out (buffer capacity in, actual peer-addr size out).
     // SAFETY: `addr`/`len` receive the peer address.
-    if let Some(r) = domain::dispatch_net_effect("accept", |net| unsafe {
+    if let Some(r) = domain::dispatch_net_on_effect("accept", fd, |net| unsafe {
         net.accept(fd, addr.cast(), len.cast(), 0)
     }) {
         return finish(r) as c_int;
@@ -761,7 +885,7 @@ unsafe extern "C" fn accept4(
 ) -> c_int {
     // man 2 accept4: accept plus SOCK_NONBLOCK/SOCK_CLOEXEC on the new fd (Linux-specific).
     // SAFETY: `addr`/`len` receive the peer address.
-    if let Some(r) = domain::dispatch_net_effect("accept", |net| unsafe {
+    if let Some(r) = domain::dispatch_net_on_effect("accept", fd, |net| unsafe {
         net.accept(fd, addr.cast(), len.cast(), flags)
     }) {
         return finish(r) as c_int;
@@ -779,7 +903,7 @@ unsafe extern "C" fn accept4(
 unsafe extern "C" fn send(fd: c_int, buf: *const c_void, len: size_t, flags: c_int) -> ssize_t {
     // man 2 send: flags MSG_DONTWAIT/MSG_NOSIGNAL/MSG_MORE; a full buffer yields EAGAIN.
     // SAFETY: `buf` points to `len` bytes.
-    if let Some(r) = domain::dispatch_net_effect("send", |net| unsafe {
+    if let Some(r) = domain::dispatch_on_effect("send", fd, |net| unsafe {
         net.send(fd, buf.cast(), len, flags)
     }) {
         return finish(r) as ssize_t;
@@ -797,7 +921,7 @@ unsafe extern "C" fn send(fd: c_int, buf: *const c_void, len: size_t, flags: c_i
 unsafe extern "C" fn recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -> ssize_t {
     // man 2 recv: 0 means orderly shutdown; flags MSG_PEEK/MSG_WAITALL/MSG_DONTWAIT.
     // SAFETY: `buf` points to `len` writable bytes.
-    if let Some(r) = dispatch_net(|net| unsafe { net.recv(fd, buf.cast(), len, flags) }) {
+    if let Some(r) = domain::dispatch_on(fd, |net| unsafe { net.recv(fd, buf.cast(), len, flags) }) {
         return finish(r) as ssize_t;
     }
     domain::observe("recv", None);
@@ -820,7 +944,7 @@ unsafe extern "C" fn sendto(
 ) -> ssize_t {
     // man 2 sendto: like send but `addr`/`addr_len` name the datagram destination.
     // SAFETY: `buf` readable; `addr` a destination sockaddr.
-    if let Some(r) = domain::dispatch_net_effect("sendto", |net| unsafe {
+    if let Some(r) = domain::dispatch_on_effect("sendto", fd, |net| unsafe {
         net.sendto(fd, buf.cast(), len, flags, addr.cast(), addr_len)
     }) {
         return finish(r) as ssize_t;
@@ -852,7 +976,7 @@ unsafe extern "C" fn recvfrom(
 ) -> ssize_t {
     // man 2 recvfrom: like recv but `addr`/`addr_len` (in/out) receive the datagram source.
     // SAFETY: `buf` writable; `addr`/`addr_len` receive the source.
-    if let Some(r) = dispatch_net(|net| unsafe {
+    if let Some(r) = domain::dispatch_on(fd, |net| unsafe {
         net.recvfrom(fd, buf.cast(), len, flags, addr.cast(), addr_len.cast())
     }) {
         return finish(r) as ssize_t;
@@ -877,7 +1001,7 @@ unsafe extern "C" fn recvfrom(
 unsafe extern "C" fn shutdown(fd: c_int, how: c_int) -> c_int {
     // man 2 shutdown: how is SHUT_RD(0)/SHUT_WR(1)/SHUT_RDWR(2).
     // SAFETY: no pointers.
-    if let Some(r) = domain::dispatch_net_effect("shutdown", |net| unsafe { net.shutdown(fd, how) })
+    if let Some(r) = domain::dispatch_on_effect("shutdown", fd, |net| unsafe { net.shutdown(fd, how) })
     {
         return finish(r) as c_int;
     }
@@ -887,25 +1011,12 @@ unsafe extern "C" fn shutdown(fd: c_int, how: c_int) -> c_int {
 }
 
 /// Hook for `close(2)`. The file plane is asked first, then the network plane, each only for an
-/// fd it owns; a real fd closes without being observed.
+/// fd it owns; another sim's socket is closed in the sim that made it (`domain::close_foreign`);
+/// a real fd closes without being observed.
 unsafe extern "C" fn close(fd: c_int) -> c_int {
-    let handled = domain::descriptor_transaction(|| {
-        if fs_owns(fd)
-            && let Some(result) = dispatch_fs(|fs| unsafe { fs.close(fd) })
-        {
-            return Some(result);
-        }
-        if net_owns(fd)
-            && let Some(result) =
-                domain::dispatch_net_effect("close", |net| unsafe { net.close(fd) })
-        {
-            return Some(result);
-        }
-        if domain::descriptor_close_can_wait(fd) {
-            return None;
-        }
+    let real = || {
         let result = unsafe { original::<unsafe extern "C" fn(c_int) -> c_int>(&CLOSE)(fd) };
-        Some(if result < 0 {
+        if result < 0 {
             -i64::from(
                 std::io::Error::last_os_error()
                     .raw_os_error()
@@ -913,11 +1024,35 @@ unsafe extern "C" fn close(fd: c_int) -> c_int {
             )
         } else {
             i64::from(result)
-        })
+        }
+    };
+    let handled = domain::descriptor_transaction(|| {
+        if let Some(FilePlane::Served(fs, serial)) = domain::file_plane(fd) {
+            crate::owners::release_file_of(fd, serial);
+            let _passthrough = Passthrough::enter();
+            if let Some(result) = unsafe { fs.close(fd) } {
+                return Some(result.into_raw());
+            }
+        }
+        if let Some(result) = domain::close_foreign(fd, real) {
+            domain::note_effect("close");
+            return Some(result);
+        }
+        if let Some(result) =
+            domain::dispatch_owned_effect("close", fd, |net| unsafe { net.close(fd) })
+        {
+            return Some(result);
+        }
+        if domain::descriptor_close_can_wait(fd) {
+            return None;
+        }
+        crate::owners::forget_real(fd);
+        Some(real())
     });
     if let Some(result) = handled {
         return finish(result) as c_int;
     }
+    crate::owners::forget_real(fd);
     unsafe { original::<unsafe extern "C" fn(c_int) -> c_int>(&CLOSE)(fd) }
 }
 
@@ -925,7 +1060,9 @@ unsafe extern "C" fn close(fd: c_int) -> c_int {
 unsafe extern "C" fn getsockname(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
     // man 2 getsockname: reports the bound local address; `len` is in/out.
     // SAFETY: `addr`/`len` receive the local address.
-    if let Some(r) = dispatch_net(|net| unsafe { net.getsockname(fd, addr.cast(), len.cast()) }) {
+    if let Some(r) =
+        domain::dispatch_net_on(fd, |net| unsafe { net.getsockname(fd, addr.cast(), len.cast()) })
+    {
         return finish(r) as c_int;
     }
     domain::observe("getsockname", None);
@@ -941,7 +1078,9 @@ unsafe extern "C" fn getsockname(fd: c_int, addr: *mut sockaddr, len: *mut sockl
 unsafe extern "C" fn getpeername(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
     // man 2 getpeername: reports the connected peer address; ENOTCONN if unconnected.
     // SAFETY: `addr`/`len` receive the peer address.
-    if let Some(r) = dispatch_net(|net| unsafe { net.getpeername(fd, addr.cast(), len.cast()) }) {
+    if let Some(r) =
+        domain::dispatch_net_on(fd, |net| unsafe { net.getpeername(fd, addr.cast(), len.cast()) })
+    {
         return finish(r) as c_int;
     }
     domain::observe("getpeername", None);
@@ -964,8 +1103,9 @@ unsafe extern "C" fn setsockopt(
     // man 2 setsockopt, man 7 socket: `level` (SOL_SOCKET/IPPROTO_*) selects the option
     // namespace for `name` (SO_REUSEADDR, SO_RCVBUF, SO_TIMESTAMPING, ...).
     // SAFETY: `val` points to `len` bytes.
-    if let Some(r) = dispatch_net(|net| unsafe { net.setsockopt(fd, level, name, val.cast(), len) })
-    {
+    if let Some(r) = domain::dispatch_net_on(fd, |net| unsafe {
+        net.setsockopt(fd, level, name, val.cast(), len)
+    }) {
         return finish(r) as c_int;
     }
     domain::observe("setsockopt", None);
@@ -987,9 +1127,9 @@ unsafe extern "C" fn getsockopt(
 ) -> c_int {
     // man 2 getsockopt: `len` is in/out; SO_ERROR retrieves and clears the pending error.
     // SAFETY: `val`/`len` receive the option value.
-    if let Some(r) =
-        dispatch_net(|net| unsafe { net.getsockopt(fd, level, name, val.cast(), len.cast()) })
-    {
+    if let Some(r) = domain::dispatch_net_on(fd, |net| unsafe {
+        net.getsockopt(fd, level, name, val.cast(), len.cast())
+    }) {
         return finish(r) as c_int;
     }
     domain::observe("getsockopt", None);
@@ -1006,6 +1146,12 @@ unsafe extern "C" fn getsockopt(
 #[allow(clippy::unnecessary_cast)]
 unsafe extern "C" fn poll(fds: *mut pollfd, nfds: nfds_t, timeout: c_int) -> c_int {
     // man 2 poll: struct pollfd {fd, events, revents}; timeout in ms, -1 blocks; POLLIN/POLLOUT.
+    if !fds.is_null() {
+        for i in 0..nfds as usize {
+            // SAFETY: `fds` points to `nfds` pollfd structs.
+            domain::settle_foreign(unsafe { (*fds.add(i)).fd });
+        }
+    }
     // SAFETY: `fds` points to `nfds` pollfd structs.
     if let Some(r) = dispatch_net(|net| unsafe { net.poll(fds.cast(), nfds as u64, timeout) }) {
         return finish(r) as c_int;
@@ -1024,21 +1170,35 @@ unsafe extern "C" fn dup(fd: c_int) -> c_int {
 }
 
 unsafe fn dup_inner(fd: c_int) -> c_int {
-    if net_owns(fd)
-        && let Some(r) = dispatch_net(|net| unsafe { net.dup(fd) })
+    if let Some(r) = domain::dispatch_owned(fd, |net| unsafe { net.dup(fd) })
     {
         return finish(r) as c_int;
     }
+    let plane = domain::file_plane(fd);
+    if let Some(FilePlane::Gone) = plane {
+        return finish(-i64::from(libc::EBADF)) as c_int;
+    }
     let newfd = unsafe { original::<unsafe extern "C" fn(c_int) -> c_int>(&DUP)(fd) };
-    if newfd >= 0 && fs_owns(fd) {
-        let _ = dispatch_fs(|fs| unsafe { fs.dup(fd, newfd) });
+    if newfd >= 0
+        && let Some(FilePlane::Served(fs, serial)) = plane
+    {
+        let _passthrough = Passthrough::enter();
+        if unsafe { fs.dup(fd, newfd) }.is_some() {
+            crate::owners::claim_file(newfd, serial);
+        }
     }
     newfd
 }
 
 unsafe extern "C" fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
-    let real =
-        || unsafe { original::<unsafe extern "C" fn(c_int, c_int) -> c_int>(&DUP2)(oldfd, newfd) };
+    let real = || {
+        let result =
+            unsafe { original::<unsafe extern "C" fn(c_int, c_int) -> c_int>(&DUP2)(oldfd, newfd) };
+        if result >= 0 && oldfd != newfd {
+            crate::owners::forget_real(newfd);
+        }
+        result
+    };
     if let Some(result) =
         domain::descriptor_transaction(|| domain::dispatch_dup_to(oldfd, newfd, None, real))
     {
@@ -1049,8 +1209,16 @@ unsafe extern "C" fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
 
 #[cfg(target_os = "linux")]
 unsafe extern "C" fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int {
-    let real = || unsafe {
-        original::<unsafe extern "C" fn(c_int, c_int, c_int) -> c_int>(&DUP3)(oldfd, newfd, flags)
+    let real = || {
+        let result = unsafe {
+            original::<unsafe extern "C" fn(c_int, c_int, c_int) -> c_int>(&DUP3)(
+                oldfd, newfd, flags,
+            )
+        };
+        if result >= 0 {
+            crate::owners::forget_real(newfd);
+        }
+        result
     };
     if let Some(result) =
         domain::descriptor_transaction(|| domain::dispatch_dup_to(oldfd, newfd, Some(flags), real))
@@ -1067,6 +1235,17 @@ unsafe extern "C" fn select(
     except: *mut libc::fd_set,
     timeout: *mut libc::timeval,
 ) -> c_int {
+    for set in [read, write, except] {
+        if set.is_null() {
+            continue;
+        }
+        for fd in 0..nfds.clamp(0, libc::FD_SETSIZE as c_int) {
+            // SAFETY: a non-null set is the caller's fd_set, holding descriptors below `nfds`.
+            if unsafe { libc::FD_ISSET(fd, set) } {
+                domain::settle_foreign(fd);
+            }
+        }
+    }
     if let Some(r) = dispatch_net(|net| unsafe {
         net.select(
             nfds,
@@ -1096,14 +1275,11 @@ unsafe extern "C" fn select(
 unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, len: size_t) -> ssize_t {
     // man 2 read: returns bytes read (0 at EOF); a stream socket fd reads like a byte stream.
     // SAFETY: `buf` points to `len` writable bytes.
-    if fs_owns(fd)
-        && let Some(r) = dispatch_fs(|fs| unsafe { fs.read(fd, buf.cast(), len) })
-    {
+    if let Some(r) = dispatch_fs_fd(fd, |fs| unsafe { fs.read(fd, buf.cast(), len) }) {
         return finish(r) as ssize_t;
     }
     // SAFETY: `buf` points to `len` writable bytes.
-    if net_owns(fd)
-        && let Some(r) = dispatch_net(|net| unsafe { net.read(fd, buf.cast(), len) })
+    if let Some(r) = domain::dispatch_owned(fd, |net| unsafe { net.read(fd, buf.cast(), len) })
     {
         return finish(r) as ssize_t;
     }
@@ -1118,16 +1294,18 @@ unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, len: size_t) -> ssize_t {
 unsafe extern "C" fn write(fd: c_int, buf: *const c_void, len: size_t) -> ssize_t {
     // man 2 write: may write fewer than `len` bytes (a short write) before returning.
     // SAFETY: `buf` points to `len` readable bytes.
-    if fs_owns(fd)
-        && let Some(r) = dispatch_fs(|fs| unsafe { fs.write(fd, buf.cast(), len) })
-    {
+    if let Some(r) = dispatch_fs_fd(fd, |fs| unsafe { fs.write(fd, buf.cast(), len) }) {
         return finish(r) as ssize_t;
     }
     // SAFETY: `buf` points to `len` readable bytes.
-    if net_owns(fd)
-        && let Some(r) =
-            domain::dispatch_net_effect("write", |net| unsafe { net.write(fd, buf.cast(), len) })
-    {
+    let write = |net: &dyn crate::net::Net| unsafe { net.write(fd, buf.cast(), len) };
+    let handled = if cfg!(target_os = "linux") && len == 8 {
+        domain::dispatch_wake(fd, write)
+    } else {
+        domain::dispatch_owned(fd, write)
+    };
+    if let Some(r) = handled {
+        domain::note_effect("write");
         return finish(r) as ssize_t;
     }
     // SAFETY: WRITE holds libc's write.
@@ -1149,7 +1327,7 @@ type FcntlFn = unsafe extern "C" fn(c_int, c_int, ...) -> c_int;
 type FcntlFn = unsafe extern "C" fn(c_int, c_int, i64) -> c_int;
 
 /// Hook for `fcntl(2)`: the owning plane's `fcntl`, else the OS, unobserved. `arg` is the third
-/// word as an integer; the commands a backend models take no pointer.
+/// word as an integer; a file plane reads it as the `struct flock *` of a record-lock command.
 ///
 /// On macOS aarch64 the third word reaches here via the naked trampoline in `crate::os::variadic`.
 // The trampoline tail-branches here from another codegen unit, so the symbol must have external
@@ -1167,16 +1345,29 @@ pub(crate) unsafe extern "C" fn fcntl(fd: c_int, cmd: c_int, arg: i64) -> c_int 
 
 unsafe fn fcntl_inner(fd: c_int, cmd: c_int, arg: i64) -> c_int {
     // man 2 fcntl: the modeled commands are F_GETFL/F_SETFL (O_NONBLOCK), F_GETFD/F_SETFD
-    // (FD_CLOEXEC) and F_DUPFD/F_DUPFD_CLOEXEC.
-    // SAFETY: no pointer args for the fcntl commands a socket/file sees (flags, dup).
-    if fs_owns(fd)
-        && let Some(r) = dispatch_fs(|fs| unsafe { fs.fcntl(fd, cmd, arg) })
-    {
-        return finish(r) as c_int;
+    // (FD_CLOEXEC), F_DUPFD/F_DUPFD_CLOEXEC and, on files, the record locks.
+    // SAFETY: the file plane reads `arg` as a pointer only for the record-lock commands, whose
+    // third argument is a `struct flock *`.
+    match domain::file_plane(fd) {
+        Some(FilePlane::Served(fs, serial)) => {
+            let handled = {
+                let _passthrough = Passthrough::enter();
+                unsafe { fs.fcntl(fd, cmd, arg) }
+            };
+            if let Some(r) = handled {
+                if let crate::net::NetResult::Ok(newfd) = r
+                    && (cmd == libc::F_DUPFD || cmd == libc::F_DUPFD_CLOEXEC)
+                {
+                    crate::owners::claim_file(newfd as c_int, serial);
+                }
+                return finish(r.into_raw()) as c_int;
+            }
+        }
+        Some(FilePlane::Gone) => return finish(-i64::from(libc::EBADF)) as c_int,
+        None => {}
     }
     // SAFETY: no pointer args for the fcntl commands a socket sees (flags, dup).
-    if net_owns(fd)
-        && let Some(r) = dispatch_net(|net| unsafe { net.fcntl(fd, cmd, arg) })
+    if let Some(r) = domain::dispatch_owned(fd, |net| unsafe { net.fcntl(fd, cmd, arg) })
     {
         return finish(r) as c_int;
     }

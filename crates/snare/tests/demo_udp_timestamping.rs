@@ -111,6 +111,7 @@ fn nanos(ts: libc::timespec) -> i128 {
 fn recvmsg_carries_a_software_rx_timestamp() {
     Sim::builder()
         .host(HostProfile::new().build())
+        .fixed_epoch()
         .build()
         .run(|| {
             let tx = udp_socket();
@@ -148,6 +149,7 @@ fn no_control_message_when_timestamping_is_off() {
     // Without SO_TIMESTAMPING the datagram is delivered with an empty control buffer.
     Sim::builder()
         .host(HostProfile::new().build())
+        .fixed_epoch()
         .build()
         .run(|| {
             let tx = udp_socket();
@@ -187,6 +189,7 @@ fn receive_timestamps_advance_between_datagrams() {
     // later datagram carries a strictly later timestamp (Documentation/networking/timestamping.rst).
     Sim::builder()
         .host(HostProfile::new().build())
+        .fixed_epoch()
         .build()
         .run(|| {
             let tx = udp_socket();
@@ -214,6 +217,7 @@ fn rx_timestamp_survives_a_small_control_buffer_without_ub() {
     // MSG_CTRUNC); the datagram payload is still delivered. The sim reports zero control length.
     Sim::builder()
         .host(HostProfile::new().build())
+        .fixed_epoch()
         .build()
         .run(|| {
             let tx = udp_socket();
@@ -250,6 +254,7 @@ fn getsockopt_reads_back_the_timestamping_flags() {
     // The generation/reporting bitmask set with SO_TIMESTAMPING reads back verbatim.
     Sim::builder()
         .host(HostProfile::new().build())
+        .fixed_epoch()
         .build()
         .run(|| {
             let fd = udp_socket();

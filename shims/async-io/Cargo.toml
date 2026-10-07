@@ -1,0 +1,44 @@
+[package]
+name = "async-io"
+version = "2.6.0"
+authors = ["Stjepan Glavina <stjepang@gmail.com>"]
+edition = "2021"
+rust-version = "1.88"
+description = "snare drop-in shim for async-io: one reactor and \"async-io\" thread per snare sim instead of per process"
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(polling_test_poll_backend)', 'cfg(async_io_no_pipe)' ] }
+
+[lib]
+doctest = false
+
+[dependencies]
+cfg-if = "1"
+concurrent-queue = "2.2.0"
+futures-io = { version = "0.3.28", default-features = false, features = ["std"] }
+futures-lite = { version = "2.0.0", default-features = false }
+parking = "2.0.0"
+polling = "3.4.0"
+rustix = { version = "1.0.7", default-features = false, features = ["fs", "net", "std"] }
+slab = "0.4.2"
+snare-interpose = { version = "3.1.0", path = "../../crates/snare-interpose" }
+tracing = { version = "0.1.37", default-features = false, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+
+[build-dependencies]
+autocfg = "1"
+
+[dev-dependencies]
+async-std = "1.13.2"
+futures-lite = "2"
+smol = "2.0.2"
+snare = { path = "../../crates/snare" }
+
+[patch.crates-io]
+async-io = { path = "." }
+async-global-executor = { path = "../async-global-executor" }
+blocking = { path = "../blocking" }

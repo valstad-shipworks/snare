@@ -48,6 +48,16 @@ snare 2 removes that constraint. It patches the **import tables** of the loaded 
 to the test's in-memory model; if the model declines, the call falls through to the real OS. Nothing the
 code under test imports changes. This reaches straight through `std` and every dependency.
 
+A function's address stored in data is redirected too: C dispatch tables such as SQLite's
+`aSyscall[]` (`{ "fstat", fstat }`, …) and Rust statics like
+`static F: unsafe extern "C" fn(..) = libc::fstat` are filled by the loader from data
+relocations (ELF `R_X86_64_64`/`R_AARCH64_ABS64`, Mach-O binds in `__const`/`__data`), and
+snare rewrites those words alongside the import slots. A pointer taken in code, one read from data
+and one returned by `dlsym` (or `GetProcAddress`) therefore all name the hook, and compare equal.
+On Windows such a pointer is the address of the linker's import thunk, which jumps through the
+patched IAT. A copy the program makes at run time before the first `Sim` is built (into the heap or
+a lazily initialized static) keeps the real address.
+
 Every resource or object used by the code under test must be created under its active simulation.
 Run initialization inside `Sim::run`, including constructors, dependency initialization, worker
 pools and lazy initialization. Objects created before entering the simulation, or created with
@@ -99,9 +109,10 @@ simulation automatically. Only managed threads are interposed; the test's own bo
 
 | Surface | Covered |
 |---|---|
-| **Time** | `clock_gettime` (`CLOCK_MONOTONIC`/`REALTIME`/`TAI`), `gettimeofday`, `QueryPerformanceCounter`, `GetTickCount64`, `mach_absolute_time` — a discrete-event virtual clock at a fixed epoch (the default, with or without a `SimHost`; `wall_clock()` opts out). Time jumps to the next pending sleep or timeout once every thread is blocked, and each call that returns without blocking costs a microsecond, so busy-polls still let time move. It can also run scaled to real time (`time_rate`), be set forward (`set_time_value`), and be paused, which holds every sleep and timed wait until time is moved from outside — see [Controlling time](#controlling-time). |
-| **Entropy** | `getrandom`/`getentropy`/`arc4random`/`ProcessPrng` — seeded, so `HashMap` order etc. is repeatable. |
-| **TCP** | `std::net::TcpStream`/`TcpListener` against scripted `connect_tester` peers, or against each other: the code under test can `bind`/`listen`/`accept` (`accept4` flags on Linux) and connect to its own listeners, with `shutdown(2)` (`SHUT_RD`/`SHUT_WR`/`SHUT_RDWR`) and bind conflicts (`EADDRINUSE`, `SO_REUSEADDR`) as the host OS has them. |
+| **Time** | `clock_gettime` (`CLOCK_MONOTONIC`/`REALTIME`/`TAI`), `gettimeofday`, `time` (the UCRT's `_time64` on Windows), their raw Linux `syscall` forms, `QueryPerformanceCounter`, `GetTickCount64`, `mach_absolute_time` — a discrete-event virtual clock (the default, with or without a `SimHost`; `wall_clock()` opts out) that continues where the process's earlier sims left off, or starts at a fixed epoch under `deterministic()` or `fixed_epoch()`. Time jumps to the next pending sleep or timeout once every thread is blocked, and each call that returns without blocking costs a microsecond, so busy-polls still let time move. It can also run scaled to real time (`time_rate`), be set forward (`set_time_value`), and be paused, which holds every sleep and timed wait until time is moved from outside — see [Controlling time](#controlling-time). |
+| **Entropy** | `getrandom`/`getentropy`/`arc4random`/`ProcessPrng`, and Linux `syscall(SYS_getrandom)` (getrandom 0.2, so rand 0.8's `thread_rng`) — seeded, so `HashMap` order etc. is repeatable. |
+| **Local time** | A sim with `TZ` in an isolated environment, or an `/etc/localtime` of its own, has its own zone: `localtime_r`, `localtime`, `mktime`, `timelocal`, `ctime_r`, `ctime` and `tzset`, and on macOS CoreFoundation's `CFTimeZoneCopySystem`/`CopyDefault`, resolve it from the sim's environment and files. See [Local time](#local-time). |
+| **TCP** | `std::net::TcpStream`/`TcpListener` against scripted `connect_tester` peers, or against each other: the code under test can `bind`/`listen`/`accept` (`accept4` flags on Linux) and connect to its own listeners, with `shutdown(2)` (`SHUT_RD`/`SHUT_WR`/`SHUT_RDWR`) and bind conflicts (`EADDRINUSE`, `SO_REUSEADDR`) as the host OS has them. Vectored `readv`/`writev` (std's and tokio's `write_vectored`) gather and scatter as on the host, a datagram socket's as one datagram. |
 | **UDP** | `std::net::UdpSocket` serviced from memory on every platform: `bind`/`connect`/`sendto`/`recvfrom`/`sendmsg`/`recvmsg` (and Linux `sendmmsg`/`recvmmsg`), blocking cross-thread receive, broadcast (`SO_BROADCAST`), multicast (`IP_ADD_MEMBERSHIP`, Linux `IP_MULTICAST_ALL`), Linux `IP_RECVERR` ICMP reports on `MSG_ERRQUEUE`, and several addresses sharing a port. Under a `SimHost` it adds `SCM_TXTIME` launch deadlines, and its sockets work with `poll` and `epoll`. TCP and UDP run together in one `Sim`. |
 | **Packet timestamps** | Kernel receive and transmit stamps from the sim's clock on the plain `Sim` and under a `SimHost`: Linux `SO_TIMESTAMP`/`SO_TIMESTAMPNS`/`SO_TIMESTAMPING` (`SCM_TIMESTAMP*`, UDP and TCP) and `MSG_ERRQUEUE` transmit stamps (`OPT_ID`, `OPT_TSONLY`, `TX_SCHED`/`TX_ACK`); macOS `SO_TIMESTAMP`/`SO_TIMESTAMP_MONOTONIC`/`SO_TIMESTAMP_CONTINUOUS`; Windows `SIO_TIMESTAMPING` on UDP (`WSARecvMsg`'s `SO_TIMESTAMP`, `SIO_GET_TX_TIMESTAMP` by `SO_TIMESTAMP_ID`). A packet is stamped when it reaches the socket, after its link delay. See [Packet timestamps](#packet-timestamps). |
 | **Raw L2** | Linux `AF_PACKET`/`SOCK_RAW` + `bind(sockaddr_ll)`; macOS `/dev/bpf*` (`BIOCSETIF`/`bpf_hdr`). What EtherCAT masters (ethercrab) use. Interfaces come from the sim's topology (`add_nic`), and frames respect their link state and MTU. |
@@ -112,7 +123,7 @@ simulation automatically. Only managed threads are interposed; the test's own bo
 | **Connect faults** | A listening address refuses (`ListenerBehavior::Refusing`) or drops SYNs until an instant (`DelayingUntil`), and an address nobody answers at makes a connect wait out the host OS's SYN retransmission plan — Linux 131 s (`tcp_syn_retries`, `tcp_syn_linear_timeouts`, `TCP_SYNCNT`), macOS 75 s (`TCP_CONNECTIONTIMEOUT`), Windows 21 s (`TCP_MAXRT`) — in virtual time. Nonblocking connects report `EINPROGRESS`/`WSAEWOULDBLOCK`, then `poll`/`epoll`/`kqueue`/`select` and `SO_ERROR`, so `connect_timeout` and `mio` behave as on the real OS. See [Connect faults](#connect-faults). |
 | **Protocol counters** | The host's UDP and TCP counters, driven by the sim's traffic: Linux `/proc/net/snmp` and `/proc/net/snmp6`, macOS `sysctl` `net.inet.udp.stats`, Windows `GetUdpStatistics(Ex/Ex2)` and `GetTcpStatistics(Ex/Ex2)`, and `proto_counters()` for the test. See [Protocol counters](#protocol-counters). |
 | **Netlink** | `AF_NETLINK` rtnetlink `RTM_GETLINK`/`IFLA_STATS64` (a dump, or one link by index or name), genetlink `CTRL_CMD_GETFAMILY`, `RTM_GETQDISC`/ETF. |
-| **Files** | `VirtualFs`: an in-memory tree behind open, sequential/positional IO, truncate, sync, stat and directory-stream calls, with glob passthrough to real paths. `SimHost` also renders `/sys`, `/proc`, `/dev/ptp*`, `/dev/cpu_dma_latency` (the request held open reads back through `SimHost::cpu_dma_latency`). Raw directory syscalls and path mutation are incomplete. |
+| **Files** | `VirtualFs`: an in-memory tree behind open, sequential/positional IO (vectored `readv`/`writev`/`preadv`/`pwritev` too), truncate, sync, stat and directory-stream calls, with glob passthrough to real paths. File times, virtual and real, follow the sim's clock (see [File timestamps](#file-timestamps)). `SimHost` also renders `/sys`, `/proc`, `/dev/ptp*`, `/dev/cpu_dma_latency` (the request held open reads back through `SimHost::cpu_dma_latency`). Raw directory syscalls and path mutation are incomplete. |
 | **Host tuning** | Scheduling (`sched_setscheduler`/affinity/priority, `mlock`/`mlockall`), resource limits (`RLIMIT_RTPRIO`/`NICE`/`MEMLOCK`), NIC config (`ethtool` rings/coalescing/channels/pause/EEE/flags/flow rules/stats, `SIOC[GS]HWTSTAMP`, qdiscs and ETF offload, threaded NAPI, queues/IRQs), PTP, capability gating — all modeled, never touching the real scheduler or NIC. |
 | **Kernel identity** | Under a `SimHost`, `uname` (and Linux `SYS_uname`) reports the profile's `sysname`/`nodename`/`kernel_release`/`kernel_version`/`machine`: a fixed kernel by default, whose Linux version string carries `PREEMPT_RT` when the profile does, or the build machine's own with `real_uname()`. `gethostname` still reads the real name. |
 | **Tester stages** | A tester's message chain: `then_test` / `then_stateful_test` drop or rewrite a message before later stages, `then_edit_state` updates state, `then_action` / `then_stateful_action` answer — run in the order added. |
@@ -164,6 +175,12 @@ Sim::builder().host(host).build().run(|| {
 });
 ```
 
+The profile's CPUs are what the code under test counts: `sysconf(_SC_NPROCESSORS_CONF)` is
+`cpus`, `_SC_NPROCESSORS_ONLN` the `online` ones, Linux `sched_getaffinity` the online set, and
+macOS's `hw.ncpu`, `hw.activecpu`, `hw.logicalcpu`, `hw.physicalcpu` (and their `_max` forms) and,
+on arm64, one performance level `hw.perflevel0.*` follow it. So `num_cpus` and
+`std::thread::available_parallelism` report it on both.
+
 `uname` reports a host named `snare` running a fixed kernel (Linux `6.12.0`, `#1 SMP PREEMPT_DYNAMIC`,
 or `#1 SMP PREEMPT_RT` with `preempt_rt(true)`; macOS `Darwin` `25.0.0`) on the build target's machine
 type. `HostProfile::real_uname()` copies all five fields from the machine running the test instead,
@@ -204,13 +221,105 @@ operate on the virtual tree, preserve inode identity across moves, and keep unli
 through open descriptors. Creation requires a declared directory parent, and pathname traversal
 checks intermediate components before resolving `.` and `..`. Relative path mutations,
 `rmdir`, `getdents64`, `fdopendir`, permissions and sparse storage need additional modelling.
+
+An open file belongs to the process, as a descriptor does in a real one: a file opened in one sim
+and kept past its run (a log file behind a global `tracing` subscriber) is the same open file when
+another sim's thread, or a thread outside every sim, writes to it, and the bytes land in the file
+system that opened it. Paths stay per sim. Once that sim is gone, calls through the descriptor fail
+with `EBADF`, and its number stays reserved until the holder closes it, so it never reaches a file
+the OS opened in the meantime. With a `SimHost` as well, the host serves the paths it models
+(`/sys`, `/proc`, `/dev`) first, the `VirtualFs` the rest.
+
+Virtual files take advisory locks: `fcntl` record locks (`F_GETLK`, `F_SETLK`, `F_SETLKW` and the
+`F_OFD_*` forms on Linux and macOS) and `flock`. Every thread is in the one process, so process
+record locks never conflict with each other and go when any descriptor of the file closes, as
+POSIX has it; open-file-description and `flock` locks conflict between separate opens and go with
+the description's last descriptor. A blocked `F_SETLKW`, `F_OFD_SETLKW` or `flock` waits like any
+other blocked call in the sim, so it lets virtual time move and keeps a deterministic schedule.
+SQLite's default VFS locks a database on a `VirtualFs` as it would on disk.
 See [OPEN_BUGS.md](OPEN_BUGS.md) for the file-plane boundaries.
+
+### File timestamps
+
+File times follow the sim's `CLOCK_REALTIME`, so code that compares a file's age with
+`SystemTime::now()` (age-based log rotation, config reloads, pruning by creation time) sees a
+consistent world:
+
+- **`VirtualFs`**: every node keeps access, modification, change and birth times in nanoseconds.
+  Declared nodes start at the instant the sim is built (`FsBuilder::times` with `NodeTimes`
+  overrides any of them). Creation stamps all four and the parent's modification and change
+  times; `write`, `pwrite`, `ftruncate` and `O_TRUNC` stamp modification and change; `link`,
+  `unlink` and `rename` stamp the inode's change time and the parents'; reads and directory
+  listings stamp the access time under Linux's `relatime` rule (only when it is not after the
+  modification or change time, or is a day old). `utimensat`, `futimens`, `utimes`, `futimes` and
+  macOS `setattrlist`/`fsetattrlist` (std's `File::set_times`, including macOS `set_created`) set
+  what they name. `stat`, `fstat`, `fstatat` and macOS `st_birthtime`, and Linux `statx`
+  (`STATX_ATIME`/`MTIME`/`CTIME`/`BTIME`), report them. Where Linux and macOS differ, the model
+  takes the host's side: a read at end of file marks the access only on Linux; setting only the
+  access time marks the change time only on Linux; on macOS a modification time set before the
+  birth time moves the birth time back (`fs_times` compares each step with the host).
+- **Real files in a sim on a virtual clock**: what the sim creates or changes on the real file
+  system is recorded per (device, inode) at the sim's time, by the same rules (writes through
+  descriptors the sim opened for writing, `O_CREAT`/`O_TRUNC`, `mkdir`, `symlink`, `link`,
+  `unlink`, `rename`, the `utimensat` family), and `stat` reports it; the real file keeps real
+  times. A change the sim cannot see (another process's write, a write through a descriptor opened
+  before the sim) shows at the sim's time of the first `stat` that notices it. A real file the sim
+  never touched shows its host times shifted by one constant, the host clock minus the sim's when
+  the sim was built: it keeps its age relative to the sim's start and its order among real files,
+  instead of sitting years after a 2023 sim clock. A sim on the real clock (`wall_clock`) reports
+  host times unchanged. A real file a sim opened for writing goes back to the OS when the sim
+  drops, so a log file kept past the run stays writable.
+- **`SimHost` files** under `/proc`, `/sys` and `/dev` carry the sim's boot instant; like procfs
+  and sysfs, the `/proc` and `/sys` ones report no birth time.
+
+## Local time
+
+The C library resolves the local time zone inside itself, where no hook sees it: glibc reads `TZ`
+and opens the zone file through its own internal calls, and macOS's libc and CoreFoundation run
+from the shared cache. A sim that decides its zone — `TZ` set in an isolated environment
+(`HostProfile::env`, `isolate_env`), or an `/etc/localtime` its `VirtualFs` serves — has snare
+resolve it instead, following tzset(3), and read the files through the sim's file plane, so
+declined paths reach the real ones:
+
+- `TZ` unset: `/etc/localtime` (a symlink into the real `/usr/share/zoneinfo` is followed), or
+  UTC when there is none.
+- `TZ` empty: UTC.
+- `TZ` (after an optional `:`) names an absolute TZif file or one under `TZDIR`
+  (`/usr/share/zoneinfo` by default), or is a POSIX TZ string such as `EST5EDT,M3.2.0,M11.1.0`.
+
+```rust
+use snare::{FsBuilder, HostProfile, Sim};
+
+let host = HostProfile::new().env("TZ", "Asia/Tokyo").build();
+Sim::builder().host(host).build().run(|| {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&1_700_000_000, &mut tm) };
+    assert_eq!(tm.tm_gmtoff, 9 * 3600);
+});
+
+let fs = FsBuilder::new().symlink("/etc/localtime", "/usr/share/zoneinfo/Europe/Oslo");
+let host = HostProfile::new().isolate_env().build();
+Sim::builder().fs(fs.build()).host(host).build().run(|| {
+    // localtime_r reports CET; on macOS iana-time-zone reports "Europe/Oslo".
+});
+```
+
+`localtime_r`, `localtime`, `mktime`, `timelocal`, `ctime_r` and `ctime` use that zone, `tzset`
+makes every thread resolve it again, and on macOS `CFTimeZoneCopySystem` and
+`CFTimeZoneCopyDefault` return a CoreFoundation zone of the same name (or built from the sim's
+TZif bytes), so `time`'s `UtcOffset::current_local_offset`, `iana-time-zone` and anything else
+reading local time through them see the sim's zone; chrono and jiff read `TZ` and
+`/etc/localtime` themselves. Rule times, `mktime`'s handling of gaps and a `tm_isdst` the time
+does not have follow glibc on Linux and tzcode on macOS, checked against them by
+`local_time_os_truth`. A sim that decides no zone — no isolated environment and no
+`/etc/localtime` of its own, as a plain `Sim` — leaves local time to the C library and the
+machine's zone. See [OPEN_BUGS.md](OPEN_BUGS.md) for what stays process-wide.
 
 ## Determinism and quiescence
 
 Time is virtual, so a test that "waits a second" finishes instantly and every run sees the same
-timestamps; randomness is seeded (`SimBuilder::seed`), per thread, so `HashMap` order, random ids and
-link faults replay. When every thread is blocked with no timer left to fire, the run is deadlocked and
+sim times (and the same absolute timestamps under `deterministic()` or `fixed_epoch()`); randomness
+is seeded (`SimBuilder::seed`), per thread, so `HashMap` order, random ids and link faults replay. When every thread is blocked with no timer left to fire, the run is deadlocked and
 the blocked simulated wait gives up (`EAGAIN`) rather than hanging the test. A thread blocked on a
 word in static data (Linux futex, Windows `WaitOnAddress`; std's stdout and stderr locks, a
 `static` mutex) is the exception: a thread outside the sim, such as another test's, may hold it, so
@@ -237,8 +346,12 @@ time, and control passes only where a thread waits — a socket, sleep, mutex, c
 channel, park, join or yield — to the next thread in a fixed order. Those waits are emulated rather than
 handed to the kernel, so the waker always moves its waiters to the run queue itself and nothing is woken
 behind the scheduler's back; locks shared with threads outside the simulation (another test running in
-parallel) are waited out without letting their timing reorder this one. With the same seed, a run
-replays exactly. What it cannot see it cannot order: a thread spinning on an atomic without ever
+parallel) are waited out without letting their timing reorder this one, for up to 50 ms of real time
+each, after which the waiter passes the baton on and waits in the schedule for the holder's unlock (a
+pool's worker left over from an earlier sim may hold its queue's lock for as long as it waits for its
+next job). A wake made from outside the schedule (another sim's thread, a thread no sim manages) on
+a condition variable, futex, semaphore or address a participant waits on reaches it in the schedule,
+however busy the schedule keeps itself. With the same seed, a run replays exactly. What it cannot see it cannot order: a thread spinning on an atomic without ever
 yielding keeps the baton, and a call that blocks in the OS outside snare's hooks blocks every thread.
 A yield with no other thread able to run time-skips to the next pending timer, as a free-running
 yield does once every other thread is parked, so a yield loop waiting on a sleeper (crossbeam's
@@ -269,12 +382,20 @@ spin* and moves time for it:
   the clock reads of a tester's loop and handlers never add up to a spin. After 64 in a row the spin is caught: isolated reads, a few back-to-back reads, or reads with
   other hooked calls between them never get there and keep holding still. A loop polling a socket
   is not a clock spin: each non-blocking call is charged its microsecond instead.
-- Each read of a caught spin moves time one step: 1/64 of the virtual time since the spin was
-  caught, at least 1 µs. The steps grow geometrically, so an hour-long spin takes about 1,100 reads
-  and a spin overshoots its own deadline by at most 1/64 of its length (one more read before any
-  other hooked call moves it one more step). A step never jumps a pending timer: one that would
-  reach the earliest timer lands 1 ns short of it, so a spinner whose deadline comes first sees it
-  first, and the next lands just past it, as a time skip does, waking its waiter.
+- Work the sim cannot see — computing, uncontended locks and atomics, allocation — can read the
+  clock 64 times in a row too: an `Instant::now()` per item of a loop, a cache stamping each
+  insert, an allocator reading its decay clock every so often. That is caught as a spin as well,
+  so a spin's first steps cost what calls that do not block cost: each of its first 65,536 reads
+  moves time 1 µs (a loop of 10,000 timestamped items takes 10 ms of virtual time, and 20,000
+  allocations under jemalloc about 18 ms). A spin that yields between its reads is waiting
+  outright and skips this stretch.
+- After those, each read moves time 1/64 of the virtual time since the spin was caught, up to one
+  second. The steps grow geometrically, so a spin on a deadline a second or an hour away takes
+  about 66,000 or 70,000 reads (about 1,000 or 4,500 when it yields between them), a fraction of a second of real time, and a spin overshoots its own
+  deadline by at most 1/64 of its length or 1 µs (one more read before any other hooked call
+  moves it one more step). A step never jumps a pending timer: one that would reach the earliest
+  timer lands 1 ns short of it, so a spinner whose deadline comes first sees it first, and the
+  next lands just past it, as a time skip does, waking its waiter.
 - Time moves only while every other participant is parked or spinning itself, no woken waiter has
   yet to run and no lease is held, so other threads' work at the current instant comes first and
   timers fire in order. A free-running spin waits for a waiter its step reached to take its
@@ -392,6 +513,66 @@ The next `Sim::run` on the same sim takes its leftovers back: they are its parti
 time skips go back to virtual time at once (monotonic time never goes backwards across the switch).
 A test that wants none of this stops its threads before the run returns.
 
+**Process-wide pools.** A pool kept in a static — rayon's global registry, a `LazyLock` of a
+`futures` `ThreadPool`, a `threadpool`, a static tokio runtime's workers and blocking pool — starts
+its threads under whichever sim touches it first, and they park on condition variables, futexes and
+semaphores between jobs. A later sim that hands one of them work wakes it, and the work is that
+sim's: a participant of a dormant sim woken by a thread of a sim whose run is in progress follows
+the waker into its sim, as a thread it had spawned, before it runs another line. It runs on the
+later sim's clock, in its schedule, and counts toward its quiescence, so time does not skip while it
+computes for it. Its place there is made ready at the wake, before the OS wakes it, and counted
+live, so the later sim cannot read as quiescent in between; a wake the OS may give to any of several
+waiters (`notify_one` on a shared queue) makes as many places as it can wake, each for whichever
+dormant waiter returns first. A place nobody takes within 200 ms of real time — the OS woke a
+thread the census never saw — is given back. Under `deterministic()` the place joins the schedule
+where the wake was made, as a spawn does, so runs replay. To leave no worker still spinning
+between jobs (rayon's yield 32 times before they park), a run's end waits, a bounded real time,
+until its leftover participants have all come to rest in a wait. Threads of a sim whose run is in
+progress never move, nor do background, helper or driver threads; a pool two sims share while both
+are running still serves both from one world (see `OPEN_BUGS.md`).
+
+**A new sim continues the process's time.** Each plain sim's clocks start where the furthest
+clock of every sim built before it had got to (see [Controlling time](#controlling-time)), so a
+process static that remembers a timestamp from an earlier sim — a static tokio runtime's timer
+wheel, a global memo or DNS cache — still sees its deadlines ahead and its entries age. A
+`deterministic()` or `fixed_epoch()` sim starts at the fixed epoch instead, where such a static
+stays stale: a cache entry from a sim that ran further may never expire in it.
+
+**Process-wide reactors.** An epoll set, a kqueue, an eventfd or a timerfd belongs to the process,
+not to a network, and a library may create one once per process: async-io keeps its poller and
+the "async-io" thread that waits on it in statics, made under whichever sim touches it first.
+When a running sim reaches such a descriptor of a dormant (or dropped) sim, it takes over every
+one that sim holds, and the leftover threads blocked on them join it, as threads it had spawned:
+they run on its clock, in its schedule, and count toward its quiescence. A timerfd keeps the time
+it had left. One closed outside every sim is gone, and its number is the OS's to reuse for a real
+file. Network sockets never move: a world has no instance of another world's connection, so
+another sim's socket (or one gone with its sim) is a connection that is gone there, as a
+connection pool kept in a static (ureq's agent, reqwest's client) must find it: its first read or
+write reports `ECONNRESET`, later reads end of stream and later writes `EPIPE`, `poll`, epoll and
+kqueue show the hang-up and the error, and `getpeername` is `ENOTCONN`. A registration of such a
+socket in an epoll set or kqueue that moves to another sim stays, and reports the same. Closing it,
+from any sim or from a thread outside every sim, closes it in the sim that made it, whose peer
+sees the connection end, and gives its number back to the OS, so std's I/O-safety check never
+sees a close fail. A `socketpair` end has no network in it either, but it carries bytes, so
+instead of moving it is mirrored: each sim that reaches one another sim made (tokio keeps its
+signal self-pipe in a static and every runtime with I/O dups it) gets an instance of the pair of
+its own under the same numbers, both ends open, and bytes written in one world are never read in
+another. Its numbers are the ends of a real socketpair, the outside world's instance, so a thread
+outside every sim (a runtime built after the sims) uses a working pair. Every other descriptor of
+a sim's network (a socket, an epoll set, a kqueue, an eventfd, a timerfd) is a `dup` of a
+placeholder that fails loudly when a call no hook serves reaches it: the read end of a pipe whose
+writer has gone, so a write fails with `EBADF` and a read is at end of file. A
+wake of another running sim's reactor (an eventfd write, a kqueue `EVFILT_USER`
+trigger) is delivered to it as a wake from outside its world. Two sims running at the same time
+cannot otherwise share one such object: a sim that
+reaches a descriptor another running sim holds waits until that run ends, but one that only
+touches the library's memory (a timer queued while the reactor's notifier is already pending)
+gives snare nothing to wait at, so tests that share a process-wide reactor must take turns (a
+static `Mutex` held across the test, or `--test-threads=1`). `cargo snare test --parallel
+<smol|async-std|rayon|all>` patches in shims that give each sim its own reactor, executor and
+thread pool and lift this for async-io, smol, async-std and rayon's global pool (see
+[Shims](#shims-shims)).
+
 ## Controlling time
 
 The clock every `Sim` runs on can be driven from the test, through `Sim` methods or a `TimeHandle`
@@ -407,12 +588,28 @@ The clock every `Sim` runs on can be driven from the test, through `Sim` methods
 
 Monotonic time never goes backwards, whatever moves the clock: every monotonic source is
 non-decreasing on each thread and across threads that synchronize, every mode switch re-anchors at
-the last reading handed out, and a request to move the clock back is refused. Realtime starts at a
-fixed epoch and moves with sim time; `CLOCK_MONOTONIC` (and `Instant`, `mach_absolute_time`,
-`QueryPerformanceCounter`, `GetTickCount64`) starts at zero in every sim, so a replay reads the same
-absolute values. The guarantee is per sim: an `Instant` taken outside the sim, or in an earlier sim
-and kept in a static, is on a different timeline and may look ahead of one taken inside. A driver thread is the one
-exception by design: it reads real time, and an executive's timestamp time while it acts at one.
+the last reading handed out, and a request to move the clock back is refused. Realtime moves with
+monotonic time, a fixed boot time apart.
+
+**Where a sim's clock starts.** A plain sim's clock continues the process's time:
+`CLOCK_MONOTONIC` (and `CLOCK_BOOTTIME`, `Instant`, `mach_absolute_time`,
+`QueryPerformanceCounter`, `GetTickCount64`) starts at the highest reading any sim's clock in the
+process has handed out — every sim built before it, the ones still running included — plus at
+least a second, on a whole second (sim time only: no real time passes), and `CLOCK_REALTIME` (`SystemTime`, `FILETIME`, `CLOCK_TAI` with it) no earlier
+than the highest realtime reading. So a library that keeps a timestamp in a static — tokio's timer
+wheel in a static runtime, a memo or cache expiry, a time-zone cache, a UUIDv7 counter, a coarse
+clock's "recent" value — never sees time go backwards from one sim to the next. A sim already
+running when another starts keeps its own timeline: only its readings up to then count. A
+`deterministic()` sim, or one built with `SimBuilder::fixed_epoch()`, starts at the fixed epoch
+instead: monotonic zero and realtime 2023-11-14T22:13:20Z (Unix time 1 700 000 000 s, a snare
+choice), so a replay reads the same absolute values; a static timestamp from an earlier sim may
+then be ahead of its clocks. Sim time — `time_value`, `set_time_value`, recorded events, the socket
+table, an `Executive`'s times — counts from the clock's start either way, so it reads the same in
+any order. Realtime minus monotonic, the sim's boot time, never changes within a sim. A
+`SimHost`'s clock is placed once, by the first sim built on it, and later sims on the host
+continue it. An `Instant` taken outside every sim, or in a `wall_clock()` sim, is on the real
+timeline and may look ahead of one taken inside. A driver thread is the one exception by design:
+it reads real time, and an executive's timestamp time while it acts at one.
 
 A paused clock is moved by something outside the simulation — the test thread before or after `run`,
 or a thread it starts under `snare::real` — so a sim where every thread waits on a paused clock is
@@ -1385,6 +1582,13 @@ SOCK_STREAM | SOCK_DGRAM)`, served by the fabric like any socket (`poll`, `epoll
 `deterministic()`, once every root thread of a run has left and nothing can run, the schedule lets
 leftover daemon threads (the `ctrlc` thread) go; they wait outside it until the sim runs again.
 
+A library that installs its dispatcher once per process and remembers that in a static
+(signal-hook-registry, and so `tokio::signal`, `signal-hook`, `async-signal`) calls `sigaction`
+only in the first sim whose code registers with it. `SimBuilder::process_signal_handlers()` lets a
+signal the sim's own code never set an action for reach the handler the code under test last
+installed in any sim of the process, so such a library works in every sim; tokio delivers a signal
+to the listeners of every runtime, as one process would.
+
 `SimBuilder::forward_real_signals()` opts a sim in to the real `SIGINT`/`SIGTERM`/`SIGHUP` (a console
 control handler on Windows): while any sim forwards, a process-wide forwarder delivers each real
 signal into every forwarding sim, and one that no sim handled or ignored is raised for real against
@@ -1458,17 +1662,46 @@ The cfgs go in through `RUSTFLAGS` (appended to any already set), and cargo then
 `build.rustflags` and `target.*.rustflags` from `.cargo/config.toml`. A crate that relies on cfgs
 from its own config file must put them in `RUSTFLAGS` as well; a `CARGO_ENCODED_RUSTFLAGS` in the
 environment overrides both and drops the snare cfgs. `cargo snare test --dry-run` prints the
+shims patched, the crates given per-sim state by `--parallel` (see [Shims](#shims-shims)), and the
 assembled command.
 
 ## Shims (`shims/`)
 
 Some crates bypass libc in ways an import-table hook cannot see — raw `io_uring` rings in mmap'd memory,
-`AF_XDP` UMEM. For those, snare provides drop-in replacement crates injected via `[patch.crates-io]`:
+`AF_XDP` UMEM, CPU counter reads — or seed from process-wide state a sim cannot replay. For those,
+snare provides drop-in replacement crates injected via `[patch.crates-io]`. `cargo snare test`
+patches these whenever their crate is in the dependency graph:
 
 - **`io-uring`** — emulates the ring in-process, executing each SQE through libc `read`/`write` so the
   interposer sees ordinary I/O.
 - **`xsk-rs`** (AF_XDP) — routes frame TX/RX through libc `send`/`recv`.
 - **`sc`, `syscalls`** — route raw syscalls through libc so the `syscall` hook catches them.
+- **`quanta`** (0.12 and 0.13), **`minstant`**, **`fastant`** — never read the TSC or the aarch64
+  system counter, so their clocks are the sim's; quanta also skips its ~200 ms calibration spin.
+- **`fastrand`** — seeds each thread's generator inside a sim from the sim instead of the
+  process-wide thread id, so deterministic sims replay whatever ran before them.
+- **`rayon-core`** — seeds each worker's steal order by its index in its pool, so pools built in a
+  deterministic sim replay.
+
+Others only let concurrent sims each keep their own copy of a runtime's process-wide state; sims
+work without them by taking turns, so they are opt-in with `--parallel` (or `parallel = [...]`
+under `[package.metadata.snare]` / `[workspace.metadata.snare]`):
+
+- **`async-io`** — one reactor and "async-io" thread per sim instead of per process, shut down
+  when the sim drops.
+- **`async-global-executor`, `blocking`** — async-std's global executor and the `unblock` thread pool,
+  one per sim, so async-std tasks and blocking jobs of one sim never run on another's threads.
+- **`smol`** — `smol::spawn`'s global executor and "smol-N" threads, one set per sim.
+- **`rayon-core`** with `--cfg snare_parallel_rayon` — rayon's global pool, one per sim.
+
+```console
+$ cargo snare test --parallel smol        # async-io + blocking + smol
+$ cargo snare test --parallel async-std   # async-io + async-global-executor + blocking
+$ cargo snare test --parallel rayon       # adds --cfg snare_parallel_rayon
+$ cargo snare test --parallel all --dry-run
+```
+
+`shims/README.md` lists each shim's change and how to patch them by hand.
 
 The shims honor `snare::real`: each resource is tagged with the passthrough mode it was created in, and
 using it in the other mode panics rather than silently mixing an emulated ring with real-OS I/O.
@@ -1477,7 +1710,7 @@ using it in the other mode panics rather than silently mixing an emulated ring w
 
 | | Linux (x86_64, aarch64) | macOS (aarch64, x86_64) | Windows (x86_64, aarch64) |
 |---|---|---|---|
-| Interposition | ELF GOT | Mach-O `__got` (+ variadic trampoline on arm64) | PE IAT |
+| Interposition | ELF GOT + data relocations | Mach-O `__got` + data binds (+ variadic trampoline on arm64) | PE IAT |
 | Time / entropy / sleep | ✅ | ✅ | ✅ |
 | TCP | ✅ | ✅ | ✅ (Winsock) |
 | UDP | ✅ | ✅ | ✅ (Winsock) |
@@ -1509,7 +1742,9 @@ crates/snare-interpose/   the engine: patchers, hooks, Domain, backend traits, r
 crates/snare/             Sim, SimHost, HostProfile, EasyBuilder, Fabric, VirtualFs, testers
 crates/cargo-snare/       the `cargo snare` subcommand
 probes/interpose-probe/   test-fixture DLL for the Windows module-loading test (unpublished)
-shims/                    io-uring, xsk-rs, sc, syscalls drop-ins ([patch.crates-io])
+shims/                    drop-in [patch.crates-io] crates: io-uring, xsk-rs, sc, syscalls, quanta, minstant,
+                          fastant, fastrand, rayon-core; with --parallel: async-io, async-global-executor,
+                          blocking, smol
 scripts/                  Windows VM and hardware test runners, socket-buffer and runtime measurements
 ```
 

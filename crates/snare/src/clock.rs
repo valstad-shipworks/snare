@@ -16,7 +16,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 use std::task::Waker;
 use std::time::Duration;
 
@@ -40,6 +40,39 @@ const HELD_POLL: Duration = Duration::from_millis(200);
 /// sim wait settles for after a time skip on another thread's behalf: long enough for the woken
 /// thread to run, and a bound on how long a wait that never takes its deadline can hold a spin.
 const SPIN_SETTLE: Duration = Duration::from_millis(5);
+
+/// `CLOCK_REALTIME` at monotonic zero on a clock that keeps the fixed epoch: Unix time
+/// 1_700_000_000 s = 2023-11-14T22:13:20Z (`date -u -r 1700000000`), a round recent instant so
+/// timestamps look plausible; a snare choice.
+const FIXED_EPOCH_NANOS: u64 = 1_700_000_000 * 1_000_000_000;
+
+/// What a continuing clock's start is rounded to, and the least it starts past the process's
+/// highest reading: a whole second, which every timer unit a hooked clock API converts to (Mach
+/// ticks, `QueryPerformanceCounter` ticks at any whole-hertz frequency, 100 ns intervals) divides,
+/// so sim time converts the same in every sim. The gap outlasts caches that trust a timestamp for
+/// under a second of `SystemTime` (chrono's thread-local `Local` zone); it costs no real time.
+const START_GRAIN: u64 = 1_000_000_000;
+
+/// Every begun clock of the process, and the highest readings of those already dropped: where a
+/// continuing clock starts (see [`Clock::begin`]).
+struct Timelines {
+    live: Vec<Weak<Clock>>,
+    /// The highest monotonic reading a dropped clock reached.
+    past_monotonic: u64,
+    /// The highest `CLOCK_REALTIME` reading a dropped clock reached.
+    past_realtime: u64,
+}
+
+static TIMELINES: Mutex<Timelines> = Mutex::new(Timelines {
+    live: Vec::new(),
+    past_monotonic: 0,
+    past_realtime: 0,
+});
+
+/// Locks [`TIMELINES`], ignoring poison: every update leaves it consistent.
+fn lock_timelines() -> MutexGuard<'static, Timelines> {
+    TIMELINES.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Virtual time as a line through real time: `v(real) = min(horizon, anchor_v + (real -
 /// anchor_real) * rate)`, the rate in 32.32 fixed point so a large rate never saturates a float
@@ -336,8 +369,14 @@ fn real_nanos() -> u64 {
 pub(crate) struct Clock {
     /// The reading in a base mode, and the line's anchor while scaled.
     monotonic_nanos: AtomicU64,
-    /// `CLOCK_REALTIME` at monotonic zero, in nanoseconds since the Unix epoch.
-    base_realtime_nanos: u64,
+    /// `CLOCK_REALTIME` at monotonic zero, in nanoseconds since the Unix epoch: the sim's boot
+    /// time. Set once, by [`begin`](Clock::begin).
+    base_realtime_nanos: AtomicU64,
+    /// The monotonic reading sim time counts from: zero on the fixed epoch, else where
+    /// [`begin`](Clock::begin) started the clock.
+    origin: AtomicU64,
+    /// [`begin`](Clock::begin) has placed the clock and listed it in [`TIMELINES`].
+    begun: AtomicBool,
     /// `CLOCK_TAI` minus `CLOCK_REALTIME`, from the sim's builder.
     tai_offset_nanos: u64,
     /// Discrete-event base mode: a sleep registers its wake deadline and blocks; virtual time jumps
@@ -413,8 +452,19 @@ pub(crate) struct Clock {
 }
 
 impl Drop for Clock {
-    /// Stops the thread the clock's wakers ran on, if one was started.
+    /// Folds the readings the clock reached into [`TIMELINES`] and stops the thread the clock's
+    /// wakers ran on, if one was started.
     fn drop(&mut self) {
+        if self.begun.load(Ordering::Acquire) {
+            let (monotonic, realtime) = self.high_water();
+            let this: *const Clock = self;
+            snare_interpose::real(|| {
+                let mut timelines = lock_timelines();
+                timelines.past_monotonic = timelines.past_monotonic.max(monotonic);
+                timelines.past_realtime = timelines.past_realtime.max(realtime);
+                timelines.live.retain(|clock| clock.as_ptr() != this);
+            });
+        }
         if let Some(runner) = self.runner.get() {
             snare_interpose::real(|| runner.close());
         }
@@ -432,14 +482,15 @@ fn driver_caller() -> bool {
 }
 
 impl Clock {
-    /// A discrete-event clock, the default base mode, at monotonic zero, with `CLOCK_TAI` leading
-    /// `CLOCK_REALTIME` by `tai_offset_secs`.
+    /// A discrete-event clock, the default base mode, at monotonic zero on the fixed epoch, with
+    /// `CLOCK_TAI` leading `CLOCK_REALTIME` by `tai_offset_secs`. A sim's clock is then placed on
+    /// the process's timeline by [`begin`](Self::begin).
     pub(crate) fn new(tai_offset_secs: u64) -> Self {
         Clock {
             monotonic_nanos: AtomicU64::new(0),
-            // A fixed epoch, Unix time 1_700_000_000 s = 2023-11-14T22:13:20Z (`date -u -r
-            // 1700000000`), keeps `Realtime` deterministic and plausible; a snare choice.
-            base_realtime_nanos: 1_700_000_000u64 * 1_000_000_000,
+            base_realtime_nanos: AtomicU64::new(FIXED_EPOCH_NANOS),
+            origin: AtomicU64::new(0),
+            begun: AtomicBool::new(false),
             tai_offset_nanos: tai_offset_secs * 1_000_000_000,
             discrete: AtomicBool::new(true),
             paused: AtomicBool::new(false),
@@ -512,15 +563,107 @@ impl Clock {
         })
     }
 
-    /// `CLOCK_REALTIME` at monotonic zero.
+    /// Places the clock on the process's timeline, once, before the first sim built on it runs;
+    /// later calls do nothing. On the `fixed` epoch it stays at monotonic zero and realtime
+    /// 2023-11-14T22:13:20Z, so absolute readings replay. Otherwise it continues: monotonic time
+    /// starts at least [`START_GRAIN`] past the highest reading any clock of the process has handed
+    /// out, on a whole [`START_GRAIN`], and realtime no earlier than the highest realtime reading, so a value a
+    /// library kept in a static from an earlier sim, or from one still running, is never ahead of
+    /// this sim's clocks. Realtime minus monotonic, the boot time, is fixed from here on.
+    pub(crate) fn begin(self: &Arc<Self>, fixed: bool) {
+        snare_interpose::real(|| {
+            let mut timelines = lock_timelines();
+            if self.begun.load(Ordering::Acquire) {
+                return;
+            }
+            // A clock whose last `Arc` is gone but whose drop has not yet folded its readings in
+            // is unreadable; its drop is under way and takes the lock next.
+            while timelines.live.iter().any(|clock| clock.strong_count() == 0) {
+                drop(timelines);
+                std::thread::yield_now();
+                timelines = lock_timelines();
+            }
+            // Dropped only once the lock is let go: the last `Arc` of a clock may be among them,
+            // and its drop takes the lock.
+            let live: Vec<Arc<Clock>> = timelines.live.iter().filter_map(Weak::upgrade).collect();
+            if !fixed {
+                let (mut monotonic, mut realtime) =
+                    (timelines.past_monotonic, timelines.past_realtime);
+                for (m, r) in live.iter().map(|clock| clock.high_water()) {
+                    monotonic = monotonic.max(m);
+                    realtime = realtime.max(r);
+                }
+                self.start_at(monotonic, realtime);
+            }
+            self.begun.store(true, Ordering::Release);
+            timelines.live.push(Arc::downgrade(self));
+            drop(timelines);
+            drop(live);
+        });
+    }
+
+    /// Moves a fresh clock's start to the first [`START_GRAIN`] a whole grain past `monotonic`
+    /// (zero for the first clock of the process), with
+    /// `CLOCK_REALTIME` there no earlier than `realtime` and sim time counted from there.
+    fn start_at(&self, monotonic: u64, realtime: u64) {
+        let base = realtime.saturating_sub(monotonic).max(FIXED_EPOCH_NANOS);
+        let start = if monotonic == 0 && realtime == 0 {
+            0
+        } else {
+            monotonic
+                .saturating_add(START_GRAIN)
+                .div_ceil(START_GRAIN)
+                .saturating_mul(START_GRAIN)
+        };
+        self.controlled(|| {
+            self.base_realtime_nanos.store(base, Ordering::Release);
+            self.origin.store(start, Ordering::Release);
+            self.publish_line(
+                start,
+                self.anchor_real.load(Ordering::Relaxed),
+                self.rate_q32.load(Ordering::Relaxed),
+                self.horizon.load(Ordering::Relaxed),
+            );
+            self.floor.fetch_max(start, Ordering::AcqRel);
+        });
+    }
+
+    /// The highest monotonic and realtime readings handed out so far, an open executive
+    /// timestamp's included.
+    fn high_water(&self) -> (u64, u64) {
+        let monotonic = self.peek().max(self.stamp.load(Ordering::Acquire));
+        (monotonic, self.realtime_at(monotonic))
+    }
+
+    /// `CLOCK_REALTIME` at monotonic zero: the sim's boot time.
+    #[cfg(unix)]
     pub(crate) fn base_realtime(&self) -> Duration {
-        Duration::from_nanos(self.base_realtime_nanos)
+        Duration::from_nanos(self.base_realtime_nanos.load(Ordering::Acquire))
+    }
+
+    /// `CLOCK_REALTIME` at sim time zero, where the sim's timeline (see `scope::timeline`) starts.
+    pub(crate) fn timeline_realtime(&self) -> Duration {
+        Duration::from_nanos(self.realtime_at(self.origin()))
+    }
+
+    /// The monotonic reading sim time counts from.
+    pub(crate) fn origin(&self) -> u64 {
+        self.origin.load(Ordering::Acquire)
+    }
+
+    /// `CLOCK_REALTIME` now, without ticking an as-fast-as-possible clock: the instant a file
+    /// operation stamps on what it touches.
+    #[cfg(unix)]
+    pub(crate) fn realtime_peek(&self) -> Duration {
+        Duration::from_nanos(self.realtime_at(self.peek()))
     }
 
     /// `CLOCK_REALTIME` nanoseconds at monotonic reading `monotonic`: the two never drift apart,
     /// since nothing in a sim steps or slews its realtime clock.
     fn realtime_at(&self, monotonic: u64) -> u64 {
-        self.base_realtime_nanos + monotonic
+        self.base_realtime_nanos
+            .load(Ordering::Acquire)
+            .saturating_add(monotonic)
     }
 
     /// Picks the base mode, discrete-event or as-fast-as-possible; set once, before the sim's
@@ -796,8 +939,8 @@ impl Clock {
             SleepRequest::Until(ClockKind::Monotonic, t) => nanos(t),
             SleepRequest::Until(kind, t) => {
                 let epoch = match kind {
-                    ClockKind::Tai => self.base_realtime_nanos + self.tai_offset_nanos,
-                    _ => self.base_realtime_nanos,
+                    ClockKind::Tai => self.realtime_at(self.tai_offset_nanos),
+                    _ => self.realtime_at(0),
                 };
                 nanos(t).saturating_sub(epoch)
             }
@@ -921,7 +1064,7 @@ impl Clock {
     #[cfg(unix)]
     pub(crate) fn reach_realtime(&self, realtime: Duration) {
         if self.jumps() {
-            let at = nanos(realtime).saturating_sub(self.base_realtime_nanos);
+            let at = nanos(realtime).saturating_sub(self.realtime_at(0));
             self.jump_to(at);
         }
     }
@@ -1379,14 +1522,15 @@ impl Clock {
     /// Sets sim time to `value`. Forward only: `Err` with the current sim time if `value` lies
     /// before it.
     pub(crate) fn set_value(&self, value: Duration) -> Result<(), Duration> {
-        let value = nanos(value);
+        let origin = self.origin();
+        let value = origin.saturating_add(nanos(value));
         self.controlled(|| {
             let now = self.peek();
             if self.is_driven() {
                 return Ok(());
             }
             if value < now {
-                return Err(Duration::from_nanos(now));
+                return Err(self.sim_time(now));
             }
             if value > now {
                 let paused = self.is_paused();
@@ -1398,11 +1542,22 @@ impl Clock {
         })
     }
 
-    /// Sim time: the monotonic reading, without ticking, at an open timestamp's
-    /// time while one is open, as the code under test reads it.
+    /// Sim time: how far the monotonic reading, without ticking, is past the
+    /// [`origin`](Self::origin), at an open timestamp's time while one is open, as the code under
+    /// test reads it.
     pub(crate) fn value(&self) -> Duration {
         let stamp = self.stamp.load(Ordering::Acquire);
-        Duration::from_nanos(self.peek().max(stamp))
+        self.sim_time(self.peek().max(stamp))
+    }
+
+    /// Monotonic reading `monotonic` as sim time.
+    pub(crate) fn sim_time(&self, monotonic: u64) -> Duration {
+        Duration::from_nanos(monotonic.saturating_sub(self.origin()))
+    }
+
+    /// Sim time `t` as a monotonic reading.
+    pub(crate) fn at_sim_time(&self, t: Duration) -> u64 {
+        self.origin().saturating_add(nanos(t))
     }
 
     /// The driver time for monotonic reading `t` under the current executive.
@@ -1559,7 +1714,7 @@ impl Clock {
 
     /// The calling thread's driver time as sim time, while it has one.
     pub(crate) fn driver_value(&self) -> Option<Duration> {
-        self.driver_time().map(Duration::from_nanos)
+        self.driver_time().map(|t| self.sim_time(t))
     }
 
     /// The first `n` pending timers: the participants' in time order, then the other threads' in

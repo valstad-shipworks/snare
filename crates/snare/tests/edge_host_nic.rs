@@ -448,9 +448,21 @@ fn ptp_golden() -> String {
         .ptp_clock(1)
         .build();
     let mut text = String::from("# unprivileged\n");
-    text.push_str(&Sim::builder().host(ptp_host()).build().run(ptp_transcript));
+    text.push_str(
+        &Sim::builder()
+            .host(ptp_host())
+            .fixed_epoch()
+            .build()
+            .run(ptp_transcript),
+    );
     text.push_str("# root\n");
-    text.push_str(&Sim::builder().host(root).build().run(ptp_transcript));
+    text.push_str(
+        &Sim::builder()
+            .host(root)
+            .fixed_epoch()
+            .build()
+            .run(ptp_transcript),
+    );
     text
 }
 

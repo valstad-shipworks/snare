@@ -73,6 +73,8 @@ mod executive;
 mod fabric;
 mod faults;
 #[cfg(unix)]
+mod fs_locks;
+#[cfg(unix)]
 mod fs_sim;
 #[cfg(unix)]
 mod ifaddrs;
@@ -141,7 +143,7 @@ pub use faults::{
     set_listener_behavior,
 };
 #[cfg(unix)]
-pub use fs_sim::{FsBuilder, VirtualFs};
+pub use fs_sim::{FsBuilder, NodeTimes, VirtualFs};
 pub use limits::{
     Privileges, Rlimit, SysLimits, privileges, set_privileges, set_sys_limits, sys_limits,
 };
@@ -178,21 +180,30 @@ pub use win_adapter::{Adapter, AdapterKey, AdvancedProperty, RegValue};
 pub use win_host::{MmcssTask, PowerThrottling, Sim, SimBuilder, WinHost, WorkingSet};
 
 /// The file plane `fs` with, on Linux, the sim's `/proc/net/snmp` and `/proc/net/snmp6` in front
-/// of it ([`procnet`]).
+/// of it ([`procnet`]), and, on a virtual clock, the real files' timestamps behind it
+/// ([`HostTimes`](fs_sim::HostTimes)).
 #[cfg(unix)]
 fn with_proc_net(
     shared: &Arc<SimShared>,
     fs: Arc<dyn snare_interpose::Fs>,
 ) -> Arc<dyn snare_interpose::Fs> {
+    let mut planes = Vec::new();
     #[cfg(target_os = "linux")]
-    return Arc::new(procnet::FsChain(vec![
-        Arc::new(procnet::ProcNetFs::new(shared)),
-        fs,
-    ]));
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = shared;
-        fs
+    planes.push(Arc::new(procnet::ProcNetFs::new(shared)) as Arc<dyn snare_interpose::Fs>);
+    planes.push(fs);
+    if let Some(clock) = &shared.clock {
+        planes.push(Arc::new(fs_sim::HostTimes::new(clock.clone())));
+    }
+    Arc::new(fs_sim::FsChain(planes))
+}
+
+/// The file plane of a sim with a `SimHost`: the host's synthetic `/sys`, `/proc` and `/dev`
+/// first, then `fs` for every path the host declines.
+#[cfg(unix)]
+fn host_files(host: &Arc<SimHost>, fs: Option<&Arc<VirtualFs>>) -> Arc<dyn snare_interpose::Fs> {
+    match fs {
+        Some(fs) => Arc::new(fs_sim::FsChain(vec![host.clone(), fs.clone()])),
+        None => host.clone(),
     }
 }
 
@@ -255,11 +266,16 @@ impl std::fmt::Debug for Sim {
     }
 }
 
-/// Writes out the frames still due and closes the capture file: threads that outlive the sim
-/// may still hold its registries.
+/// Drops the sim's [`snare_interpose::sim_local`] values inside a last run, so a shim's per-sim
+/// reactor shuts down in the sim that made it. Then writes out the frames still due and closes
+/// the capture file: threads that outlive the sim may still hold its registries.
 #[cfg(unix)]
 impl Drop for Sim {
     fn drop(&mut self) {
+        let locals = self.domain.take_locals();
+        if !locals.is_empty() {
+            self.run(move || drop(locals));
+        }
         if let Some(capture) = self.shared.capture() {
             capture.finish();
         }
@@ -339,12 +355,14 @@ impl Sim {
         self.time().set_value(value);
     }
 
-    /// Sim time, without ticking the clock: how far the sim's clock has moved since it was built,
-    /// which is also how far `CLOCK_REALTIME` is past its fixed epoch (2023-11-14T22:13:20Z, Unix
-    /// time 1 700 000 000 s: a snare choice, a round recent instant so timestamps look plausible).
-    /// `CLOCK_MONOTONIC` reads the same value, so every sim's monotonic clock starts at zero and a
-    /// replay reads identical absolute instants. An `Instant` from outside the sim, or from an
-    /// earlier sim, belongs to another timeline and may look ahead of one taken in it.
+    /// Sim time, without ticking the clock: how far the sim's clock has moved since it was built.
+    /// `CLOCK_MONOTONIC` reads its start plus this, and `CLOCK_REALTIME` its boot time plus that:
+    /// on the [`fixed_epoch`](SimBuilder::fixed_epoch) (a [`deterministic`](SimBuilder::deterministic)
+    /// sim's) the start is zero and the boot time 2023-11-14T22:13:20Z (Unix time
+    /// 1 700 000 000 s: a snare choice, a round recent instant so timestamps look plausible), so a
+    /// replay reads identical absolute instants; otherwise the clock starts where the process's
+    /// earlier sims left off, so time never goes backwards from one sim to the next. An `Instant`
+    /// from outside the sim belongs to another timeline and may look ahead of one taken in it.
     #[track_caller]
     pub fn time_value(&self) -> Duration {
         self.time().value()
@@ -739,6 +757,8 @@ pub struct SimBuilder {
     /// `deterministic`.
     wall_clock: bool,
     time_rate: Option<f64>,
+    /// See [`fixed_epoch`](Self::fixed_epoch).
+    fixed_epoch: bool,
     seed: u64,
     deterministic: bool,
     /// The inverse of [`record_events`](Self::record_events), so `Default` records.
@@ -749,6 +769,8 @@ pub struct SimBuilder {
     /// Names, real-resolver snapshots and the real-DNS fallback, applied at `build`.
     dns: dns::DnsSetup,
     forward_signals: bool,
+    /// See [`process_signal_handlers`](Self::process_signal_handlers).
+    process_signal_handlers: bool,
     /// `None` keeps the default (or the host profile's), `Some` overrides it at `build`.
     privileges: Option<Privileges>,
     sys_limits: Option<SysLimits>,
@@ -819,13 +841,30 @@ impl SimBuilder {
         self
     }
 
+    /// Starts the virtual clock at the fixed epoch, as a [`deterministic`](Self::deterministic)
+    /// sim's does: `CLOCK_MONOTONIC` (and `Instant`, `mach_absolute_time`) at zero and
+    /// `CLOCK_REALTIME` at 2023-11-14T22:13:20Z, so a test that checks absolute readings sees the
+    /// same values whatever ran before it in the process. By default a sim's clock instead
+    /// continues the process's time: it starts where the furthest clock of every sim built before
+    /// it (still running or not) had got to, rounded up to a whole second, so a library that keeps
+    /// a timestamp in a static (a runtime's timer wheel, a cache's expiry, a rate limiter) never
+    /// sees time go backwards from one sim to the next. Sim time
+    /// ([`Sim::time_value`], recorded events, the [`Executive`](crate::sched::Executive)) counts
+    /// from the clock's start either way. With a [`SimHost`], the host's clock is placed once, by
+    /// the first sim built on it.
+    pub fn fixed_epoch(mut self) -> Self {
+        self.fixed_epoch = true;
+        self
+    }
+
     /// Runs the sim's threads deterministically: one at a time, switching only where a thread
     /// waits — a socket, sleep, mutex, condition variable, channel, park, join or yield — and
     /// always to the next runnable thread in a fixed order, so with the same [`seed`](Self::seed)
     /// a run replays exactly, interleavings included. It covers every participant of the run: the
     /// code under test, its testers and the test body, but not threads marked with
     /// [`sched::mark_background`] and the like, which run beside it. Implies the virtual clock,
-    /// which may be paused, advanced and set but not scaled to real time.
+    /// which may be paused, advanced and set but not scaled to real time, and starts it at the
+    /// [`fixed_epoch`](Self::fixed_epoch) so absolute readings replay too.
     ///
     /// What it cannot see it cannot order: a thread spinning on an atomic without ever yielding
     /// keeps running, and a call that blocks in the OS outside snare's hooks blocks everyone.
@@ -864,9 +903,9 @@ impl SimBuilder {
     }
 
     /// Serves scheduling, CPU-topology, NIC and socket-tuning calls from a [`SimHost`]. The host
-    /// also serves its own synthetic `/sys`, `/proc` and `/dev` reads, so it occupies the file
-    /// plane and takes precedence over any [`fs`](Self::fs) set alongside it; every path it does
-    /// not model is declined and reaches the real OS.
+    /// also serves its own synthetic `/sys`, `/proc` and `/dev` reads, ahead of any
+    /// [`fs`](Self::fs) set alongside it: a path the host does not model goes on to that
+    /// [`VirtualFs`], and one neither serves reaches the real OS.
     pub fn host(mut self, host: Arc<SimHost>) -> Self {
         self.host = Some(host);
         self
@@ -912,6 +951,18 @@ impl SimBuilder {
     /// real against the process's own disposition. The last sim to drop puts them back.
     pub fn forward_real_signals(mut self) -> Self {
         self.forward_signals = true;
+        self
+    }
+
+    /// Lets a signal this sim's code never set an action for (`sigaction`, `signal`) reach the
+    /// handler the code under test last installed for it in any sim of the process. A library
+    /// that installs its dispatcher once per process and remembers that in a static
+    /// (signal-hook-registry, and so `tokio::signal`, `signal-hook` and `async-signal`) never
+    /// calls `sigaction` again in a later sim, or in one running alongside the sim whose code
+    /// first registered, so without this only that sim's signals reach it. The dispatcher runs
+    /// whatever every sim registered with it, as one process's would.
+    pub fn process_signal_handlers(mut self) -> Self {
+        self.process_signal_handlers = true;
         self
     }
 
@@ -1020,12 +1071,16 @@ impl SimBuilder {
         };
         if let Some(clock) = &clock {
             clock.set_deterministic(self.deterministic);
+            clock.begin(self.deterministic || self.fixed_epoch);
             if let Some(rate) = self.time_rate {
                 clock.check_rate(rate);
                 clock.set_rate(rate);
             }
         }
         let shared = SimShared::new(self.seed, clock.clone());
+        if let Some(fs) = &self.fs {
+            fs.attach_clock(clock.clone());
+        }
         #[cfg(target_os = "linux")]
         shared
             .rx_timestamp_startup
@@ -1034,6 +1089,9 @@ impl SimBuilder {
         shared
             .strict_sockopts
             .store(self.strict_sockopts, std::sync::atomic::Ordering::Relaxed);
+        shared
+            .signals
+            .reach_process_handlers(self.process_signal_handlers);
         crate::pcapng::attach(&shared, self.pcapng, self.pcapng_wall_comment);
         let (host_nics, host_routes) = match &self.host {
             Some(host) => host.topology_facts(),
@@ -1072,16 +1130,17 @@ impl SimBuilder {
         if let Some(host) = &self.host {
             // The host owns the NIC/scheduling/synthetic-fs planes: its `Net` handles the
             // ethtool and timestamping ioctls, netlink and UDP; its `Fs` the synthetic
-            // `/sys`·`/proc`; its `Host` the scheduling calls; and its clock layer makes
-            // `clock_gettime` (incl. `CLOCK_TAI`) deterministic. The fabric sits behind it on the
-            // net plane so the socket families the host declines — TCP streams, raw L2 — are still
-            // simulated, and the interface queries it declines are answered from the topology: a
-            // test gets host-modelled UDP and fabric-modelled TCP at once.
+            // `/sys`·`/proc`, in front of a `VirtualFs` if one is set; its `Host` the scheduling
+            // calls; and its clock layer makes `clock_gettime` (incl. `CLOCK_TAI`) deterministic.
+            // The fabric sits behind it on the net plane so the socket families the host declines
+            // — TCP streams, raw L2 — are still simulated, and the interface queries it declines
+            // are answered from the topology: a test gets host-modelled UDP and fabric-modelled
+            // TCP at once.
             builder = builder
                 .layers([host.clock_layer()])
                 .net(host.clone())
                 .net(fabric.clone())
-                .fs(with_proc_net(&shared, host.clone()))
+                .fs(with_proc_net(&shared, host_files(host, self.fs.as_ref())))
                 .host(host.clone());
             // Only isolate the environment when the test asked to (see `HostProfile::env`), so
             // hosts that do not configure env keep reading the real one.

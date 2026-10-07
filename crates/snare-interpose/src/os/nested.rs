@@ -25,8 +25,37 @@
 use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
+/// How many hooked waits one thread can have in progress at once and still tell a nested one: one
+/// for each wait the sim's own code runs inside another. A snare choice, well past the two or
+/// three a dispatch inside a parked wait reaches; a wait beyond it goes untracked.
+const MAX_WAITS: usize = 8;
+
+/// The hooked waits in progress on a thread, outermost first: each object waited on, and whether
+/// a wait nested in it spoiled it. Fixed-size, so the futex and semaphore hooks that keep it never
+/// allocate, nor register a destructor on a thread's first wait, either of which could reenter an
+/// allocator that waits on a lock of its own.
+struct Waits {
+    waits: [(usize, bool); MAX_WAITS],
+    len: usize,
+}
+
+impl Waits {
+    fn active(&self) -> &[(usize, bool)] {
+        &self.waits[..self.len]
+    }
+
+    fn active_mut(&mut self) -> &mut [(usize, bool)] {
+        &mut self.waits[..self.len]
+    }
+}
+
 thread_local! {
-    static WAITS: RefCell<Vec<(usize, bool)>> = const { RefCell::new(Vec::new()) };
+    static WAITS: RefCell<Waits> = const {
+        RefCell::new(Waits {
+            waits: [(0, false); MAX_WAITS],
+            len: 0,
+        })
+    };
     static STARTING: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -66,11 +95,15 @@ pub(crate) fn begin(addr: usize) -> Option<Outer> {
     let nested = WAITS
         .try_with(|waits| {
             let mut waits = waits.borrow_mut();
-            if let Some(wait) = waits.iter_mut().find(|wait| wait.0 == addr) {
+            if let Some(wait) = waits.active_mut().iter_mut().find(|wait| wait.0 == addr) {
                 wait.1 = true;
                 true
             } else {
-                waits.push((addr, false));
+                if waits.len < MAX_WAITS {
+                    let len = waits.len;
+                    waits.waits[len] = (addr, false);
+                    waits.len += 1;
+                }
                 false
             }
         })
@@ -86,14 +119,20 @@ pub(crate) fn begin(addr: usize) -> Option<Outer> {
 #[cfg(target_os = "linux")]
 pub(crate) fn waiting(addr: usize) -> bool {
     WAITS
-        .try_with(|waits| waits.borrow().iter().any(|wait| wait.0 == addr))
+        .try_with(|waits| waits.borrow().active().iter().any(|wait| wait.0 == addr))
         .unwrap_or(false)
 }
 
 /// Whether a nested wait spoiled the calling thread's wait on `addr`.
 pub(crate) fn spoiled(addr: usize) -> bool {
     WAITS
-        .try_with(|waits| waits.borrow().iter().any(|wait| wait.0 == addr && wait.1))
+        .try_with(|waits| {
+            waits
+                .borrow()
+                .active()
+                .iter()
+                .any(|wait| wait.0 == addr && wait.1)
+        })
         .unwrap_or(false)
 }
 
@@ -109,10 +148,12 @@ impl Drop for Outer {
         let clear = WAITS
             .try_with(|waits| {
                 let mut waits = waits.borrow_mut();
-                if let Some(index) = waits.iter().rposition(|wait| wait.0 == self.addr) {
-                    waits.remove(index);
+                let active = waits.active_mut();
+                if let Some(index) = active.iter().rposition(|wait| wait.0 == self.addr) {
+                    active.copy_within(index + 1.., index);
+                    waits.len -= 1;
                 }
-                !waits.iter().any(|wait| wait.1)
+                !waits.active().iter().any(|wait| wait.1)
             })
             .unwrap_or(true);
         if clear {

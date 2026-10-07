@@ -2,8 +2,9 @@
 //! clock: exactly when a run of clock reads becomes a spin, exactly how far each step of a spin
 //! moves time, and exactly what each non-blocking call costs.
 //!
-//! The rules pinned: 63 reads in a row hold still, the 64th moves the clock 1 µs and every read
-//! after it moves it `min(max(spun / 64, 1 µs), 1 s)`, where `spun` is the time since the spin was caught;
+//! The rules pinned: 63 reads in a row hold still, the 64th moves the clock 1 µs, as do the 65,535
+//! reads after it, and every read after those moves it `min(max(spun / 64, 1 µs), 1 s)`, where
+//! `spun` is the time since the spin was caught;
 //! any other hooked call ends the spin and starts the count again; a step never jumps a pending
 //! timer but lands 1 ns short of it and then 1 ns past it; a paused or executive-driven clock
 //! never moves under a spin; a call that returns without blocking costs exactly 1 µs, and inside
@@ -51,14 +52,20 @@ fn other_call(sock: &UdpSocket) {
     sock.local_addr().unwrap();
 }
 
+/// Reads of a caught spin, counted from the one that catches it, that each move the clock 1 µs.
+const EVEN_READS: usize = 1 << 16;
+
 /// The readings after each of `n` reads of a lone spin caught at `origin`, as the step rule gives
-/// them: still for 63 reads, then each read moves `min(max((now - origin) / 64, 1 µs), 1 s)`.
+/// them: still for 63 reads, 1 µs for each of the next [`EVEN_READS`], then each read moves
+/// `min(max((now - origin) / 64, 1 µs), 1 s)`.
 fn spin_model(origin: u64, n: usize) -> Vec<u64> {
     let mut now = origin;
     (1..=n)
         .map(|read| {
-            if read >= 64 {
+            if read >= 64 + EVEN_READS {
                 now = now.saturating_add(((now - origin) / 64).clamp(US, 1_000_000_000));
+            } else if read >= 64 {
+                now += US;
             }
             now
         })
@@ -99,17 +106,23 @@ fn reads_split_by_other_calls_never_add_up_to_a_spin() {
     }
 }
 
-/// Every reading of a 3000-read spin, exactly as the step rule gives it: 1 µs steps while the spin
-/// is younger than 64 µs, then steps of 1/64 of its age, capped at one second.
+/// Every reading of a spin of 68,000 reads, exactly as the step rule gives it: 1 µs steps for the
+/// first 65,536 reads of the caught spin, then steps of 1/64 of its age, capped at one second.
 #[test]
 fn a_lone_spin_steps_exactly_by_the_rule() {
-    let expected = spin_model(0, 3_000);
+    const READS: usize = 68_000;
+    let expected = spin_model(0, READS);
     assert_eq!(expected[63], US);
     assert_eq!(expected[127], 65 * US);
-    assert!(expected[2_999] < 3_600_000_000_000);
+    assert_eq!(expected[63 + EVEN_READS - 1], EVEN_READS as u64 * US);
+    assert_eq!(
+        expected[63 + EVEN_READS],
+        (EVEN_READS as u64 + EVEN_READS as u64 / 64) * US
+    );
+    assert!(expected[READS - 1] < 3_600_000_000_000);
     for (name, sim) in sims() {
         let seen = sim().run(|| {
-            (0..3_000)
+            (0..READS)
                 .map(|_| {
                     reads(1);
                     ns()
