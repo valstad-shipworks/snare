@@ -126,7 +126,7 @@ simulation automatically. Only managed threads are interposed; the test's own bo
 | **Recorded events** | A sim-wide log (`recorded_events()`, `Sim::recorded_events`) of what crossed each tester's boundary, what link policies did to datagrams, policy changes, injected faults and delivered signals, stamped on the sim's clock. |
 | **Packet capture** | `SimBuilder::pcapng(path)` (or `SNARE_PCAPNG_DIR` for every sim, `SNARE_PCAPNG_TESTS` for chosen tests) writes what crosses the sim's network to a pcapng file Wireshark opens: fabricated Ethernet/IP headers around each TCP connection (handshake, segments, ACKs at arrival, FINs, resets, SYN retransmissions), each datagram once at its sender, ICMP port unreachables and raw L2 frames verbatim, stamped on the sim's clock per interface, optionally commented with real wall time. See [Packet capture](#packet-capture). |
 | **Environment** | `getenv`/`setenv`/`unsetenv` lookups and mutations are isolated (opt-in). macOS enumeration uses the simulated snapshot; Linux `vars`/`vars_os` still read the real process environment. |
-| **Windows** | The thread-scheduling plane (`SetThreadPriority`/affinity/priority-class/`timeBeginPeriod`, MMCSS `AvSetMmThreadCharacteristicsW`/`AvSetMmThreadPriority`/`AvRevertMmThreadCharacteristics`, power throttling through `Set/GetProcessInformation` and `Set/GetThreadInformation`, CPU sets) runs against a `WinHost`, read back with `Sim::time_periods`, `mmcss_tasks`, `process_power_throttling`, `thread_power_throttling`, `process_default_cpu_sets` and `thread_selected_cpu_sets`, and `std::net::TcpStream`/`TcpListener`/`UdpSocket` are serviced from memory by a Winsock fabric (`socket`/`bind`/`listen`/`accept`/`connect`/`send`/`recv`/`sendto`/`recvfrom` with `MSG_PEEK`/`MSG_WAITALL` and `WSAEMSGSIZE` truncation, the synchronous `WSASend`/`WSARecv`/`WSASendTo`/`WSARecvFrom`/`WSASendMsg` and the `WSARecvMsg` extension, blocking recv/accept, UDP broadcast/multicast/multi-IP, don't-fragment, `WSAIoctl` including `SIO_CPU_AFFINITY`, read back with `Sim::socket_cpu_affinity`). `WSAPoll` and `select` readiness and `WSADuplicateSocket` (`try_clone`) are modelled, IOCP is planned; a sim socket never reaches Winsock — overlapped calls and event/window-message notification on one fail with `WSAEOPNOTSUPP`. A pcap/npcap interposer is in place structurally. |
+| **Windows** | The thread-scheduling plane (`SetThreadPriority`/affinity/priority-class/`timeBeginPeriod`, MMCSS `AvSetMmThreadCharacteristicsW`/`AvSetMmThreadPriority`/`AvRevertMmThreadCharacteristics`, power throttling through `Set/GetProcessInformation` and `Set/GetThreadInformation`, CPU sets) runs against a `WinHost`, read back with `Sim::time_periods`, `mmcss_tasks`, `process_power_throttling`, `thread_power_throttling`, `process_default_cpu_sets` and `thread_selected_cpu_sets`, and `std::net::TcpStream`/`TcpListener`/`UdpSocket` are serviced from memory by a Winsock fabric (`socket`/`bind`/`listen`/`accept`/`connect`/`send`/`recv`/`sendto`/`recvfrom` with `MSG_PEEK`/`MSG_WAITALL` and `WSAEMSGSIZE` truncation, the synchronous `WSASend`/`WSARecv`/`WSASendTo`/`WSARecvFrom`/`WSASendMsg` and the `WSARecvMsg` extension, blocking recv/accept, UDP broadcast/multicast/multi-IP, don't-fragment, `WSAIoctl` including `SIO_CPU_AFFINITY`, read back with `Sim::socket_cpu_affinity`). `WSAPoll` and `select` readiness and `WSADuplicateSocket` (`try_clone`) are modelled, and I/O completion ports cover Mio's single-socket `\Device\Afd` poll profile (see [OPEN_BUGS.md](OPEN_BUGS.md) for its bounds); a sim socket never reaches Winsock — overlapped calls and event/window-message notification on one fail with `WSAEOPNOTSUPP`. A pcap/npcap interposer is in place structurally. |
 
 Registered hooks record unsupported calls in `Domain::unmodelled()`. An empty report is a useful
 check, but does not prove full simulation: unhooked functions, direct process-global reads and CPU
@@ -1454,6 +1454,12 @@ $ cargo snare test            # builds with --cfg snare, patches in the shims, r
 `cargo --config patch.crates-io...`. Plain `cargo test` builds neither snare nor the
 `#[cfg(snare)]` tests.
 
+The cfgs go in through `RUSTFLAGS` (appended to any already set), and cargo then ignores
+`build.rustflags` and `target.*.rustflags` from `.cargo/config.toml`. A crate that relies on cfgs
+from its own config file must put them in `RUSTFLAGS` as well; a `CARGO_ENCODED_RUSTFLAGS` in the
+environment overrides both and drops the snare cfgs. `cargo snare test --dry-run` prints the
+assembled command.
+
 ## Shims (`shims/`)
 
 Some crates bypass libc in ways an import-table hook cannot see — raw `io_uring` rings in mmap'd memory,
@@ -1475,7 +1481,7 @@ using it in the other mode panics rather than silently mixing an emulated ring w
 | Time / entropy / sleep | ✅ | ✅ | ✅ |
 | TCP | ✅ | ✅ | ✅ (Winsock) |
 | UDP | ✅ | ✅ | ✅ (Winsock) |
-| Readiness | ✅ (`epoll`, `poll`, `eventfd`) | ✅ (`kqueue`/`kevent`, `poll`) | ✅ (`WSAPoll`, `select`) |
+| Readiness | ✅ (`epoll`, `poll`, `eventfd`) | ✅ (`kqueue`/`kevent`, `poll`) | ✅ (`WSAPoll`, `select`, IOCP for Mio) |
 | Raw L2 | `AF_PACKET` | `/dev/bpf` | pcap/npcap (structural) |
 | Host scheduling | ✅ | ✅ (pthread/Mach) | ✅ (`WinHost`) |
 | Interfaces and routing | ✅ (`getifaddrs`, `SIOCGIF*`, netlink) | ✅ (`getifaddrs`, `SIOCGIF*`, `sysctl`) | ✅ (IP Helper) |
@@ -1502,7 +1508,9 @@ The minimum supported Rust version is 1.88.
 crates/snare-interpose/   the engine: patchers, hooks, Domain, backend traits, real()
 crates/snare/             Sim, SimHost, HostProfile, EasyBuilder, Fabric, VirtualFs, testers
 crates/cargo-snare/       the `cargo snare` subcommand
+probes/interpose-probe/   test-fixture DLL for the Windows module-loading test (unpublished)
 shims/                    io-uring, xsk-rs, sc, syscalls drop-ins ([patch.crates-io])
+scripts/                  Windows VM and hardware test runners, socket-buffer and runtime measurements
 ```
 
 ## Running the tests
@@ -1531,3 +1539,7 @@ Behaviour that mirrors a kernel interface is cited in the code to its authority 
 (`man 2 sched_setscheduler`), a kernel header (`<linux/if_link.h> struct rtnl_link_stats64`), or a
 `Documentation/` path (`Documentation/networking/timestamping.rst`) — so the modeled struct layouts,
 magic numbers, and errno conventions can be checked against the real thing.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).

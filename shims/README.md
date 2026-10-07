@@ -22,10 +22,10 @@ in a consumer manifest:
 
 ```toml
 [patch.crates-io]
-sc        = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.0.0" }
-syscalls  = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.0.0" }
-io-uring  = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.0.0" }
-xsk-rs    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.0.0" }
+sc        = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.0.1" }
+syscalls  = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.0.1" }
+io-uring  = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.0.1" }
+xsk-rs    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.0.1" }
 ```
 
 These are for **test/simulation builds only**, never release. Each `syscallN` returns the kernel's
