@@ -1,16 +1,16 @@
            0 w2 holds 0 count 1
            0 w4 holds 0 count 2
-        3100 w1 holds 0 count 3
-        8200 w0 holds 0 count 4
-       10300 w3 holds 0 count 5
-       11400 w2 holds 1 count 6
-       15500 w4 holds 1 count 7
-       18600 w1 holds 1 count 8
-       23700 w0 holds 1 count 9
-       25800 w3 holds 1 count 10
-       26900 w2 holds 2 count 11
-       31000 w4 holds 2 count 12
-       34100 w1 holds 2 count 13
-       39200 w0 holds 2 count 14
-       41300 w3 holds 2 count 15
-       46500 main joined
+           0 w1 holds 0 count 3
+           0 w0 holds 0 count 4
+           0 w3 holds 0 count 5
+        1100 w0 holds 1 count 6
+        2100 w1 holds 1 count 7
+        2100 w0 holds 2 count 8
+        3100 w2 holds 1 count 9
+        4100 w1 holds 2 count 10
+        4100 w3 holds 1 count 11
+        5100 w4 holds 1 count 12
+        6200 w2 holds 2 count 13
+        8200 w3 holds 2 count 14
+       10200 w4 holds 2 count 15
+       15300 main joined
