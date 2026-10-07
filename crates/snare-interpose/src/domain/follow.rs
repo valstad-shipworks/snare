@@ -530,6 +530,9 @@ fn follow(to: &Domain) -> bool {
         return false;
     }
     let from_ptr = state::domain();
+    if from_ptr.is_null() {
+        return false;
+    }
     let to_ptr = Arc::as_ptr(&to.0);
     if from_ptr == to_ptr {
         return true;
