@@ -104,7 +104,7 @@ jobs:
   # quanta 0.12's own `test_recent` races its other tests on the shared recent-time global.
   shims:
     runs-on: ${{ matrix.os }}
-    name: shims (${{ matrix.shim }}${{ matrix.rustflags && ', parallel' || '' }}, ${{ matrix.os }})
+    name: shims (${{ matrix.shim }}${{ matrix.rustflags && ', parallel' || '' }}${{ matrix.os == 'macos-latest' && ', macos' || '' }})
 
     strategy:
       fail-fast: false
