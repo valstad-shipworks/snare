@@ -128,7 +128,10 @@ fn exercise(calls: &Calls, path: &str) {
     let rc =
         unsafe { (calls.getaddrinfo)(TABLE_HOST.as_ptr(), std::ptr::null(), &hints, &mut result) };
     assert_eq!(rc, 0, "getaddrinfo through the table finds the sim's host");
-    let address = unsafe { *(*result).ai_addr.cast::<libc::sockaddr_in>() };
+    let entry = unsafe { result.as_ref() }.expect("getaddrinfo returned no entry");
+    let address = unsafe { entry.ai_addr.cast::<libc::sockaddr_in>().as_ref() }
+        .copied()
+        .expect("the entry has an address");
     assert_eq!(
         Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr)),
         TABLE_ADDRESS

@@ -382,10 +382,12 @@ fn virtual_deadline(after: Duration) -> Option<Duration> {
 /// mutex's address until an unlock there wakes it. A mutex held by a thread outside the schedule
 /// (another test's, a thread no sim manages, a pool's worker left over from an earlier sim) is
 /// first waited for in real time, keeping the baton, for [`DET_OUTSIDE_HOLDER_GRACE`], so a short
-/// hold cannot reorder this simulation's threads; a holder that keeps it longer (blocked itself,
-/// as a pool's worker waiting for its next job while holding the queue's lock) is then waited for
-/// in the schedule, where its unlock reaches the waiter wherever it is made
-/// (`domain::det_wake_addr`). Any other error from `pthread_mutex_trylock` (`EINVAL`, or `EAGAIN`
+/// hold cannot reorder this simulation's threads; a holder that keeps it longer and belongs to a
+/// sim (a pool's worker left over from an earlier run, blocked itself waiting for its next job
+/// while holding the queue's lock) is then waited for in the schedule, where its unlock reaches
+/// the waiter wherever it is made (`domain::det_wake_addr`). On macOS, where a mutex names its
+/// holder, one no sim manages keeps being waited for with the baton held, so time stands still
+/// until it lets go, as a lock held outside holds time still outside a schedule. Any other error from `pthread_mutex_trylock` (`EINVAL`, or `EAGAIN`
 /// once a recursive mutex's count is exhausted; POSIX pthread_mutex_lock, which also specifies
 /// trylock) is returned as is.
 ///
@@ -428,6 +430,8 @@ unsafe fn det_mutex_lock(mutex: *mut pthread_mutex_t) -> c_int {
                         return 0;
                     }
                     Some(r) => return r,
+                    #[cfg(target_os = "macos")]
+                    None if !crate::census::mutex_held_by_managed(addr) => {}
                     None => {
                         grace = Duration::ZERO;
                         let _label = crate::wait_label("mutex");

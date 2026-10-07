@@ -387,10 +387,11 @@ spin* and moves time for it:
   insert, an allocator reading its decay clock every so often. That is caught as a spin as well,
   so a spin's first steps cost what calls that do not block cost: each of its first 65,536 reads
   moves time 1 µs (a loop of 10,000 timestamped items takes 10 ms of virtual time, and 20,000
-  allocations under jemalloc about 18 ms).
+  allocations under jemalloc about 18 ms). A spin that yields between its reads is waiting
+  outright and skips this stretch.
 - After those, each read moves time 1/64 of the virtual time since the spin was caught, up to one
   second. The steps grow geometrically, so a spin on a deadline a second or an hour away takes
-  about 66,000 or 70,000 reads, a fraction of a second of real time, and a spin overshoots its own
+  about 66,000 or 70,000 reads (about 1,000 or 4,500 when it yields between them), a fraction of a second of real time, and a spin overshoots its own
   deadline by at most 1/64 of its length or 1 µs (one more read before any other hooked call
   moves it one more step). A step never jumps a pending timer: one that would reach the earliest
   timer lands 1 ns short of it, so a spinner whose deadline comes first sees it first, and the

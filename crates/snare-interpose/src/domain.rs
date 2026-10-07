@@ -1024,6 +1024,12 @@ impl Domain {
         self.0.accounting.os_threads()
     }
 
+    /// Whether a live thread of the domain holds the pthread mutex at `mutex`.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn holds_native_mutex(&self, mutex: usize) -> bool {
+        self.0.accounting.native_mutex_lineage(mutex).is_some()
+    }
+
     /// What the audit has seen since the executive attached (empty without audit).
     pub fn audit(&self) -> AuditReport {
         self.0.accounting.audit_report()
@@ -3161,7 +3167,9 @@ const SPIN_AFTER: u32 = 64;
 /// reads it about 18,000 times in 20,000 large allocations) is caught as a spin too, and this
 /// keeps what it costs in line with what its work would cost in hooked calls: about 65 ms of
 /// virtual time for its first 65,536 reads. A spin on a deadline further off gets there in about
-/// 4,000 more reads, an hour-long one included, a fraction of a second of real time.
+/// 4,000 more reads, an hour-long one included, a fraction of a second of real time. A spin that
+/// yields between its reads is waiting outright and skips this stretch: each of its turns costs a
+/// real `sched_yield`, which would make 65,536 of them seconds of real time.
 const SPIN_EVEN_READS: u32 = 1 << 16;
 
 /// The fraction of a clock spin's length each of its steps moves virtual time once its first
@@ -3182,6 +3190,9 @@ struct Spin {
     events: u32,
     /// The clock reads among `events`, saturating.
     reads: u32,
+    /// Whether any of `events` was a yield: a thread that hands the CPU back between reads is
+    /// waiting, not reading the clock in passing as it works.
+    yielded: bool,
     /// Whether the thread read the clock since its last yield: it polls the clock, waiting on a
     /// deadline of its own rather than only on what another thread does.
     polling: bool,
@@ -3199,6 +3210,7 @@ impl Spin {
     const IDLE: Spin = Spin {
         events: 0,
         reads: 0,
+        yielded: false,
         polling: false,
         origin: None,
         counted: ptr::null(),
@@ -3220,6 +3232,7 @@ fn note_spin(read: bool) -> (bool, bool) {
         let mut spin = cell.get();
         spin.events = spin.events.saturating_add(1);
         spin.reads = spin.reads.saturating_add(u32::from(read));
+        spin.yielded |= !read;
         let polling = read || spin.polling;
         spin.polling = read;
         cell.set(spin);
@@ -3269,7 +3282,8 @@ pub fn end_spin() {
 
 /// Counts the calling thread's caught spin in `domain`'s `spinning`, and in `clock_spinning` while
 /// it polls the clock (`clock`), noting where it started; returns where its steps grow from and
-/// how many clock reads it has made.
+/// how many of its clock reads count toward [`SPIN_EVEN_READS`]: all of them for a spin that never
+/// yields, none for one that does.
 fn count_spin(domain: &Inner, clock: bool) -> (Option<std::time::Duration>, u32) {
     let Ok(mut spin) = SPIN.try_with(std::cell::Cell::get) else {
         return (None, 0);
@@ -3288,7 +3302,8 @@ fn count_spin(domain: &Inner, clock: bool) -> (Option<std::time::Duration>, u32)
         spin.counted_clock = clock;
     }
     let _ = SPIN.try_with(|cell| cell.set(spin));
-    (spin.origin, spin.reads)
+    let reads = if spin.yielded { u32::MAX } else { spin.reads };
+    (spin.origin, reads)
 }
 
 /// One step of the calling participant's caught spin, `clock` when the event polls the clock (a
@@ -3302,7 +3317,7 @@ fn count_spin(domain: &Inner, clock: bool) -> (Option<std::time::Duration>, u32)
 /// other running thread may have work to do at the current instant, which comes first. Then:
 ///
 /// - A clock read of the spin moves time one step (see [`Layer::spin_step`]): 1 µs for its first
-///   [`SPIN_EVEN_READS`] reads, then 1/64 of the
+///   [`SPIN_EVEN_READS`] reads unless it yields between them, then 1/64 of the
 ///   virtual time since the spin was caught, between 1 µs and 1 s, landing 1 ns short of the earliest
 ///   timer it would reach and past it on the next step, so the threads woken there run at their
 ///   own instants and in order with the spinner. A yield-only spin, which waits on another

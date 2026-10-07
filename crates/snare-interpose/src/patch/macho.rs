@@ -341,11 +341,13 @@ unsafe fn patch_image(
 
         let mut patched = Vec::new();
         let mut others = Vec::new();
-        if !symtab.is_null() && !dysymtab.is_null() && (*dysymtab).nindirectsyms != 0 {
+        if let (Some(symtab), Some(dysymtab)) = (symtab.as_ref(), dysymtab.as_ref())
+            && dysymtab.nindirectsyms != 0
+        {
             let tables = Tables {
-                symbols: (linkedit_base + (*symtab).symoff as usize) as *const Nlist64,
-                strings: (linkedit_base + (*symtab).stroff as usize) as *const u8,
-                indirect: (linkedit_base + (*dysymtab).indirectsymoff as usize) as *const u32,
+                symbols: (linkedit_base + symtab.symoff as usize) as *const Nlist64,
+                strings: (linkedit_base + symtab.stroff as usize) as *const u8,
+                indirect: (linkedit_base + dysymtab.indirectsymoff as usize) as *const u32,
             };
             for &segment in &segments {
                 let read_only = is_read_only(&*segment);
@@ -379,16 +381,16 @@ unsafe fn patch_image(
         let mut bind = |segment: usize, offset: u64, name: &[u8], addend: i64| {
             patch_bind(&image, segment, offset, name, addend, &mut patched, &mut others);
         };
-        if !dyld_info.is_null() && (*dyld_info).bind_size != 0 {
+        if let Some(info) = dyld_info.as_ref().filter(|info| info.bind_size != 0) {
             let opcodes = std::slice::from_raw_parts(
-                (linkedit_base + (*dyld_info).bind_off as usize) as *const u8,
-                (*dyld_info).bind_size as usize,
+                (linkedit_base + info.bind_off as usize) as *const u8,
+                info.bind_size as usize,
             );
             for_each_bind(opcodes, &mut bind);
-        } else if !chained.is_null() && (*chained).datasize != 0 {
+        } else if let Some(chained) = chained.as_ref().filter(|chained| chained.datasize != 0) {
             let fixups = std::slice::from_raw_parts(
-                (linkedit_base + (*chained).dataoff as usize) as *const u8,
-                (*chained).datasize as usize,
+                (linkedit_base + chained.dataoff as usize) as *const u8,
+                chained.datasize as usize,
             );
             for_each_chained_bind(&image, fixups, &mut bind);
         }

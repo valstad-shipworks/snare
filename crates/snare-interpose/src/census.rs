@@ -155,6 +155,19 @@ impl Drop for ServiceThread {
     }
 }
 
+/// Whether a thread some sim of the process manages, running or left over from an ended run,
+/// holds the pthread mutex at `mutex`; `false` when no sim's thread does, or the mutex names no
+/// holder.
+#[cfg(target_os = "macos")]
+pub(crate) fn mutex_held_by_managed(mutex: usize) -> bool {
+    let _passthrough = Passthrough::enter();
+    let domains: Vec<Domain> = lock(&DOMAINS)
+        .iter()
+        .filter_map(|(_, weak)| weak.upgrade())
+        .collect();
+    domains.iter().any(|domain| domain.holds_native_mutex(mutex))
+}
+
 /// Takes a census of every OS thread of the process, relative to `sim`; `None` where the OS's
 /// threads cannot be listed.
 pub fn census(sim: Option<&Domain>) -> Option<ThreadCensus> {
