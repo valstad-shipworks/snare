@@ -19,7 +19,7 @@ fn builder(deterministic: bool) -> snare::SimBuilder {
     if deterministic {
         Sim::builder().deterministic()
     } else {
-        Sim::builder()
+        Sim::builder().fixed_epoch()
     }
 }
 

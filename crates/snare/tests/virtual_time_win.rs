@@ -24,7 +24,7 @@ unsafe extern "C" {
 
 #[test]
 fn crt_time_reads_the_virtual_clock() {
-    let (t, stored) = vsim().run(|| {
+    let (t, stored) = Sim::builder().fixed_epoch().build().run(|| {
         let mut stored = 0i64;
         (unsafe { _time64(&mut stored) }, stored)
     });
