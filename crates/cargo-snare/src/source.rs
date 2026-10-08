@@ -80,6 +80,21 @@ impl Source {
         }
     }
 
+    /// The snare release this source is pinned to: a git tag `vX.Y.Z`, or `None` for a path, a
+    /// branch, a commit or a tag of another form.
+    pub(crate) fn release(&self) -> Option<(u64, u64, u64)> {
+        let Source::Git {
+            reference: GitRef::Tag(tag),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let mut parts = tag.strip_prefix('v')?.splitn(3, '.');
+        let mut next = || parts.next()?.parse::<u64>().ok();
+        Some((next()?, next()?, next()?))
+    }
+
     /// A short description for `--dry-run`.
     pub(crate) fn describe(&self) -> String {
         match self {
@@ -369,6 +384,18 @@ mod tests {
                 interposer: true,
             }
         );
+    }
+
+    #[test]
+    fn a_release_tag_names_its_version() {
+        let tagged = |tag: &str| Source::Git {
+            url: SNARE_GIT.into(),
+            reference: GitRef::Tag(tag.into()),
+            interposer: true,
+        };
+        assert_eq!(tagged("v3.0.1").release(), Some((3, 0, 1)));
+        assert_eq!(tagged("release-3").release(), None);
+        assert_eq!(Source::Path("/s".into()).release(), None);
     }
 
     #[test]

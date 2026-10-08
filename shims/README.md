@@ -73,7 +73,8 @@ whether or not the graph has its crate; it never selects a parallel shim by itse
 crates.io snare at version `X`, this repository at tag `vX`, with `snare` and `snare-interpose`
 patched from that tag too; for a path or git snare, the same checkout or the same git reference.
 The shims depend on `snare-interpose` within this repository, so taking them from anywhere else
-would link a second interposer, whose sims the code under test never sees. To apply them by hand
+would link a second interposer, whose sims the code under test never sees. A shim newer than that
+release is left out, with a note: update snare to get it. To apply them by hand
 in a consumer manifest, keep `snare` and `snare-interpose` on the same source (a crate with a shim
 per release line takes a patch key per line, with `package` and `version` to pick the shim):
 

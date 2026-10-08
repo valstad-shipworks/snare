@@ -33,6 +33,8 @@ pub(crate) struct Shim {
     /// The semver-compatible release line it replaces: `0.12` matches 0.12.x, `2` matches 2.x.
     pub(crate) line: &'static str,
     pub(crate) need: Need,
+    /// The first snare release whose `shims/` holds it, as (major, minor, patch).
+    pub(crate) since: (u64, u64, u64),
 }
 
 impl Shim {
@@ -42,7 +44,18 @@ impl Shim {
             dir,
             line,
             need,
+            since: (2, 0, 0),
         }
+    }
+
+    /// The same shim, first released with snare `since`.
+    const fn since(self, since: (u64, u64, u64)) -> Self {
+        Shim { since, ..self }
+    }
+
+    /// Whether the snare release `release` ships this shim.
+    pub(crate) fn shipped_in(&self, release: (u64, u64, u64)) -> bool {
+        release >= self.since
     }
 
     /// Whether `version` of the crate is one this shim can stand in for.
@@ -84,21 +97,22 @@ pub(crate) const SHIMS: [Shim; 14] = [
     Shim::new("xsk-rs", "xsk-rs", "0.8", Need::Default),
     Shim::new("sc", "sc", "0.2", Need::Default),
     Shim::new("syscalls", "syscalls", "0.8", Need::Default),
-    Shim::new("quanta", "quanta-0.12", "0.12", Need::Default),
-    Shim::new("quanta", "quanta-0.13", "0.13", Need::Default),
-    Shim::new("minstant", "minstant", "0.1", Need::Default),
-    Shim::new("fastant", "fastant", "0.1", Need::Default),
-    Shim::new("fastrand", "fastrand", "2", Need::Default),
-    Shim::new("rayon-core", "rayon-core", "1", Need::Default),
-    Shim::new("async-io", "async-io", "2", Need::Parallel),
+    Shim::new("quanta", "quanta-0.12", "0.12", Need::Default).since((3, 1, 0)),
+    Shim::new("quanta", "quanta-0.13", "0.13", Need::Default).since((3, 1, 0)),
+    Shim::new("minstant", "minstant", "0.1", Need::Default).since((3, 1, 0)),
+    Shim::new("fastant", "fastant", "0.1", Need::Default).since((3, 1, 0)),
+    Shim::new("fastrand", "fastrand", "2", Need::Default).since((3, 1, 0)),
+    Shim::new("rayon-core", "rayon-core", "1", Need::Default).since((3, 1, 0)),
+    Shim::new("async-io", "async-io", "2", Need::Parallel).since((3, 1, 0)),
     Shim::new(
         "async-global-executor",
         "async-global-executor",
         "2",
         Need::Parallel,
-    ),
-    Shim::new("blocking", "blocking", "1", Need::Parallel),
-    Shim::new("smol", "smol", "2", Need::Parallel),
+    )
+    .since((3, 1, 0)),
+    Shim::new("blocking", "blocking", "1", Need::Parallel).since((3, 1, 0)),
+    Shim::new("smol", "smol", "2", Need::Parallel).since((3, 1, 0)),
 ];
 
 /// Crates whose per-sim mode is a cfg read by their default shim rather than a shim of its own.
@@ -255,6 +269,19 @@ pub(crate) fn cfgs(patched: &[&Shim], parallel: &BTreeSet<&str>) -> Vec<&'static
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn older_releases_lack_the_newer_shims() {
+        let shipped = |release| {
+            SHIMS
+                .iter()
+                .filter(|shim| shim.shipped_in(release))
+                .map(|shim| shim.dir)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shipped((3, 0, 1)), ["io-uring", "xsk-rs", "sc", "syscalls"]);
+        assert_eq!(shipped((3, 1, 0)).len(), SHIMS.len());
+    }
     use super::*;
 
     fn names(list: &[&str]) -> Vec<String> {

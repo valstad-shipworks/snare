@@ -203,7 +203,6 @@ fn run_test(args: TestArgs) -> i32 {
     }
     let graph = shims::packages(&metadata);
     let patches = shims::select(present, &graph, &parallel.crates, args.all_shims);
-    let cfgs = shims::cfgs(&patches, &parallel.crates);
     let source = match source::resolve(
         &metadata,
         args.shims_dir.as_deref(),
@@ -216,6 +215,28 @@ fn run_test(args: TestArgs) -> i32 {
             return 1;
         }
     };
+
+    let patches = match source.release() {
+        Some(release) => {
+            let (shipped, missing): (Vec<&Shim>, Vec<&Shim>) = patches
+                .into_iter()
+                .partition(|shim| shim.shipped_in(release));
+            for shim in missing {
+                eprintln!(
+                    "cargo-snare: snare {}.{}.{} has no {} shim; {} is left unpatched (update snare \
+                     to get it)",
+                    release.0,
+                    release.1,
+                    release.2,
+                    shim.label(),
+                    shim.krate
+                );
+            }
+            shipped
+        }
+        None => patches,
+    };
+    let cfgs = shims::cfgs(&patches, &parallel.crates);
 
     let mut cmd = Command::new("cargo");
     cmd.arg("test");
