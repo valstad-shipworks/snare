@@ -2166,10 +2166,10 @@ impl Net for WinNet {
 
     /// `accept`
     /// ([Microsoft Learn: accept](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-accept)):
-    /// the oldest queued connection, as a new blocking handle for end `B`. A blocking accept waits
-    /// without a timeout, since `SO_RCVTIMEO` covers receive calls only. The page says the new
-    /// socket has the listening socket's properties; the sim starts it blocking whatever the
-    /// listener's `FIONBIO` mode.
+    /// the oldest queued connection, as a new handle for end `B`. A blocking accept waits without a
+    /// timeout, since `SO_RCVTIMEO` covers receive calls only. The new socket has the listening
+    /// socket's properties, its `FIONBIO` mode among them (mio's Windows `accept` relies on it and
+    /// never sets the mode again).
     unsafe fn accept(
         &self,
         fd: c_int,
@@ -2224,7 +2224,7 @@ impl Net for WinNet {
             Sock::Stream {
                 conn,
                 end: End::B,
-                nonblocking: false,
+                nonblocking,
                 rec,
             },
         );

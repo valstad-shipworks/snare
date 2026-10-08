@@ -122,3 +122,44 @@ fn peek_leaves_bytes_queued_os_truth() {
     assert_eq!(real, (b"peekaboo".to_vec(), b"peekaboo".to_vec()));
     assert_eq!(simmed, real);
 }
+
+/// A socket `accept` returns has the listening socket's properties
+/// ([Microsoft Learn: accept](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-accept)),
+/// `FIONBIO` among them: off a nonblocking listener, a read with nothing queued is
+/// `WSAEWOULDBLOCK` rather than a wait. Whether each accepted socket would block, off a
+/// nonblocking listener and off a blocking one.
+fn accepted_inherit_the_listeners_mode() -> (bool, bool) {
+    let would_block = |listener: &TcpListener| {
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut accepted, _) = loop {
+            match listener.accept() {
+                Ok(pair) => break pair,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::yield_now(),
+                Err(e) => panic!("accept: {e}"),
+            }
+        };
+        accepted
+            .set_read_timeout(Some(std::time::Duration::from_millis(10)))
+            .unwrap();
+        let mut buf = [0u8; 1];
+        match accepted.read(&mut buf) {
+            Err(e) => e.kind() == std::io::ErrorKind::WouldBlock && e.raw_os_error() == Some(10035),
+            Ok(n) => panic!("read {n} bytes nobody sent"),
+        }
+    };
+    let nonblocking = TcpListener::bind("127.0.0.1:0").unwrap();
+    nonblocking.set_nonblocking(true).unwrap();
+    let blocking = TcpListener::bind("127.0.0.1:0").unwrap();
+    (would_block(&nonblocking), would_block(&blocking))
+}
+
+#[test]
+fn accepted_sockets_inherit_the_listeners_mode_os_truth() {
+    let real = snare::real(accepted_inherit_the_listeners_mode);
+    let simmed = Sim::new().run(accepted_inherit_the_listeners_mode);
+    assert!(
+        real.0,
+        "a nonblocking listener's accepted socket would block"
+    );
+    assert_eq!(simmed, real);
+}
