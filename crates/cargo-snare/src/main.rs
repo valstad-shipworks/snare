@@ -272,11 +272,51 @@ fn run_test(args: TestArgs) -> i32 {
         return 0;
     }
 
-    match cmd.status() {
+    let lock = LockGuard::save(&metadata);
+    // Ctrl-C reaches cargo too, which stops; this process outlives it to put the lock file back.
+    let _ = ctrlc::set_handler(|| {});
+    let code = match cmd.status() {
         Ok(status) => status.code().unwrap_or(1),
         Err(e) => {
             eprintln!("cargo-snare: failed to run cargo: {e}");
             1
+        }
+    };
+    drop(lock);
+    code
+}
+
+/// The workspace's `Cargo.lock` as it was before the patched `cargo test`, put back when dropped.
+/// Cargo records a `[patch]` source in the lock file it resolves, so without this every run would
+/// leave the shims' git (or path) sources in a lock file the workspace may commit, and a later
+/// plain build, `cargo package` or `--locked` build would see it changed.
+struct LockGuard {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
+}
+
+impl LockGuard {
+    fn save(metadata: &Value) -> Option<LockGuard> {
+        let path = Path::new(metadata["workspace_root"].as_str()?).join("Cargo.lock");
+        let contents = std::fs::read(&path).ok();
+        Some(LockGuard { path, contents })
+    }
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let restored = match &self.contents {
+            Some(contents) => std::fs::write(&self.path, contents),
+            None => match std::fs::remove_file(&self.path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            },
+        };
+        if let Err(e) = restored {
+            eprintln!(
+                "cargo-snare: could not restore {}: {e}",
+                self.path.display()
+            );
         }
     }
 }
