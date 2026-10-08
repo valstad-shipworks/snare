@@ -393,14 +393,20 @@ Supported model boundaries and unverified approximations. These do not establish
   (jemalloc, mimalloc) calls the hooked pthread, clock and thread functions from inside its own
   critical sections, where a hook that allocates or waits on a lock whose holder allocates can
   deadlock the allocator. Setting up a default mutex or condition variable records nothing, the
-  nested-wait record is fixed-size, the census keeps room for 64 watched mutexes, and a lock or
-  unlock takes the census lock only when a participant may be waiting for that mutex
-  (`alloc_jemalloc.rs`, `alloc_mimalloc.rs`). What remains: while a participant waits for one of
-  the allocator's own locks, that lock's holder takes the census lock to record letting go, and a
-  thread holding the census lock still allocates when it adds a thread's row or records a wake,
-  so the three can still meet. A deterministic schedule's lock records and the
-  clock layer's timer bookkeeping also allocate, on paths an allocator reaches only through a
-  contended lock or a caught clock spin.
+  nested-wait record is fixed-size, and the census keeps room for 64 watched mutexes. A thread
+  holding a pthread mutex (just taken, about to be let go, or won after a contended wait) records
+  it, and its wait's end, for the census and for a deterministic schedule without allocating or
+  waiting for either lock: a record that finds its lock taken is queued for the holder. A
+  deterministic schedule allocates nothing under its lock or as a thread waits or wakes in it, as
+  each thread's share is made when it joins and the schedule's tables grow with the lock let go,
+  and the lists of waiters a wake from another sim reaches have fixed room (`alloc_jemalloc.rs`,
+  `alloc_mimalloc.rs`). What remains: outside a deterministic schedule, a thread that waits for one
+  of the allocator's locks while it holds another (allocators nest theirs) takes the census lock to
+  count its wait, whose holder may be allocating as it adds a thread's row or records a wake, and a
+  condition-variable wait takes it with its mutex held again. A time skip or a caught clock spin's
+  step allocates in the clock layer's timer bookkeeping, a caught spin outside a deterministic
+  schedule takes the census and readiness locks, and a condition-variable wait records its signal
+  count, allocating, under a lock its signal takes.
 - **Long clock-reading loops:** a loop that reads the clock with no other hooked call between
   reads is a clock spin whether it waits on time or works (README, "Clock spins"). Its first
   65,536 reads cost 1 µs each, as calls that do not block do; past those its steps grow toward
