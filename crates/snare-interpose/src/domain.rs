@@ -4565,9 +4565,8 @@ pub(crate) fn det_held_inside(addr: usize) -> bool {
         }
         #[cfg(target_os = "macos")]
         if let Some(domain) = here()
-            && let Some(lineage) = domain.accounting.native_mutex_lineage(addr)
+            && domain.accounting.native_mutex_lineage(addr).is_some()
         {
-            sched.took(addr, lineage);
             return true;
         }
         false

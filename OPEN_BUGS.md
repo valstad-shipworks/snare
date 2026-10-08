@@ -406,7 +406,10 @@ Supported model boundaries and unverified approximations. These do not establish
   condition-variable wait takes it with its mutex held again. A time skip or a caught clock spin's
   step allocates in the clock layer's timer bookkeeping, a caught spin outside a deterministic
   schedule takes the census and readiness locks, and a condition-variable wait records its signal
-  count, allocating, under a lock its signal takes.
+  count, allocating, under a lock its signal takes. Under a deterministic schedule, a wait on more
+  than eight readiness keys frees its key list under the schedule's lock as it ends, and Windows
+  shared (SRW) locks record their holders, allocating, under it. The executive's arm callback runs
+  on the thread that has just won a contended mutex, which may be one of the allocator's.
 - **Long clock-reading loops:** a loop that reads the clock with no other hooked call between
   reads is a clock spin whether it waits on time or works (README, "Clock spins"). Its first
   65,536 reads cost 1 µs each, as calls that do not block do; past those its steps grow toward

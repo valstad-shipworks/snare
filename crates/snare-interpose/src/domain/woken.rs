@@ -287,8 +287,11 @@ pub(super) fn settle(domain: &Inner) {
             }
             (any, running, fresh)
         };
+        if !any {
+            return;
+        }
         let at_rest =
-            !any || (running == 0 && domain.sched.as_ref().is_none_or(|sched| sched.detached()));
+            running == 0 && domain.sched.as_ref().is_none_or(|sched| sched.detached());
         if at_rest && rested {
             return;
         }

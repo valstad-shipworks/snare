@@ -659,9 +659,9 @@ pub(crate) struct Scheduler {
     owner_records: Pending<MutexRecord>,
 }
 
-/// How many mutexes [`MutexOwners`] tracks at once. A snare choice, far past the mutexes a
-/// domain's threads hold at once; one taken while it is full goes unrecorded, and so counts as
-/// held outside the domain.
+/// How many slots [`MutexOwners`] has; it tracks one fewer mutex at once, so a probe always ends
+/// at a free slot. A snare choice, far past the mutexes a domain's threads hold at once; one taken
+/// while it is full goes unrecorded, and so counts as held outside the domain.
 #[cfg(any(unix, windows))]
 const OWNED_MUTEXES: usize = 1024;
 
@@ -669,12 +669,18 @@ const OWNED_MUTEXES: usize = 1024;
 /// hold never allocates: the thread recording it may be inside a C allocator, holding the lock an
 /// allocation would need. Open addressing with linear probing; address 0 marks a free slot.
 #[cfg(any(unix, windows))]
-struct MutexOwners(Box<[(usize, u64)]>);
+struct MutexOwners {
+    slots: Box<[(usize, u64)]>,
+    len: usize,
+}
 
 #[cfg(any(unix, windows))]
 impl Default for MutexOwners {
     fn default() -> Self {
-        Self(vec![(0, 0); OWNED_MUTEXES].into_boxed_slice())
+        Self {
+            slots: vec![(0, 0); OWNED_MUTEXES].into_boxed_slice(),
+            len: 0,
+        }
     }
 }
 
@@ -691,7 +697,7 @@ impl MutexOwners {
     fn find(&self, addr: usize) -> Option<usize> {
         let mut i = Self::home(addr);
         for _ in 0..OWNED_MUTEXES {
-            let slot = self.0[i].0;
+            let slot = self.slots[i].0;
             if slot == addr || slot == 0 {
                 return Some(i);
             }
@@ -701,39 +707,47 @@ impl MutexOwners {
     }
 
     fn insert(&mut self, addr: usize, owner: u64) {
-        if let Some(i) = self.find(addr) {
-            self.0[i] = (addr, owner);
+        let Some(i) = self.find(addr) else {
+            return;
+        };
+        if self.slots[i].0 == 0 {
+            if self.len + 1 >= OWNED_MUTEXES {
+                return;
+            }
+            self.len += 1;
         }
+        self.slots[i] = (addr, owner);
     }
 
     fn contains(&self, addr: usize) -> bool {
-        self.find(addr).is_some_and(|i| self.0[i].0 == addr)
+        self.find(addr).is_some_and(|i| self.slots[i].0 == addr)
     }
 
     /// Frees `addr`'s slot, moving back each later entry of its probe run that may fill it.
     fn remove(&mut self, addr: usize) {
-        let Some(mut hole) = self.find(addr).filter(|&i| self.0[i].0 == addr) else {
+        let Some(mut hole) = self.find(addr).filter(|&i| self.slots[i].0 == addr) else {
             return;
         };
         let mut j = hole;
         loop {
             j = (j + 1) & Self::MASK;
-            let entry = self.0[j];
+            let entry = self.slots[j];
             if entry.0 == 0 {
                 break;
             }
             let home = Self::home(entry.0);
             if (j.wrapping_sub(home) & Self::MASK) >= (j.wrapping_sub(hole) & Self::MASK) {
-                self.0[hole] = entry;
+                self.slots[hole] = entry;
                 hole = j;
             }
         }
-        self.0[hole] = (0, 0);
+        self.slots[hole] = (0, 0);
+        self.len -= 1;
     }
 
     /// One of the mutexes `owner` holds.
     fn held_by(&self, owner: u64) -> Option<usize> {
-        self.0
+        self.slots
             .iter()
             .find(|&&(addr, o)| addr != 0 && o == owner)
             .map(|&(addr, _)| addr)
@@ -742,7 +756,7 @@ impl MutexOwners {
     #[cfg(test)]
     fn owner(&self, addr: usize) -> Option<u64> {
         let i = self.find(addr)?;
-        (self.0[i].0 == addr).then_some(self.0[i].1)
+        (self.slots[i].0 == addr).then_some(self.slots[i].1)
     }
 
     fn apply(&mut self, record: MutexRecord) {
@@ -769,7 +783,17 @@ impl Scheduler {
     pub(crate) fn lock(&self) -> MutexGuard<'_, State> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.take_owner_records(&mut st);
+        self.shed_foreign();
         st
+    }
+
+    /// Drops the queued outside wakes of a detached schedule, which has no waiters left for them
+    /// and no `block`, `yield_now` or `dispatch` that would take them, so they never fill the
+    /// queue and send a later wake to wait for the state.
+    fn shed_foreign(&self) {
+        if self.detached() {
+            self.foreign_queue.drain(|_| {});
+        }
     }
 
     /// The state if no other thread holds it, its queued owner records taken.
@@ -780,6 +804,7 @@ impl Scheduler {
             Err(std::sync::TryLockError::WouldBlock) => return None,
         };
         self.take_owner_records(&mut st);
+        self.shed_foreign();
         Some(st)
     }
 
@@ -1961,6 +1986,24 @@ mod tests {
         for (&addr, &owner) in &model {
             assert_eq!(owners.owner(addr), Some(owner));
         }
-        assert_eq!(owners.0.iter().filter(|e| e.0 != 0).count(), model.len());
+        assert_eq!(owners.slots.iter().filter(|e| e.0 != 0).count(), model.len());
+    }
+
+    #[test]
+    fn a_full_table_refuses_a_new_mutex_and_still_removes() {
+        let mut owners = MutexOwners::default();
+        for i in 1..=OWNED_MUTEXES + 8 {
+            owners.insert(8 * i, i as u64);
+        }
+        assert_eq!(owners.len, OWNED_MUTEXES - 1);
+        assert!(owners.slots.iter().any(|e| e.0 == 0));
+        assert!(!owners.contains(8 * OWNED_MUTEXES));
+        owners.insert(8, 99);
+        assert_eq!(owners.owner(8), Some(99));
+        for i in 1..OWNED_MUTEXES {
+            owners.remove(8 * i);
+        }
+        assert_eq!(owners.len, 0);
+        assert!(owners.slots.iter().all(|e| e.0 == 0));
     }
 }
