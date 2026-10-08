@@ -44,6 +44,7 @@ use crate::host::Host;
 use crate::layer::{Flow, Layer, Unmodelled};
 use crate::net::Net;
 use crate::resolve::Resolver;
+use crate::room::RoomVec;
 use crate::signals::Signals;
 use crate::state::{self, Passthrough};
 
@@ -1794,6 +1795,25 @@ fn unpark_inner(domain: &Inner, sim: bool, may_wait: bool, woken: bool) -> Optio
     Some(domain.accounting.bump())
 }
 
+/// [`unpark`] for a participant back from a contended pthread mutex, which it now holds: the
+/// mutex may be one of a C allocator's own locks, so the row is updated without waiting for the
+/// census (`Accounting::record_running`). Such a wait passes an open timestamp's gate, takes no
+/// release and joins nothing, so nothing else of `unpark` applies. `None`, changing nothing, for
+/// any other wait.
+fn unpark_holding(domain: &Inner) -> Option<EpochBump> {
+    if accounting::current_wait_label() != Some("mutex")
+        || accounting::current_wait_key().is_some()
+        || accounting::gated()
+    {
+        return None;
+    }
+    let _passthrough = Passthrough::enter();
+    let stamp = domain.row_stamp();
+    domain.parked.fetch_sub(1, Ordering::SeqCst);
+    domain.accounting.record_running(thread_lineage(), stamp);
+    Some(domain.accounting.bump())
+}
+
 /// As [`mark_sim_waiting`]`(false)`, for a backend that holds its own lock while it leaves the
 /// wait: `None`, still parked, while the calling participant must wait at an open timestamp's
 /// gate, which it does with [`pass_gate`] once it has let go of that lock.
@@ -1881,13 +1901,20 @@ pub fn note_effect(op: &'static str) {
 /// lineage): the waiters a wake from a thread of another domain, or of none, can reach. A word two
 /// sims share (a lock in static data, parking_lot's process-wide bucket locks, a channel handed
 /// across) has waiters from both.
-static KEYED_WAITERS: Mutex<Vec<(usize, usize, u64)>> = Mutex::new(Vec::new());
+static KEYED_WAITERS: Mutex<KeyedWaiters> = Mutex::new(RoomVec::new());
+
+/// How many waiters [`KEYED_WAITERS`] lists before it allocates. A snare choice, past the
+/// participants of every sim parked on an address at once: the census lock is held while a waiter
+/// is listed, and a thread inside a C allocator may be waiting for it.
+const KEYED_ROOM: usize = 256;
+
+type KeyedWaiters = RoomVec<(usize, usize, u64), KEYED_ROOM>;
 
 /// How many entries [`KEYED_WAITERS`] holds, so a wake no participant anywhere waits on skips its
 /// lock.
 static KEYED_WAITER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-fn keyed_waiters() -> std::sync::MutexGuard<'static, Vec<(usize, usize, u64)>> {
+fn keyed_waiters() -> std::sync::MutexGuard<'static, KeyedWaiters> {
     KEYED_WAITERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -1924,13 +1951,13 @@ fn release_elsewhere(key: usize, n: usize, signal: impl Fn(&mut Core, usize)) {
     }
     let own = state::domain() as usize;
     let _passthrough = Passthrough::enter();
-    let others: Vec<Domain> = {
+    let others = {
         let waiters = keyed_waiters();
         let parked = waiters.iter().filter(|w| w.0 == key).count();
         if parked == 0 || n < parked {
             return;
         }
-        let mut others: Vec<Domain> = Vec::new();
+        let mut others = RoomVec::<Domain, { det_foreign::WAKE_ROOM }>::new();
         for &(_, domain, _) in waiters.iter().filter(|w| w.0 == key && w.1 != own) {
             if others.iter().all(|other| other.key() != domain) {
                 // SAFETY: a listed participant keeps its domain alive: it is delisted as it
@@ -1943,7 +1970,7 @@ fn release_elsewhere(key: usize, n: usize, signal: impl Fn(&mut Core, usize)) {
         }
         others
     };
-    for domain in others {
+    for domain in others.iter() {
         let mut core = domain.0.accounting.core();
         signal(&mut core, n);
         core.note_foreign_release(key);
@@ -2081,7 +2108,8 @@ pub(crate) fn release_native_futex(
 /// waiter could take it, and whether a thread of the domain is what keeps it from doing so.
 ///
 /// Dropping it stops the watch and refreshes `Accounting::watching` and `Accounting::watched`, the
-/// count that lets [`note_mutex`] skip the census lock for a mutex nobody watches.
+/// count that lets [`note_mutex`] skip the census lock for a mutex nobody watches. It drops with the
+/// mutex taken, so the census learns of it without being waited for (`Accounting::record`).
 #[cfg(any(unix, windows))]
 pub(crate) struct MutexWatch {
     /// The waiter's domain, held because a thread following a wake out of it during the wait
@@ -2098,14 +2126,7 @@ impl Drop for MutexWatch {
         let Some(domain) = self.domain.take() else {
             return;
         };
-        let mut core = domain.0.accounting.core();
-        core.unwatch_mutex(self.mutex);
-        domain
-            .0
-            .accounting
-            .watching
-            .store(core.watching(), Ordering::SeqCst);
-        drop(core);
+        domain.0.accounting.record_unwatch(self.mutex);
         domain
             .0
             .accounting
@@ -2213,10 +2234,10 @@ pub(crate) fn mutex_held_inside(mutex: usize) -> bool {
 }
 
 /// [`note_mutex_taken`] and [`note_mutex_freed`]: records the hold in the calling thread's
-/// `accounting::Held`, then updates a watched mutex's owner in the census. Does nothing under
-/// passthrough or off a domain, and skips the census unless a participant may be watching this
-/// mutex (checked without the lock, in `Accounting::watched`, after the record, so a waiter that
-/// starts watching meanwhile reads the record).
+/// `accounting::Held`, then updates a watched mutex's owner in the census, without waiting for its
+/// lock. Does nothing under passthrough or off a domain, and skips the census unless a participant
+/// may be watching this mutex (checked without the lock, in `Accounting::watched`, after the
+/// record, so a waiter that starts watching meanwhile reads the record).
 #[cfg(any(unix, windows))]
 fn note_mutex(mutex: usize, taken: bool) {
     if state::passthrough() {
@@ -2243,13 +2264,9 @@ fn note_mutex(mutex: usize, taken: bool) {
         return;
     }
     let _passthrough = Passthrough::enter();
-    let lineage = thread_lineage();
-    let mut core = domain.accounting.core();
-    if taken {
-        core.mutex_taken(mutex, lineage);
-    } else {
-        core.mutex_freed(mutex, lineage);
-    }
+    domain
+        .accounting
+        .record_mutex(mutex, thread_lineage(), taken);
 }
 
 /// [`note_effect`] from a hook: only the code under test's own calls count, not the sim's.
@@ -2806,7 +2823,8 @@ fn native_wait_inner<R>(wait: impl FnOnce() -> R, woken: impl FnOnce(&R) -> bool
 
 fn native_wait_parked<R>(wait: impl FnOnce() -> R, woken: impl FnOnce(&R) -> bool) -> R {
     let result = wait();
-    drop(unpark_inner(here().unwrap(), false, true, woken(&result)));
+    let domain = here().unwrap();
+    drop(unpark_holding(domain).or_else(|| unpark_inner(domain, false, true, woken(&result))));
     rejoin_schedule();
     if let Some(domain) = here() {
         drain_signals(domain);
@@ -4547,9 +4565,8 @@ pub(crate) fn det_held_inside(addr: usize) -> bool {
         }
         #[cfg(target_os = "macos")]
         if let Some(domain) = here()
-            && let Some(lineage) = domain.accounting.native_mutex_lineage(addr)
+            && domain.accounting.native_mutex_lineage(addr).is_some()
         {
-            sched.took(addr, lineage);
             return true;
         }
         false

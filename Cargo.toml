@@ -4,7 +4,7 @@ members = ["crates/*", "probes/interpose-probe"]
 exclude = ["shims"]
 
 [workspace.package]
-version = "3.1.0"
+version = "3.1.1"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"

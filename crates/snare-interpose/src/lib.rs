@@ -112,8 +112,10 @@ on_supported_targets! {
     #[cfg(unix)]
     mod owners;
     mod patch;
+    mod pending;
     mod race;
     mod resolve;
+    mod room;
     mod sched;
     mod signals;
     mod stall;

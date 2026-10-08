@@ -15,11 +15,13 @@
 //! them, or seed from process-wide state a sim cannot replay (see `shims/README.md`). Shims that
 //! only give each sim its own copy of a crate's process-wide state are patched only when
 //! `--parallel` or the workspace's `[*.metadata.snare] parallel` asks for them (see [`shims`]).
-//! The shims come from the snare repository at the tag matching this binary's version, or from a
-//! local `--shims-dir`.
+//! The shims come from wherever the workspace's lock file put `snare-interpose`, so a shim and
+//! the code under test link one copy of the interposer (see [`source`]), or from a local
+//! `--shims-dir`.
 
 mod init;
 mod shims;
+mod source;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
@@ -28,12 +30,9 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
 
 use shims::{Parallel, SHIMS, Shim};
+use source::Source;
 
-/// The repository holding `shims/`. Cargo finds a git dependency's package by name anywhere in
-/// the repository, so each shim resolves to its subdirectory.
-const SHIMS_GIT: &str = "https://github.com/valstad-shipworks/snare";
-
-/// The release tag of this binary, whose `shims/` match the interposer it was released with.
+/// The release tag of this binary, used for the shims when the workspace has no snare.
 const SHIMS_TAG: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 /// Appended to `RUSTFLAGS`. `rustix_use_libc` is the cfg rustix's build script reads to select
@@ -88,13 +87,15 @@ enum Cmd {
 #[derive(Args)]
 struct TestArgs {
     /// Directory holding the drop-in shims (the snare repository's `shims/`), used instead of the
-    /// snare repository's tagged copy.
+    /// copy matching the workspace's snare.
     #[arg(long, value_name = "DIR")]
     shims_dir: Option<PathBuf>,
 
-    /// Git ref (tag, branch or commit) of the snare repository to take the shims from.
-    #[arg(long, value_name = "REF", default_value = SHIMS_TAG, conflicts_with = "shims_dir")]
-    shims_rev: String,
+    /// Git ref (tag, branch or commit) of the snare repository to take the shims from, instead of
+    /// the release matching the workspace's snare; `snare` and `snare-interpose` from crates.io
+    /// are patched from it too.
+    #[arg(long, value_name = "REF", conflicts_with = "shims_dir")]
+    shims_rev: Option<String>,
 
     /// Patch every default shim, and every parallel shim `--parallel` selects, even ones whose
     /// crate is not in the dependency graph. Never selects a parallel shim by itself.
@@ -202,27 +203,57 @@ fn run_test(args: TestArgs) -> i32 {
     }
     let graph = shims::packages(&metadata);
     let patches = shims::select(present, &graph, &parallel.crates, args.all_shims);
+    let source = match source::resolve(
+        &metadata,
+        args.shims_dir.as_deref(),
+        args.shims_rev.as_deref(),
+        SHIMS_TAG,
+    ) {
+        Ok(source) => source,
+        Err(e) => {
+            eprintln!("cargo-snare: {e}");
+            return 1;
+        }
+    };
+
+    let patches = match source.release() {
+        Some(release) => {
+            let (shipped, missing): (Vec<&Shim>, Vec<&Shim>) = patches
+                .into_iter()
+                .partition(|shim| shim.shipped_in(release));
+            for shim in missing {
+                eprintln!(
+                    "cargo-snare: snare {}.{}.{} has no {} shim; {} is left unpatched (update snare \
+                     to get it)",
+                    release.0,
+                    release.1,
+                    release.2,
+                    shim.label(),
+                    shim.krate
+                );
+            }
+            shipped
+        }
+        None => patches,
+    };
     let cfgs = shims::cfgs(&patches, &parallel.crates);
 
     let mut cmd = Command::new("cargo");
     cmd.arg("test");
+    let mut entries = Vec::new();
     for shim in &patches {
         let key = shim.patch_key();
-        let mut set = |field: &str, value: String| {
-            cmd.arg("--config")
-                .arg(format!("patch.crates-io.{key}.{field}={value}"));
-        };
-        match &args.shims_dir {
-            Some(dir) => set("path", toml_string(&dir.join(shim.dir))),
-            None => {
-                set("git", format!("\"{SHIMS_GIT}\""));
-                set("rev", format!("\"{}\"", args.shims_rev));
-            }
-        }
+        entries.extend(source.patch(&key, shim.dir));
         if shim.aliased() {
-            set("package", format!("\"{}\"", shim.krate));
-            set("version", format!("\"{}\"", shim.line));
+            entries.push(format!("patch.crates-io.{key}.package=\"{}\"", shim.krate));
+            entries.push(format!("patch.crates-io.{key}.version=\"{}\"", shim.line));
         }
+    }
+    if !patches.is_empty() {
+        entries.extend(source.interposer_patches());
+    }
+    for entry in entries {
+        cmd.arg("--config").arg(entry);
     }
     cmd.args(&args.cargo_args);
 
@@ -237,15 +268,55 @@ fn run_test(args: TestArgs) -> i32 {
     cmd.env("RUSTFLAGS", rustflags);
 
     if args.dry_run {
-        print_invocation(&cmd, &patches, &parallel);
+        print_invocation(&cmd, &patches, &parallel, &source);
         return 0;
     }
 
-    match cmd.status() {
+    let lock = LockGuard::save(&metadata);
+    // Ctrl-C reaches cargo too, which stops; this process outlives it to put the lock file back.
+    let _ = ctrlc::set_handler(|| {});
+    let code = match cmd.status() {
         Ok(status) => status.code().unwrap_or(1),
         Err(e) => {
             eprintln!("cargo-snare: failed to run cargo: {e}");
             1
+        }
+    };
+    drop(lock);
+    code
+}
+
+/// The workspace's `Cargo.lock` as it was before the patched `cargo test`, put back when dropped.
+/// Cargo records a `[patch]` source in the lock file it resolves, so without this every run would
+/// leave the shims' git (or path) sources in a lock file the workspace may commit, and a later
+/// plain build, `cargo package` or `--locked` build would see it changed.
+struct LockGuard {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
+}
+
+impl LockGuard {
+    fn save(metadata: &Value) -> Option<LockGuard> {
+        let path = Path::new(metadata["workspace_root"].as_str()?).join("Cargo.lock");
+        let contents = std::fs::read(&path).ok();
+        Some(LockGuard { path, contents })
+    }
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let restored = match &self.contents {
+            Some(contents) => std::fs::write(&self.path, contents),
+            None => match std::fs::remove_file(&self.path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            },
+        };
+        if let Err(e) = restored {
+            eprintln!(
+                "cargo-snare: could not restore {}: {e}",
+                self.path.display()
+            );
         }
     }
 }
@@ -278,25 +349,15 @@ fn cargo_metadata() -> Result<Value, i32> {
     })
 }
 
-/// `path` as a TOML basic string, escaping `\` and `"` (TOML v1.0.0, String, basic strings), so
-/// Windows paths survive inside `--config`.
-fn toml_string(path: &Path) -> String {
-    let escaped = path
-        .display()
-        .to_string()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
-    format!("\"{escaped}\"")
-}
-
 /// Prints which shims are patched, which crates get per-sim state, and the command as a shell
 /// line, `RUSTFLAGS` included, for `--dry-run`. The arguments are not shell-quoted.
-fn print_invocation(cmd: &Command, patches: &[&Shim], parallel: &Parallel) {
+fn print_invocation(cmd: &Command, patches: &[&Shim], parallel: &Parallel, source: &Source) {
     if patches.is_empty() {
         println!("cargo-snare: no shim crates in the dependency graph; none patched");
     } else {
         let labels: Vec<String> = patches.iter().map(|shim| shim.label()).collect();
         println!("cargo-snare: patching {}", labels.join(", "));
+        println!("cargo-snare: {}", source.describe());
     }
     if parallel.crates.is_empty() {
         println!(

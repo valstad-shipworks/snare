@@ -17,24 +17,27 @@
 //! wakes still reaches the schedule, and while no thread holds the baton its wake hands it on.
 //!
 //! Invariants, all under the [`State`] lock: at most one thread holds the baton (`holder`); a
-//! thread is in at most one of `runnable` and `blocked`, and the holder is in neither; every
-//! `blocked` thread is queued under its key in `queues` (the queues may hold stale entries, which
-//! [`Scheduler::wake_key`] skips). The thread that lets go of the baton with nothing runnable runs
+//! thread is at most one of runnable and blocked, and the holder is neither; a key's waiters wake
+//! in the order they began to wait. The thread that lets go of the baton with nothing runnable runs
 //! [`Scheduler::dispatch`] itself, or delegates it to a parked thread ([`Grant::Dispatch`]) when it
 //! is leaving the schedule, so exactly one thread drives the schedule while it is idle.
 //!
 //! Lock order: the [`State`] lock may be held while taking a [`Parker`]'s lock (to delegate), but a
-//! parker's lock is never held while taking the state lock — a grant drops the state lock first,
-//! and a parked thread lets go of its parker before re-locking the state. Every entry point that
+//! parker's lock is never held while taking the state lock — a parked thread lets go of its parker
+//! before re-locking the state. Every entry point that
 //! locks runs under [`Passthrough`] (callers of [`Scheduler::lock`] enter it themselves), so the
 //! scheduler's own mutexes and condition variables are not hooked back into it. The domain's
 //! census lock, when both are needed, is taken first (see `Domain::if_quiescent`).
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
+#[cfg(any(unix, windows))]
+use crate::pending::MutexRecord;
+use crate::pending::Pending;
 use crate::stall::{Idle, STALL_WARN};
 use crate::state::Passthrough;
 
@@ -182,8 +185,8 @@ enum Grant {
     Dispatch,
 }
 
-/// Where a parked thread waits to be handed the baton. One per thread, kept in
-/// [`State::parkers`] and shared by `Arc` so a grant can be made after the state lock is released.
+/// Where a parked thread waits to be handed the baton. One per thread, kept in its [`Slot`] and
+/// shared by `Arc` so a grant can be made after the state lock is released.
 #[derive(Default)]
 struct Parker {
     /// The pending grant, taken by the parked thread. A one-slot latch: a grant made before the
@@ -209,6 +212,12 @@ impl Parker {
             *grant = Some(Grant::Dispatch);
             self.granted.notify_one();
         }
+    }
+
+    /// Drops a pending grant, as the thread leaves the schedule: one made meanwhile went to a
+    /// thread no longer waiting for it.
+    fn forget(&self) {
+        *self.grant.lock().unwrap() = None;
     }
 
     /// Blocks until a grant is pending and takes it, looping over the condition variable's
@@ -299,35 +308,35 @@ impl Blocked {
 pub(crate) const EXTERNAL: u64 = u64::MAX;
 
 /// A deterministic schedule's state, behind [`Scheduler::lock`]. Threads are named by lineage id.
+///
+/// What a lock, unlock, wait or wake does under the lock neither allocates nor frees: a thread
+/// inside a C allocator, holding one of its locks, may be waiting for this one, and the allocation
+/// could need that lock. Each thread's share lives in its [`Slot`], made before the lock is taken
+/// ([`Scheduler::lock_with_room`]), and the tables only ever grow with the lock let go.
 #[derive(Default)]
 pub(crate) struct State {
     /// The lineage id of the thread allowed to run.
     holder: Option<u64>,
-    /// Address waiters re-polled for something outside the sim, with the key they waited on, to
-    /// tell whether the re-poll found progress.
-    repolled: HashMap<u64, DetKey>,
-    /// Threads ready to run, with why they were made ready.
-    runnable: BTreeMap<u64, DetWake>,
-    /// Threads waiting, ordered by lineage id so timeouts wake in a fixed order. Boxed: a debug
-    /// build gives each move of an entry inside the map's insert its own stack slot, on the stack
-    /// of a thread that may have only 16 KiB.
-    blocked: BTreeMap<u64, Box<Blocked>>,
-    /// Each key's waiters, in the order they began to wait.
-    queues: HashMap<DetKey, VecDeque<u64>>,
-    /// Each thread's parker, created on first use and dropped when it leaves the schedule.
-    parkers: HashMap<u64, Arc<Parker>>,
+    /// Every thread the schedule has met and that has not left the domain, by lineage.
+    threads: Threads,
+    /// How many threads are ready to run (`Slot::runnable`).
+    runnable: usize,
+    /// How many threads are waiting (`Slot::blocked`).
+    blocked: usize,
+    /// The order threads began to wait in, for each key's waiters to wake oldest first.
+    next_wait: u64,
     /// The last thread handed the baton: the round-robin cursor.
     last: u64,
-    /// Threads that have left the domain, so a late join on one returns at once and
+    /// Threads that have left the domain, in order, so a late join on one returns at once and
     /// [`Scheduler::lineage_of`] no longer names a handle the OS may have reused: a `pthread_t`'s
     /// lifetime ends once the thread has terminated and been joined or detached, after which it
     /// may be reused (POSIX XSH 2.9.2 "Thread IDs"), and a Windows thread id is unique only "until
     /// the thread terminates" ([Microsoft Learn: GetCurrentThreadId function](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentthreadid)).
-    exited: std::collections::HashSet<u64>,
-    /// OS thread handles of this domain's threads, for joins: the `pthread_t` from `pthread_self`
-    /// on unix, the thread id from `GetCurrentThreadId` on Windows (see
+    exited: Vec<u64>,
+    /// OS thread handles of this domain's threads, for joins, in order: the `pthread_t` from
+    /// `pthread_self` on unix, the thread id from `GetCurrentThreadId` on Windows (see
     /// `os::current_thread_handle`).
-    handles: HashMap<usize, u64>,
+    handles: Vec<(usize, u64)>,
     /// When, in real time (`accounting::real_elapsed`), the current stretch of real-time waits
     /// with nothing else able to move began, for the stall warning; `None` once the baton is
     /// granted.
@@ -340,49 +349,181 @@ pub(crate) struct State {
     pub(crate) waits: u64,
     /// Threads inside [`Scheduler::enter_root`] that have not yet left.
     roots: usize,
-    /// Threads the schedule let go when it detached, which have not yet waited in it again.
-    let_go: HashSet<u64>,
-    /// Let-go threads now in a native wait, by the key a wake in the schedule releases them with.
-    outside: HashMap<u64, DetKey>,
     /// Keys a wake from outside the schedule reached while none of their waiters was blocked: the
     /// next wait on one returns at once (see `domain::det_foreign`).
-    foreign: HashSet<DetKey>,
-    /// Threads caught in a spin (see `domain::clock_spin`), with whether its last step polled the clock.
-    /// A runnable thread in here waits on time rather than having work to do.
-    spinners: BTreeMap<u64, bool>,
+    foreign: ForeignKeys,
     /// Which of this domain's threads holds each pthread mutex, by address. A mutex held by none
     /// of them is held outside the domain — by another test's simulation or an unmanaged thread.
     #[cfg(any(unix, windows))]
-    owners: HashMap<usize, u64>,
+    owners: MutexOwners,
     #[cfg(windows)]
     shared_owners: HashMap<usize, std::collections::BTreeSet<u64>>,
+}
+
+/// One thread's share of the schedule.
+struct Slot {
+    /// Where it waits for the baton, shared by `Arc` so a grant can be made after the state lock
+    /// is released.
+    parker: Arc<Parker>,
+    /// Ready to run, with why it was made ready.
+    runnable: Option<DetWake>,
+    /// Waiting, with what for and when it began (`State::next_wait`).
+    blocked: Option<(Blocked, u64)>,
+    /// Re-polled for something outside the sim while waiting, with the key it waited on, to tell
+    /// whether the re-poll found progress.
+    repolled: Option<DetKey>,
+    /// Let go when the schedule detached, and not yet waiting in it again.
+    let_go: bool,
+    /// Let go and now in a native wait, with the key a wake in the schedule releases it with.
+    outside: Option<DetKey>,
+    /// Caught in a spin (see `domain::clock_spin`), with whether its last step polled the clock. A
+    /// runnable thread spinning waits on time rather than having work to do.
+    spinner: Option<bool>,
+}
+
+impl Slot {
+    fn new(parker: Arc<Parker>) -> Self {
+        Self {
+            parker,
+            runnable: None,
+            blocked: None,
+            repolled: None,
+            let_go: false,
+            outside: None,
+            spinner: None,
+        }
+    }
+}
+
+/// The schedule's threads, ordered by lineage. Room for more is made only with the state lock let
+/// go (see [`Scheduler::lock_with_room`]).
+#[derive(Default)]
+struct Threads(Vec<(u64, Slot)>);
+
+impl Threads {
+    fn get(&self, t: u64) -> Option<&Slot> {
+        let i = self.0.binary_search_by_key(&t, |&(t, _)| t).ok()?;
+        Some(&self.0[i].1)
+    }
+
+    fn get_mut(&mut self, t: u64) -> Option<&mut Slot> {
+        let i = self.0.binary_search_by_key(&t, |&(t, _)| t).ok()?;
+        Some(&mut self.0[i].1)
+    }
+
+    /// `t`'s slot, made with the parker taken out of `parker` if it has none; `None` if it has
+    /// none and there is no room or no parker for one.
+    fn get_or_insert(
+        &mut self,
+        t: u64,
+        parker: &mut Option<Arc<Parker>>,
+    ) -> Option<&mut Slot> {
+        let i = match self.0.binary_search_by_key(&t, |&(t, _)| t) {
+            Ok(i) => i,
+            Err(i) => {
+                if self.0.len() == self.0.capacity() {
+                    return None;
+                }
+                self.0.insert(i, (t, Slot::new(parker.take()?)));
+                i
+            }
+        };
+        Some(&mut self.0[i].1)
+    }
+
+    fn remove(&mut self, t: u64) -> Option<Slot> {
+        let i = self.0.binary_search_by_key(&t, |&(t, _)| t).ok()?;
+        Some(self.0.remove(i).1)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (u64, &Slot)> {
+        self.0.iter().map(|(t, slot)| (*t, slot))
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = (u64, &mut Slot)> {
+        self.0.iter_mut().map(|(t, slot)| (*t, slot))
+    }
+}
+
+/// How many keys [`ForeignKeys`] keeps. A snare choice, far past the waits that race a wake from
+/// outside at once; past it one is forgotten, and its waiter is left to the re-poll that catches
+/// what changed outside the schedule.
+const FOREIGN_KEYS: usize = 64;
+
+/// [`State::foreign`]: a fixed set, as an outside wake may come from a thread inside an allocator.
+struct ForeignKeys {
+    keys: [Option<DetKey>; FOREIGN_KEYS],
+    /// The slot the next key takes when none is free.
+    next: usize,
+}
+
+impl Default for ForeignKeys {
+    fn default() -> Self {
+        Self {
+            keys: [None; FOREIGN_KEYS],
+            next: 0,
+        }
+    }
+}
+
+impl ForeignKeys {
+    fn insert(&mut self, key: DetKey) {
+        if self.keys.contains(&Some(key)) {
+            return;
+        }
+        let slot = match self.keys.iter().position(Option::is_none) {
+            Some(free) => free,
+            None => {
+                self.next = (self.next + 1) % FOREIGN_KEYS;
+                self.next
+            }
+        };
+        self.keys[slot] = Some(key);
+    }
+
+    fn remove(&mut self, key: DetKey) -> bool {
+        match self.keys.iter().position(|&k| k == Some(key)) {
+            Some(i) => {
+                self.keys[i] = None;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.keys = [None; FOREIGN_KEYS];
+    }
 }
 
 impl State {
     /// The thread that holds the baton or is next to, if any: the schedule is not idle.
     pub(crate) fn running(&self) -> Option<u64> {
-        self.holder
-            .filter(|&t| t != EXTERNAL)
-            .or_else(|| self.runnable.keys().next().copied())
+        self.holder.filter(|&t| t != EXTERNAL).or_else(|| {
+            self.threads
+                .iter()
+                .find(|(_, slot)| slot.runnable.is_some())
+                .map(|(t, _)| t)
+        })
     }
 
     /// How many threads are running or ready, and how many are blocked.
     pub(crate) fn counts(&self) -> (usize, usize) {
         let holding = usize::from(self.holder.is_some_and(|t| t != EXTERNAL));
-        (self.runnable.len() + holding, self.blocked.len())
+        (self.runnable + holding, self.blocked)
     }
 
     /// Takes the baton for an executive; called only on an idle schedule.
     pub(crate) fn hold_external(&mut self) {
         debug_assert!(
-            !self.parkers.contains_key(&EXTERNAL),
+            self.threads.get(EXTERNAL).is_none(),
             "a thread has the executive's lineage"
         );
         self.holder = Some(EXTERNAL);
     }
 
     fn idle(&self) -> bool {
-        self.holder.is_none() && self.runnable.is_empty()
+        self.holder.is_none() && self.runnable == 0
     }
 
     /// The participant holding the baton, if any (an executive's hold is not a participant's).
@@ -415,12 +556,81 @@ impl State {
 
     /// A re-polled waiter did something: progress, unless it only blocked again on the same key.
     fn settle_repoll(&mut self, t: u64, blocked_on: Option<DetKey>) {
-        if let Some(key) = self.repolled.remove(&t)
+        if let Some(key) = self.threads.get_mut(t).and_then(|slot| slot.repolled.take())
             && blocked_on != Some(key)
         {
             crate::domain::count_outside_wake();
         }
     }
+
+    /// Makes `t` ready to run with `why`, replacing why it was made ready if it already was.
+    fn set_runnable(&mut self, t: u64, why: DetWake) {
+        if let Some(slot) = self.threads.get_mut(t)
+            && slot.runnable.replace(why).is_none()
+        {
+            self.runnable += 1;
+        }
+    }
+
+    /// Makes `t` ready to run with `why` unless it already is.
+    fn set_runnable_if_not(&mut self, t: u64, why: DetWake) {
+        if let Some(slot) = self.threads.get_mut(t)
+            && slot.runnable.is_none()
+        {
+            slot.runnable = Some(why);
+            self.runnable += 1;
+        }
+    }
+
+    fn take_runnable(&mut self, t: u64) -> Option<DetWake> {
+        let why = self.threads.get_mut(t)?.runnable.take()?;
+        self.runnable -= 1;
+        Some(why)
+    }
+
+    fn is_runnable(&self, t: u64) -> bool {
+        self.threads.get(t).is_some_and(|slot| slot.runnable.is_some())
+    }
+
+    /// Records `t` waiting in `blocked`, after every wait begun before it.
+    fn set_blocked(&mut self, t: u64, blocked: Blocked) {
+        let order = self.next_wait;
+        if let Some(slot) = self.threads.get_mut(t) {
+            if slot.blocked.replace((blocked, order)).is_none() {
+                self.blocked += 1;
+            }
+            self.next_wait += 1;
+        }
+    }
+
+    fn take_blocked(&mut self, t: u64) -> Option<Blocked> {
+        let (blocked, _) = self.threads.get_mut(t)?.blocked.take()?;
+        self.blocked -= 1;
+        Some(blocked)
+    }
+
+    fn blocked(&self) -> impl Iterator<Item = (u64, &Blocked)> {
+        self.threads
+            .iter()
+            .filter_map(|(t, slot)| slot.blocked.as_ref().map(|(b, _)| (t, b)))
+    }
+
+    /// The first blocked thread's parker, which takes over moving the schedule on.
+    fn first_blocked_parker(&self) -> Option<&Arc<Parker>> {
+        self.threads
+            .iter()
+            .find(|(_, slot)| slot.blocked.is_some())
+            .map(|(_, slot)| &slot.parker)
+    }
+}
+
+/// Room [`Scheduler::lock_with_room`] makes in the state's tables before handing it out.
+#[derive(Clone, Copy, Default)]
+struct Room {
+    /// New threads, each with room to leave the domain later.
+    threads: usize,
+    /// New thread handles.
+    handles: usize,
 }
 
 /// A wake from outside a schedule, queued for it: (key, count, futex mask, futex scope).
@@ -439,9 +649,123 @@ pub(crate) struct Scheduler {
     /// Wakes from outside the schedule made while [`state`](Self::state) was held, as (key, count,
     /// futex mask, futex scope), for its holder to deliver: it may be waiting, holding it, on the
     /// very thread that made them (a layer's time skip runs the code under test's wakers).
-    foreign_queue: Mutex<Vec<ForeignWake>>,
-    /// Whether `foreign_queue` may hold any, so delivering them skips its lock when not.
-    foreign_queued: AtomicBool,
+    foreign_queue: Pending<ForeignWake>,
+    /// How many threads are let go (`Slot::let_go`), so a hook on any other thread skips the
+    /// state lock in [`rejoin`](Self::rejoin).
+    let_go: AtomicUsize,
+    /// Mutexes taken and let go while [`state`](Self::state) was held, for its next holder to
+    /// record in `owners` (see `crate::pending`).
+    #[cfg(any(unix, windows))]
+    owner_records: Pending<MutexRecord>,
+}
+
+/// How many slots [`MutexOwners`] has; it tracks one fewer mutex at once, so a probe always ends
+/// at a free slot. A snare choice, far past the mutexes a domain's threads hold at once; one taken
+/// while it is full goes unrecorded, and so counts as held outside the domain.
+#[cfg(any(unix, windows))]
+const OWNED_MUTEXES: usize = 1024;
+
+/// Which thread holds each mutex, by address, in a table made with the schedule, so recording a
+/// hold never allocates: the thread recording it may be inside a C allocator, holding the lock an
+/// allocation would need. Open addressing with linear probing; address 0 marks a free slot.
+#[cfg(any(unix, windows))]
+struct MutexOwners {
+    slots: Box<[(usize, u64)]>,
+    len: usize,
+}
+
+#[cfg(any(unix, windows))]
+impl Default for MutexOwners {
+    fn default() -> Self {
+        Self {
+            slots: vec![(0, 0); OWNED_MUTEXES].into_boxed_slice(),
+            len: 0,
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl MutexOwners {
+    const MASK: usize = OWNED_MUTEXES - 1;
+
+    fn home(addr: usize) -> usize {
+        let hash = ((addr >> 3) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        (hash >> (64 - OWNED_MUTEXES.trailing_zeros())) as usize
+    }
+
+    /// The slot holding `addr`, or the free slot where it would go; `None` if neither is found.
+    fn find(&self, addr: usize) -> Option<usize> {
+        let mut i = Self::home(addr);
+        for _ in 0..OWNED_MUTEXES {
+            let slot = self.slots[i].0;
+            if slot == addr || slot == 0 {
+                return Some(i);
+            }
+            i = (i + 1) & Self::MASK;
+        }
+        None
+    }
+
+    fn insert(&mut self, addr: usize, owner: u64) {
+        let Some(i) = self.find(addr) else {
+            return;
+        };
+        if self.slots[i].0 == 0 {
+            if self.len + 1 >= OWNED_MUTEXES {
+                return;
+            }
+            self.len += 1;
+        }
+        self.slots[i] = (addr, owner);
+    }
+
+    fn contains(&self, addr: usize) -> bool {
+        self.find(addr).is_some_and(|i| self.slots[i].0 == addr)
+    }
+
+    /// Frees `addr`'s slot, moving back each later entry of its probe run that may fill it.
+    fn remove(&mut self, addr: usize) {
+        let Some(mut hole) = self.find(addr).filter(|&i| self.slots[i].0 == addr) else {
+            return;
+        };
+        let mut j = hole;
+        loop {
+            j = (j + 1) & Self::MASK;
+            let entry = self.slots[j];
+            if entry.0 == 0 {
+                break;
+            }
+            let home = Self::home(entry.0);
+            if (j.wrapping_sub(home) & Self::MASK) >= (j.wrapping_sub(hole) & Self::MASK) {
+                self.slots[hole] = entry;
+                hole = j;
+            }
+        }
+        self.slots[hole] = (0, 0);
+        self.len -= 1;
+    }
+
+    /// One of the mutexes `owner` holds.
+    fn held_by(&self, owner: u64) -> Option<usize> {
+        self.slots
+            .iter()
+            .find(|&&(addr, o)| addr != 0 && o == owner)
+            .map(|&(addr, _)| addr)
+    }
+
+    #[cfg(test)]
+    fn owner(&self, addr: usize) -> Option<u64> {
+        let i = self.find(addr)?;
+        (self.slots[i].0 == addr).then_some(self.slots[i].1)
+    }
+
+    fn apply(&mut self, record: MutexRecord) {
+        if record.taken {
+            self.insert(record.mutex, record.lineage);
+        } else {
+            self.remove(record.mutex);
+        }
+    }
 }
 
 /// How long the scheduler waits in real time, when every thread is blocked on a lock or address
@@ -457,7 +781,91 @@ impl Scheduler {
     /// held it must not wedge every other thread of the domain. The caller enters passthrough
     /// first.
     pub(crate) fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.take_owner_records(&mut st);
+        self.shed_foreign();
+        st
+    }
+
+    /// Drops the queued outside wakes of a detached schedule, which has no waiters left for them
+    /// and no `block`, `yield_now` or `dispatch` that would take them, so they never fill the
+    /// queue and send a later wake to wait for the state.
+    fn shed_foreign(&self) {
+        if self.detached() {
+            self.foreign_queue.drain(|_| {});
+        }
+    }
+
+    /// The state if no other thread holds it, its queued owner records taken.
+    fn try_lock(&self) -> Option<MutexGuard<'_, State>> {
+        let mut st = match self.state.try_lock() {
+            Ok(st) => st,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        self.take_owner_records(&mut st);
+        self.shed_foreign();
+        Some(st)
+    }
+
+    /// [`lock`](Self::lock), once the state's tables have `room`: they grow with the lock let go,
+    /// the old ones are freed with it let go too, and the lock is taken again until the room is
+    /// there.
+    fn lock_with_room(&self, room: Room) -> MutexGuard<'_, State> {
+        loop {
+            let st = self.lock();
+            let threads = st.threads.0.len() + room.threads;
+            let exits = st.exited.len() + threads + 1;
+            let handles = st.handles.len() + room.handles;
+            let short = |len: usize, capacity: usize| (len > capacity).then(|| len.max(2 * capacity));
+            let grow = (
+                short(threads, st.threads.0.capacity()),
+                short(exits, st.exited.capacity()),
+                short(handles, st.handles.capacity()),
+            );
+            if grow == (None, None, None) {
+                return st;
+            }
+            drop(st);
+            let mut threads = grow.0.map(Vec::with_capacity);
+            let mut exited = grow.1.map(Vec::with_capacity);
+            let mut handles = grow.2.map(Vec::with_capacity);
+            let mut st = self.lock();
+            fn adopt<T>(table: &mut Vec<T>, grown: &mut Option<Vec<T>>) {
+                if let Some(grown) = grown
+                    && grown.capacity() > table.capacity()
+                {
+                    grown.append(table);
+                    std::mem::swap(table, grown);
+                }
+            }
+            adopt(&mut st.threads.0, &mut threads);
+            adopt(&mut st.exited, &mut exited);
+            adopt(&mut st.handles, &mut handles);
+            drop(st);
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn take_owner_records(&self, st: &mut State) {
+        self.owner_records.drain(|record| st.owners.apply(record));
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn take_owner_records(&self, _st: &mut State) {}
+
+    /// Records `record` in `owners` without waiting for the state: queued for its holder if
+    /// another thread has it, as a lock or unlock hook may be running inside an allocator that
+    /// holder's next allocation needs.
+    #[cfg(any(unix, windows))]
+    fn record_owner(&self, record: MutexRecord) {
+        let _passthrough = Passthrough::enter();
+        let mut st = match self.try_lock() {
+            Some(st) => st,
+            None if self.owner_records.push(record) => return,
+            None => self.lock(),
+        };
+        st.owners.apply(record);
     }
 
     /// Takes the baton for an executive once the schedule is idle: no thread holds it and none is
@@ -487,8 +895,44 @@ impl Scheduler {
         let Some(st) = Self::grant_next(st) else {
             return;
         };
-        if let Some(parker) = st.blocked.keys().next().and_then(|t| st.parkers.get(t)) {
+        if let Some(parker) = st.first_blocked_parker() {
             parker.delegate();
+        }
+    }
+
+    /// The state locked with a slot for `t`, made if it has none, and the slot's parker. `None` if
+    /// `skip` says, under the lock, not to make one. A parker for a new slot is made, and one left
+    /// unused freed, with the lock let go.
+    fn lock_slot(
+        &self,
+        t: u64,
+        skip: impl Fn(&State) -> bool,
+    ) -> Option<(MutexGuard<'_, State>, Arc<Parker>)> {
+        let mut spare = None;
+        loop {
+            let mut st = self.lock_with_room(Room {
+                threads: 1,
+                handles: 0,
+            });
+            if skip(&st) {
+                drop(st);
+                return None;
+            }
+            let parker = st
+                .threads
+                .get_or_insert(t, &mut spare)
+                .map(|slot| slot.parker.clone());
+            match parker {
+                Some(parker) if spare.is_none() => return Some((st, parker)),
+                Some(_) => {
+                    drop(st);
+                    spare = None;
+                }
+                None => {
+                    drop(st);
+                    spare = Some(Arc::new(Parker::default()));
+                }
+            }
         }
     }
 
@@ -496,16 +940,17 @@ impl Scheduler {
     /// another thread of the domain holds it.
     pub(crate) fn enter_root(&self, me: u64) {
         let _passthrough = Passthrough::enter();
-        let mut st = self.lock();
+        let Some((mut st, parker)) = self.lock_slot(me, |_| false) else {
+            return;
+        };
         st.roots += 1;
         self.detached.store(false, Ordering::SeqCst);
-        let parker = st.parkers.entry(me).or_default().clone();
         if st.holder.is_none() {
             st.holder = Some(me);
             st.last = me;
             return;
         }
-        st.runnable.insert(me, DetWake::Woken);
+        st.set_runnable(me, DetWake::Woken);
         drop(st);
         self.park(&parker);
     }
@@ -514,24 +959,23 @@ impl Scheduler {
     /// before the OS starts it for every thread being blocked.
     pub(crate) fn spawned(&self, child: u64) {
         let _passthrough = Passthrough::enter();
-        let mut st = self.lock();
-        if self.detached() {
+        let Some((mut st, _)) = self.lock_slot(child, |_| self.detached()) else {
             return;
-        }
-        st.parkers.entry(child).or_default();
-        st.runnable.insert(child, DetWake::Woken);
+        };
+        st.set_runnable(child, DetWake::Woken);
         Self::grant_if_idle(st);
     }
 
     /// A participant joins the schedule from outside it: queue it and wait for its turn.
     pub(crate) fn attach_thread(&self, me: u64) {
         let _passthrough = Passthrough::enter();
-        let mut st = self.lock();
-        let parker = st.parkers.entry(me).or_default().clone();
+        let Some((mut st, parker)) = self.lock_slot(me, |_| false) else {
+            return;
+        };
         if st.holder == Some(me) {
             return;
         }
-        st.runnable.insert(me, DetWake::Woken);
+        st.set_runnable(me, DetWake::Woken);
         Self::grant_if_idle(st);
         self.park(&parker);
     }
@@ -543,9 +987,11 @@ impl Scheduler {
     pub(crate) fn detach_thread(&self, me: u64) {
         let _passthrough = Passthrough::enter();
         let mut st = self.lock();
-        st.parkers.remove(&me);
-        st.runnable.remove(&me);
-        st.blocked.remove(&me);
+        st.take_runnable(me);
+        st.take_blocked(me);
+        if let Some(slot) = st.threads.get(me) {
+            slot.parker.forget();
+        }
         let disowned = Self::disown(&mut st, me);
         if st.holder != Some(me) {
             if disowned {
@@ -557,7 +1003,7 @@ impl Scheduler {
         let Some(st) = Self::grant_next(st) else {
             return;
         };
-        if let Some(parker) = st.blocked.keys().next().and_then(|t| st.parkers.get(t)) {
+        if let Some(parker) = st.first_blocked_parker() {
             parker.delegate();
         }
     }
@@ -566,14 +1012,23 @@ impl Scheduler {
     pub(crate) fn unspawned(&self, child: u64) {
         let _passthrough = Passthrough::enter();
         let mut st = self.lock();
-        st.runnable.remove(&child);
-        st.parkers.remove(&child);
+        st.take_runnable(child);
+        let slot = st.threads.remove(child);
+        drop(st);
+        drop(slot);
     }
 
     /// Records the OS handle of a thread this domain created, for [`lineage_of`](Scheduler::lineage_of).
     pub(crate) fn record_handle(&self, handle: usize, child: u64) {
         let _passthrough = Passthrough::enter();
-        self.lock().handles.insert(handle, child);
+        let mut st = self.lock_with_room(Room {
+            threads: 0,
+            handles: 1,
+        });
+        match st.handles.binary_search_by_key(&handle, |&(h, _)| h) {
+            Ok(i) => st.handles[i].1 = child,
+            Err(i) => st.handles.insert(i, (handle, child)),
+        }
     }
 
     /// The lineage id of the thread with this OS handle, if this domain created it and it has not
@@ -581,20 +1036,20 @@ impl Scheduler {
     pub(crate) fn lineage_of(&self, handle: usize) -> Option<u64> {
         let _passthrough = Passthrough::enter();
         let st = self.lock();
-        let lineage = *st.handles.get(&handle)?;
-        (!st.exited.contains(&lineage)).then_some(lineage)
+        let i = st.handles.binary_search_by_key(&handle, |&(h, _)| h).ok()?;
+        let lineage = st.handles[i].1;
+        st.exited.binary_search(&lineage).is_err().then_some(lineage)
     }
 
     /// A new managed thread's first act: wait for the baton.
     pub(crate) fn started(&self, me: u64) {
         let _passthrough = Passthrough::enter();
-        let parker = {
-            let mut st = self.lock();
-            if self.detached() && !st.runnable.contains_key(&me) && st.holder != Some(me) {
-                return;
-            }
-            st.parkers.entry(me).or_default().clone()
+        let Some((st, parker)) = self.lock_slot(me, |st| {
+            self.detached() && !st.is_runnable(me) && st.holder != Some(me)
+        }) else {
+            return;
         };
+        drop(st);
         self.park(&parker);
     }
 
@@ -607,31 +1062,33 @@ impl Scheduler {
     /// [`enter_root`](Self::enter_root)): wake its joiners and pass the baton on.
     pub(crate) fn exit(&self, me: u64, root: bool) {
         let _passthrough = Passthrough::enter();
-        let mut st = self.lock();
+        let mut st = self.lock_with_room(Room::default());
         if root {
             st.roots = st.roots.saturating_sub(1);
         }
-        st.let_go.remove(&me);
-        st.outside.remove(&me);
         st.settle_repoll(me, None);
-        st.exited.insert(me);
-        st.parkers.remove(&me);
-        st.runnable.remove(&me);
-        st.blocked.remove(&me);
-        st.spinners.remove(&me);
+        if let Err(i) = st.exited.binary_search(&me) {
+            st.exited.insert(i, me);
+        }
+        st.take_runnable(me);
+        st.take_blocked(me);
+        let slot = st.threads.remove(me);
+        if slot.as_ref().is_some_and(|slot| slot.let_go) {
+            self.let_go.fetch_sub(1, Ordering::SeqCst);
+        }
         Self::disown(&mut st, me);
         Self::wake_key(&mut st, DetKey::Exit(me), usize::MAX, DetWake::Woken);
         if st.holder == Some(me) {
             st.holder = None;
-            let Some(st) = Self::grant_next(st) else {
-                return;
-            };
-            if let Some(parker) = st.blocked.keys().next().and_then(|t| st.parkers.get(t)) {
+            if let Some(st) = Self::grant_next(st)
+                && let Some(parker) = st.first_blocked_parker()
+            {
                 parker.delegate();
             }
         } else {
             Self::grant_if_idle(st);
         }
+        drop(slot);
     }
 
     /// Parks the running thread on `key` until it is woken or virtual time reaches `deadline`.
@@ -656,48 +1113,7 @@ impl Scheduler {
             (true, Some(at), Some(now)) => crate::domain::register_timer(at - now),
             _ => None,
         };
-        let mut st = self.lock();
-        if st.holder != Some(me) && st.let_go.remove(&me) && !self.detached() {
-            // A thread let go when the schedule detached waits in it again, without the baton.
-            st.waits += 1;
-            st.blocked.insert(
-                me,
-                Box::new(Blocked {
-                    key,
-                    mask,
-                    futex_private: crate::accounting::wait_futex_private(),
-                    readiness,
-                    deadline,
-                    signal_version: wait_signal_version(key),
-                    futex_value: futex_wait_value(key),
-                    #[cfg(windows)]
-                    address_value: address_wait_value(key),
-                    #[cfg(windows)]
-                    timer_waker: !register_timer,
-                    outside_holder: OUTSIDE_HOLDER
-                        .try_with(std::cell::Cell::get)
-                        .unwrap_or(false),
-                }),
-            );
-            st.queues.entry(key).or_default().push_back(me);
-            let parker = st.parkers.entry(me).or_default().clone();
-            drop(st);
-            let why = self.park(&parker);
-            if let Some(key) = timer {
-                crate::domain::unregister_timer(key);
-            }
-            return why;
-        }
-        // Not this domain's running thread (it raced in from outside the schedule), or a join on a
-        // thread outside the schedule that exited since the caller looked: let it go.
-        if st.holder != Some(me) || matches!(key, DetKey::Exit(t) if st.exited.contains(&t)) {
-            drop(st);
-            if let Some(key) = timer {
-                crate::domain::unregister_timer(key);
-            }
-            return DetWake::Woken;
-        }
-        let blocked = Box::new(Blocked {
+        let blocked = Blocked {
             key,
             mask,
             futex_private: crate::accounting::wait_futex_private(),
@@ -712,10 +1128,37 @@ impl Scheduler {
             outside_holder: OUTSIDE_HOLDER
                 .try_with(std::cell::Cell::get)
                 .unwrap_or(false),
-        });
-        self.take_foreign(&mut st);
-        if st.foreign.remove(&key) || blocked.changed_outside() {
+        };
+        let mut st = self.lock();
+        if st.holder != Some(me) && self.take_let_go(&mut st, me) && !self.detached() {
+            // A thread let go when the schedule detached waits in it again, without the baton.
+            st.waits += 1;
+            st.set_blocked(me, blocked);
+            let parker = st.threads.get(me).map(|slot| slot.parker.clone());
             drop(st);
+            let why = parker.map_or(DetWake::Woken, |parker| self.park(&parker));
+            if let Some(key) = timer {
+                crate::domain::unregister_timer(key);
+            }
+            return why;
+        }
+        // Not this domain's running thread (it raced in from outside the schedule), or a join on a
+        // thread outside the schedule that exited since the caller looked: let it go.
+        let parker = st.threads.get(me).map(|slot| slot.parker.clone());
+        let joined_gone =
+            matches!(key, DetKey::Exit(t) if st.exited.binary_search(&t).is_ok());
+        let Some(parker) = parker.filter(|_| st.holder == Some(me) && !joined_gone) else {
+            drop(st);
+            drop(blocked);
+            if let Some(key) = timer {
+                crate::domain::unregister_timer(key);
+            }
+            return DetWake::Woken;
+        };
+        self.take_foreign(&mut st);
+        if st.foreign.remove(key) || blocked.changed_outside() {
+            drop(st);
+            drop(blocked);
             if let Some(key) = timer {
                 crate::domain::unregister_timer(key);
             }
@@ -723,9 +1166,7 @@ impl Scheduler {
         }
         st.settle_repoll(me, Some(key));
         st.waits += 1;
-        st.blocked.insert(me, blocked);
-        st.queues.entry(key).or_default().push_back(me);
-        let parker = st.parkers.entry(me).or_default().clone();
+        st.set_blocked(me, blocked);
         st.holder = None;
         self.dispatch(st);
         self.repoll_if_spoiled(me);
@@ -736,18 +1177,36 @@ impl Scheduler {
         why
     }
 
+    /// Clears `t`'s let-go mark; `true` if it had one.
+    fn take_let_go(&self, st: &mut State, t: u64) -> bool {
+        let Some(slot) = st.threads.get_mut(t) else {
+            return false;
+        };
+        if !std::mem::take(&mut slot.let_go) {
+            return false;
+        }
+        self.let_go.fetch_sub(1, Ordering::SeqCst);
+        true
+    }
+
     /// Records that `me` now holds the mutex at `addr`.
     #[cfg(any(unix, windows))]
     pub(crate) fn took(&self, addr: usize, me: u64) {
-        let _passthrough = Passthrough::enter();
-        self.lock().owners.insert(addr, me);
+        self.record_owner(MutexRecord {
+            mutex: addr,
+            lineage: me,
+            taken: true,
+        });
     }
 
     /// Records that the mutex at `addr` was released.
     #[cfg(any(unix, windows))]
     pub(crate) fn released(&self, addr: usize) {
-        let _passthrough = Passthrough::enter();
-        self.lock().owners.remove(&addr);
+        self.record_owner(MutexRecord {
+            mutex: addr,
+            lineage: 0,
+            taken: false,
+        });
     }
 
     /// Whether one of this domain's threads holds the mutex at `addr`.
@@ -763,7 +1222,7 @@ impl Scheduler {
         {
             return true;
         }
-        state.owners.contains_key(&addr)
+        state.owners.contains(addr)
     }
 
     #[cfg(windows)]
@@ -826,17 +1285,10 @@ impl Scheduler {
         private: Option<bool>,
     ) -> usize {
         let _passthrough = Passthrough::enter();
-        let mut st = match self.state.try_lock() {
-            Ok(st) => st,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                self.foreign_queue
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push((key, n, mask, private));
-                self.foreign_queued.store(true, Ordering::SeqCst);
-                return 0;
-            }
+        let mut st = match self.try_lock() {
+            Some(st) => st,
+            None if self.foreign_queue.push((key, n, mask, private)) => return 0,
+            None => self.lock(),
         };
         let woken = Self::wake_foreign_locked(&mut st, key, n, mask, private);
         if woken > 0 {
@@ -863,14 +1315,10 @@ impl Scheduler {
 
     /// Delivers the wakes [`wake_foreign`](Self::wake_foreign) queued while the state was held.
     fn take_foreign(&self, st: &mut State) {
-        if !self.foreign_queued.swap(false, Ordering::SeqCst) {
-            return;
-        }
-        let queued =
-            std::mem::take(&mut *self.foreign_queue.lock().unwrap_or_else(|e| e.into_inner()));
-        for (key, n, mask, private) in queued {
-            Self::wake_foreign_locked(st, key, n, mask, private);
-        }
+        self.foreign_queue
+            .drain(|(key, n, mask, private)| {
+                Self::wake_foreign_locked(st, key, n, mask, private);
+            });
     }
 
     pub(crate) fn wake_readiness(&self, event: ReadinessWake<'_>) -> usize {
@@ -890,28 +1338,33 @@ impl Scheduler {
     /// baton when their wait returns: a wake from inside the schedule orders them as it would a
     /// waiter in it.
     fn wake_outside(st: &mut State, key: DetKey, n: usize) -> usize {
-        let mut waiters: Vec<u64> = st
-            .outside
-            .iter()
-            .filter(|&(_, &k)| k == key)
-            .map(|(&t, _)| t)
-            .collect();
-        waiters.sort_unstable();
-        waiters.truncate(n);
-        for &t in &waiters {
-            st.outside.remove(&t);
-            st.parkers.entry(t).or_default();
-            st.runnable.insert(t, DetWake::Woken);
+        let mut woken = 0;
+        let mut newly_runnable = 0;
+        for (_, slot) in st.threads.iter_mut() {
+            if woken == n {
+                break;
+            }
+            if slot.outside != Some(key) {
+                continue;
+            }
+            slot.outside = None;
+            if slot.runnable.replace(DetWake::Woken).is_none() {
+                newly_runnable += 1;
+            }
+            woken += 1;
         }
-        waiters.len()
+        st.runnable += newly_runnable;
+        woken
     }
 
     /// A let-go thread enters a native wait on `key`; see [`wake_outside`](Self::wake_outside).
     pub(crate) fn wait_outside(&self, me: u64, key: DetKey) {
         let _passthrough = Passthrough::enter();
         let mut st = self.lock();
-        if st.let_go.contains(&me) {
-            st.outside.insert(me, key);
+        if let Some(slot) = st.threads.get_mut(me)
+            && slot.let_go
+        {
+            slot.outside = Some(key);
         }
     }
 
@@ -919,15 +1372,22 @@ impl Scheduler {
     /// again, waits for the baton before going back to the code under test, so it never runs
     /// beside the thread holding it.
     pub(crate) fn rejoin(&self, me: u64) {
-        let _passthrough = Passthrough::enter();
-        let mut st = self.lock();
-        st.outside.remove(&me);
-        if self.detached() || !st.let_go.remove(&me) {
+        if self.let_go.load(Ordering::SeqCst) == 0 {
             return;
         }
-        let parker = st.parkers.entry(me).or_default().clone();
+        let _passthrough = Passthrough::enter();
+        let mut st = self.lock();
+        if let Some(slot) = st.threads.get_mut(me) {
+            slot.outside = None;
+        }
+        if self.detached() || !self.take_let_go(&mut st, me) {
+            return;
+        }
+        let Some(parker) = st.threads.get(me).map(|slot| slot.parker.clone()) else {
+            return;
+        };
         if st.holder != Some(me) {
-            st.runnable.entry(me).or_insert(DetWake::Woken);
+            st.set_runnable_if_not(me, DetWake::Woken);
             Self::grant_if_idle(st);
         } else {
             drop(st);
@@ -943,28 +1403,26 @@ impl Scheduler {
     /// wait for a holder outside it, in real time. Returns whether it held any.
     #[cfg(any(unix, windows))]
     fn disown(st: &mut State, me: u64) -> bool {
-        let held: Vec<usize> = st
-            .owners
-            .iter()
-            .filter(|&(_, &owner)| owner == me)
-            .map(|(&addr, _)| addr)
-            .collect();
-        #[cfg(windows)]
-        let held = {
-            let mut held = held;
-            for (&addr, owners) in &mut st.shared_owners {
-                if owners.remove(&me) {
-                    held.push(addr);
-                }
-            }
-            st.shared_owners.retain(|_, owners| !owners.is_empty());
-            held
-        };
-        for &addr in &held {
-            st.owners.remove(&addr);
+        let mut held = false;
+        while let Some(addr) = st.owners.held_by(me) {
+            st.owners.remove(addr);
             Self::wake_key(st, DetKey::Addr(addr), usize::MAX, DetWake::Woken);
+            held = true;
         }
-        !held.is_empty()
+        #[cfg(windows)]
+        {
+            let shared: Vec<usize> = st
+                .shared_owners
+                .iter_mut()
+                .filter_map(|(&addr, owners)| owners.remove(&me).then_some(addr))
+                .collect();
+            st.shared_owners.retain(|_, owners| !owners.is_empty());
+            for &addr in &shared {
+                Self::wake_key(st, DetKey::Addr(addr), usize::MAX, DetWake::Woken);
+            }
+            held |= !shared.is_empty();
+        }
+        held
     }
 
     /// No mutex owners are kept off unix.
@@ -988,12 +1446,14 @@ impl Scheduler {
         }
         st.settle_repoll(me, None);
         self.take_foreign(&mut st);
-        if st.runnable.is_empty() {
+        if st.runnable == 0 {
             // Nobody else can run: yielding changes nothing, so keep the baton.
             return;
         }
-        st.runnable.insert(me, DetWake::Woken);
-        let parker = st.parkers.entry(me).or_default().clone();
+        let Some(parker) = st.threads.get(me).map(|slot| slot.parker.clone()) else {
+            return;
+        };
+        st.set_runnable(me, DetWake::Woken);
         st.holder = None;
         self.dispatch(st);
         self.park(&parker);
@@ -1012,9 +1472,17 @@ impl Scheduler {
         if st.holder != Some(me) {
             return;
         }
-        st.spinners.insert(me, clock);
-        let others_work = st.runnable.keys().any(|t| !st.spinners.contains_key(t));
-        let clock_elsewhere = st.spinners.iter().any(|(&t, &c)| c && t != me);
+        if let Some(slot) = st.threads.get_mut(me) {
+            slot.spinner = Some(clock);
+        }
+        let others_work = st
+            .threads
+            .iter()
+            .any(|(_, slot)| slot.runnable.is_some() && slot.spinner.is_none());
+        let clock_elsewhere = st
+            .threads
+            .iter()
+            .any(|(t, slot)| slot.spinner == Some(true) && t != me);
         if others_work || (!clock && clock_elsewhere) {
             drop(st);
             self.yield_now(me);
@@ -1038,7 +1506,9 @@ impl Scheduler {
     /// `me`'s spin ended: it made another hooked call.
     pub(crate) fn unspin(&self, me: u64) {
         let _passthrough = Passthrough::enter();
-        self.lock().spinners.remove(&me);
+        if let Some(slot) = self.lock().threads.get_mut(me) {
+            slot.spinner = None;
+        }
     }
 
     /// Waits on `parker` until the thread is handed the baton, moving the schedule on meanwhile
@@ -1067,17 +1537,23 @@ impl Scheduler {
         }
         let _passthrough = Passthrough::enter();
         let mut st = self.lock();
-        let Some(key) = st.blocked.get(&me).map(|b| b.key) else {
+        let Some(key) = st
+            .threads
+            .get(me)
+            .and_then(|slot| slot.blocked.as_ref())
+            .map(|(b, _)| b.key)
+        else {
             return;
         };
         Self::unblock(&mut st, me, DetWake::Woken);
-        st.repolled.insert(me, key);
+        if let Some(slot) = st.threads.get_mut(me) {
+            slot.repolled = Some(key);
+        }
         Self::grant_if_idle(st);
     }
 
-    /// Moves up to `n` of `key`'s waiters, oldest first, from `blocked` to `runnable` with `why`.
-    /// Queue entries for threads no longer blocked (timed out, re-polled, gone) are dropped
-    /// without counting. Returns how many moved; grants nothing.
+    /// Moves up to `n` of `key`'s waiters, oldest first, from blocked to runnable with `why`.
+    /// Returns how many moved; grants nothing.
     fn wake_key(st: &mut State, key: DetKey, n: usize, why: DetWake) -> usize {
         Self::wake_key_masked(st, key, n, u32::MAX, why)
     }
@@ -1094,6 +1570,8 @@ impl Scheduler {
         })
     }
 
+    /// Wakes the waiters on `key` that `matches` accepts, oldest first, up to `n` of them: all in
+    /// one pass when `n` reaches them all, else the oldest left, one pass each.
     fn wake_key_matching(
         st: &mut State,
         key: DetKey,
@@ -1101,42 +1579,45 @@ impl Scheduler {
         why: DetWake,
         matches: impl Fn(&Blocked) -> bool,
     ) -> usize {
-        let State {
-            blocked,
-            queues,
-            runnable,
-            ..
-        } = st;
-        let Some(queue) = queues.get_mut(&key) else {
-            return 0;
+        let waiting = |slot: &Slot| {
+            slot.blocked
+                .as_ref()
+                .filter(|(wait, _)| wait.key == key && matches(wait))
+                .map(|&(_, order)| order)
         };
-        let mut woken = 0;
-        let mut index = 0;
-        while woken < n && index < queue.len() {
-            let t = queue[index];
-            let Some(wait) = blocked.get(&t).filter(|wait| wait.key == key) else {
-                queue.remove(index);
-                continue;
-            };
-            if matches(wait) {
-                queue.remove(index);
-                blocked.remove(&t);
-                runnable.insert(t, why);
-                woken += 1;
-            } else {
-                index += 1;
+        let all = st
+            .threads
+            .iter()
+            .filter(|(_, slot)| waiting(slot).is_some())
+            .count();
+        if n >= all {
+            let mut i = 0;
+            while let Some((t, hit)) = st.threads.0.get(i).map(|(t, slot)| (*t, waiting(slot).is_some())) {
+                if hit {
+                    Self::unblock(st, t, why);
+                }
+                i += 1;
             }
+            return all;
         }
-        woken
+        for _ in 0..n {
+            let oldest = st
+                .threads
+                .iter()
+                .filter_map(|(t, slot)| waiting(slot).map(|order| (order, t)))
+                .min();
+            let Some((_, t)) = oldest else {
+                break;
+            };
+            Self::unblock(st, t, why);
+        }
+        n
     }
 
-    /// Moves `t`, if blocked, to `runnable` with `why`, removing it from its key's queue.
+    /// Moves `t`, if blocked, to runnable with `why`.
     fn unblock(st: &mut State, t: u64, why: DetWake) {
-        if let Some(b) = st.blocked.remove(&t) {
-            if let Some(q) = st.queues.get_mut(&b.key) {
-                q.retain(|&w| w != t);
-            }
-            st.runnable.insert(t, why);
+        if st.take_blocked(t).is_some() {
+            st.set_runnable(t, why);
         }
     }
 
@@ -1153,14 +1634,18 @@ impl Scheduler {
         let Some(now) = now else {
             return;
         };
-        let due: Vec<u64> = st
-            .blocked
-            .iter()
-            .filter(|(_, b)| b.deadline.is_some_and(|at| now >= at) && matches(b))
-            .map(|(&t, _)| t)
-            .collect();
-        for t in due {
-            Self::unblock(st, t, DetWake::TimedOut);
+        let mut i = 0;
+        while let Some((t, due)) = st.threads.0.get(i).map(|(t, slot)| {
+            let due = slot
+                .blocked
+                .as_ref()
+                .is_some_and(|(b, _)| b.deadline.is_some_and(|at| now >= at) && matches(b));
+            (*t, due)
+        }) {
+            if due {
+                Self::unblock(st, t, DetWake::TimedOut);
+            }
+            i += 1;
         }
     }
 
@@ -1199,7 +1684,7 @@ impl Scheduler {
     pub(crate) fn release_due_native_at(&self, now: Option<Duration>) {
         let _passthrough = Passthrough::enter();
         let mut st = self.lock();
-        let others_run = !st.runnable.is_empty();
+        let others_run = st.runnable > 0;
         Self::release_due_matching(&mut st, now, |wait| {
             matches!(wait.key, DetKey::Addr(_)) && (!others_run || wait.woken_by_timer())
         });
@@ -1209,20 +1694,20 @@ impl Scheduler {
     /// Hands the baton to the next runnable thread after the cursor, or gives the lock back if no
     /// thread is runnable.
     fn grant_next(mut st: MutexGuard<'_, State>) -> Option<MutexGuard<'_, State>> {
+        let last = st.last;
         let next = st
-            .runnable
-            .range(st.last.saturating_add(1)..)
-            .next()
-            .or_else(|| st.runnable.iter().next())
-            .map(|(&t, &why)| (t, why));
-        let Some((t, why)) = next else {
+            .threads
+            .iter()
+            .find(|&(t, slot)| t > last && slot.runnable.is_some())
+            .or_else(|| st.threads.iter().find(|(_, slot)| slot.runnable.is_some()))
+            .map(|(t, slot)| (t, slot.parker.clone()));
+        let Some((t, parker)) = next else {
             return Some(st);
         };
-        st.runnable.remove(&t);
+        let why = st.take_runnable(t).unwrap_or(DetWake::Woken);
         st.holder = Some(t);
         st.last = t;
         st.end_idle();
-        let parker = st.parkers.entry(t).or_default().clone();
         drop(st);
         parker.grant(why);
         None
@@ -1247,7 +1732,7 @@ impl Scheduler {
                 None => return skipped,
             };
             self.went_idle.notify_all();
-            if st.blocked.is_empty() {
+            if st.blocked == 0 {
                 return skipped;
             }
             if st.roots == 0 && !crate::domain::leases_held() {
@@ -1329,32 +1814,32 @@ impl Scheduler {
     /// and which carries no owner to tell; or on a lock it knows such a thread holds.
     fn blocked_on_shared_word(st: &State) -> bool {
         #[cfg(any(target_os = "linux", windows))]
-        return st.blocked.values().any(|b| {
+        return st.blocked().any(|(_, b)| {
             b.outside_holder
                 || matches!(b.key, DetKey::Addr(addr) if crate::domain::in_static_image(addr))
         });
         #[cfg(not(any(target_os = "linux", windows)))]
-        st.blocked.values().any(|b| b.outside_holder)
+        st.blocked().any(|(_, b)| b.outside_holder)
     }
 
     /// Every root has left and nothing can run: lets every blocked thread go, to wait outside the
     /// schedule from now on. Called with no holder.
     fn detach(&self, mut st: MutexGuard<'_, State>) {
         self.detached.store(true, Ordering::SeqCst);
-        let blocked: Vec<u64> = std::mem::take(&mut st.blocked).into_keys().collect();
-        st.queues.clear();
-        st.repolled.clear();
         st.foreign.clear();
         st.end_idle();
-        let parkers: Vec<Arc<Parker>> = blocked
-            .iter()
-            .filter_map(|t| st.parkers.get(t).cloned())
-            .collect();
-        st.let_go.extend(blocked);
-        drop(st);
-        for parker in parkers {
-            parker.grant(DetWake::Woken);
+        st.blocked = 0;
+        let mut let_go = 0;
+        for (_, slot) in st.threads.iter_mut() {
+            slot.repolled = None;
+            if slot.blocked.take().is_some() {
+                if !std::mem::replace(&mut slot.let_go, true) {
+                    let_go += 1;
+                }
+                slot.parker.grant(DetWake::Woken);
+            }
         }
+        self.let_go.fetch_add(let_go, Ordering::SeqCst);
     }
 
     /// One real-time wait of a dispatch on a held clock or a leased domain. `None` when another
@@ -1385,7 +1870,7 @@ impl Scheduler {
         if st.holder.is_some() {
             return None;
         }
-        if !st.runnable.is_empty() {
+        if st.runnable > 0 {
             return Some(st);
         }
         let now = crate::domain::virtual_now();
@@ -1406,15 +1891,22 @@ impl Scheduler {
         for (key, count, _lifetime) in crate::domain::take_timer_word_wakes() {
             Self::wake_key(st, DetKey::Addr(key), count, DetWake::Woken);
         }
-        let addr_waiters: Vec<(u64, DetKey)> = st
-            .blocked
-            .iter()
-            .filter(|(_, b)| b.should_repoll())
-            .map(|(&t, b)| (t, b.key))
-            .collect();
-        for (t, key) in addr_waiters {
-            Self::unblock(st, t, DetWake::Woken);
-            st.repolled.insert(t, key);
+        let mut i = 0;
+        while let Some((t, key)) = st.threads.0.get(i).map(|(t, slot)| {
+            let key = slot
+                .blocked
+                .as_ref()
+                .filter(|(b, _)| b.should_repoll())
+                .map(|(b, _)| b.key);
+            (*t, key)
+        }) {
+            if let Some(key) = key {
+                Self::unblock(st, t, DetWake::Woken);
+                if let Some(slot) = st.threads.get_mut(t) {
+                    slot.repolled = Some(key);
+                }
+            }
+            i += 1;
         }
     }
 }
@@ -1464,5 +1956,54 @@ fn futex_value(addr: usize) -> u32 {
     {
         let _ = addr;
         0
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod tests {
+    use super::{MutexOwners, OWNED_MUTEXES};
+    use std::collections::HashMap;
+
+    #[test]
+    fn mutex_owners_agree_with_a_map_through_collisions_and_removals() {
+        let mut owners = MutexOwners::default();
+        let mut model = HashMap::new();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for step in 0..200_000u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let addr = 8 * (1 + seed % (3 * OWNED_MUTEXES as u64 / 4)) as usize;
+            if seed >> 40 & 1 == 0 && model.len() < OWNED_MUTEXES - 1 {
+                owners.insert(addr, step);
+                model.insert(addr, step);
+            } else {
+                owners.remove(addr);
+                model.remove(&addr);
+            }
+            assert_eq!(owners.contains(addr), model.contains_key(&addr));
+        }
+        for (&addr, &owner) in &model {
+            assert_eq!(owners.owner(addr), Some(owner));
+        }
+        assert_eq!(owners.slots.iter().filter(|e| e.0 != 0).count(), model.len());
+    }
+
+    #[test]
+    fn a_full_table_refuses_a_new_mutex_and_still_removes() {
+        let mut owners = MutexOwners::default();
+        for i in 1..=OWNED_MUTEXES + 8 {
+            owners.insert(8 * i, i as u64);
+        }
+        assert_eq!(owners.len, OWNED_MUTEXES - 1);
+        assert!(owners.slots.iter().any(|e| e.0 == 0));
+        assert!(!owners.contains(8 * OWNED_MUTEXES));
+        owners.insert(8, 99);
+        assert_eq!(owners.owner(8), Some(99));
+        for i in 1..OWNED_MUTEXES {
+            owners.remove(8 * i);
+        }
+        assert_eq!(owners.len, 0);
+        assert!(owners.slots.iter().all(|e| e.0 == 0));
     }
 }

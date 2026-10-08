@@ -21,6 +21,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+#[cfg(any(unix, windows))]
+use crate::pending::MutexRecord;
+use crate::pending::Pending;
 use crate::state::Passthrough;
 
 /// How a managed thread takes part in its domain.
@@ -118,6 +121,11 @@ pub(crate) fn timer_consumed(key: usize) {
 /// it was.
 pub(crate) fn swap_gated(gated: bool) -> bool {
     GATED.try_with(|g| g.replace(gated)).unwrap_or(false)
+}
+
+/// Whether the calling thread is counted held at the gate (see [`swap_gated`]).
+pub(crate) fn gated() -> bool {
+    GATED.try_with(Cell::get).unwrap_or(false)
 }
 
 /// Notes which thread (by lineage) the calling thread is about to join; the next wait takes it.
@@ -944,7 +952,7 @@ const WATCHED_MUTEXES: usize = 64;
 /// The census's watched mutexes, with room for [`WATCHED_MUTEXES`] made when the census is: a
 /// participant starts watching a lock as its wait begins, and when that is an allocator's own lock,
 /// taken inside the allocator, an allocation under the census lock could wait on the very lock it
-/// waits for, or on its holder, which may need the census lock to record taking it.
+/// waits for.
 struct WatchedMutexes(HashMap<usize, Watched>);
 
 impl Default for WatchedMutexes {
@@ -971,10 +979,9 @@ impl std::ops::DerefMut for WatchedMutexes {
 const WATCH_SLOTS: usize = 256;
 
 /// How many participants' waits watch a pthread mutex, counted in the slot its address hashes to,
-/// so a lock or an unlock of a mutex nobody waits for skips the census lock without taking it. An
-/// allocator's locks are taken and let go inside the allocator, by threads that may hold one while
-/// another thread holds the census lock and allocates; only a lock a participant is waiting for
-/// right then, or one sharing its slot, makes its holder take the census lock.
+/// so a lock or an unlock of a mutex nobody waits for skips the census without touching its lock.
+/// Only a lock a participant is waiting for right then, or one sharing its slot, makes its holder
+/// record it there (see [`Accounting::record_mutex`]).
 pub(crate) struct WatchFilter([AtomicU32; WATCH_SLOTS]);
 
 impl Default for WatchFilter {
@@ -990,6 +997,22 @@ impl WatchFilter {
         let hash = ((mutex >> 3) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         &self.0[(hash >> 56) as usize % WATCH_SLOTS]
     }
+}
+
+/// A change to the census made by a thread holding a pthread mutex, applied by the census's next
+/// holder when the thread finds it held (see `Accounting::record`).
+#[derive(Clone, Copy)]
+enum CensusRecord {
+    #[cfg(any(unix, windows))]
+    Mutex(MutexRecord),
+    /// [`Core::unwatch_mutex`].
+    #[cfg(any(unix, windows))]
+    Unwatch(usize),
+    /// A participant's row shows it running, as of the stamp ([`Core::set_waiting`]).
+    Running {
+        lineage: u64,
+        since: Option<(Duration, Duration)>,
+    },
 }
 
 /// A pthread mutex the census tracks because a participant's wait needs it.
@@ -1641,6 +1664,15 @@ impl Core {
         }
     }
 
+    #[cfg(any(unix, windows))]
+    fn apply_mutex_record(&mut self, record: MutexRecord) {
+        if record.taken {
+            self.mutex_taken(record.mutex, record.lineage);
+        } else {
+            self.mutex_freed(record.mutex, record.lineage);
+        }
+    }
+
     /// `lineage` let go of `mutex`, unless another thread has taken it since.
     #[cfg(any(unix, windows))]
     pub(crate) fn mutex_freed(&mut self, mutex: usize, lineage: u64) {
@@ -1795,6 +1827,9 @@ pub(crate) struct Accounting {
     pub(crate) watching: AtomicUsize,
     /// Which pthread mutexes the census may watch, so a lock elsewhere skips it.
     pub(crate) watched: WatchFilter,
+    /// What threads holding a pthread mutex recorded while the census was held, for its next
+    /// holder to apply (see `crate::pending`).
+    records: Pending<CensusRecord>,
     /// Effects of non-participant threads, to tell their wakes from outside ones.
     effects: AtomicU64,
     /// Participants woken from a native wait by something outside the domain (see
@@ -1846,14 +1881,67 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Accounting {
     /// Locks the census. Callers hold passthrough, so blocking here is not itself counted.
     pub(crate) fn core(&self) -> MutexGuard<'_, Core> {
-        let core = lock(&self.core);
-        #[cfg(windows)]
-        let mut core = core;
+        let mut core = lock(&self.core);
         #[cfg(windows)]
         self.flush_timer_signals(&mut core);
-        #[cfg(not(windows))]
-        let core = core;
+        self.take_records(&mut core);
         core
+    }
+
+    fn take_records(&self, core: &mut Core) {
+        self.records.drain(|record| self.apply(core, record));
+    }
+
+    fn apply(&self, core: &mut Core, record: CensusRecord) {
+        match record {
+            #[cfg(any(unix, windows))]
+            CensusRecord::Mutex(record) => core.apply_mutex_record(record),
+            #[cfg(any(unix, windows))]
+            CensusRecord::Unwatch(mutex) => {
+                core.unwatch_mutex(mutex);
+                self.watching.store(core.watching(), Ordering::SeqCst);
+            }
+            CensusRecord::Running { lineage, since } => {
+                let _ = core.set_waiting(lineage, None, since);
+            }
+        }
+    }
+
+    /// Applies `record` without waiting for the census: queued for its holder if another thread
+    /// has it, as the hook making it holds a pthread mutex, which may be one of an allocator's own
+    /// locks that the holder's next allocation needs. Callers hold passthrough.
+    fn record(&self, record: CensusRecord) {
+        let mut core = match self.core.try_lock() {
+            Ok(core) => core,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) if self.records.push(record) => return,
+            Err(std::sync::TryLockError::WouldBlock) => lock(&self.core),
+        };
+        self.take_records(&mut core);
+        self.apply(&mut core, record);
+    }
+
+    /// Records that `lineage` took (`taken`) or let go of the pthread mutex at `mutex`, which a
+    /// participant may be watching (see [`record`](Self::record)).
+    #[cfg(any(unix, windows))]
+    pub(crate) fn record_mutex(&self, mutex: usize, lineage: u64, taken: bool) {
+        self.record(CensusRecord::Mutex(MutexRecord {
+            mutex,
+            lineage,
+            taken,
+        }));
+    }
+
+    /// A participant's wait that needed `mutex` ended, holding it (see [`record`](Self::record)).
+    #[cfg(any(unix, windows))]
+    pub(crate) fn record_unwatch(&self, mutex: usize) {
+        self.record(CensusRecord::Unwatch(mutex));
+    }
+
+    /// `lineage`, back from a contended lock holding the mutex, runs again as of `since` (see
+    /// [`record`](Self::record)); the caller has already uncounted it parked.
+    pub(crate) fn record_running(&self, lineage: u64, since: Option<(Duration, Duration)>) {
+        self.record(CensusRecord::Running { lineage, since });
     }
 
     #[cfg(windows)]
@@ -1913,11 +2001,10 @@ impl Accounting {
     /// Waits on the timestamp gate, releasing the census meanwhile. A condition variable may wake
     /// spuriously, so callers re-check `gate_closed` in a loop.
     pub(crate) fn wait_at_gate<'a>(&self, core: MutexGuard<'a, Core>) -> MutexGuard<'a, Core> {
-        let core = self.gate.wait(core).unwrap_or_else(|e| e.into_inner());
-        #[cfg(windows)]
-        let mut core = core;
+        let mut core = self.gate.wait(core).unwrap_or_else(|e| e.into_inner());
         #[cfg(windows)]
         self.flush_timer_signals(&mut core);
+        self.take_records(&mut core);
         core
     }
 

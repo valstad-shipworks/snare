@@ -15,7 +15,7 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Key, Table, Value};
 
 /// The version requirement written for snare: this binary's major version, whose snare has the
 /// `cfg(snare)` check and the prelude.
-const SNARE_REQ: &str = env!("CARGO_PKG_VERSION_MAJOR");
+const SNARE_REQ: &str = concat!("^", env!("CARGO_PKG_VERSION_MAJOR"));
 
 /// Edits the package manifest at `manifest` (or the one `cargo locate-project` finds) and, when
 /// its lints come from the workspace, the workspace root manifest. Returns the exit code.

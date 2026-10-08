@@ -1630,7 +1630,7 @@ combining its platform `cfg`), and declares the cfg to the `unexpected_cfgs` lin
 
 ```toml
 [target.'cfg(snare)'.dev-dependencies]
-snare = "3"
+snare = "^3"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(snare)'] }
@@ -1655,8 +1655,10 @@ $ cargo snare test            # builds with --cfg snare, patches in the shims, r
 ```
 
 `cargo snare` sets `--cfg snare` (and `--cfg rustix_use_libc`) and injects the drop-in shims via
-`cargo --config patch.crates-io...`. Plain `cargo test` builds neither snare nor the
-`#[cfg(snare)]` tests.
+`cargo --config patch.crates-io...`, from the snare release the lock file resolved (tag `vX` for
+a crates.io snare `X`, with `snare` and `snare-interpose` patched from it so one interposer is
+linked), or from the checkout or git reference a path or git snare comes from. Plain `cargo test`
+builds neither snare nor the `#[cfg(snare)]` tests.
 
 The cfgs go in through `RUSTFLAGS` (appended to any already set), and cargo then ignores
 `build.rustflags` and `target.*.rustflags` from `.cargo/config.toml`. A crate that relies on cfgs
@@ -1724,14 +1726,13 @@ using it in the other mode panics rather than silently mixing an emulated ring w
 
 Linux means glibc (`target_env = "gnu"`). Every other target — musl, 32-bit x86 and ARM, Android,
 the BSDs, illumos, Redox — stops at a single `compile_error!` naming the supported targets. A crate
-that also builds for those targets gates the dev-dependency:
+that also builds for those targets needs no gate beyond `cfg(snare)`: only `cargo snare test` sets
+it, on the machine running the tests, so a build for any other target never pulls snare in.
 
 ```toml
-[target.'cfg(all(snare, any(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")), target_os = "macos", windows)))'.dev-dependencies]
-snare = "3"
+[target.'cfg(snare)'.dev-dependencies]
+snare = "^3"
 ```
-
-and puts its sim tests behind the same `cfg`.
 
 The minimum supported Rust version is 1.88.
 

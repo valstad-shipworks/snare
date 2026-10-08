@@ -69,27 +69,34 @@ whether or not the graph has its crate; it never selects a parallel shim by itse
 
 ## Patching by hand
 
-`cargo snare test` patches the shims in from this repository at its release tag. To apply them by
-hand in a consumer manifest (a crate with a shim per release line takes a patch key per line, with
-`package` and `version` to pick the shim):
+`cargo snare test` takes the shims from wherever the lock file put `snare-interpose`: for a
+crates.io snare at version `X`, this repository at tag `vX`, with `snare` and `snare-interpose`
+patched from that tag too; for a path or git snare, the same checkout or the same git reference.
+The shims depend on `snare-interpose` within this repository, so taking them from anywhere else
+would link a second interposer, whose sims the code under test never sees. A shim newer than that
+release is left out, with a note: update snare to get it. To apply them by hand
+in a consumer manifest, keep `snare` and `snare-interpose` on the same source (a crate with a shim
+per release line takes a patch key per line, with `package` and `version` to pick the shim):
 
 ```toml
 [patch.crates-io]
-sc          = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0" }
-syscalls    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0" }
-io-uring    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0" }
-xsk-rs      = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0" }
-quanta_0_12 = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0", package = "quanta", version = "0.12" }
-quanta_0_13 = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0", package = "quanta", version = "0.13" }
-minstant    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0" }
-fastant     = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0" }
-fastrand    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0" }
-rayon-core  = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0" }
+snare       = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
+snare-interpose = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
+sc          = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
+syscalls    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
+io-uring    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
+xsk-rs      = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
+quanta_0_12 = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1", package = "quanta", version = "0.12" }
+quanta_0_13 = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1", package = "quanta", version = "0.13" }
+minstant    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
+fastant     = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
+fastrand    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
+rayon-core  = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
 # parallel-only, as needed:
-async-io    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0" }
-async-global-executor = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0" }
-blocking    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0" }
-smol        = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.0" }
+async-io    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
+async-global-executor = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
+blocking    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
+smol        = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
 ```
 
 Patch only the crates the graph has (cargo warns about an unused patch), build with `--cfg snare`,
