@@ -18,6 +18,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::task::Waker;
 use std::time::{Duration, Instant};
@@ -521,6 +522,28 @@ impl WakeKeys {
 
 use snare_interpose::ReadinessWake as WakeEvent;
 
+/// What a wait listens to besides its fixed keys and its deadline.
+#[derive(Default)]
+struct Wake<'a> {
+    /// Keys the wait refreshes each time it re-checks.
+    dynamic_keys: Option<&'a std::cell::RefCell<WakeKeys>>,
+    /// The clock reaching this (monotonic nanos) is what the wait waits for.
+    due: Option<u64>,
+    /// An unpark setting this ends the wait.
+    token: Option<Arc<AtomicBool>>,
+}
+
+/// Which clock moves reach a sleeping waiter.
+#[derive(Clone, Copy)]
+struct Timing {
+    /// Every clock move whose time is not known reaches it.
+    sensitive: bool,
+    /// When its wait falls due on the virtual clock (monotonic nanos).
+    due: Option<u64>,
+    /// Every clock move reaches it, whenever its wait falls due.
+    steady: bool,
+}
+
 /// Guarded by one lock so a quiescence check sees a consistent picture.
 struct State {
     /// Active subscriptions, including their domain and unread wake generations.
@@ -549,24 +572,60 @@ struct Waiters {
     keys: Vec<WakeKey>,
     broad: bool,
     time_sensitive: bool,
+    /// When the wait falls due on its domain's virtual clock (monotonic nanos): the clock moving
+    /// there reaches it.
+    due: Option<u64>,
+    /// Time-sensitive for a reason other than `due` (a delayed arrival, a real-clock deadline), so
+    /// every move of the clock reaches it.
+    steady: bool,
+    /// A park token that makes the wait ready: any bump that finds it set reaches the waiter.
+    token: Option<Arc<AtomicBool>>,
 }
 
 impl State {
     /// Records a bump of `domain` (0 for every domain): each current sleeper of that domain, and
     /// of the threads outside every domain, is stale until it runs. Hands `notify` the condvar of
     /// each entry reached.
-    fn bump(&mut self, domain: usize, event: WakeEvent<'_>, mut notify: impl FnMut(&Arc<Condvar>)) {
+    fn bump(&mut self, domain: usize, event: WakeEvent<'_>, notify: impl FnMut(&Arc<Condvar>)) {
+        self.reach(
+            domain,
+            |waiters| match event {
+                WakeEvent::All => true,
+                WakeEvent::Timer => waiters.time_sensitive,
+                WakeEvent::Keys(keys) => keys.iter().any(|key| waiters.keys.contains(key)),
+            },
+            notify,
+        );
+    }
+
+    /// Records the clock of `domain` moving to `now` (monotonic nanos): reaches the waits it made
+    /// due and those that every clock move concerns, and leaves the rest asleep.
+    fn bump_due(&mut self, domain: usize, now: u64, notify: impl FnMut(&Arc<Condvar>)) {
+        self.reach(
+            domain,
+            |waiters| {
+                waiters.time_sensitive
+                    && (waiters.steady || waiters.due.is_some_and(|due| due <= now))
+            },
+            notify,
+        );
+    }
+
+    fn reach(
+        &mut self,
+        domain: usize,
+        relevant: impl Fn(&Waiters) -> bool,
+        mut notify: impl FnMut(&Arc<Condvar>),
+    ) {
         for waiters in &mut self.waiters {
             if domain != 0 && waiters.domain != domain && waiters.domain != 0 {
                 continue;
             }
-            let relevant = waiters.broad
-                || match event {
-                    WakeEvent::All => true,
-                    WakeEvent::Timer => waiters.time_sensitive,
-                    WakeEvent::Keys(keys) => keys.iter().any(|key| waiters.keys.contains(key)),
-                };
-            if relevant {
+            let unparked = waiters
+                .token
+                .as_ref()
+                .is_some_and(|token| token.load(Ordering::Acquire));
+            if waiters.broad || unparked || relevant(waiters) {
                 waiters.generation += 1;
                 waiters.stale = waiters.sleeping;
                 if waiters.sleeping > 0 {
@@ -588,6 +647,9 @@ impl State {
             keys: Vec::new(),
             broad: true,
             time_sensitive: true,
+            due: None,
+            steady: false,
+            token: None,
         });
         waiters.id = self.next_waiter;
         waiters.domain = domain;
@@ -597,6 +659,9 @@ impl State {
         waiters.keys.clear();
         waiters.broad = keys.is_none();
         waiters.time_sensitive = keys.is_none();
+        waiters.due = None;
+        waiters.steady = false;
+        waiters.token = None;
         if let Some(keys) = keys {
             waiters.keys.extend_from_slice(keys);
         }
@@ -606,7 +671,9 @@ impl State {
 
     fn unregister(&mut self, id: u64) {
         if let Some(i) = self.waiters.iter().position(|w| w.id == id) {
-            self.spare.push(self.waiters.swap_remove(i));
+            let mut waiters = self.waiters.swap_remove(i);
+            waiters.token = None;
+            self.spare.push(waiters);
         }
     }
 
@@ -619,14 +686,11 @@ impl State {
 
     /// Counts a sleeper of `domain` asleep, returning the condvar it sleeps on and the domain's
     /// generation for [`awake`](Self::awake).
-    fn asleep(
-        &mut self,
-        id: u64,
-        time_sensitive: bool,
-        keys: Option<&[WakeKey]>,
-    ) -> (Arc<Condvar>, u64) {
+    fn asleep(&mut self, id: u64, timing: Timing, keys: Option<&[WakeKey]>) -> (Arc<Condvar>, u64) {
         let waiters = self.waiters.iter_mut().find(|w| w.id == id).unwrap();
-        waiters.time_sensitive = time_sensitive;
+        waiters.time_sensitive = timing.sensitive;
+        waiters.due = timing.due;
+        waiters.steady = timing.steady;
         if let Some(keys) = keys {
             waiters.keys.clear();
             waiters.keys.extend_from_slice(keys);
@@ -708,21 +772,42 @@ impl Readiness {
         self.bump_unscheduled_event(domain, WakeEvent::Timer);
     }
 
+    /// As [`bump_keys`](Self::bump_keys), for the waiters on the condvar only.
+    pub(crate) fn bump_keys_unscheduled(&self, domain: usize, keys: &[WakeKey]) {
+        self.bump_unscheduled_event(domain, WakeEvent::Keys(keys));
+    }
+
+    /// Wakes the waiters on the condvar of the domain with key `domain` that its clock reaching
+    /// `now` (monotonic nanos) concerns: those whose wait fell due by then, those that every clock
+    /// move concerns (a delayed arrival, a real-clock deadline) and those already unparked.
+    /// Waiters in a deterministic schedule are left to the schedule.
+    pub(crate) fn bump_due_unscheduled(&self, domain: usize, now: u64) {
+        self.notify_with(
+            |state, notify| state.bump_due(domain, now, notify),
+            |changed| changed.notify_all(),
+        );
+    }
+
     fn bump_unscheduled_event(&self, domain: usize, event: WakeEvent<'_>) {
         self.notify_bump(domain, event, |changed| changed.notify_all());
     }
 
-    fn notify_bump(
+    fn notify_bump(&self, domain: usize, event: WakeEvent<'_>, notify: impl FnMut(&Arc<Condvar>)) {
+        self.notify_with(|state, reach| state.bump(domain, event, reach), notify);
+    }
+
+    /// Runs `bump` under the lock, then hands `notify` the condvar of each entry it reached once
+    /// the lock is let go.
+    fn notify_with(
         &self,
-        domain: usize,
-        event: WakeEvent<'_>,
+        bump: impl FnOnce(&mut State, &mut dyn FnMut(&Arc<Condvar>)),
         mut notify: impl FnMut(&Arc<Condvar>),
     ) {
         let mut woken: [Option<Arc<Condvar>>; 32] = std::array::from_fn(|_| None);
         let mut spill = Vec::new();
         let mut reached = 0;
         let mut state = self.state.lock().unwrap();
-        state.bump(domain, event, |changed| match woken.get_mut(reached) {
+        bump(&mut state, &mut |changed| match woken.get_mut(reached) {
             Some(slot) => {
                 *slot = Some(changed.clone());
                 reached += 1;
@@ -762,7 +847,7 @@ impl Readiness {
         deadline: Option<Deadline>,
         mut ready: impl FnMut() -> bool,
     ) -> bool {
-        self.wait_interested(label, deadline, None, None, || true, &mut ready)
+        self.wait_interested(label, deadline, None, || true, Wake::default(), &mut ready)
     }
 
     pub(crate) fn wait_until_on(
@@ -773,7 +858,60 @@ impl Readiness {
         time_sensitive: impl FnMut() -> bool,
         ready: impl FnMut() -> bool,
     ) -> bool {
-        self.wait_interested(label, deadline, Some(keys), None, time_sensitive, ready)
+        self.wait_interested(
+            label,
+            deadline,
+            Some(keys),
+            time_sensitive,
+            Wake::default(),
+            ready,
+        )
+    }
+
+    /// Blocks until `ready()` holds, which only the clock reaching `due` (monotonic nanos on the
+    /// calling thread's domain's clock) can bring about. Gives up as an indefinite
+    /// [`wait_until`](Self::wait_until) does; the caller keeps the timer that stops a time skip
+    /// short of `due`.
+    pub(crate) fn wait_due(
+        &self,
+        label: &'static str,
+        due: u64,
+        ready: impl FnMut() -> bool,
+    ) -> bool {
+        self.wait_interested(
+            label,
+            None,
+            Some(&[]),
+            || false,
+            Wake {
+                due: Some(due),
+                ..Wake::default()
+            },
+            ready,
+        )
+    }
+
+    /// Blocks until `token` is set or the deadline passes. Only an unpark that sets the token and
+    /// bumps `key`, or the deadline, ends the wait; a clock move that is no time skip, or a bump of
+    /// any other key, leaves it asleep.
+    pub(crate) fn wait_parked(
+        &self,
+        label: &'static str,
+        deadline: Option<Deadline>,
+        key: WakeKey,
+        token: &Arc<AtomicBool>,
+    ) -> bool {
+        self.wait_interested(
+            label,
+            deadline,
+            Some(&[key]),
+            || false,
+            Wake {
+                token: Some(token.clone()),
+                ..Wake::default()
+            },
+            || token.load(Ordering::Acquire),
+        )
     }
 
     pub(crate) fn wait_until_dynamic(
@@ -788,11 +926,14 @@ impl Readiness {
             label,
             deadline,
             Some(&[]),
-            Some(&keys),
             || {
                 let mut keys = keys.borrow_mut();
                 keys.clear();
                 interests(&mut keys)
+            },
+            Wake {
+                dynamic_keys: Some(&keys),
+                ..Wake::default()
             },
             ready,
         )
@@ -803,18 +944,22 @@ impl Readiness {
         label: &'static str,
         deadline: Option<Deadline>,
         keys: Option<&[WakeKey]>,
-        dynamic_keys: Option<&std::cell::RefCell<WakeKeys>>,
         mut time_sensitive: impl FnMut() -> bool,
+        wake: Wake<'_>,
         mut ready: impl FnMut() -> bool,
     ) -> bool {
+        let dynamic_keys = wake.dynamic_keys;
         let _label = snare_interpose::wait_label(label);
         snare_interpose::end_spin();
+        // A deterministic schedule has no notion of a due time or a park token: there such a wait
+        // stays broad, as every wait without keys is.
+        let scheduled_broad = wake.due.is_some() || wake.token.is_some();
         if snare_interpose::det_active()
             && let Some(result) = Self::wait_deterministic(
                 deadline,
-                keys,
-                dynamic_keys,
-                &mut time_sensitive,
+                keys.filter(|_| !scheduled_broad),
+                dynamic_keys.filter(|_| !scheduled_broad),
+                || scheduled_broad || time_sensitive(),
                 &mut ready,
             )
         {
@@ -832,24 +977,32 @@ impl Readiness {
         }
         let subscription = Subscription {
             readiness: self,
-            id: self
-                .state
-                .lock()
-                .unwrap()
-                .register(snare_interpose::domain_key(), keys),
+            id: {
+                let mut state = self.state.lock().unwrap();
+                let id = state.register(snare_interpose::domain_key(), keys);
+                if let Some(waiters) = state.waiters.last_mut() {
+                    waiters.token = wake.token.clone();
+                }
+                id
+            },
         };
-        let timed = deadline.is_some();
+        let timed = deadline.is_some() || wake.due.is_some() || wake.token.is_some();
         let initial_sensitive = time_sensitive();
         let sensitive = std::cell::Cell::new(timed || initial_sensitive);
+        let steady = std::cell::Cell::new(initial_sensitive);
         let mut parked = Parked {
             waiter: subscription.id,
             time_sensitive: Some(&sensitive),
+            steady: Some(&steady),
+            due: wake.due.or(timer),
+            unfiled_deadline: deadline.is_some() && timer.is_none(),
             dynamic_keys,
             ..Parked::default()
         };
         let predicate = || {
             let needed = time_sensitive();
             sensitive.set(timed || needed);
+            steady.set(needed);
             ready()
         };
         let result = self.wait_inner(&mut deadline, &mut timer, &mut parked, predicate);
@@ -965,6 +1118,8 @@ impl Readiness {
                     on_virtual: true,
                 });
                 *timer = snare_interpose::register_timer(remaining);
+                parked.due = *timer;
+                parked.unfiled_deadline = timer.is_none();
             }
             let deadline = *deadline;
             // A deadline already reached ends the wait before any time skip: a zero timeout is a
@@ -1260,6 +1415,13 @@ impl Drop for Subscription<'_> {
 struct Parked<'a> {
     waiter: u64,
     time_sensitive: Option<&'a std::cell::Cell<bool>>,
+    steady: Option<&'a std::cell::Cell<bool>>,
+    /// When the wait falls due on the virtual clock: the instant it waits for, or the one its
+    /// deadline's timer is filed at (the clock keys a timer by its instant).
+    due: Option<u64>,
+    /// Whether the wait has a deadline with no virtual timer filed for it (one on the real clock),
+    /// whose passing no instant of the virtual clock tells.
+    unfiled_deadline: bool,
     dynamic_keys: Option<&'a std::cell::RefCell<WakeKeys>>,
     /// Counted as parked in the domain.
     entered: bool,
@@ -1272,9 +1434,14 @@ struct Parked<'a> {
 impl Parked<'_> {
     fn asleep(&self, state: &mut State) -> (Arc<Condvar>, u64) {
         let keys = self.dynamic_keys.map(std::cell::RefCell::borrow);
+        let timing = Timing {
+            sensitive: self.timer_sensitive(),
+            due: self.due,
+            steady: self.unfiled_deadline || self.steady.is_none_or(std::cell::Cell::get),
+        };
         state.asleep(
             self.waiter,
-            self.timer_sensitive(),
+            timing,
             keys.as_ref().map(|keys| keys.as_slice()),
         )
     }
@@ -1311,6 +1478,112 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    fn sleeping(state: &mut State, keys: &[WakeKey], timing: Timing) -> u64 {
+        let id = state.register(7, Some(keys));
+        state.asleep(id, timing, None);
+        id
+    }
+
+    fn generation(state: &State, id: u64) -> u64 {
+        state
+            .waiters
+            .iter()
+            .find(|w| w.id == id)
+            .unwrap()
+            .generation
+    }
+
+    fn timed(due: u64) -> Timing {
+        Timing {
+            sensitive: true,
+            due: Some(due),
+            steady: false,
+        }
+    }
+
+    #[test]
+    fn an_unpark_reaches_only_the_park_it_names() {
+        let mut state = State {
+            waiters: Vec::new(),
+            spare: Vec::new(),
+            next_waiter: 0,
+        };
+        let parked = |state: &mut State, n| {
+            let id = sleeping(state, &[WakeKey::Thread(n)], timed(u64::MAX));
+            state.waiters.last_mut().unwrap().token = Some(Arc::new(AtomicBool::new(false)));
+            state.waiters.last_mut().unwrap().due = None;
+            id
+        };
+        let a = parked(&mut state, 1);
+        let b = parked(&mut state, 2);
+        let sleeper = sleeping(&mut state, &[], timed(100));
+        let mut notified = 0;
+        state.bump(7, WakeEvent::Keys(&[WakeKey::Thread(1)]), |_| notified += 1);
+        assert_eq!(notified, 1);
+        assert_eq!(generation(&state, a), 1);
+        assert_eq!(generation(&state, b), 0);
+        assert_eq!(generation(&state, sleeper), 0);
+    }
+
+    #[test]
+    fn a_clock_move_reaches_the_waits_it_made_due_and_no_others() {
+        let mut state = State {
+            waiters: Vec::new(),
+            spare: Vec::new(),
+            next_waiter: 0,
+        };
+        let early = sleeping(&mut state, &[], timed(100));
+        let late = sleeping(&mut state, &[], timed(200));
+        let arrival = sleeping(
+            &mut state,
+            &[WakeKey::Socket(3)],
+            Timing {
+                sensitive: true,
+                due: Some(300),
+                steady: true,
+            },
+        );
+        let keyed = sleeping(
+            &mut state,
+            &[WakeKey::Socket(4)],
+            Timing {
+                sensitive: false,
+                due: None,
+                steady: false,
+            },
+        );
+        let mut notified = 0;
+        state.bump_due(7, 150, |_| notified += 1);
+        assert_eq!(notified, 2);
+        assert_eq!(generation(&state, early), 1);
+        assert_eq!(generation(&state, late), 0);
+        assert_eq!(generation(&state, arrival), 1);
+        assert_eq!(generation(&state, keyed), 0);
+
+        state.bump(7, WakeEvent::Timer, |_| notified += 1);
+        assert_eq!(generation(&state, late), 1);
+        assert_eq!(generation(&state, keyed), 0);
+    }
+
+    #[test]
+    fn a_set_token_reaches_its_park_on_any_bump() {
+        let mut state = State {
+            waiters: Vec::new(),
+            spare: Vec::new(),
+            next_waiter: 0,
+        };
+        let token = Arc::new(AtomicBool::new(false));
+        let park = sleeping(&mut state, &[WakeKey::Thread(9)], timed(u64::MAX));
+        state.waiters.last_mut().unwrap().token = Some(token.clone());
+        state.bump_due(7, 0, |_| {});
+        assert_eq!(generation(&state, park), 0);
+        token.store(true, Ordering::Release);
+        state.bump_due(7, 0, |_| {});
+        assert_eq!(generation(&state, park), 1);
+        state.bump(7, WakeEvent::Keys(&[WakeKey::Socket(1)]), |_| {});
+        assert_eq!(generation(&state, park), 2);
+    }
+
     #[test]
     fn idle_subscriptions_keep_generations_without_notifications() {
         crate::Sim::new().run(|| {
@@ -1328,7 +1601,15 @@ mod tests {
             assert_eq!(state.waiters[0].generation, 1);
             assert_eq!(state.waiters[0].stale, 0);
 
-            let (_, generation) = state.asleep(id, false, None);
+            let (_, generation) = state.asleep(
+                id,
+                Timing {
+                    sensitive: false,
+                    due: None,
+                    steady: false,
+                },
+                None,
+            );
             assert_eq!(generation, 1);
             state.bump(7, WakeEvent::Keys(&key), |woken| {
                 assert!(Arc::ptr_eq(woken, &changed));
@@ -1354,7 +1635,15 @@ mod tests {
             state.bump(7, WakeEvent::Keys(&key), |_| notified += 1);
             assert_eq!(notified, 1);
             assert_eq!(state.waiters[0].generation, 1);
-            let (_, generation) = state.asleep(reused, false, None);
+            let (_, generation) = state.asleep(
+                reused,
+                Timing {
+                    sensitive: false,
+                    due: None,
+                    steady: false,
+                },
+                None,
+            );
             state.bump(7, WakeEvent::Keys(&key), |_| notified += 1);
             assert_eq!(notified, 2);
             assert_eq!(state.waiters[0].stale, 1);
@@ -1457,7 +1746,15 @@ mod tests {
         let waiter = {
             let mut state = board.state.lock().unwrap();
             let waiter = state.register(domain.key(), None);
-            state.asleep(waiter, true, None);
+            state.asleep(
+                waiter,
+                Timing {
+                    sensitive: true,
+                    due: None,
+                    steady: true,
+                },
+                None,
+            );
             waiter
         };
         let stale = Arc::new(AtomicBool::new(false));

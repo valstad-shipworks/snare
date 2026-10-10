@@ -968,7 +968,7 @@ impl Clock {
         self.add_pending(wake, false, false);
         loop {
             snare_interpose::note_wait_deadline(Some(Duration::from_nanos(wake)));
-            readiness.wait_until("sleep", None, || self.peek() >= wake || self.jumps());
+            readiness.wait_due("sleep", wake, || self.peek() >= wake || self.jumps());
             if done() {
                 break;
             }

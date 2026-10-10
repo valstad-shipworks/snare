@@ -21,7 +21,7 @@ use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::{Pin, pin};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
@@ -339,7 +339,9 @@ pub enum ParkResult {
 /// sim's waits.
 struct ParkCell {
     /// Set by an unpark, consumed by the park that sees it.
-    token: AtomicBool,
+    token: Arc<AtomicBool>,
+    /// The readiness key an unpark bumps, unique in the process: a park in a sim waits on it alone.
+    key: crate::readiness::WakeKey,
     /// The owning thread, for a real `unpark` when it parks off a sim or past a sim give-up.
     thread: std::thread::Thread,
     /// Weak, so a parked thread's cell never keeps a finished sim alive.
@@ -350,7 +352,7 @@ impl ParkCell {
     /// Sets the token and wakes the thread, both its real park and its sim wait. On the clock's
     /// waker thread ([`in_clock_wake`](crate::clock::in_clock_wake)) the kick is left to the
     /// clock's caller, which wakes the sim's waiters once the wakers have run and may meanwhile
-    /// hold locks a kick would take.
+    /// hold locks a kick would take; any bump it makes reaches a park whose token is set.
     fn unpark(&self) {
         self.token.store(true, Ordering::Release);
         self.thread.unpark();
@@ -360,7 +362,7 @@ impl ParkCell {
         let sim =
             snare_interpose::real(|| self.sim.lock().unwrap_or_else(|e| e.into_inner()).upgrade());
         if let Some(sim) = sim {
-            sim.kick();
+            sim.kick_parked(self.key);
         }
     }
 }
@@ -377,7 +379,11 @@ impl Wake for ParkCell {
 
 thread_local! {
     static PARK_CELL: Arc<ParkCell> = Arc::new(ParkCell {
-        token: AtomicBool::new(false),
+        token: Arc::new(AtomicBool::new(false)),
+        key: {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            crate::readiness::WakeKey::Thread(NEXT.fetch_add(1, Ordering::Relaxed))
+        },
         thread: std::thread::current(),
         sim: Mutex::new(Weak::new()),
     });
@@ -459,9 +465,12 @@ fn park_as(label: &'static str, deadline: Option<Instant>) -> ParkResult {
             continue;
         }
         let woken = snare_interpose::real(|| {
-            crate::readiness::readiness().wait_until(label, left.map(Deadline::timeout), || {
-                cell.token.load(Ordering::Acquire)
-            })
+            crate::readiness::readiness().wait_parked(
+                label,
+                left.map(Deadline::timeout),
+                cell.key,
+                &cell.token,
+            )
         });
         if !woken && left.is_none() {
             let _label = snare_interpose::wait_label(label);

@@ -62,6 +62,8 @@ pub enum ReadinessKey {
     Descriptor(u64),
     #[cfg(windows)]
     CompletionPort(u64),
+    /// A thread's park token: its unpark is the only event that changes it.
+    Thread(u64),
 }
 
 /// Which subscriptions a readiness notification reaches.
