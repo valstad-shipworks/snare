@@ -371,7 +371,7 @@ impl Executive {
         }
         let (fired, wakers) = snare_interpose::real(|| self.clock.fire_upto(before, after));
         wake(wakers);
-        self.shared.kick();
+        self.shared.kick_clock();
         fired
     }
 
@@ -414,7 +414,7 @@ impl Executive {
             })
             .map_err(|_| NotQuiescent)?;
         wake(wakers);
-        self.shared.kick();
+        self.shared.kick_clock();
         Ok(fired)
     }
 
@@ -486,7 +486,7 @@ impl Executive {
         let woke = !wakers.is_empty();
         wake(wakers);
         if fired > 0 || woke || reached {
-            self.shared.kick();
+            self.shared.kick_clock();
         } else {
             self.domain.kick_due();
         }

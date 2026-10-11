@@ -154,6 +154,49 @@ impl SimShared {
         });
     }
 
+    /// As [`kick`](Self::kick) after an unpark of the thread whose park waits on `key`: of the
+    /// waits outside a deterministic schedule only that park is woken, along with any other whose
+    /// token is set; a deterministic schedule is kicked as by [`kick`](Self::kick).
+    pub(crate) fn kick_parked(&self, key: crate::readiness::WakeKey) {
+        snare_interpose::real(|| {
+            if let Some(clock) = &self.clock {
+                clock.wake_due();
+            }
+            let domain = self.domain_key();
+            crate::readiness::readiness().bump_keys_unscheduled(domain, &[key]);
+            self.kick_schedule(domain);
+        });
+    }
+
+    /// As [`kick`](Self::kick) after an executive moved the clock: of the waits outside a
+    /// deterministic schedule only those the clock's reading reached, those every clock move
+    /// concerns and those already unparked are woken; a deterministic schedule is kicked as by
+    /// [`kick`](Self::kick).
+    pub(crate) fn kick_clock(&self) {
+        snare_interpose::real(|| {
+            let domain = self.domain_key();
+            match &self.clock {
+                Some(clock) => {
+                    clock.wake_due();
+                    crate::readiness::readiness().bump_due_unscheduled(domain, clock.peek());
+                }
+                None => crate::readiness::readiness().bump_time_unscheduled(domain),
+            }
+            self.kick_schedule(domain);
+        });
+    }
+
+    /// The deterministic half of [`kick`](Self::kick): the schedule's readiness waits re-check and
+    /// the domain's layers release what the clock reached.
+    fn kick_schedule(&self, domain: usize) {
+        if domain == 0 || domain == snare_interpose::domain_key() {
+            snare_interpose::det_wake_readiness(snare_interpose::ReadinessWake::All);
+        }
+        if let Some(domain) = self.domain.get().and_then(WeakDomain::upgrade) {
+            domain.kick_after_readiness();
+        }
+    }
+
     pub(crate) fn kick_keys(&self, keys: &[crate::readiness::WakeKey]) {
         snare_interpose::real(|| {
             if let Some(clock) = &self.clock {
