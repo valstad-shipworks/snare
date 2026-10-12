@@ -570,6 +570,8 @@ pub(crate) struct RowWait {
     pub(crate) key: Option<usize>,
     /// The pthread mutex the wait returns holding.
     pub(crate) mutex: Option<usize>,
+    /// Blocked in the deterministic schedule rather than in the OS.
+    pub(crate) scheduled: bool,
     #[cfg(target_os = "linux")]
     pub(crate) mask: u32,
     #[cfg(any(target_os = "linux", windows))]
@@ -2438,6 +2440,7 @@ mod release_tests {
                 deadline: None,
                 key: Some(1),
                 mutex: None,
+                scheduled: false,
                 mask,
                 token: 0,
                 expected: Some(0),
@@ -2606,6 +2609,7 @@ mod timer_release_tests {
             deadline: None,
             key: Some(key),
             mutex: None,
+            scheduled: false,
             token: signals.admit(),
             woken: false,
         };

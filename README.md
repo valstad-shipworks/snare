@@ -474,7 +474,7 @@ its own. A participant that legitimately runs longer than
 
 A stuck thread cannot be made to panic from outside, and the test would never finish, so the
 watchdog attempts its report on the process's stderr — past the test harness's output capture —
-with a 100 ms reporting budget, then aborts the test process. Locked or blocked stderr may leave
+with a 2 s reporting budget, then aborts the test process. Locked or blocked stderr may leave
 the report incomplete, and OS scheduling may delay detection and termination. The report names
 every participant: running (and, under `deterministic()`, which one holds the baton), or what it
 waits in and until when, what it last

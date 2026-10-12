@@ -365,12 +365,15 @@ Supported model boundaries and unverified approximations. These do not establish
   running sim that wakes it through a condition variable, futex, semaphore, parker or
   `WaitOnAddress` (README, "Process-wide pools"). Work it picks up with no wake stays in its old
   world: a worker still spinning when the later sim posts work (a run's end waits up to 200 ms of
-  real time with no thread coming to rest, 1 s for one that has never blocked, 5 s in all, for its
-  leftovers to park), or one polling
+  real time with no thread coming to rest, 1 s for one that has never blocked or keeps yielding,
+  5 s in all, for its leftovers to park), or one polling
   an atomic. A yield gives nothing to tell which running sim, if any, posted the work it finds. Only
   participants are listed as waiters, so background, helper and driver leftovers never move. A
   futex word does not say whether it is a lock or a condition: on Linux a leftover parked on a
-  std `Mutex` that a running sim's thread unlocks follows that sim as well. A follower that reaches
+  std `Mutex` that a running sim's thread unlocks follows that sim as well. On macOS one parked on
+  a contended pthread mutex (std's `Mutex` there) stays in its old world, and so does what it does
+  once it holds the lock: a worker that then takes a job from a receiver kept behind that `Mutex`
+  without waiting for it runs the job there. A follower that reaches
   a socket of its old sim finds a dead connection, as sockets never move: a client made in an
   earlier sim and kept in a static (reqwest's pooled connections) drops that connection and
   reconnects in the sim it now runs in instead of reaching the earlier sim's server. A wake the OS gives to a thread other than the
@@ -404,11 +407,10 @@ Supported model boundaries and unverified approximations. These do not establish
   of the allocator's locks while it holds another (allocators nest theirs) takes the census lock to
   count its wait, whose holder may be allocating as it adds a thread's row or records a wake, and a
   condition-variable wait takes it with its mutex held again. A time skip or a caught clock spin's
-  step allocates in the clock layer's timer bookkeeping, a caught spin outside a deterministic
-  schedule takes the census and readiness locks, and a condition-variable wait records its signal
-  count, allocating, under a lock its signal takes. Under a deterministic schedule, a wait on more
-  than eight readiness keys frees its key list under the schedule's lock as it ends, and Windows
-  shared (SRW) locks record their holders, allocating, under it. The executive's arm callback runs
+  step allocates in the clock layer's timer bookkeeping, and a caught spin outside a deterministic
+  schedule takes the census and readiness locks. Under a deterministic schedule, a wait on more than
+  eight readiness keys frees its key list under the schedule's lock as it ends, and Windows shared
+  (SRW) locks record their holders, allocating, under it. The executive's arm callback runs
   on the thread that has just won a contended mutex, which may be one of the allocator's.
 - **Long clock-reading loops:** a loop that reads the clock with no other hooked call between
   reads is a clock spin whether it waits on time or works (README, "Clock spins"). Its first

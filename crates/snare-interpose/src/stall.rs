@@ -25,7 +25,7 @@
 //!
 //! A busy stall cannot be unwound into the test: the stuck thread never reaches a hook, and one
 //! thread cannot make another panic. The watchdog attempts its report on the process's standard
-//! error, past the test harness's output capture. Reporting gets 100 ms before the process aborts,
+//! error, past the test harness's output capture. Reporting gets 2 s before the process aborts,
 //! even if stderr is locked or blocked.
 
 use std::fmt::Write as _;
@@ -224,7 +224,7 @@ fn fail(domain: &Domain, stalled: Duration, after: Duration) -> ! {
             })
     });
     if reporter.is_ok() {
-        let _ = finished_rx.recv_timeout(Duration::from_millis(100));
+        let _ = finished_rx.recv_timeout(Duration::from_secs(2));
     }
     std::process::abort();
 }

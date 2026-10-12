@@ -1027,7 +1027,7 @@ impl SimBuilder {
     ///
     /// On firing, a report naming each participant (running, or what it waits in and until when,
     /// what it last waited in, the leases it holds) is attempted on the process's stderr, past
-    /// the test harness's capture. Reporting has a 100 ms budget before the process aborts, so
+    /// the test harness's capture. Reporting has a 2 s budget before the process aborts, so
     /// locked or blocked stderr may leave the report incomplete. A stuck thread cannot be made
     /// to panic from outside. Samples are scheduled every eighth of `after` (between 1 ms and
     /// 250 ms); OS scheduling can delay detection and termination. Panics if `after` is zero.

@@ -53,16 +53,75 @@ static PTHREAD_COND_INIT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "linux")]
 static PTHREAD_COND_DESTROY: AtomicUsize = AtomicUsize::new(0);
 
-type WaitSignalMasks =
-    std::collections::HashMap<(u32, Option<bool>), std::sync::Weak<std::sync::atomic::AtomicU64>>;
-type WaitSignals = std::collections::HashMap<usize, WaitSignalMasks>;
-static WAIT_SIGNALS: std::sync::OnceLock<std::sync::Mutex<WaitSignals>> =
-    std::sync::OnceLock::new();
+/// The signals a deterministic waiter on `addr` with `mask` and `private` has seen, for as many
+/// waiters as it has.
+struct WaitSignal {
+    addr: usize,
+    mask: u32,
+    private: Option<bool>,
+    waiters: usize,
+    version: u64,
+}
+
+/// Every [`WaitSignal`] a waiter holds. A signal reaches this from inside a C allocator holding its
+/// own locks, so nothing allocates or frees under the lock: the table grows with the lock let go
+/// ([`wait_signals_with_room`]), and an entry no waiter holds is removed in place.
+static WAIT_SIGNALS: std::sync::Mutex<Vec<WaitSignal>> = std::sync::Mutex::new(Vec::new());
+/// How many entries [`WAIT_SIGNALS`] holds, read without its lock.
+static WAIT_SIGNAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static WAIT_SIGNAL_VERSION: std::cell::Cell<Option<(usize, u64)>> = const { std::cell::Cell::new(None) };
+    static IN_WAIT_SIGNALS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(target_os = "linux")]
     static FUTEX_WAIT_VALUE: std::cell::Cell<Option<(usize, u32)>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`WAIT_SIGNALS`] locked by this thread. Its own lock word is only ever waited on in passthrough,
+/// which tracks no signal, so the futex wake its release can make has nothing to note. Noting it
+/// would lock it again, and each contended release would wake and recurse once more, on whatever
+/// stack made the outer call.
+struct LockedWaitSignals {
+    signals: std::sync::MutexGuard<'static, Vec<WaitSignal>>,
+    _releasing: Releasing,
+}
+
+struct Releasing(bool);
+
+impl Drop for Releasing {
+    fn drop(&mut self) {
+        let _ = IN_WAIT_SIGNALS.try_with(|held| held.set(self.0));
+    }
+}
+
+fn holding_wait_signals() -> bool {
+    IN_WAIT_SIGNALS.try_with(|held| held.get()).unwrap_or(false)
+}
+
+fn lock_wait_signals() -> LockedWaitSignals {
+    let releasing = Releasing(
+        IN_WAIT_SIGNALS
+            .try_with(|held| held.replace(true))
+            .unwrap_or(false),
+    );
+    LockedWaitSignals {
+        signals: WAIT_SIGNALS.lock().unwrap(),
+        _releasing: releasing,
+    }
+}
+
+impl std::ops::Deref for LockedWaitSignals {
+    type Target = Vec<WaitSignal>;
+
+    fn deref(&self) -> &Vec<WaitSignal> {
+        &self.signals
+    }
+}
+
+impl std::ops::DerefMut for LockedWaitSignals {
+    fn deref_mut(&mut self) -> &mut Vec<WaitSignal> {
+        &mut self.signals
+    }
 }
 
 pub(crate) fn wait_signal_version(addr: usize) -> Option<u64> {
@@ -88,45 +147,97 @@ pub(crate) fn signal_version(addr: usize) -> Option<u64> {
 }
 
 pub(crate) fn signal_version_masked(addr: usize, mask: u32, private: Option<bool>) -> Option<u64> {
-    let signals = WAIT_SIGNALS.get()?;
+    if WAIT_SIGNAL_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
     crate::real(|| {
-        signals
-            .lock()
-            .unwrap()
-            .get(&addr)?
-            .get(&(mask, private))?
-            .upgrade()
-            .map(|signal| signal.load(std::sync::atomic::Ordering::Acquire))
+        lock_wait_signals()
+            .iter()
+            .find(|signal| (signal.addr, signal.mask, signal.private) == (addr, mask, private))
+            .map(|signal| signal.version)
     })
 }
 
-fn track_signal(addr: usize) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
-    track_signal_masked(addr, u32::MAX, None)
-}
-
-fn track_signal_masked(
+/// A waiter's hold on the [`WaitSignal`] for its address, mask and scope, let go on drop.
+struct SignalWatch {
     addr: usize,
     mask: u32,
     private: Option<bool>,
-) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
-    crate::real(|| {
-        let signals = WAIT_SIGNALS.get_or_init(Default::default);
-        let mut signals = signals.lock().unwrap();
-        signals.retain(|_, masks| {
-            masks.retain(|_, signal| signal.strong_count() > 0);
-            !masks.is_empty()
-        });
-        let masks = signals.entry(addr).or_default();
-        match masks
-            .get(&(mask, private))
-            .and_then(std::sync::Weak::upgrade)
-        {
-            Some(signal) => signal,
-            None => {
-                let signal = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                masks.insert((mask, private), std::sync::Arc::downgrade(&signal));
-                signal
+    /// The signal count when the hold was taken.
+    version: u64,
+}
+
+impl Drop for SignalWatch {
+    fn drop(&mut self) {
+        crate::real(|| {
+            let mut signals = lock_wait_signals();
+            let key = (self.addr, self.mask, self.private);
+            if let Some(at) = signals
+                .iter()
+                .position(|signal| (signal.addr, signal.mask, signal.private) == key)
+            {
+                signals[at].waiters -= 1;
+                if signals[at].waiters == 0 {
+                    signals.swap_remove(at);
+                    WAIT_SIGNAL_COUNT.store(signals.len(), Ordering::Release);
+                }
             }
+        });
+    }
+}
+
+/// [`WAIT_SIGNALS`], locked, with room for one more entry.
+fn wait_signals_with_room() -> LockedWaitSignals {
+    loop {
+        let signals = lock_wait_signals();
+        if signals.len() < signals.capacity() {
+            return signals;
+        }
+        let room = (2 * signals.capacity()).max(8);
+        drop(signals);
+        let mut grown = Vec::with_capacity(room);
+        let mut signals = lock_wait_signals();
+        if grown.capacity() > signals.capacity() {
+            grown.append(&mut signals);
+            std::mem::swap(&mut *signals, &mut grown);
+        }
+        drop(signals);
+    }
+}
+
+fn track_signal(addr: usize) -> SignalWatch {
+    track_signal_masked(addr, u32::MAX, None)
+}
+
+fn track_signal_masked(addr: usize, mask: u32, private: Option<bool>) -> SignalWatch {
+    crate::real(|| {
+        let mut signals = wait_signals_with_room();
+        let key = (addr, mask, private);
+        let version = match signals
+            .iter_mut()
+            .find(|signal| (signal.addr, signal.mask, signal.private) == key)
+        {
+            Some(signal) => {
+                signal.waiters += 1;
+                signal.version
+            }
+            None => {
+                signals.push(WaitSignal {
+                    addr,
+                    mask,
+                    private,
+                    waiters: 1,
+                    version: 0,
+                });
+                WAIT_SIGNAL_COUNT.store(signals.len(), Ordering::Release);
+                0
+            }
+        };
+        SignalWatch {
+            addr,
+            mask,
+            private,
+            version,
         }
     })
 }
@@ -136,20 +247,19 @@ fn note_wait_signal(addr: usize) {
 }
 
 fn note_wait_signal_masked(addr: usize, mask: u32, private: Option<bool>) {
-    if let Some(signals) = WAIT_SIGNALS.get() {
-        crate::real(|| {
-            if let Some(masks) = signals.lock().unwrap().get(&addr) {
-                for (&(wait_mask, wait_private), signal) in masks {
-                    if wait_mask & mask != 0
-                        && private.is_none_or(|scope| wait_private == Some(scope))
-                        && let Some(signal) = signal.upgrade()
-                    {
-                        signal.fetch_add(1, std::sync::atomic::Ordering::Release);
-                    }
-                }
-            }
-        });
+    if WAIT_SIGNAL_COUNT.load(Ordering::Acquire) == 0 || holding_wait_signals() {
+        return;
     }
+    crate::real(|| {
+        for signal in lock_wait_signals().iter_mut() {
+            if signal.addr == addr
+                && signal.mask & mask != 0
+                && private.is_none_or(|scope| signal.private == Some(scope))
+            {
+                signal.version += 1;
+            }
+        }
+    });
 }
 
 /// Mutexes or condition variables, by address, that were set up other than the default way: the
@@ -494,7 +604,7 @@ unsafe fn det_cond_wait(
     let previous = WAIT_SIGNAL_VERSION.with(|version| {
         version.replace(Some((
             cond as usize,
-            signal.load(std::sync::atomic::Ordering::Acquire),
+            signal.version,
         )))
     });
     unsafe { det_mutex_unlock(mutex) };
@@ -1154,12 +1264,82 @@ pub(crate) unsafe fn futex(
     args: [usize; 6],
     real: impl Fn([usize; 6]) -> c_long,
 ) -> Option<c_long> {
-    let [word, op, value, ..] = args;
-    let command = op as c_int & !(libc::FUTEX_PRIVATE_FLAG | libc::FUTEX_CLOCK_REALTIME);
-    if command != libc::FUTEX_WAIT && command != libc::FUTEX_WAIT_BITSET {
+    let command = args[1] as c_int & !(libc::FUTEX_PRIVATE_FLAG | libc::FUTEX_CLOCK_REALTIME);
+    // SAFETY: as for this function.
+    unsafe {
+        match command {
+            libc::FUTEX_WAKE | libc::FUTEX_WAKE_BITSET => futex_wake(args, real),
+            libc::FUTEX_WAIT | libc::FUTEX_WAIT_BITSET => futex_wait(args, real, command),
+            _ => futex_call(args, real),
+        }
+    }
+}
+
+/// [`futex`] for `FUTEX_WAKE` and `FUTEX_WAKE_BITSET`. Kept apart from the waits, whose locals
+/// would otherwise widen the frame of every wake, the call made deepest in a hook: a thread on the
+/// smallest stack the OS allows makes one from inside the schedule, and the release of
+/// [`WAIT_SIGNALS`] that follows makes another.
+///
+/// # Safety
+/// As for [`futex`].
+#[cfg(target_os = "linux")]
+unsafe fn futex_wake(args: [usize; 6], real: impl Fn([usize; 6]) -> c_long) -> Option<c_long> {
+    if holding_wait_signals() {
+        return Some(real(args));
+    }
+    let [word, op, value, _, _, bitset] = args;
+    let op = op as c_int;
+    let command = op & !(libc::FUTEX_PRIVATE_FLAG | libc::FUTEX_CLOCK_REALTIME);
+    if op & libc::FUTEX_CLOCK_REALTIME != 0
+        || (command == libc::FUTEX_WAKE_BITSET && bitset as u32 == 0)
+        || !word.is_multiple_of(std::mem::align_of::<u32>())
+    {
+        return Some(real(args));
+    }
+    domain::note_hook_effect("FUTEX_WAKE");
+    if deterministic() {
         // SAFETY: as for this function.
         return unsafe { futex_call(args, real) };
     }
+    let mask = if command == libc::FUTEX_WAKE_BITSET {
+        bitset as u32
+    } else {
+        u32::MAX
+    };
+    let private = op & libc::FUTEX_PRIVATE_FLAG != 0;
+    let n = (value as c_int).max(1) as usize;
+    let native = domain::release_native_futex(
+        word,
+        n,
+        mask,
+        private,
+        || {
+            let result = real(args);
+            if result >= 0 {
+                note_wait_signal_masked(word, mask, Some(private));
+            }
+            result
+        },
+        || futex_word(word),
+    );
+    if native < 0 {
+        return Some(native);
+    }
+    Some(native + domain::det_wake_futex_addr(word, n, mask, private) as c_long)
+}
+
+/// [`futex`] for `FUTEX_WAIT` and `FUTEX_WAIT_BITSET`.
+///
+/// # Safety
+/// As for [`futex`].
+#[cfg(target_os = "linux")]
+#[inline(never)]
+unsafe fn futex_wait(
+    args: [usize; 6],
+    real: impl Fn([usize; 6]) -> c_long,
+    command: c_int,
+) -> Option<c_long> {
+    let [word, op, value, ..] = args;
     if !domain::virtual_waits() && !nested::waiting(word) {
         return None;
     }
@@ -1346,57 +1526,17 @@ fn nested_futex_wait(args: [usize; 6], real: &impl Fn([usize; 6]) -> c_long) -> 
     0
 }
 
-/// The body of [`futex`] for every operation but a nested wait.
+/// The body of [`futex`] for every operation but a nested wait and a wake outside a deterministic
+/// schedule.
 ///
 /// # Safety
 /// As for [`futex`].
 #[cfg(target_os = "linux")]
+#[inline(never)]
 unsafe fn futex_call(args: [usize; 6], real: impl Fn([usize; 6]) -> c_long) -> Option<c_long> {
     let [word, op, value, timeout, word2, bitset] = args;
     let op = op as c_int;
     let command = op & !(libc::FUTEX_PRIVATE_FLAG | libc::FUTEX_CLOCK_REALTIME);
-    if command == libc::FUTEX_WAKE || command == libc::FUTEX_WAKE_BITSET {
-        if op & libc::FUTEX_CLOCK_REALTIME != 0
-            || (command == libc::FUTEX_WAKE_BITSET && bitset as u32 == 0)
-            || !word.is_multiple_of(std::mem::align_of::<u32>())
-        {
-            return Some(real(args));
-        }
-        let mask = if command == libc::FUTEX_WAKE_BITSET {
-            bitset as u32
-        } else {
-            u32::MAX
-        };
-        domain::note_hook_effect("FUTEX_WAKE");
-        let n = (value as c_int).max(1) as usize;
-        if !deterministic() {
-            let native = domain::release_native_futex(
-                word,
-                n,
-                mask,
-                op & libc::FUTEX_PRIVATE_FLAG != 0,
-                || {
-                    let result = real(args);
-                    if result >= 0 {
-                        note_wait_signal_masked(
-                            word,
-                            mask,
-                            Some(op & libc::FUTEX_PRIVATE_FLAG != 0),
-                        );
-                    }
-                    result
-                },
-                || futex_word(word),
-            );
-            if native < 0 {
-                return Some(native);
-            }
-            let woken =
-                domain::det_wake_futex_addr(word, n, mask, op & libc::FUTEX_PRIVATE_FLAG != 0)
-                    as c_long;
-            return Some(native + woken);
-        }
-    }
     let mut timeout_value = timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -1660,10 +1800,7 @@ unsafe fn det_futex(
                 crate::accounting::wait_futex_private(),
             );
             let signal_previous = WAIT_SIGNAL_VERSION.with(|cell| {
-                cell.replace(Some((
-                    word,
-                    signal.load(std::sync::atomic::Ordering::Acquire),
-                )))
+                cell.replace(Some((word, signal.version)))
             });
             let previous = FUTEX_WAIT_VALUE.with(|cell| cell.replace(Some((word, value as u32))));
             let result = match domain::det_block(crate::DetKey::Addr(word), deadline) {
