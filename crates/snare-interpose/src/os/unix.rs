@@ -948,6 +948,36 @@ unsafe extern "C" fn syscall(
     ) -> libc::c_long;
     // std's and parking_lot's blocking edge on Linux: a futex wait counted toward quiescence and
     // timed in the domain's clock (see `os::sync`).
+    if number == libc::SYS_futex {
+        // SAFETY: SYSCALL holds libc's syscall; the arguments are the caller's futex arguments.
+        let real = |[a, b, c, d, e, f]: [usize; 6]| unsafe {
+            original::<SyscallFn>(&SYSCALL)(number, a, b, c, d, e, f)
+        };
+        // SAFETY: as above.
+        if let Some(r) = unsafe { crate::os::sync::futex([a, b, c, d, e, f], real) } {
+            return r;
+        }
+    }
+    // SAFETY: as for this function.
+    unsafe { other_syscall(number, a, b, c, d, e, f) }
+}
+
+/// [`syscall`] past the futex hook. Kept out of line so that a futex call, the one a hook makes
+/// deepest in its stack, does not carry this frame.
+///
+/// # Safety
+/// As for [`syscall`].
+#[cfg(target_os = "linux")]
+#[inline(never)]
+unsafe fn other_syscall(
+    number: libc::c_long,
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+    e: usize,
+    f: usize,
+) -> libc::c_long {
     if number == libc::SYS_getdents64
         && let Some(result) = domain::dispatch_fs_fd(a as c_int, |fs| unsafe {
             fs.getdents64(a as c_int, b as *mut u8, c as u32 as usize)
@@ -967,16 +997,6 @@ unsafe extern "C" fn syscall(
         })
     {
         return crate::os::sockets::finish(result);
-    }
-    if number == libc::SYS_futex {
-        // SAFETY: SYSCALL holds libc's syscall; the arguments are the caller's futex arguments.
-        let real = |[a, b, c, d, e, f]: [usize; 6]| unsafe {
-            original::<SyscallFn>(&SYSCALL)(number, a, b, c, d, e, f)
-        };
-        // SAFETY: as above.
-        if let Some(r) = unsafe { crate::os::sync::futex([a, b, c, d, e, f], real) } {
-            return r;
-        }
     }
     if let Some(r) = net_syscall(number, [a, b, c, d, e, f]) {
         return crate::os::sockets::finish(r);

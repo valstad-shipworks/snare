@@ -14,10 +14,14 @@
 //! Which of several waiters a partial wake reaches is the OS's choice. Each waiter a wake for at
 //! least every listed waiter reaches gets a place of its own; a partial wake makes as many places
 //! as it may wake waiters of dormant sims, each claimable by any of them (of whichever dormant sim)
-//! returning from a wait on that word. A place nobody takes within [`SETTLE`] is given back by a service thread, as the
-//! kernel may have woken a waiter the census never listed (one outside every sim, or still in an
-//! uncounted grace period) instead: the waker's sim stops waiting for it. A waiter that still
-//! arrives later follows all the same, onto a place made as it arrives.
+//! returning from a wait on that word. Once they are taken, a waiter still returning there within
+//! [`SETTLE`] follows too, onto a place made as it arrives: the first to return may have returned on
+//! its own (a condition variable may wake spuriously), leaving the one the OS woke without a place.
+//! A place nobody takes within [`SETTLE`] is given back by a service thread, as the kernel may have
+//! woken a waiter the census never listed (one outside every sim, or still in an uncounted grace
+//! period) instead: the waker's sim stops waiting for it. A waiter that still arrives later follows
+//! all the same, onto a place made as it arrives. A wake moves nobody once its sim's run has ended,
+//! and leaves no record that keeps a later sim's wake on the same word from making places.
 //!
 //! Threads of a sim whose run is in progress never move, nor do threads of other classes than
 //! participants, which are not listed.
@@ -138,9 +142,12 @@ pub(crate) fn place_woken(key: usize, n: usize) {
     let mut pending = woken();
     for (from, lineage) in dormant {
         let waiting = if exact {
-            pending
-                .iter()
-                .any(|w| w.from.0.key() == from.0.key() && w.exact && w.lineage == lineage)
+            pending.iter().any(|w| {
+                w.from.0.key() == from.0.key()
+                    && w.exact
+                    && w.lineage == lineage
+                    && w.place.is_some()
+            })
                 || from
                     .0
                     .followers
@@ -148,7 +155,11 @@ pub(crate) fn place_woken(key: usize, n: usize) {
                     .unwrap_or_else(|e| e.into_inner())
                     .contains_key(&lineage)
         } else {
-            pending.iter().filter(|w| !w.exact && w.key == key).count() >= listed
+            pending
+                .iter()
+                .filter(|w| !w.exact && w.key == key && w.place.is_some())
+                .count()
+                >= listed
         };
         if waiting {
             continue;
@@ -189,32 +200,45 @@ pub(super) fn follow_woken(relock: Option<&dyn Fn(bool)>) {
     // SAFETY: the calling thread's domain is live while it is installed.
     let me = unsafe { &*here };
     let lineage = thread_lineage();
-    let record = {
+    let (to, place, taken) = {
         let _passthrough = Passthrough::enter();
         let mut pending = woken();
         let found = pending
             .iter()
-            .position(|w| {
-                w.exact && w.key == key && w.lineage == lineage && w.from.0.key() == me.key()
+            .enumerate()
+            .filter(|(_, w)| {
+                w.key == key
+                    && (!w.exact || (w.lineage == lineage && w.from.0.key() == me.key()))
+                    && !w.to.0.dormant.load(Ordering::SeqCst)
             })
-            .or_else(|| pending.iter().position(|w| !w.exact && w.key == key));
-        let record = found.map(|i| pending.swap_remove(i));
+            .min_by_key(|(_, w)| (w.place.is_none(), !w.exact))
+            .map(|(i, _)| i);
+        let Some(i) = found else {
+            return;
+        };
+        let found = if pending[i].exact {
+            let mut record = pending.swap_remove(i);
+            (record.to.clone(), record.place.take(), Some(record))
+        } else {
+            let record = &mut pending[i];
+            let place = record.place.take();
+            if place.is_some() {
+                record.by = Instant::now() + SETTLE;
+            }
+            (record.to.clone(), place, None)
+        };
         WOKEN_COUNT.store(pending.len(), Ordering::SeqCst);
-        record
-    };
-    let Some(mut record) = record else {
-        return;
+        found
     };
     let moves = follow::followable()
         && me.dormant.load(Ordering::SeqCst)
-        && !record.to.0.dormant.load(Ordering::SeqCst);
-    let place = record.place.take();
+        && !to.0.dormant.load(Ordering::SeqCst);
     if !moves {
         if let Some(place) = place {
-            give_back(&record.to, place);
+            give_back(&to, place);
         }
         let _passthrough = Passthrough::enter();
-        drop(record);
+        drop((to, taken));
         return;
     }
     if let Some(relock) = relock {
@@ -233,8 +257,8 @@ pub(super) fn follow_woken(relock: Option<&dyn Fn(bool)>) {
                 unsafe { follow::give_back(old) };
             }
         }
-        follow::follow(&record.to);
-        drop(record);
+        follow::follow(&to);
+        drop((to, taken));
     }
     if let Some(relock) = relock {
         relock(true);
@@ -259,19 +283,23 @@ const SETTLE_POLL: Duration = Duration::from_micros(200);
 /// follow, doing that sim's work in this one's world. The wait goes on while threads keep coming to
 /// rest, each within [`SETTLE`] of the last (a deterministic schedule hands the spinners its baton
 /// one at a time), up to [`SETTLE_CAP`]; a thread that never rests (computing, or blocked in a call
-/// snare does not see) holds it up [`SETTLE`] at most, or [`SETTLE_FRESH`] if it has never blocked. A rest must hold across two looks, since a
-/// thread a deterministic schedule lets go returns from its wait there before it waits natively.
+/// snare does not see) holds it up [`SETTLE`] at most, or [`SETTLE_FRESH`] if it has never blocked
+/// or keeps yielding (on a loaded machine each yield of a spinner can cost it a full turn of the
+/// run queue). Only a native wait nothing has released is a rest, however long the OS takes to run
+/// a released thread: one a wake or an unlock released runs on, as does one waiting in the
+/// deterministic schedule, which lets it go as it detaches. A rest must hold across two looks.
 pub(super) fn settle(domain: &Inner) {
     let _passthrough = Passthrough::enter();
     let start = Instant::now();
     let mut by = start + SETTLE;
     let mut rested = false;
     let mut fewest = usize::MAX;
+    let mut yields = domain.dormant_yields.load(Ordering::Relaxed);
     while Instant::now() < by.min(start + SETTLE_CAP) {
         if !domain.dormant.load(Ordering::SeqCst) {
             return;
         }
-        let (any, running, fresh) = {
+        let (any, running, fresh, released) = {
             let core = domain.accounting.core();
             let participants = core
                 .rows
@@ -282,16 +310,20 @@ pub(super) fn settle(domain: &Inner) {
             let mut fresh = false;
             for row in participants {
                 any = true;
-                running += usize::from(row.wait.is_none());
+                running += usize::from(row.wait.is_none_or(|wait| wait.scheduled));
                 fresh |= row.wait.is_none() && row.last_wait.is_none();
             }
-            (any, running, fresh)
+            let released = core.released > 0
+                || core.has_pending_releases()
+                || core.first_unheld_lock().is_some();
+            (any, running, fresh, released)
         };
         if !any {
             return;
         }
-        let at_rest =
-            running == 0 && domain.sched.as_ref().is_none_or(|sched| sched.detached());
+        let at_rest = running == 0
+            && !released
+            && domain.sched.as_ref().is_none_or(|sched| sched.detached());
         if at_rest && rested {
             return;
         }
@@ -302,6 +334,11 @@ pub(super) fn settle(domain: &Inner) {
         }
         if fresh {
             by = by.max(start + SETTLE_FRESH);
+        }
+        let yielded = domain.dormant_yields.load(Ordering::Relaxed);
+        if yielded != yields {
+            yields = yielded;
+            by = by.max((Instant::now() + SETTLE).min(start + SETTLE_FRESH));
         }
         std::thread::sleep(SETTLE_POLL);
     }

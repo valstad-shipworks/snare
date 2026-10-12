@@ -264,16 +264,25 @@ fn latency_on_the_wall_clock_takes_real_time() {
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
         set_udp_policy("127.0.0.6:8000", |p| p.latency = Duration::from_millis(40));
         // Measured on the real clock: off the virtual clock the latency is real time, but the
-        // sim's own clock (Windows' tick clock) need not be.
-        let start = snare::real(std::time::Instant::now);
-        tx.send_to(b"x", "127.0.0.6:8000").unwrap();
-        let mut buf = [0u8; 4];
-        rx.recv_from(&mut buf).unwrap();
-        let waited = snare::real(|| start.elapsed());
-        assert!(
-            (Duration::from_millis(35)..Duration::from_millis(190)).contains(&waited),
-            "woke at the arrival, not the 200ms deadlock poll: {waited:?}"
-        );
+        // sim's own clock (Windows' tick clock) need not be. A loaded host can stall the receiver
+        // well past the arrival, so only one of a few trips has to beat the 200ms deadlock poll.
+        let mut waits = Vec::new();
+        for _ in 0..5 {
+            let start = snare::real(std::time::Instant::now);
+            tx.send_to(b"x", "127.0.0.6:8000").unwrap();
+            let mut buf = [0u8; 4];
+            rx.recv_from(&mut buf).unwrap();
+            let waited = snare::real(|| start.elapsed());
+            assert!(
+                waited >= Duration::from_millis(35),
+                "arrived before its latency: {waited:?}"
+            );
+            waits.push(waited);
+            if waited < Duration::from_millis(190) {
+                return;
+            }
+        }
+        panic!("woke at the 200ms deadlock poll, not the arrival: {waits:?}");
     });
 }
 

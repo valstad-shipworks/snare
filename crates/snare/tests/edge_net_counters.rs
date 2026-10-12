@@ -303,10 +303,25 @@ fn tcp_lifecycle() -> Vec<[i64; 6]> {
 /// Linux counts `OutRsts` for the reset its own closed port answers a SYN with, `EstabResets`
 /// only for a socket leaving `ESTABLISHED` or `CLOSE_WAIT` by a reset, and `CurrEstab` over
 /// those two states only (net/ipv4/tcp.c `tcp_set_state`).
+///
+/// The host's counters cover its whole network namespace, so any other connection opened or
+/// closed during a run (the CI runner's own, another process's) shows in its deltas: the host
+/// truth is the lifecycle two consecutive runs agree on.
 #[cfg(target_os = "linux")]
 #[test]
 fn tcp_lifecycle_counters_os_truth() {
-    let real = tcp_lifecycle();
+    let mut runs = vec![tcp_lifecycle()];
+    let real = loop {
+        let run = tcp_lifecycle();
+        if runs.last() == Some(&run) {
+            break run;
+        }
+        runs.push(run);
+        assert!(
+            runs.len() < 10,
+            "no two consecutive host runs agreed: {runs:?}"
+        );
+    };
     let sim = Sim::new().run(tcp_lifecycle);
     assert_eq!(sim, real);
 }

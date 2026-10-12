@@ -162,6 +162,8 @@ pub(crate) struct Inner {
     /// Every run that began has ended, so the threads still managed are left over from one (see
     /// [`Layer::dormant`]). `false` until the first run ends.
     dormant: AtomicBool,
+    /// Yields its participants made while it was dormant (see `woken::settle`).
+    dormant_yields: AtomicUsize,
     /// Places another sim made ready for this domain's threads that are to follow descriptors
     /// handed over to it, by lineage (see `follow`).
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -1320,6 +1322,7 @@ impl DomainBuilder {
             watchdog: std::sync::OnceLock::new(),
             runs: Mutex::new(0),
             dormant: AtomicBool::new(false),
+            dormant_yields: AtomicUsize::new(0),
             followers: Mutex::default(),
             fd_waits: Mutex::default(),
             locals: Mutex::default(),
@@ -1688,6 +1691,7 @@ fn park_if(domain: &Inner, sim: bool, waiting: impl FnOnce() -> bool) -> Option<
         } else {
             accounting::current_wait_mutex()
         },
+        scheduled: false,
         #[cfg(target_os = "linux")]
         mask: accounting::wait_mask_value(),
         #[cfg(any(target_os = "linux", windows))]
@@ -3152,6 +3156,11 @@ pub(crate) fn yield_point() {
     if !counts_native_waits() {
         return;
     }
+    if let Some(domain) = here()
+        && domain.dormant.load(Ordering::Relaxed)
+    {
+        domain.dormant_yields.fetch_add(1, Ordering::Relaxed);
+    }
     let (caught, polling) = note_spin(false);
     let det = det_active();
     if polling {
@@ -4432,6 +4441,7 @@ fn det_block_with_timer(
             deadline,
             key: None,
             mutex: None,
+            scheduled: true,
             #[cfg(target_os = "linux")]
             mask: accounting::wait_mask_value(),
             #[cfg(any(target_os = "linux", windows))]

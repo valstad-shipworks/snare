@@ -27,6 +27,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::c_int;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -4073,36 +4074,9 @@ impl Net for Fabric {
                     let (local, requested, queue, rec, broadcast) =
                         (*local, *requested, queue.clone(), rec.clone(), *broadcast);
                     drop(socks);
-                    let sender = match self.shared().route_send(
-                        &rec.view(local.or(unhashed(requested))),
-                        server,
-                        Op::Connect,
-                        station,
-                        broadcast,
-                    ) {
-                        Ok(sender) => sender,
-                        Err(errno) => return err(errno),
-                    };
-                    match local {
-                        None => {
-                            let unbound = unhashed(requested)
-                                .unwrap_or(SocketAddr::new(unspecified_like(server.ip()), 0));
-                            let ip = sender.connected_local(unbound).ip();
-                            if let Err(errno) = self.autobind(fd, &queue, &rec, ip) {
-                                return err(errno);
-                            }
-                        }
-                        Some(bound) => {
-                            self.rehash(fd, &queue, &rec, bound, sender.connected_local(bound))
-                        }
-                    }
-                    if let Some(Sock::Dgram { peer, .. }) = self.socks.lock().unwrap().get_mut(&fd)
-                    {
-                        *peer = Some(server);
-                    }
-                    rec.set_peer(Some(server));
-                    rec.note_tx_nic(sender.egress_name());
-                    return ok(0);
+                    return self.connect_dgram(
+                        fd, server, station, local, requested, &queue, &rec, broadcast,
+                    );
                 }
                 Sock::Fresh {
                     domain,
@@ -4152,42 +4126,7 @@ impl Net for Fabric {
                 Err(errno) => return err(errno),
             };
         if bound == Some(server) {
-            if cfg!(target_os = "macos") {
-                return err(libc::EINVAL);
-            }
-            let pipe = Pipe::new(None, None, self.shared().domain_key());
-            pipe.read_by(&rec);
-            pipe.write_by(&rec);
-            rec.set_ends(server, server);
-            let conn = Arc::new(Conn {
-                a_to_b: pipe.clone(),
-                b_to_a: pipe,
-                client: server,
-                server,
-                regs: self.regs.clone(),
-                hop: None,
-                pair: false,
-                pair_id: 0,
-                tap: None,
-                stamps: Default::default(),
-                write_delays: Default::default(),
-                #[cfg(target_os = "macos")]
-                mac_shutdown: Default::default(),
-            });
-            self.socks.lock().unwrap().insert(
-                fd,
-                Sock::Stream {
-                    conn,
-                    end: End::A,
-                    nonblocking,
-                    rec,
-                },
-            );
-            return if nonblocking {
-                err(libc::EINPROGRESS)
-            } else {
-                ok(0)
-            };
+            return self.connect_to_self(fd, server, nonblocking, rec);
         }
         crate::netstats::bump(&self.shared().stats.tcp(server.ip()).active_opens);
         let host_local = matches!(&sender, Sender::Host(path) if path.local);
@@ -4205,75 +4144,23 @@ impl Net for Fabric {
         if client.port() == 0 {
             return err(libc::EADDRNOTAVAIL);
         }
-        if let (Syn::Accept, Some(listener)) = (syn, &listener) {
-            let conn = self.establish(&rec, server, client, &sender, listener.tester);
-            if let Some(lrec) = listener.rec.as_ref().and_then(std::sync::Weak::upgrade) {
-                conn.a_to_b.pending_reader(lrec.state().buf);
-            }
-            if let Some(tap) = &conn.tap {
-                tap.open(false, Duration::ZERO);
-            }
-            self.socks.lock().unwrap().insert(
-                fd,
-                Sock::Stream {
-                    conn: conn.clone(),
-                    end: End::A,
-                    nonblocking,
-                    rec,
-                },
-            );
-            admission
-                .expect("accepted SYN reserves a queue entry")
-                .queue(conn);
-            let mut keys = crate::readiness::WakeKeys::default();
-            self.fd_interests([fd], &mut keys);
-            if let Some(key) = listener.wake_key() {
-                keys.push(key);
-            }
-            self.shared().bump_keys(keys.as_slice());
-            if nonblocking {
-                if let Some(rec) = self.rec(fd) {
-                    rec.state().connect_ack = cfg!(target_os = "linux");
-                }
-                return err(libc::EINPROGRESS);
-            }
-            return ok(0);
-        }
-        let plan = self.shared().syn_plan(&rec.opts(), syn);
-        let server_in = listener.as_ref().is_none_or(|l| l.tester);
-        let tap = self.shared().tcp_tap(&sender, client, server, server_in);
-        let attempt = match ConnectAttempt::start(&plan, syn, client, tap) {
-            Ok(attempt) => attempt,
-            Err(Outcome::Failed(errno)) => {
-                self.shared()
-                    .connect_settled(server, Outcome::Failed(errno), false);
-                if errno == libc::ECONNREFUSED && host_local {
-                    crate::netstats::bump(&self.shared().stats.tcp(server.ip()).out_rsts);
-                }
-                if nonblocking {
-                    rec.state().tcp_failed = true;
-                    rec.set_pending_error(errno, None);
-                    return err(libc::EINPROGRESS);
-                }
-                return err(errno);
-            }
-            Err(Outcome::Connected) => unreachable!("a SYN a listener accepts connects at once"),
+        let connect = StreamConnect {
+            domain,
+            bound,
+            nonblocking,
+            server,
+            client,
+            host_local,
         };
-        self.socks.lock().unwrap().insert(
-            fd,
-            Sock::Connecting {
-                domain,
-                local: bound,
-                nonblocking,
-                rec,
-                dest: server,
-                attempt: Arc::new(Mutex::new(attempt)),
-            },
-        );
-        // man 2 connect: a nonblocking socket's connect that cannot complete at once fails with
-        // EINPROGRESS; poll for POLLOUT, then read SO_ERROR.
-        if nonblocking {
-            return err(libc::EINPROGRESS);
+        if let (Syn::Accept, Some(listener)) = (syn, &listener) {
+            let admission = admission.expect("accepted SYN reserves a queue entry");
+            return self.connect_accepted(fd, rec, &sender, listener, admission, &connect);
+        }
+        let server_in = listener.as_ref().is_none_or(|l| l.tester);
+        if let ControlFlow::Break(result) =
+            self.start_connect(fd, rec, &sender, syn, server_in, &connect)
+        {
+            return result;
         }
         self.await_connect(fd)
     }
@@ -6399,7 +6286,221 @@ enum Progress {
     Idle,
 }
 
+/// A stream socket's connect, as [`Net::connect`] has worked it out so far. The branches it hands
+/// this to are kept out of line, so the frame `connect` keeps beneath the calls it makes, a
+/// blocking connect's wait among them, holds none of their locals: a thread on the smallest stack
+/// the OS allows connects too.
+struct StreamConnect {
+    domain: c_int,
+    bound: Option<SocketAddr>,
+    nonblocking: bool,
+    server: SocketAddr,
+    client: SocketAddr,
+    host_local: bool,
+}
+
 impl Fabric {
+    /// Connects datagram socket `fd`, bound at `local` (asked for `requested`), to `server`: fixes
+    /// its default peer and source address, binding it first if it is not bound (man 2 connect).
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn connect_dgram(
+        &self,
+        fd: c_int,
+        server: SocketAddr,
+        station: bool,
+        local: Option<SocketAddr>,
+        requested: Option<SocketAddr>,
+        queue: &Arc<DgramQueue>,
+        rec: &Arc<SockRec>,
+        broadcast: bool,
+    ) -> Option<NetResult> {
+        let sender = match self.shared().route_send(
+            &rec.view(local.or(unhashed(requested))),
+            server,
+            Op::Connect,
+            station,
+            broadcast,
+        ) {
+            Ok(sender) => sender,
+            Err(errno) => return err(errno),
+        };
+        match local {
+            None => {
+                let unbound = unhashed(requested)
+                    .unwrap_or(SocketAddr::new(unspecified_like(server.ip()), 0));
+                let ip = sender.connected_local(unbound).ip();
+                if let Err(errno) = self.autobind(fd, queue, rec, ip) {
+                    return err(errno);
+                }
+            }
+            Some(bound) => self.rehash(fd, queue, rec, bound, sender.connected_local(bound)),
+        }
+        if let Some(Sock::Dgram { peer, .. }) = self.socks.lock().unwrap().get_mut(&fd) {
+            *peer = Some(server);
+        }
+        rec.set_peer(Some(server));
+        rec.note_tx_nic(sender.egress_name());
+        ok(0)
+    }
+
+    /// Connects stream socket `fd` to the address it is bound at: Linux makes it a connection to
+    /// itself; macOS refuses it with EINVAL.
+    #[inline(never)]
+    fn connect_to_self(
+        &self,
+        fd: c_int,
+        server: SocketAddr,
+        nonblocking: bool,
+        rec: Arc<SockRec>,
+    ) -> Option<NetResult> {
+        if cfg!(target_os = "macos") {
+            return err(libc::EINVAL);
+        }
+        let pipe = Pipe::new(None, None, self.shared().domain_key());
+        pipe.read_by(&rec);
+        pipe.write_by(&rec);
+        rec.set_ends(server, server);
+        let conn = Arc::new(Conn {
+            a_to_b: pipe.clone(),
+            b_to_a: pipe,
+            client: server,
+            server,
+            regs: self.regs.clone(),
+            hop: None,
+            pair: false,
+            pair_id: 0,
+            tap: None,
+            stamps: Default::default(),
+            write_delays: Default::default(),
+            #[cfg(target_os = "macos")]
+            mac_shutdown: Default::default(),
+        });
+        self.socks.lock().unwrap().insert(
+            fd,
+            Sock::Stream {
+                conn,
+                end: End::A,
+                nonblocking,
+                rec,
+            },
+        );
+        if nonblocking {
+            err(libc::EINPROGRESS)
+        } else {
+            ok(0)
+        }
+    }
+
+    /// Completes `fd`'s connect at once, on a SYN `listener` accepts into the queue entry
+    /// `admission` reserved.
+    #[inline(never)]
+    fn connect_accepted(
+        &self,
+        fd: c_int,
+        rec: Arc<SockRec>,
+        sender: &Sender,
+        listener: &Arc<Listener>,
+        admission: ListenerAdmission,
+        connect: &StreamConnect,
+    ) -> Option<NetResult> {
+        let conn = self.establish(
+            &rec,
+            connect.server,
+            connect.client,
+            sender,
+            listener.tester,
+        );
+        if let Some(lrec) = listener.rec.as_ref().and_then(std::sync::Weak::upgrade) {
+            conn.a_to_b.pending_reader(lrec.state().buf);
+        }
+        if let Some(tap) = &conn.tap {
+            tap.open(false, Duration::ZERO);
+        }
+        self.socks.lock().unwrap().insert(
+            fd,
+            Sock::Stream {
+                conn: conn.clone(),
+                end: End::A,
+                nonblocking: connect.nonblocking,
+                rec,
+            },
+        );
+        admission.queue(conn);
+        let mut keys = crate::readiness::WakeKeys::default();
+        self.fd_interests([fd], &mut keys);
+        if let Some(key) = listener.wake_key() {
+            keys.push(key);
+        }
+        self.shared().bump_keys(keys.as_slice());
+        if connect.nonblocking {
+            if let Some(rec) = self.rec(fd) {
+                rec.state().connect_ack = cfg!(target_os = "linux");
+            }
+            return err(libc::EINPROGRESS);
+        }
+        ok(0)
+    }
+
+    /// Starts `fd`'s connect on a SYN no listener accepts at once, leaving the socket connecting;
+    /// `server_in` when a tester answers it. Continues when a blocking connect has to wait for the
+    /// attempt to settle.
+    #[inline(never)]
+    fn start_connect(
+        &self,
+        fd: c_int,
+        rec: Arc<SockRec>,
+        sender: &Sender,
+        syn: Syn,
+        server_in: bool,
+        connect: &StreamConnect,
+    ) -> ControlFlow<Option<NetResult>> {
+        let &StreamConnect {
+            domain,
+            bound,
+            nonblocking,
+            server,
+            client,
+            host_local,
+        } = connect;
+        let plan = self.shared().syn_plan(&rec.opts(), syn);
+        let tap = self.shared().tcp_tap(sender, client, server, server_in);
+        let attempt = match ConnectAttempt::start(&plan, syn, client, tap) {
+            Ok(attempt) => attempt,
+            Err(Outcome::Failed(errno)) => {
+                self.shared()
+                    .connect_settled(server, Outcome::Failed(errno), false);
+                if errno == libc::ECONNREFUSED && host_local {
+                    crate::netstats::bump(&self.shared().stats.tcp(server.ip()).out_rsts);
+                }
+                if nonblocking {
+                    rec.state().tcp_failed = true;
+                    rec.set_pending_error(errno, None);
+                    return ControlFlow::Break(err(libc::EINPROGRESS));
+                }
+                return ControlFlow::Break(err(errno));
+            }
+            Err(Outcome::Connected) => unreachable!("a SYN a listener accepts connects at once"),
+        };
+        self.socks.lock().unwrap().insert(
+            fd,
+            Sock::Connecting {
+                domain,
+                local: bound,
+                nonblocking,
+                rec,
+                dest: server,
+                attempt: Arc::new(Mutex::new(attempt)),
+            },
+        );
+        // man 2 connect: a nonblocking socket's connect that cannot complete at once fails with
+        // EINPROGRESS; poll for POLLOUT, then read SO_ERROR.
+        if nonblocking {
+            return ControlFlow::Break(err(libc::EINPROGRESS));
+        }
+        ControlFlow::Continue(())
+    }
+
     /// The listener a connect to `server` reaches: one on the exact address, else — for one of
     /// the host's own addresses — one on the wildcard address of that port.
     fn listener_for(&self, server: SocketAddr, host_local: bool) -> Option<Arc<Listener>> {
