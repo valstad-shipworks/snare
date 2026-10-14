@@ -15,15 +15,16 @@
 //! topology lock held, so the event log must never take the topology lock. The `Policies` locks
 //! (in `netpolicy`) are likewise taken under the topology lock in [`SimShared::fan_out`].
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
+use crate::HashMap;
 use crate::events::{Fault, LinkFault, RecordedEvent};
 use crate::readiness::Deadline;
 use crate::scope::{self, SimShared};
@@ -902,6 +903,48 @@ impl Sender {
     }
 }
 
+/// `addr` with a v4-mapped IPv6 address (RFC 4291 §2.5.5.2) turned into the IPv4 address it
+/// carries: what an IPv6 socket's traffic to it is on the wire, and how the fabric holds it.
+pub(crate) fn unmapped(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(IpAddr::V4(v4), v6.port()),
+            None => addr,
+        },
+        SocketAddr::V4(_) => addr,
+    }
+}
+
+/// How a socket reports `addr`: an IPv6 socket (`inet6`) gives an IPv4 address v4-mapped (RFC
+/// 3493 §3.7), except that macOS gives the IPv4 wildcard as `::`. Measured on Linux, macOS and
+/// Windows by tests/dual_stack_os_truth.rs.
+pub(crate) fn reported(inet6: bool, addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(v4) if inet6 => {
+            let ip = if cfg!(target_os = "macos") && v4.ip().is_unspecified() {
+                Ipv6Addr::UNSPECIFIED
+            } else {
+                v4.ip().to_ipv6_mapped()
+            };
+            SocketAddr::V6(SocketAddrV6::new(ip, v4.port(), 0, 0))
+        }
+        _ => addr,
+    }
+}
+
+/// Where an IPv6 socket at `local` stands toward `dest`: a dual-stack socket's IPv6 wildcard is
+/// the IPv4 wildcard toward an IPv4 address, and an IPv4 address it took sends to an IPv6 one from
+/// the IPv6 wildcard, as the route picks the source.
+pub(crate) fn toward(local: SocketAddr, dest: SocketAddr) -> SocketAddr {
+    match (local.ip(), dest.is_ipv4()) {
+        (IpAddr::V6(ip), true) if ip.is_unspecified() => {
+            SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), local.port())
+        }
+        (IpAddr::V4(_), false) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), local.port()),
+        _ => local,
+    }
+}
+
 /// A socket a datagram could be delivered to.
 pub(crate) struct Cand<Q> {
     /// The address the socket is bound at.
@@ -910,8 +953,170 @@ pub(crate) struct Cand<Q> {
     pub(crate) endpoint: bool,
     /// The interface the socket is bound to (see [`SockView::device`]).
     pub(crate) device: Option<u32>,
+    /// A dual-stack socket at the IPv6 wildcard (RFC 3493 §3.7), which takes IPv4 datagrams as
+    /// one at the IPv4 wildcard would, but after any such IPv4 socket: Linux `compute_score`
+    /// (net/ipv4/udp.c) scores an `AF_INET` socket higher, XNU `in_pcblookup_hash`
+    /// (bsd/netinet/in_pcb.c) returns a wildcard IPv4 socket before a v4-mapped one, and Windows
+    /// does the same (measured by tests/dual_stack_os_truth.rs).
+    pub(crate) dual: bool,
+    /// How it shares its address with other sockets.
+    pub(crate) share: Share,
     /// The backend's handle on the socket's receive queue, passed through untouched.
     pub(crate) q: Q,
+}
+
+/// What decides which of several sockets sharing one address takes a unicast datagram or a
+/// connection there ([`pick_shared`]).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Share {
+    /// When it took the address ([`SimShared::bind_order`]); 0 for a tester's endpoint, which
+    /// never shares one.
+    pub(crate) order: u64,
+    /// `SO_REUSEPORT`: on Linux a member of the address's load-balancing group.
+    pub(crate) reuseport: bool,
+    /// Created `AF_INET6`.
+    pub(crate) inet6: bool,
+    /// The peer a datagram socket is connected to.
+    pub(crate) peer: Option<SocketAddr>,
+}
+
+impl Share {
+    /// The share of the code under test's socket `rec`.
+    pub(crate) fn of(rec: &crate::sockets::SockRec) -> Self {
+        Share::of_state(&rec.state())
+    }
+
+    /// The share of the socket whose state is `state`.
+    pub(crate) fn of_state(state: &crate::sockets::SockState) -> Self {
+        Share {
+            order: state.bound_order,
+            #[cfg(unix)]
+            reuseport: state.opts.reuseport,
+            #[cfg(windows)]
+            reuseport: false,
+            inet6: state.inet6,
+            peer: state.peer,
+        }
+    }
+}
+
+/// Which of `shares`, sockets sharing one address (a `wildcard` one or not), a unicast datagram
+/// or a connection from `src` to `dest` reaches, as an index into `shares`, which must not be
+/// empty. Measured by tests/reuseport_os_truth.rs.
+///
+/// - Linux scores a socket connected to `src` above the rest (net/ipv4/udp.c `compute_score`).
+///   Otherwise the first socket of the address's hash chain wins: they are added at its head,
+///   so the most recently bound comes first, except that an IPv6 `SO_REUSEPORT` socket is added
+///   at its tail (net/ipv4/udp.c `udp_lib_get_port`, net/ipv4/inet_hashtables.c `__inet_hash`).
+///   When the winner is in a `SO_REUSEPORT` group, the group picks a member by a hash of the
+///   flow's addresses and ports keyed with a boot-time secret (net/core/sock_reuseport.c
+///   `reuseport_select_sock`, `reciprocal_scale`), so one flow keeps to one member while the
+///   group is unchanged. snare keys [`flow_hash`] with the sim's seed and indexes the members in
+///   bind order: the same seed spreads flows the same way, but not as a real kernel would.
+/// - macOS takes a socket connected to `src` first (bsd/netinet/in_pcb.c `in_pcblookup_hash`
+///   matches the full four-tuple before a wildcard one); otherwise the most recently bound of
+///   sockets at a specific address, and the earliest bound of sockets at the wildcard.
+/// - Windows takes the earliest bound, connected or not; a datagram from another peer than the
+///   one it is connected to is then dropped.
+pub(crate) fn pick_shared(
+    shares: &[Share],
+    wildcard: bool,
+    src: SocketAddr,
+    dest: SocketAddr,
+    seed: u64,
+) -> usize {
+    let index = |key: &dyn Fn(&Share) -> (bool, i128)| {
+        (0..shares.len())
+            .min_by_key(|&i| key(&shares[i]))
+            .unwrap_or(0)
+    };
+    let oldest = |s: &Share| (false, i128::from(s.order));
+    let newest = |s: &Share| (false, -i128::from(s.order));
+    if cfg!(windows) {
+        return index(&oldest);
+    }
+    let src = canonical(src);
+    if shares.iter().any(|s| s.peer.map(canonical) == Some(src)) {
+        return index(&|s| (s.peer.map(canonical) != Some(src), -i128::from(s.order)));
+    }
+    if cfg!(target_os = "macos") {
+        return if wildcard {
+            index(&oldest)
+        } else {
+            index(&newest)
+        };
+    }
+    let first = index(&|s| {
+        if s.inet6 && s.reuseport {
+            (true, i128::from(s.order))
+        } else {
+            newest(s)
+        }
+    });
+    if !shares[first].reuseport {
+        return first;
+    }
+    let mut group: Vec<usize> = (0..shares.len()).filter(|&i| shares[i].reuseport).collect();
+    group.sort_by_key(|&i| shares[i].order);
+    let scaled = ((flow_hash(seed, src, dest) >> 32) * group.len() as u64) >> 32;
+    group[scaled as usize]
+}
+
+/// `addr` with a v4-mapped IPv6 address as its IPv4 one.
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
+/// A hash of one flow's source and destination, keyed with `seed`: splitmix64 (Steele, Lea and
+/// Flood, "Fast splittable pseudorandom number generators", OOPSLA 2014) over the addresses and
+/// ports, so it is the same on every host and in every build.
+fn flow_hash(seed: u64, src: SocketAddr, dest: SocketAddr) -> u64 {
+    let word = |ip: IpAddr| match ip.to_canonical() {
+        IpAddr::V4(v4) => u64::from(u32::from(v4)),
+        IpAddr::V6(v6) => {
+            let bits = u128::from(v6);
+            (bits >> 64) as u64 ^ bits as u64
+        }
+    };
+    let ports = (u64::from(src.port()) << 16) | u64::from(dest.port());
+    [word(src.ip()), word(dest.ip()), ports]
+        .into_iter()
+        .fold(seed, |h, w| {
+            let mut z = (h ^ w).wrapping_add(0x9e37_79b9_7f4a_7c15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        })
+}
+
+impl<Q> Cand<Q> {
+    /// The candidate as a recipient of a datagram to `dest`: on its port and of its family, or a
+    /// dual-stack socket standing at the IPv4 wildcard for an IPv4 one; `None` otherwise.
+    fn toward(mut self, dest: SocketAddr) -> Option<Self> {
+        if self.addr.port() != dest.port() {
+            return None;
+        }
+        if self.addr.is_ipv4() == dest.is_ipv4() {
+            self.dual = false;
+            return Some(self);
+        }
+        if !(self.dual && dest.is_ipv4()) {
+            return None;
+        }
+        self.addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), dest.port());
+        Some(self)
+    }
+
+    /// Whether the socket takes a datagram from `src`: a datagram socket connected to another
+    /// peer is passed over (Linux `compute_score` returns -1 for it; XNU `udp_input` skips it).
+    /// Windows offers it the datagram all the same, and it is dropped there.
+    fn takes_from(&self, src: SocketAddr) -> bool {
+        cfg!(windows)
+            || self
+                .share
+                .peer
+                .is_none_or(|peer| canonical(peer) == canonical(src))
+    }
 }
 
 /// One recipient's copies of a datagram; none when the link lost it on the way.
@@ -925,6 +1130,8 @@ pub(crate) struct Copy<Q> {
     pub(crate) via: Option<(Arc<LinkState>, u64)>,
     /// The interface it arrived on, for a socket of the host.
     pub(crate) nic: Option<Arc<str>>,
+    /// That interface's index.
+    pub(crate) ingress: Option<u32>,
     /// The smallest MTU of the interfaces it crosses (the sender's egress, the link, the
     /// recipient's ingress), `None` when it crosses none: a datagram longer than its packets may
     /// be crossed as IP fragments, which the receiver charges one buffer each
@@ -1050,6 +1257,13 @@ impl Topology {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn index_of_address(&self, ip: IpAddr) -> Option<u32> {
         self.owner(ip).map(|n| n.index)
+    }
+
+    /// Interface `index`'s address in `peer`'s family that faces `peer`: one on its subnet, else
+    /// the first.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn source_on(&self, index: u32, peer: IpAddr) -> Option<IpAddr> {
+        self.nic(index)?.source_for(peer)
     }
 
     /// The loopback interface's index: 1 unless a host interface took it.
@@ -1225,6 +1439,15 @@ impl Topology {
             return true;
         }
         self.owner(ip).is_some_and(NicRec::addresses_live)
+    }
+
+    /// Whether `ip` is an address one of the host's interfaces holds now: exactly, where
+    /// [`is_host`](Self::is_host) takes all of loopback's 127/8.
+    #[cfg(windows)]
+    pub(crate) fn holds(&self, ip: IpAddr) -> bool {
+        self.nics
+            .iter()
+            .any(|n| n.addresses_live() && n.spec.addresses.iter().any(|net| net.addr == ip))
     }
 
     /// Whether `ip` is a configured station address on some segment.
@@ -1474,12 +1697,16 @@ impl Topology {
     }
 
     /// Claims `ip` for the host if it may bind it: one of its addresses, a station address, a
-    /// broadcast or multicast address, or — while the sim is open — any address, which becomes
-    /// the host's on `sim0` (127/8 is always on loopback). Otherwise `EADDRNOTAVAIL`, bind's
-    /// "nonexistent interface or not local" error (man 7 ip, `EADDRNOTAVAIL`;
-    /// `WSAEADDRNOTAVAIL` on Windows). With `sim0` gone, the claim goes to the first non-loopback
+    /// broadcast or (but on Windows) multicast address, or — while the sim is open — any address,
+    /// which becomes the host's on `sim0` (127/8 is always on loopback). Otherwise
+    /// `EADDRNOTAVAIL`, bind's "nonexistent interface or not local" error (man 7 ip,
+    /// `EADDRNOTAVAIL`; `WSAEADDRNOTAVAIL` on Windows, measured for a multicast group by
+    /// tests/reuseport_os_truth.rs). With `sim0` gone, the claim goes to the first non-loopback
     /// interface, else to loopback.
     fn claim(&mut self, ip: IpAddr) -> Result<(), i32> {
+        if ip.is_multicast() && cfg!(windows) {
+            return Err(code::EADDRNOTAVAIL);
+        }
         if ip.is_unspecified() || ip.is_multicast() || self.is_broadcast(ip) || self.is_host(ip) {
             return Ok(());
         }
@@ -2359,23 +2586,28 @@ impl SimShared {
         let mut topo = self.topo();
         let dip = dest.ip();
         let kind = topo.dest_kind(dip);
-        let mut cands: Vec<Cand<Q>> = cands
+        let src = wire.src;
+        let cands: Vec<Cand<Q>> = cands
             .into_iter()
-            .filter(|c| c.addr.port() == dest.port() && c.addr.is_ipv4() == dest.is_ipv4())
+            .filter_map(|c| c.toward(dest))
+            .filter(|c| c.takes_from(src))
             .collect();
         let mut chosen: Vec<Cand<Q>> = match kind {
-            DestKind::Unicast => match cands.iter().position(|c| c.addr == dest) {
-                Some(i) => {
-                    cands.swap(0, i);
-                    cands.truncate(1);
-                    cands
-                }
-                None if topo.presence(dip, station) == Presence::Host => cands
+            DestKind::Unicast if cands.iter().any(|c| c.addr == dest) => {
+                let exact = cands.into_iter().filter(|c| c.addr == dest).collect();
+                self.one_of(exact, src, dest)
+            }
+            DestKind::Unicast if topo.presence(dip, station) == Presence::Host => {
+                let mut wildcards: Vec<Cand<Q>> = cands
                     .into_iter()
                     .filter(|c| c.addr.ip().is_unspecified())
-                    .collect(),
-                None => Vec::new(),
-            },
+                    .collect();
+                if wildcards.iter().any(|c| !c.dual) {
+                    wildcards.retain(|c| !c.dual);
+                }
+                self.one_of(wildcards, src, dest)
+            }
+            DestKind::Unicast => Vec::new(),
             DestKind::Limited | DestKind::Multicast => cands,
             DestKind::Directed(net) => cands
                 .into_iter()
@@ -2407,29 +2639,46 @@ impl SimShared {
         let dest = wire.dest;
         let dip = dest.ip();
         let kind = topo.dest_kind(dip);
-        let chosen = cand.filter(|c| {
-            if c.addr.port() != dest.port() || c.addr.is_ipv4() != dest.is_ipv4() {
-                return false;
-            }
-            match kind {
-                DestKind::Unicast => {
-                    c.addr == dest
-                        || (c.addr.ip().is_unspecified()
-                            && topo.presence(dip, station) == Presence::Host)
+        let src = wire.src;
+        let chosen = cand.and_then(|c| c.toward(dest)).filter(|c| {
+            c.takes_from(src)
+                && match kind {
+                    DestKind::Unicast => {
+                        c.addr == dest
+                            || (c.addr.ip().is_unspecified()
+                                && topo.presence(dip, station) == Presence::Host)
+                    }
+                    DestKind::Limited | DestKind::Multicast => true,
+                    DestKind::Directed(net) => {
+                        let ip = c.addr.ip();
+                        let station = c.endpoint || topo.is_station_ip(ip);
+                        ip.is_unspecified() || ip == dip || (station && net.contains(ip))
+                    }
                 }
-                DestKind::Limited | DestKind::Multicast => true,
-                DestKind::Directed(net) => {
-                    let ip = c.addr.ip();
-                    let station = c.endpoint || topo.is_station_ip(ip);
-                    ip.is_unspecified() || ip == dip || (station && net.contains(ip))
-                }
-            }
         });
         let mut out = None;
         self.fan_out_selected(&mut topo, sender, wire, kind, chosen, tx, |copy| {
             out = Some(copy)
         });
         out
+    }
+
+    /// The one of `cands`, sockets sharing one address, a unicast datagram from `src` reaches
+    /// ([`pick_shared`]).
+    fn one_of<Q>(
+        &self,
+        mut cands: Vec<Cand<Q>>,
+        src: SocketAddr,
+        dest: SocketAddr,
+    ) -> Vec<Cand<Q>> {
+        if cands.len() > 1 {
+            let shares: Vec<Share> = cands.iter().map(|c| c.share).collect();
+            let wildcard = cands[0].addr.ip().is_unspecified();
+            let i = pick_shared(&shares, wildcard, src, dest, self.seed);
+            cands.swap(0, i);
+        }
+        cands.truncate(1);
+        cands
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2558,7 +2807,8 @@ impl SimShared {
                     fault,
                 });
             }
-            let nic = match ingress.filter(|_| rcpt_host) {
+            let ingress = ingress.filter(|_| rcpt_host);
+            let nic = match ingress {
                 Some(index) => {
                     for _ in &delays {
                         topo.account(index, Dir::Rx, frame, multicast);
@@ -2572,6 +2822,7 @@ impl SimShared {
                 delays,
                 via,
                 nic,
+                ingress,
                 mtu,
             });
         }
@@ -3252,7 +3503,7 @@ pub(crate) mod frag {
     ///
     /// # Safety
     /// `val` and `len` are each null or valid, `val` writable for `*len` bytes.
-    unsafe fn write_int(value: c_int, val: *mut u8, len: *mut u32) {
+    pub(crate) unsafe fn write_int(value: c_int, val: *mut u8, len: *mut u32) {
         if val.is_null() || len.is_null() {
             return;
         }
@@ -3274,33 +3525,87 @@ pub(crate) mod frag {
         }
     }
 
-    /// Whether a datagram from `rec` (an IPv6 socket if `v6`) to `dest` may not be fragmented, and
-    /// the IP and UDP headers it carries.
-    fn no_frag(rec: &SockRec, v6: bool, dest: SocketAddr) -> (bool, usize) {
-        let frag = rec.state().frag;
+    /// The IP and UDP headers a datagram to `dest` carries.
+    fn headers(dest: SocketAddr) -> usize {
         let v4_dest = match dest.ip() {
             IpAddr::V4(_) => true,
             IpAddr::V6(ip) => ip.to_ipv4_mapped().is_some(),
         };
-        let headers = UDP_HEADER + if v4_dest { IPV4_HEADER } else { IPV6_HEADER };
+        UDP_HEADER + if v4_dest { IPV4_HEADER } else { IPV6_HEADER }
+    }
+
+    /// Whether a datagram from `rec` (an IPv6 socket if `v6`) to `dest` may not be fragmented, and
+    /// the IP and UDP headers it carries. `dontfrag` is the send's own `IPV6_DONTFRAG`, which
+    /// stands in for the socket's (Linux `ip6_datagram_send_ctl`, macOS `ip6_setpktopt`).
+    fn no_frag(rec: &SockRec, v6: bool, dest: SocketAddr, dontfrag: Option<bool>) -> (bool, usize) {
+        let frag = rec.state().frag;
+        let headers = headers(dest);
+        let v4_dest = headers == UDP_HEADER + IPV4_HEADER;
+        let dontfrag6 = dontfrag.unwrap_or(frag.dontfrag6);
         let keep_whole = if cfg!(target_os = "linux") {
             if v4_dest {
                 PMTUDISC_NO_FRAG.contains(&frag.pmtudisc)
             } else {
-                PMTUDISC_NO_FRAG.contains(&frag.pmtudisc6) || frag.dontfrag6
+                PMTUDISC_NO_FRAG.contains(&frag.pmtudisc6) || dontfrag6
             }
         } else if v6 {
-            frag.dontfrag6
+            dontfrag6
         } else {
             frag.dontfrag
         };
         (keep_whole, headers)
     }
 
+    /// The MTU of the interface a host datagram leaves through; `None` for a station's.
+    fn egress_mtu(shared: &SimShared, sender: &Sender) -> Option<usize> {
+        let Sender::Host(path) = sender else {
+            return None;
+        };
+        shared.nic(&path.name).map(|nic| nic.spec.mtu as usize)
+    }
+
+    /// `UDP_MAX_SEGMENTS` (include/linux/udp.h): 128 since Linux 6.12, measured on 7.0.
+    #[cfg(target_os = "linux")]
+    const UDP_MAX_SEGMENTS: usize = 128;
+
+    /// Checks a Linux segmented send (`UDP_SEGMENT`) of `len` bytes in `gso`-byte segments to
+    /// `dest`, as net/ipv4/udp.c `udp_send_skb` does in place of the don't-fragment check (a
+    /// segmented send is built against `IP_MAX_MTU`, whatever the socket's mode): `EMSGSIZE` when
+    /// a segment (the whole send, if shorter) with its headers exceeds the egress MTU, `EINVAL`
+    /// past `UDP_MAX_SEGMENTS` segments. Measured on Linux 7.0 with a 1500-byte loopback MTU.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn check_gso(
+        shared: &SimShared,
+        sender: &Sender,
+        dest: SocketAddr,
+        len: usize,
+        gso: u16,
+    ) -> Result<(), c_int> {
+        let gso = usize::from(gso);
+        if egress_mtu(shared, sender).is_some_and(|mtu| headers(dest) + len.min(gso) > mtu) {
+            return Err(libc::EMSGSIZE);
+        }
+        if len > gso * UDP_MAX_SEGMENTS {
+            return Err(libc::EINVAL);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn check_gso(
+        _: &SimShared,
+        _: &Sender,
+        _: SocketAddr,
+        _: usize,
+        _: u16,
+    ) -> Result<(), c_int> {
+        Ok(())
+    }
+
     /// Refuses with `EMSGSIZE` a datagram of `len` payload bytes from `rec` (an IPv6 socket if
     /// `v6`) to `dest` that may not be fragmented and is larger, with its headers, than the MTU
     /// of the interface `sender` leaves through. A station's datagram crosses no interface of the
-    /// host and is never refused.
+    /// host and is never refused. `dontfrag` is the send's `IPV6_DONTFRAG` control message.
     pub(crate) fn check_send(
         shared: &SimShared,
         rec: &SockRec,
@@ -3308,15 +3613,13 @@ pub(crate) mod frag {
         sender: &Sender,
         dest: SocketAddr,
         len: usize,
+        dontfrag: Option<bool>,
     ) -> Result<(), c_int> {
-        let Sender::Host(path) = sender else {
-            return Ok(());
-        };
-        let (keep_whole, headers) = no_frag(rec, v6, dest);
+        let (keep_whole, headers) = no_frag(rec, v6, dest, dontfrag);
         if !keep_whole {
             return Ok(());
         }
-        let Some(mtu) = shared.nic(&path.name).map(|nic| nic.spec.mtu as usize) else {
+        let Some(mtu) = egress_mtu(shared, sender) else {
             return Ok(());
         };
         if len.saturating_add(headers) > mtu {

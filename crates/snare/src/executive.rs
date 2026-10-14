@@ -495,8 +495,13 @@ impl Executive {
     }
 
     /// Whether the sim is quiescent, and what holds it up if not, read under the same locks as
-    /// [`jump_to`](Self::jump_to).
+    /// [`jump_to`](Self::jump_to), but for a running participant's answer, which those locks
+    /// cannot change and which is read without the readiness lock.
     pub fn quiescence(&self) -> Quiescence {
+        if let Some(mut q) = self.domain.busy_quiescence() {
+            q.next_deadline = self.next_deadline();
+            return q;
+        }
         let mut next = None;
         let mut q = readiness().locked(self.domain.key(), |settling| {
             self.domain.quiescence(settling, || {
@@ -510,6 +515,13 @@ impl Executive {
             self.next_deadline()
         };
         q
+    }
+
+    /// The quiescence epoch, as [`quiescence`](Self::quiescence) reports it, read without taking
+    /// any lock: an executive that expects the sim to settle soon can watch it move before it
+    /// sleeps in [`arm_notify`](Self::arm_notify).
+    pub fn epoch(&self) -> u64 {
+        self.domain.epoch()
     }
 
     /// Calls `f` once the quiescence epoch moves past `seen_epoch` (at once if it already has):
@@ -538,6 +550,11 @@ impl Executive {
                 owner: timer.owner.map(|lineage| self.domain.display_name(lineage)),
             })
             .collect()
+    }
+
+    /// How many timers [`timers`](Self::timers) lists with no limit, without listing them.
+    pub fn timer_count(&self) -> usize {
+        snare_interpose::real(|| self.clock.pending_timer_count())
     }
 
     /// The starvation hints raised since the last call (see

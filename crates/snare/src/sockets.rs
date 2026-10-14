@@ -10,7 +10,7 @@
 //! it must run with neither a backend lock nor the record's `state` held. Table reads run inside
 //! [`snare_interpose::real`] so their mutexes reach the OS, not the sim.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_int;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
+use crate::HashMap;
 use crate::limits::{Charge, SockBuf};
 use crate::netstats::ProtoStats;
 use crate::readiness::Deadline;
@@ -192,6 +193,12 @@ pub(crate) struct SockOpts {
     pub(crate) linger: Option<Duration>,
     /// `SO_REUSEADDR`.
     pub(crate) reuseaddr: bool,
+    /// `SO_REUSEPORT` (Linux, macOS).
+    #[cfg(unix)]
+    pub(crate) reuseport: bool,
+    /// Windows `SO_EXCLUSIVEADDRUSE`.
+    #[cfg(windows)]
+    pub(crate) exclusive: bool,
     /// Linux `SO_PRIORITY`.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) priority: c_int,
@@ -392,10 +399,19 @@ pub(crate) struct SockState {
     pub(crate) ty: c_int,
     /// The descriptors open on this file description; it closes when the last goes.
     fds: BTreeSet<c_int>,
+    /// Created `AF_INET6`: its IPv4 addresses are reported v4-mapped.
+    pub(crate) inet6: bool,
+    /// `IPV6_V6ONLY`: an IPv6 socket bound to the wildcard takes no IPv4 traffic.
+    pub(crate) v6only: bool,
     pub(crate) local: Option<SocketAddr>,
+    /// When the socket took its address, in the sim's bind order ([`SimShared::bind_order`]):
+    /// which of several sockets sharing an address receives depends on it.
+    ///
+    /// [`SimShared::bind_order`]: crate::scope::SimShared::bind_order
+    pub(crate) bound_order: u64,
     /// Bound at a station address: across a link from the host, so its datagrams are not the
     /// host's to count.
-    station: bool,
+    pub(crate) station: bool,
     pub(crate) peer: Option<SocketAddr>,
     pub(crate) tcp_established: bool,
     #[cfg(unix)]
@@ -414,6 +430,9 @@ pub(crate) struct SockState {
     pub(crate) dgram: DgramOpts,
     /// `IP_MTU_DISCOVER`, `IP_DONTFRAG` and their IPv6 counterparts.
     pub(crate) frag: FragOpts,
+    /// The receive options and UDP offload settings of `crate::ancillary`.
+    #[cfg(unix)]
+    pub(crate) anc: crate::ancillary::Opts,
     /// Linux `MSG_ERRQUEUE` reports, oldest first.
     errq: VecDeque<IcmpReport>,
     delivered: u64,
@@ -442,6 +461,16 @@ pub(crate) struct SockState {
     /// The values of options set that the sim ignores as harmless, by `(level, name)`, so a
     /// `getsockopt` reads back what was set. On Windows unmodelled options are kept here too.
     ignored: HashMap<(c_int, c_int), Vec<u8>>,
+}
+
+impl SockState {
+    /// Whether the socket at `addr` is dual-stack: an IPv6 socket without `IPV6_V6ONLY` at the
+    /// IPv6 wildcard (RFC 3493 §3.7), which takes IPv4 traffic too.
+    pub(crate) fn dual_at(&self, addr: SocketAddr) -> bool {
+        self.inet6
+            && !self.v6only
+            && addr.ip() == std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -949,6 +978,8 @@ impl SockRec {
                 .icmp_errors
                 .partition_point(|pending| pending.order < error.order);
             state.icmp_errors.insert(position, error);
+            drop(state);
+            crate::notices::notice(0, self.wake_key());
             return;
         }
         #[cfg(unix)]
@@ -961,6 +992,8 @@ impl SockRec {
             return;
         }
         state.pending_error = Some(error);
+        drop(state);
+        crate::notices::notice(0, self.wake_key());
     }
 
     /// Reports the error visible to `taker`, recording the fault it reports.
@@ -1069,6 +1102,8 @@ impl SockRec {
             #[cfg(target_os = "linux")]
             charged: false,
         });
+        drop(state);
+        crate::notices::notice(0, self.wake_key());
     }
 
     /// The earliest arrived ICMP or transmit timestamp report for `MSG_ERRQUEUE`. An ICMP
@@ -1162,6 +1197,28 @@ impl SockRec {
     #[cfg(unix)]
     pub(crate) fn error_wakes(&self) -> u64 {
         Self::count_error_wakes(&mut self.state())
+    }
+
+    /// What a readiness check reads of the record, under one lock: [`peek_error`]'s answer,
+    /// whether a transmit stamp or an ICMP report is readable on the error queue (Linux; always
+    /// `false` elsewhere), and [`error_wakes`].
+    ///
+    /// [`peek_error`]: Self::peek_error
+    /// [`error_wakes`]: Self::error_wakes
+    #[cfg(unix)]
+    pub(crate) fn error_readiness(&self) -> (Option<c_int>, bool, u64) {
+        let mut state = self.state();
+        let error = state
+            .pending_error
+            .as_ref()
+            .filter(|error| error.visible.is_none_or(|deadline| deadline.passed()))
+            .map(|error| error.errno);
+        #[cfg(target_os = "linux")]
+        let report = crate::tstamp::next_tx_report(&state.ts).is_some()
+            || state.errq.iter().any(|r| r.charged);
+        #[cfg(not(target_os = "linux"))]
+        let report = false;
+        (error, report, Self::count_error_wakes(&mut state))
     }
 
     #[cfg(unix)]
@@ -1290,7 +1347,10 @@ impl SocketTable {
                 #[cfg(target_os = "linux")]
                 ty: 0,
                 fds: BTreeSet::from([fd]),
+                inet6: false,
+                v6only: false,
                 local: None,
+                bound_order: 0,
                 station: false,
                 peer: None,
                 tcp_established: false,
@@ -1308,6 +1368,8 @@ impl SocketTable {
                 error_wakes: 0,
                 dgram: DgramOpts::default(),
                 frag: FragOpts::default(),
+                #[cfg(unix)]
+                anc: crate::ancillary::Opts::default(),
                 errq: VecDeque::new(),
                 delivered: 0,
                 delivered_bytes: 0,
@@ -1324,7 +1386,7 @@ impl SocketTable {
                 #[cfg(windows)]
                 win: Default::default(),
                 unmodelled: Vec::new(),
-                ignored: HashMap::new(),
+                ignored: HashMap::default(),
             }),
             stats,
         });

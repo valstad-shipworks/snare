@@ -248,6 +248,43 @@ fn a_file_of_a_dropped_sim_fails_with_ebadf_until_closed() {
     assert_eq!(close(fd), Err(libc::EBADF));
 }
 
+/// The working directory is where a sim's own relative paths resolve, so another sim's
+/// directory cannot become it: `fchdir` through one fails with `EXDEV`, from another sim or from
+/// outside every sim, and leaves the working directory alone; once its sim is gone, `EBADF`.
+#[test]
+fn another_sims_directory_cannot_become_the_working_directory() {
+    let sim = Sim::builder().fs(logs()).build();
+    let dir = sim.run(|| {
+        open(
+            "/xlogs",
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    });
+    let fchdir = |fd| {
+        if unsafe { libc::fchdir(fd) } < 0 {
+            Err(errno())
+        } else {
+            Ok(())
+        }
+    };
+    let other = Sim::builder()
+        .fs(FsBuilder::new().own_prefix("/own").dir("/own").build())
+        .build();
+    let cwd = other.run(move || {
+        std::env::set_current_dir("/own").unwrap();
+        let result = fchdir(dir);
+        (result, std::env::current_dir().unwrap())
+    });
+    assert_eq!(cwd, (Err(libc::EXDEV), PathBuf::from("/own")));
+    let before = std::env::current_dir().unwrap();
+    assert_eq!(fchdir(dir), Err(libc::EXDEV));
+    assert_eq!(std::env::current_dir().unwrap(), before);
+    assert_eq!(sim.run(move || fchdir(dir)), Ok(()));
+    drop(sim);
+    assert_eq!(fchdir(dir), Err(libc::EBADF));
+    assert_eq!(close(dir), Ok(()));
+}
+
 #[test]
 fn a_virtual_fs_serves_behind_a_sim_host() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("shared-desc-host");

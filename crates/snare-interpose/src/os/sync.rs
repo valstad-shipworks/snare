@@ -270,7 +270,7 @@ fn note_wait_signal_masked(addr: usize, mask: u32, private: Option<bool>) {
 struct Unusual<V> {
     /// How many entries `map` holds, read without its lock.
     len: AtomicUsize,
-    map: std::sync::Mutex<Option<std::collections::HashMap<usize, V>>>,
+    map: std::sync::Mutex<Option<crate::HashMap<usize, V>>>,
 }
 
 impl<V: Copy> Unusual<V> {
@@ -704,6 +704,10 @@ fn taken(mutex: *mut pthread_mutex_t, r: c_int) -> c_int {
 unsafe extern "C" fn pthread_mutex_lock(mutex: *mut pthread_mutex_t) -> c_int {
     // SAFETY: PTHREAD_MUTEX_LOCK holds libc's pthread_mutex_lock.
     let lock = unsafe { original::<MutexFn>(&PTHREAD_MUTEX_LOCK) };
+    if crate::state::passthrough() {
+        // SAFETY: forwarding the caller's argument unchanged.
+        return unsafe { lock(mutex) };
+    }
     if !domain::counts_native_waits() {
         // SAFETY: forwarding the caller's argument unchanged.
         return taken(mutex, unsafe { lock(mutex) });
@@ -743,6 +747,10 @@ unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut pthread_mutex_t) -> c_int
 /// `pthread_mutex_unlock`: forwarded and recorded, and it wakes one waiter parked on the mutex in
 /// a deterministic schedule: its own thread's, or another's waiting on a holder outside it.
 unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut pthread_mutex_t) -> c_int {
+    if crate::state::passthrough() {
+        // SAFETY: PTHREAD_MUTEX_UNLOCK holds libc's pthread_mutex_unlock; argument forwarded.
+        return unsafe { original::<MutexFn>(&PTHREAD_MUTEX_UNLOCK)(mutex) };
+    }
     if deterministic() {
         // SAFETY: the caller's mutex.
         return unsafe { det_mutex_unlock(mutex) };
@@ -800,6 +808,25 @@ unsafe extern "C" fn pthread_cond_wait(
         // SAFETY: the caller's condvar and held mutex.
         return unsafe { det_cond_wait(cond, mutex, None) };
     }
+    let mut signals = None;
+    let held_off = match domain::hold_off_while(|| {
+        let since = signals
+            .get_or_insert_with(|| track_signal(cond as usize))
+            .version;
+        // SAFETY: the caller's condvar and held mutex.
+        unsafe { cond_wait_real(cond, mutex, OUTSIDE_HOLDER_GRACE) }.or_else(|| {
+            (signal_version_masked(cond as usize, u32::MAX, None) != Some(since)).then_some(0)
+        })
+    }) {
+        Ok(r) => return r,
+        Err(held_off) => held_off,
+    };
+    if let Some(signals) = signals.filter(|_| held_off.held()) {
+        let signalled =
+            || signal_version_masked(cond as usize, u32::MAX, None) != Some(signals.version);
+        // SAFETY: the caller's condvar and held mutex.
+        return unsafe { cond_wait_held_off(cond, mutex, &signalled) };
+    }
     // SAFETY: PTHREAD_COND_WAIT holds libc's pthread_cond_wait.
     let wait = unsafe { original::<CondWaitFn>(&PTHREAD_COND_WAIT) };
     let _watch = cond_watch(mutex);
@@ -828,12 +855,82 @@ unsafe fn cond_outside_grace(
     grace: Duration,
 ) -> c_int {
     domain::end_spin();
+    // SAFETY: as for this function.
+    unsafe { cond_wait_real(cond, mutex, grace) }.unwrap_or(0)
+}
+
+/// The counted rest of an untimed condition-variable wait that was held off
+/// ([`domain::hold_off_while`]): its attempts each waited with a timeout and let go of `mutex` in
+/// between, so a signal may have been made while none waited. It parks unless `signalled` finds a
+/// signal made since the wait began, and then waits in slices of [`HELD_OFF_SLICE`], returning once
+/// woken or once a slice finds such a signal, which no other waiter may have taken; at worst a
+/// spurious wakeup (POSIX pthread_cond_wait).
+///
+/// # Safety
+/// As for `pthread_cond_wait`, with `mutex` held by the caller.
+unsafe fn cond_wait_held_off(
+    cond: *mut pthread_cond_t,
+    mutex: *mut pthread_mutex_t,
+    signalled: &dyn Fn() -> bool,
+) -> c_int {
+    let _watch = cond_watch(mutex);
+    let _label = crate::accounting::wait_label_mutex("cond", Some(cond as usize), mutex as usize);
+    // SAFETY: the caller's mutex, which the wait returns holding.
+    let relock = |lock: bool| unsafe { relock_mutex(mutex, lock) };
+    let r = domain::native_cond_wait_checked(&relock, signalled, || loop {
+        // SAFETY: the caller's condvar and held mutex.
+        match unsafe { cond_timedwait(cond, mutex, HELD_OFF_SLICE) } {
+            libc::ETIMEDOUT if !signalled() => {}
+            libc::ETIMEDOUT => break 0,
+            r => break r,
+        }
+    });
+    domain::note_mutex_taken(mutex as usize);
+    r.unwrap_or(0)
+}
+
+/// How long each wait of [`cond_wait_held_off`] lasts before it looks for a signal it missed. A
+/// snare choice: a missed signal leaves its waiter counted released meanwhile, so the domain does
+/// not skip time past it; this only bounds how late it returns in real time.
+const HELD_OFF_SLICE: Duration = Duration::from_millis(10);
+
+/// Waits on `cond` for `timeout` of real time, uncounted; `None` if it timed out, else the wait's
+/// result.
+///
+/// # Safety
+/// As for [`cond_outside_grace`].
+unsafe fn cond_wait_real(
+    cond: *mut pthread_cond_t,
+    mutex: *mut pthread_mutex_t,
+    timeout: Duration,
+) -> Option<c_int> {
+    domain::note_mutex_freed(mutex as usize);
+    let r = domain::uncounted_wait(
+        cond as usize,
+        // SAFETY: as for this function.
+        || unsafe { cond_timedwait(cond, mutex, timeout) },
+        |&r| r == 0,
+    );
+    domain::note_mutex_taken(mutex as usize);
+    (r != libc::ETIMEDOUT).then_some(r)
+}
+
+/// The real `pthread_cond_timedwait` on `cond` for `timeout` of real time, on the clock the
+/// condition variable measures its deadlines on.
+///
+/// # Safety
+/// As for [`cond_outside_grace`].
+unsafe fn cond_timedwait(
+    cond: *mut pthread_cond_t,
+    mutex: *mut pthread_mutex_t,
+    timeout: Duration,
+) -> c_int {
     // SAFETY: PTHREAD_COND_TIMEDWAIT_RELATIVE_NP holds libc's function.
     #[cfg(target_os = "macos")]
     let (wait, timeout) = unsafe {
         (
             original::<CondTimedWaitFn>(&PTHREAD_COND_TIMEDWAIT_RELATIVE_NP),
-            to_timespec(grace),
+            to_timespec(timeout),
         )
     };
     // SAFETY: PTHREAD_COND_TIMEDWAIT holds libc's function.
@@ -851,15 +948,12 @@ unsafe fn cond_outside_grace(
                     _ => libc::CLOCK_REALTIME,
                 };
                 libc::clock_gettime(clock, &mut ts);
-                span(&ts) + grace
+                span(&ts) + timeout
             })),
         )
     };
-    domain::note_mutex_freed(mutex as usize);
-    // SAFETY: the caller's condvar and held mutex, with the grace as the timeout.
-    let r = unsafe { wait(cond, mutex, &timeout) };
-    domain::note_mutex_taken(mutex as usize);
-    if r == libc::ETIMEDOUT { 0 } else { r }
+    // SAFETY: the caller's condvar and held mutex, with the timeout.
+    unsafe { wait(cond, mutex, &timeout) }
 }
 
 /// A condition-variable wait is about to let go of `mutex` inside libc, where no hook sees it.
@@ -1134,8 +1228,10 @@ unsafe fn semaphore_wait(semaphore: *mut libc::c_void, timeout: u64) -> c_long {
     {
         return r;
     }
+    // SAFETY: a non-blocking take on the caller's semaphore.
+    let take = || (unsafe { wait(semaphore, DISPATCH_TIME_NOW) } == 0).then_some(0);
     if timeout == DISPATCH_TIME_FOREVER || (timeout as i64) < 0 {
-        return domain::native_wait_on(crate::DetKey::Addr(semaphore as usize), || {
+        return domain::native_wait_on_checked(crate::DetKey::Addr(semaphore as usize), take, || {
             if nested::spoiled(semaphore as usize) {
                 return 0;
             }
@@ -1164,15 +1260,20 @@ unsafe fn semaphore_wait(semaphore: *mut libc::c_void, timeout: u64) -> c_long {
     if let Some(r) = unsafe { det_semaphore_wait(semaphore, wait, virtual_deadline(after)) } {
         return r;
     }
-    let outcome = domain::timed_native_wait(after, None, None, |slice| {
-        if nested::spoiled(semaphore as usize) {
-            return Some(0);
-        }
-        let span = i64::try_from(slice.as_nanos()).unwrap_or(i64::MAX);
-        // SAFETY: the caller's semaphore, with a deadline `slice` from now on the real clock.
-        let r = unsafe { wait(semaphore, deadline_in(DISPATCH_TIME_NOW, span)) };
-        (r == 0).then_some(r)
-    });
+    let outcome = domain::timed_native_wait_checked(
+        after,
+        take,
+        |slice| {
+            if nested::spoiled(semaphore as usize) {
+                return Some(0);
+            }
+            let span = i64::try_from(slice.as_nanos()).unwrap_or(i64::MAX);
+            // SAFETY: the caller's semaphore, with a deadline `slice` from now on the real clock.
+            let r = unsafe { wait(semaphore, deadline_in(DISPATCH_TIME_NOW, span)) };
+            (r == 0).then_some(r)
+        },
+        |_| true,
+    );
     match outcome {
         TimedWait::Woken(r) => r,
         TimedWait::TimedOut => KERN_OPERATION_TIMED_OUT,
@@ -1216,13 +1317,12 @@ unsafe fn det_semaphore_wait(
 #[cfg(target_os = "macos")]
 unsafe extern "C" fn dispatch_semaphore_signal(semaphore: *mut libc::c_void) -> c_long {
     domain::note_hook_effect("dispatch_semaphore_signal");
-    domain::note_release(semaphore as usize, 1);
     // SAFETY: DISPATCH_SEMAPHORE_SIGNAL holds libdispatch's function; argument forwarded.
-    let r = unsafe {
+    let r = domain::release_native(semaphore as usize, 1, || unsafe {
         original::<unsafe extern "C" fn(*mut libc::c_void) -> c_long>(&DISPATCH_SEMAPHORE_SIGNAL)(
             semaphore,
         )
-    };
+    });
     if domain::det_wake_addr(semaphore as usize, 1) > 0 {
         return 1;
     }
@@ -1320,7 +1420,7 @@ unsafe fn futex_wake(args: [usize; 6], real: impl Fn([usize; 6]) -> c_long) -> O
             }
             result
         },
-        || futex_word(word),
+        || futex_word(word, &real),
     );
     if native < 0 {
         return Some(native);
@@ -1368,7 +1468,7 @@ unsafe fn futex_wait(
     if word == 0 || !word.is_multiple_of(std::mem::align_of::<u32>()) {
         return Some(real(args));
     }
-    if futex_word(word).is_none() {
+    if futex_word(word, &real).is_none() {
         return Some(real(args));
     }
     let Some(outer) = nested::begin(word) else {
@@ -1465,10 +1565,37 @@ unsafe fn read_process_memory<T: Copy>(address: usize, output: &mut T) -> bool {
     memory.read_at(bytes, address as u64).ok() == Some(bytes.len())
 }
 
+/// The futex word at `address`, or `None` where the kernel would fail a futex call on it with
+/// `EFAULT`. `real` probes it with a `FUTEX_CMP_REQUEUE` that wakes and requeues nothing: the
+/// kernel reads the word as for any futex call, then answers `EAGAIN` or 0 if it could and
+/// `EFAULT` if not (man 2 futex), in one call. Should that call itself be refused (a seccomp
+/// filter), the word is copied out as [`read_futex_argument`] does.
 #[cfg(target_os = "linux")]
-fn futex_word(address: usize) -> Option<u32> {
-    let mut word = 0;
-    unsafe { read_futex_argument(address, &mut word) }.then_some(word)
+fn futex_word(address: usize, real: &impl Fn([usize; 6]) -> c_long) -> Option<u32> {
+    let saved = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    let probe = real([
+        address,
+        (libc::FUTEX_CMP_REQUEUE | libc::FUTEX_PRIVATE_FLAG) as usize,
+        0,
+        0,
+        address,
+        0,
+    ]);
+    let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    // SAFETY: errno is this thread's.
+    unsafe { *libc::__errno_location() = saved };
+    match error {
+        _ if probe >= 0 => {}
+        libc::EAGAIN => {}
+        libc::EFAULT => return None,
+        _ => {
+            let mut word = 0;
+            return unsafe { read_futex_argument(address, &mut word) }.then_some(word);
+        }
+    }
+    // SAFETY: the kernel just read the word, and the caller's futex word is read atomically as
+    // the kernel would.
+    Some(unsafe { (*(address as *const std::sync::atomic::AtomicU32)).load(Ordering::SeqCst) })
 }
 
 #[cfg(target_os = "linux")]
@@ -1575,7 +1702,7 @@ unsafe fn futex_call(args: [usize; 6], real: impl Fn([usize; 6]) -> c_long) -> O
         if op & libc::FUTEX_PRIVATE_FLAG == 0 {
             return shared_futex_preflight(args, &real).map(Some);
         }
-        match futex_word(word) {
+        match futex_word(word, &real) {
             Some(current) if current != value as u32 => Some(Some((-1, libc::EAGAIN))),
             Some(_) => None,
             None => Some(None),
@@ -1585,6 +1712,12 @@ unsafe fn futex_call(args: [usize; 6], real: impl Fn([usize; 6]) -> c_long) -> O
         if domain::counts_native_waits()
             && (domain::in_static_image(word) || domain::backing_off())
             && let Some(r) = outside_grace(OUTSIDE_HOLDER_GRACE, op, command, args, &real)
+                .or_else(|| {
+                    domain::hold_off_while(|| {
+                        outside_grace(OUTSIDE_HOLDER_GRACE, op, command, args, &real)
+                    })
+                    .ok()
+                })
         {
             return Some(r);
         }
@@ -1599,7 +1732,7 @@ unsafe fn futex_call(args: [usize; 6], real: impl Fn([usize; 6]) -> c_long) -> O
                 }
                 Some((result, error))
             },
-            |result| result.is_some_and(|(result, _)| result == 0),
+            |result| result.is_some_and(|(result, error)| result == 0 || error == libc::EAGAIN),
         );
         let Some((result, error)) = result else {
             return Some(real(args));
@@ -1646,7 +1779,7 @@ unsafe fn futex_call(args: [usize; 6], real: impl Fn([usize; 6]) -> c_long) -> O
             }
             (r != -1 || e != libc::ETIMEDOUT).then_some(Some((r, e)))
         },
-        |result| result.is_some_and(|(result, _)| result == 0),
+        |result| result.is_some_and(|(result, error)| result == 0 || error == libc::EAGAIN),
     );
     let (r, e) = match outcome {
         TimedWait::Woken(Some(woken)) => woken,
@@ -1719,8 +1852,14 @@ fn outside_grace(
         MATCH_ANY
     };
     let deadline_ptr = &deadline as *const timespec as usize;
-    let r = real([word, attempt_op, value, deadline_ptr, word2, bits]);
-    let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    let (r, e) = domain::uncounted_wait(
+        word,
+        || {
+            let r = real([word, attempt_op, value, deadline_ptr, word2, bits]);
+            (r, std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        },
+        |&(r, _)| r == 0,
+    );
     if r == -1 && e == libc::ETIMEDOUT {
         return None;
     }
@@ -1832,7 +1971,7 @@ unsafe fn det_futex(
                 n,
                 mask,
                 op & libc::FUTEX_PRIVATE_FLAG != 0,
-                || futex_word(word),
+                || futex_word(word, real),
             );
             let woken =
                 domain::det_wake_futex_addr(word, n, mask, op & libc::FUTEX_PRIVATE_FLAG != 0);
@@ -1875,7 +2014,7 @@ unsafe fn det_sem_round(sem: *mut libc::sem_t, deadline: Option<Duration>) -> Op
         // A semaphore in static data may be posted from outside the simulation (a real signal
         // handler): give that a moment in real time, keeping the baton, before waiting in the
         // schedule, so whether this wait yields never depends on outside timing.
-        let until = to_timespec(crate::real(real_realtime) + OUTSIDE_HOLDER_GRACE);
+        let until = to_timespec(real_now(libc::CLOCK_REALTIME) + OUTSIDE_HOLDER_GRACE);
         // SAFETY: SEM_TIMEDWAIT holds libc's sem_timedwait; the caller's semaphore.
         if unsafe { original::<SemTimedFn>(&SEM_TIMEDWAIT)(sem, &until) } == 0 {
             domain::det_wait_begins(deadline);
@@ -1889,6 +2028,10 @@ unsafe fn det_sem_round(sem: *mut libc::sem_t, deadline: Option<Duration>) -> Op
 }
 
 /// `sem_wait`: decrements the semaphore, blocking while it is zero (man 3 sem_wait).
+///
+/// A signal handler of the domain's interrupts it as the host's does ([`SEM_RESTART`]): under a
+/// deterministic schedule the wait looks for a signal each time the schedule wakes it; otherwise
+/// the native wait is one a signal kicks ([`sem_wait_kicked`]).
 unsafe extern "C" fn sem_wait(sem: *mut libc::sem_t) -> c_int {
     // SAFETY: SEM_WAIT holds libc's sem_wait.
     let wait = unsafe { original::<SemFn>(&SEM_WAIT) };
@@ -1897,15 +2040,205 @@ unsafe extern "C" fn sem_wait(sem: *mut libc::sem_t) -> c_int {
         return unsafe { wait(sem) };
     }
     let _label = crate::accounting::wait_label_on("semaphore", sem as usize);
-    while deterministic() {
-        // SAFETY: the caller's semaphore.
-        if let Some(r) = unsafe { det_sem_round(sem, None) } {
-            return r;
+    let (r, _) = crate::signals::interruptible(SEM_RESTART, || {
+        loop {
+            while deterministic() {
+                // SAFETY: the caller's semaphore.
+                if let Some(r) = unsafe { det_sem_round(sem, None) } {
+                    return r;
+                }
+                if crate::signals::interrupt_pending() && !crate::signals::deliver_interrupting() {
+                    return fail(libc::EINTR);
+                }
+            }
+            // SAFETY: SEM_TRYWAIT holds libc's sem_trywait, a non-blocking take on the caller's
+            // semaphore.
+            let take =
+                || (unsafe { original::<SemFn>(&SEM_TRYWAIT)(sem) } == 0).then_some(SemWait::Took);
+            // SAFETY: the caller's semaphore.
+            let wait = || unsafe { sem_wait_kicked(sem, None) };
+            match domain::native_wait_on_checked(crate::DetKey::Addr(sem as usize), take, wait) {
+                SemWait::Took => return 0,
+                SemWait::Failed(e) => return fail(e),
+                SemWait::Signaled if !crate::signals::deliver_interrupting() => {
+                    return fail(libc::EINTR);
+                }
+                SemWait::Signaled => {}
+            }
+        }
+    });
+    r
+}
+
+/// How a native semaphore wait ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SemWait {
+    /// It took a post.
+    Took,
+    /// A signal of the domain's is pending for the thread: the caller delivers it.
+    Signaled,
+    /// It failed with this errno, as the real call would: `EINTR` for a real signal's handler,
+    /// `ETIMEDOUT` once its deadline passed.
+    Failed(c_int),
+}
+
+/// glibc's `sem_t` on the LP64 targets snare supports: `struct new_sem` with 64-bit atomics
+/// (glibc nptl/semaphoreP.h, sysdeps/nptl/internaltypes.h). `data` holds the value in its low 32
+/// bits, the futex word waiters sleep on (`SEM_VALUE_OFFSET` 0 on little-endian), and the number
+/// of waiters in its high 32 (`SEM_NWAITERS_SHIFT`); `private` is glibc's `LLL_PRIVATE` (0) for a
+/// semaphore `sem_init` made process-private and `LLL_SHARED` (`FUTEX_PRIVATE_FLAG`) for a shared
+/// one, which its futex calls XOR into the flag (lowlevellock-futex.h `__lll_private_flag`).
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct GlibcSem {
+    data: std::sync::atomic::AtomicU64,
+    private: c_int,
+}
+
+#[cfg(target_os = "linux")]
+impl GlibcSem {
+    /// Whether its futex calls are process-private (`FUTEX_PRIVATE_FLAG`).
+    fn private(&self) -> bool {
+        (libc::FUTEX_PRIVATE_FLAG ^ self.private) & libc::FUTEX_PRIVATE_FLAG != 0
+    }
+}
+
+/// One waiter, in [`GlibcSem::data`]'s high half.
+#[cfg(target_os = "linux")]
+const SEM_WAITER: u64 = 1 << 32;
+
+/// One wait for a post to `sem` until `until`, an absolute `CLOCK_REALTIME` time (for good with
+/// `None`), made as glibc's `__new_sem_wait_slow64` makes it (nptl/sem_waitcommon.c): counted
+/// among the semaphore's waiters, so a `sem_post` of any thread or process wakes it (glibc's
+/// `sem_post` wakes the futex only while a waiter is counted), and taking a post with the same
+/// exchange. Where glibc waits again after a wake that left nothing to take, this returns
+/// `Ok(false)`, so that a kick ([`Kick::Futex`](crate::signals::Kick) on the value word) ends it.
+/// `Err` is the errno a timeout (`ETIMEDOUT`) or a real signal's handler (`EINTR`) ends it with,
+/// which glibc returns as well.
+///
+/// # Safety
+/// `sem` is the caller's semaphore, one glibc made.
+#[cfg(target_os = "linux")]
+unsafe fn glibc_sem_wait(sem: *mut libc::sem_t, until: Option<&timespec>) -> Result<bool, c_int> {
+    // SAFETY: the caller's semaphore, in glibc's layout.
+    let sem = unsafe { &*sem.cast::<GlibcSem>() };
+    let value = u64::from(u32::MAX);
+    let op = libc::FUTEX_WAIT_BITSET
+        | libc::FUTEX_CLOCK_REALTIME
+        | if sem.private() {
+            libc::FUTEX_PRIVATE_FLAG
+        } else {
+            0
+        };
+    let timeout = until.map_or(std::ptr::null(), std::ptr::from_ref);
+    let mut d = sem.data.fetch_add(SEM_WAITER, Ordering::Relaxed) + SEM_WAITER;
+    loop {
+        if d & value != 0 {
+            match sem.data.compare_exchange_weak(
+                d,
+                d - 1 - SEM_WAITER,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(true),
+                Err(now) => {
+                    d = now;
+                    continue;
+                }
+            }
+        }
+        // SAFETY: a wait on the semaphore's value word while it reads 0, with a null or valid
+        // absolute timeout.
+        let r = crate::real(|| unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                sem.data.as_ptr().cast::<u32>(),
+                op,
+                0u32,
+                timeout,
+                std::ptr::null::<u32>(),
+                libc::FUTEX_BITSET_MATCH_ANY,
+            )
+        });
+        let e = if r == 0 { 0 } else { errno() };
+        if e == libc::ETIMEDOUT || e == libc::EINTR {
+            sem.data.fetch_sub(SEM_WAITER, Ordering::Relaxed);
+            return Err(e);
+        }
+        d = sem.data.load(Ordering::Relaxed);
+        if r == 0 && d & value == 0 {
+            sem.data.fetch_sub(SEM_WAITER, Ordering::Relaxed);
+            return Ok(false);
         }
     }
-    // SAFETY: forwarding the caller's argument unchanged.
-    domain::native_wait_on(crate::DetKey::Addr(sem as usize), || unsafe { wait(sem) })
 }
+
+/// A native wait on `sem` until `until` (see [`glibc_sem_wait`]) that a signal left pending for
+/// the thread ends with [`SemWait::Signaled`] ([`crate::signals::kickable`]): glibc's own
+/// `sem_wait` would wait again after the kick's wake.
+///
+/// # Safety
+/// `sem` is the caller's semaphore.
+#[cfg(target_os = "linux")]
+unsafe fn sem_wait_kicked(sem: *mut libc::sem_t, until: Option<&timespec>) -> SemWait {
+    use crate::signals::KickWait;
+    let kick = crate::signals::Kick::Futex {
+        word: sem as usize,
+        // SAFETY: the caller's semaphore, in glibc's layout.
+        private: unsafe { &*sem.cast::<GlibcSem>() }.private(),
+    };
+    loop {
+        // SAFETY: the caller's semaphore.
+        match crate::signals::kickable(kick, || unsafe { glibc_sem_wait(sem, until) }) {
+            KickWait::Pending => return SemWait::Signaled,
+            KickWait::Ran(Ok(true)) | KickWait::Kicked(Ok(true)) => return SemWait::Took,
+            KickWait::Ran(Err(e)) | KickWait::Kicked(Err(e)) => return SemWait::Failed(e),
+            KickWait::Ran(Ok(false)) | KickWait::Kicked(Ok(false)) => {}
+        }
+    }
+}
+
+/// A native wait on `sem` that a signal left pending for the thread ends with
+/// [`SemWait::Signaled`]: Darwin's `sem_wait` blocks in an abort-safe kernel wait, which
+/// [`Kick::Abort`](crate::signals::Kick) ends with `EINTR`. An `EINTR` no kick explains is a real
+/// signal handler's, which Darwin's `sem_wait` always fails with.
+///
+/// # Safety
+/// `sem` is the caller's semaphore.
+#[cfg(target_os = "macos")]
+unsafe fn sem_wait_kicked(sem: *mut libc::sem_t, _until: Option<&timespec>) -> SemWait {
+    use crate::signals::KickWait;
+    // SAFETY: SEM_WAIT holds libc's sem_wait.
+    let wait = unsafe { original::<SemFn>(&SEM_WAIT) };
+    let kick = crate::signals::Kick::this_thread();
+    loop {
+        // SAFETY: the caller's semaphore.
+        let waited = crate::signals::kickable(kick, || match unsafe { wait(sem) } {
+            0 => 0,
+            _ => errno(),
+        });
+        match waited {
+            KickWait::Pending => return SemWait::Signaled,
+            KickWait::Ran(0) | KickWait::Kicked(0) => return SemWait::Took,
+            KickWait::Kicked(libc::EINTR) => {
+                if crate::signals::interrupt_pending() {
+                    return SemWait::Signaled;
+                }
+            }
+            KickWait::Ran(e) | KickWait::Kicked(e) => return SemWait::Failed(e),
+        }
+    }
+}
+
+/// How a `sem_wait` a signal handler interrupts goes on: glibc's restarts under `SA_RESTART`, its
+/// futex wait being restarted by the kernel (man 7 signal lists `sem_wait` among the calls
+/// `SA_RESTART` restarts), and Darwin's always fails with `EINTR`. Pinned against both hosts by
+/// crates/snare/tests/signal_interrupts.rs.
+const SEM_RESTART: crate::signals::Restart = if cfg!(target_os = "linux") {
+    crate::signals::Restart::WithSaRestart
+} else {
+    crate::signals::Restart::Never
+};
 
 /// `sem_trywait`: fails with `EAGAIN` when the semaphore is zero (man 3 sem_wait). A caller
 /// looping on it is busy-polling, so each such failure charges the per-call latency that lets a
@@ -1927,9 +2260,10 @@ unsafe extern "C" fn sem_trywait(sem: *mut libc::sem_t) -> c_int {
 /// the schedule must not disturb the errno the real call left.
 unsafe extern "C" fn sem_post(sem: *mut libc::sem_t) -> c_int {
     domain::note_hook_effect("sem_post");
-    domain::note_release(sem as usize, 1);
     // SAFETY: SEM_POST holds libc's sem_post; argument forwarded unchanged.
-    let r = unsafe { original::<SemFn>(&SEM_POST)(sem) };
+    let r = domain::release_native(sem as usize, 1, || unsafe {
+        original::<SemFn>(&SEM_POST)(sem)
+    });
     if r == 0 {
         let e = errno();
         domain::det_wake_addr(sem as usize, 1);
@@ -1943,53 +2277,82 @@ unsafe extern "C" fn sem_post(sem: *mut libc::sem_t) -> c_int {
 #[cfg(target_os = "linux")]
 type SemTimedFn = unsafe extern "C" fn(*mut libc::sem_t, *const timespec) -> c_int;
 
-/// The kernel's `CLOCK_REALTIME`, the clock a `sem_timedwait` deadline is on: an absolute time
-/// "since the Epoch" (man 3 sem_wait).
+/// The kernel's reading of `clock`: `CLOCK_REALTIME`, the clock a `sem_timedwait` deadline is on,
+/// an absolute time "since the Epoch" (man 3 sem_wait), or `sem_clockwait`'s `CLOCK_MONOTONIC`.
 #[cfg(target_os = "linux")]
-fn real_realtime() -> Duration {
+fn real_now(clock: libc::clockid_t) -> Duration {
     let mut ts = timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // SAFETY: clock_gettime fills `ts`; under passthrough this is the kernel's realtime clock.
-    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+    // SAFETY: clock_gettime fills `ts`; under passthrough this is the kernel's clock.
+    crate::real(|| unsafe { libc::clock_gettime(clock, &mut ts) });
     span(&ts)
 }
 
 /// A semaphore wait until `deadline` on the clock `kind` reads, in the domain's time: the
-/// deterministic schedule's, or real waits sliced against the virtual clock. `None` when the domain
-/// has no virtual reading of `kind`, so the caller makes the real call with the caller's deadline.
+/// deterministic schedule's, or kicked native waits sliced against the virtual clock. A domain
+/// with no virtual reading of `kind` waits until the deadline on the kernel's clock. Either way a
+/// signal handler of the domain's interrupts it with `EINTR`, whatever its `SA_RESTART`: glibc's
+/// timed futex wait is restarted only when no handler ran (the kernel's `-ERESTART_RESTARTBLOCK`,
+/// man 7 signal lists `sem_timedwait` among the calls `SA_RESTART` restarts, but measured on Linux
+/// 7.0 with glibc 2.41 it fails with `EINTR` under it; pinned by
+/// crates/snare/tests/signal_interrupts.rs).
 ///
 /// # Safety
-/// `sem` is the caller's semaphore; `real` is one real wait on it until an absolute
-/// `CLOCK_REALTIME` time.
+/// `sem` is the caller's semaphore.
 #[cfg(target_os = "linux")]
 unsafe fn sem_wait_until(
     sem: *mut libc::sem_t,
     kind: crate::layer::ClockKind,
     deadline: Duration,
-    real: impl Fn(&timespec) -> c_int,
-) -> Option<c_int> {
-    let now = domain::now(kind)?;
-    let after = deadline.saturating_sub(now);
+) -> c_int {
+    let clock = match kind {
+        crate::layer::ClockKind::Monotonic => libc::CLOCK_MONOTONIC,
+        _ => libc::CLOCK_REALTIME,
+    };
+    let now = || domain::now(kind).unwrap_or_else(|| real_now(clock));
     let _label = crate::accounting::wait_label_on("semaphore", sem as usize);
-    while deterministic() {
-        // SAFETY: the caller's semaphore.
-        if let Some(r) = unsafe { det_sem_round(sem, virtual_deadline(after)) } {
-            return Some(r);
+    let (r, _) = crate::signals::interruptible(crate::signals::Restart::Never, || {
+        let scheduled = virtual_deadline(deadline.saturating_sub(now()));
+        while deterministic() {
+            // SAFETY: the caller's semaphore.
+            if let Some(r) = unsafe { det_sem_round(sem, scheduled) } {
+                return r;
+            }
+            if crate::signals::interrupt_pending() && !crate::signals::deliver_interrupting() {
+                return fail(libc::EINTR);
+            }
         }
-    }
-    let outcome = domain::timed_native_wait(after, None, None, |slice| {
-        let until = to_timespec(crate::real(real_realtime) + slice);
-        let r = real(&until);
-        let e = errno();
-        (r == 0 || e != libc::ETIMEDOUT).then_some((r, e))
+        // SAFETY: SEM_TRYWAIT holds libc's sem_trywait, a non-blocking take on the caller's
+        // semaphore.
+        let take = || (unsafe { original::<SemFn>(&SEM_TRYWAIT)(sem) } == 0).then_some(SemWait::Took);
+        loop {
+            let outcome = domain::timed_native_wait_checked(
+                deadline.saturating_sub(now()),
+                take,
+                |slice| {
+                    let until = to_timespec(real_now(libc::CLOCK_REALTIME) + slice);
+                    // SAFETY: the caller's semaphore.
+                    match unsafe { sem_wait_kicked(sem, Some(&until)) } {
+                        SemWait::Failed(libc::ETIMEDOUT) => None,
+                        waited => Some(waited),
+                    }
+                },
+                |waited| *waited == SemWait::Took,
+            );
+            match outcome {
+                TimedWait::Woken(SemWait::Took) => return 0,
+                TimedWait::Woken(SemWait::Failed(e)) => return fail(e),
+                TimedWait::Woken(SemWait::Signaled) if !crate::signals::deliver_interrupting() => {
+                    return fail(libc::EINTR);
+                }
+                TimedWait::Woken(SemWait::Signaled) => {}
+                TimedWait::TimedOut => return fail(libc::ETIMEDOUT),
+            }
+        }
     });
-    Some(match outcome {
-        TimedWait::Woken((0, _)) => 0,
-        TimedWait::Woken((_, e)) => fail(e),
-        TimedWait::TimedOut => fail(libc::ETIMEDOUT),
-    })
+    r
 }
 
 /// A `timespec` this hook can model, as a span. glibc rejects a `tv_nsec` outside
@@ -2011,14 +2374,9 @@ unsafe extern "C" fn sem_timedwait(sem: *mut libc::sem_t, abs_timeout: *const ti
     let timed = unsafe { original::<SemTimedFn>(&SEM_TIMEDWAIT) };
     if domain::virtual_waits()
         && let Some(deadline) = valid(abs_timeout)
-        // SAFETY: the caller's semaphore, waited on with real realtime deadlines.
-        && let Some(r) = unsafe {
-            sem_wait_until(sem, crate::layer::ClockKind::Realtime, deadline, |until| {
-                timed(sem, until)
-            })
-        }
     {
-        return r;
+        // SAFETY: the caller's semaphore.
+        return unsafe { sem_wait_until(sem, crate::layer::ClockKind::Realtime, deadline) };
     }
     // SAFETY: forwarding the caller's arguments unchanged.
     domain::native_wait(|| unsafe { timed(sem, abs_timeout) })
@@ -2035,13 +2393,8 @@ unsafe extern "C" fn sem_clockwait(
 ) -> c_int {
     type ClockWaitFn =
         unsafe extern "C" fn(*mut libc::sem_t, libc::clockid_t, *const timespec) -> c_int;
-    // SAFETY: SEM_CLOCKWAIT holds libc's sem_clockwait; SEM_TIMEDWAIT its sem_timedwait.
-    let (clockwait, timed) = unsafe {
-        (
-            original::<ClockWaitFn>(&SEM_CLOCKWAIT),
-            original::<SemTimedFn>(&SEM_TIMEDWAIT),
-        )
-    };
+    // SAFETY: SEM_CLOCKWAIT holds libc's sem_clockwait.
+    let clockwait = unsafe { original::<ClockWaitFn>(&SEM_CLOCKWAIT) };
     let kind = match clock {
         libc::CLOCK_MONOTONIC => Some(crate::layer::ClockKind::Monotonic),
         libc::CLOCK_REALTIME => Some(crate::layer::ClockKind::Realtime),
@@ -2049,10 +2402,9 @@ unsafe extern "C" fn sem_clockwait(
     };
     if domain::virtual_waits()
         && let (Some(kind), Some(deadline)) = (kind, valid(abs_timeout))
-        // SAFETY: the caller's semaphore, waited on with real realtime deadlines.
-        && let Some(r) = unsafe { sem_wait_until(sem, kind, deadline, |until| timed(sem, until)) }
     {
-        return r;
+        // SAFETY: the caller's semaphore.
+        return unsafe { sem_wait_until(sem, kind, deadline) };
     }
     // SAFETY: forwarding the caller's arguments unchanged.
     domain::native_wait(|| unsafe { clockwait(sem, clock, abs_timeout) })

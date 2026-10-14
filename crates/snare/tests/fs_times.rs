@@ -10,9 +10,9 @@
 //! and each side mimics its host.
 
 use std::ffi::CString;
-use std::fs::{File, FileTimes, OpenOptions};
+use std::fs::{File, FileTimes, OpenOptions, Permissions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -283,6 +283,32 @@ fn script(root: &Path, pause: &dyn Fn()) -> Vec<(&'static str, Vec<String>)> {
             .set_times(FileTimes::new().set_accessed(at(1_100_000_000)))
             .unwrap();
     });
+    step("chmod", &[&n, d], &[&n, d], &mut || {
+        std::fs::set_permissions(&n, Permissions::from_mode(0o600)).unwrap();
+    });
+    step("chmod to the mode it has", &[&n], &[&n], &mut || {
+        std::fs::set_permissions(&n, Permissions::from_mode(0o600)).unwrap();
+    });
+    step("fchmod", &[&n], &[&n], &mut || {
+        File::open(&n)
+            .unwrap()
+            .set_permissions(Permissions::from_mode(0o640))
+            .unwrap();
+    });
+    step("chown naming no id", &[&n], &[&n], &mut || {
+        std::os::unix::fs::chown(&n, None, None).unwrap();
+    });
+    let (uid, gid) = {
+        let m = std::fs::metadata(&n).unwrap();
+        (m.uid(), m.gid())
+    };
+    step("chown to the ids it has", &[&n], &[&n], &mut || {
+        std::os::unix::fs::chown(&n, Some(uid), Some(gid)).unwrap();
+    });
+    let s = dir.join("s");
+    step("lchown a symlink", &[&s, &n], &[&s, &n], &mut || {
+        std::os::unix::fs::lchown(&s, None, Some(gid)).unwrap();
+    });
     step("unlink", &[d], &[d], &mut || {
         std::fs::remove_file(&n).unwrap();
     });
@@ -359,6 +385,15 @@ fn script_os_truth() {
     assert_eq!(expect("link"), ["c", "mc"]);
     assert_eq!(expect("rename within a directory"), ["c", "mc"]);
     assert_eq!(expect("utimensat omitting both"), ["-"]);
+    assert_eq!(expect("chmod"), ["c", "-"]);
+    assert_eq!(expect("chmod to the mode it has"), ["c"]);
+    assert_eq!(expect("chown to the ids it has"), ["c"]);
+    assert_eq!(expect("lchown a symlink"), ["c", "-"]);
+    if cfg!(target_os = "macos") {
+        assert_eq!(expect("chown naming no id"), ["-"]);
+    } else {
+        assert_eq!(expect("chown naming no id"), ["c"]);
+    }
     if cfg!(target_os = "macos") {
         assert_eq!(expect("utimensat the access time"), ["a"]);
         assert_eq!(expect("set the modification time before birth"), ["mcb"]);

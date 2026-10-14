@@ -324,3 +324,74 @@ fn an_unpark_from_outside_reaches_a_busy_deterministic_schedule() {
     });
     assert!(ticks > 0);
 }
+
+#[cfg(unix)]
+fn mask_hup(how: libc::c_int) {
+    // SAFETY: a zeroed set is valid and is only read once filled.
+    unsafe {
+        let mut hup: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut hup);
+        libc::sigaddset(&mut hup, libc::SIGHUP);
+        assert_eq!(libc::pthread_sigmask(how, &hup, std::ptr::null_mut()), 0);
+    }
+}
+
+/// A leftover worker woken into a later sim keeps the signals it blocked: a signal sent to the
+/// process goes past it to the later sim's thread that takes it.
+#[cfg(unix)]
+#[test]
+fn a_leftover_worker_keeps_its_signal_mask_in_a_later_sim() {
+    static HANDLED: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn on_hup(_: libc::c_int) {
+        HANDLED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    for deterministic in [false, true] {
+        let jobs = sim(false).run(|| {
+            let (jobs, queue) = mpsc::channel::<Job>();
+            std::thread::spawn(move || {
+                mask_hup(libc::SIG_BLOCK);
+                for job in queue {
+                    job();
+                }
+            });
+            jobs
+        });
+        let handled = sim(deterministic).run(|| {
+            // SAFETY: a zeroed action is valid; the call only reads it.
+            unsafe {
+                let mut act: libc::sigaction = std::mem::zeroed();
+                act.sa_sigaction = on_hup as *const () as usize;
+                libc::sigemptyset(&mut act.sa_mask);
+                assert_eq!(libc::sigaction(libc::SIGHUP, &act, std::ptr::null_mut()), 0);
+            }
+            mask_hup(libc::SIG_BLOCK);
+            HANDLED.store(0, Ordering::SeqCst);
+            let (done, finished) = mpsc::channel();
+            jobs.send(Box::new(move || {
+                for _ in 0..30 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                done.send(()).unwrap();
+            }))
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(3));
+            let taker = std::thread::spawn(|| {
+                mask_hup(libc::SIG_UNBLOCK);
+                for _ in 0..30 {
+                    if HANDLED.load(Ordering::SeqCst) > 0 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            std::thread::sleep(Duration::from_millis(3));
+            // SAFETY: a signal the sim models, sent to its own process.
+            assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGHUP) }, 0);
+            taker.join().unwrap();
+            finished.recv().unwrap();
+            HANDLED.load(Ordering::SeqCst)
+        });
+        assert_eq!(handled, 1, "deterministic: {deterministic}");
+    }
+}

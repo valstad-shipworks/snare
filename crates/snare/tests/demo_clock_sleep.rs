@@ -36,19 +36,20 @@ fn nanosleep_advances_monotonic_by_the_request() {
     });
 }
 
+/// man 2 nanosleep: only an early return (`EINTR`) writes the unslept remainder back, so a sleep
+/// slept out leaves it as the host leaves it.
 #[test]
-fn nanosleep_reports_zero_remaining() {
-    let host = HostProfile::new().build();
-    Sim::builder().host(host).build().run(|| {
-        // man 2 nanosleep: on early return the unslept remainder is written back. The sim never
-        // interrupts a sleep, so the remainder is always zero.
-        let req = ts(0, 250_000_000);
+fn nanosleep_leaves_the_remainder_as_the_host_does() {
+    let sleep = || {
+        let req = ts(0, 25_000_000);
         let mut remaining = ts(9, 9);
         let rc = unsafe { libc::nanosleep(&req, &mut remaining) };
-        assert_eq!(rc, 0);
-        assert_eq!(remaining.tv_sec, 0, "no seconds remain");
-        assert_eq!(remaining.tv_nsec, 0, "no nanoseconds remain");
-    });
+        (rc, remaining.tv_sec, remaining.tv_nsec)
+    };
+    let real = sleep();
+    assert_eq!(real.0, 0);
+    let host = HostProfile::new().build();
+    assert_eq!(Sim::builder().host(host).build().run(sleep), real);
 }
 
 #[test]

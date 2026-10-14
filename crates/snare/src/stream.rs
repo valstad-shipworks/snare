@@ -181,6 +181,8 @@ pub(crate) enum Sent {
     Stuck,
     /// An error became pending while the send waited, with nothing written.
     Error,
+    /// A signal handler interrupted the wait, with nothing written: `EINTR`.
+    Interrupted,
 }
 
 impl Pipe {
@@ -364,6 +366,18 @@ impl Pipe {
     /// neither a reading socket nor a window bounds it (a tester reading with no window), and
     /// always for a socketpair. Must be called without `inner` held.
     fn capacity(&self) -> Option<usize> {
+        let window = self.recv_room()?;
+        let send = self
+            .writer
+            .get()
+            .map_or(0, |rec| rec.state().buf.tcp_send_space());
+        Some(window.saturating_add(send))
+    }
+
+    /// The receive side of [`capacity`](Self::capacity): what the reader's end takes and
+    /// acknowledges; the rest of what the pipe holds waits in the writer's send buffer. `None`
+    /// when nothing bounds it. Must be called without `inner` held.
+    fn recv_room(&self) -> Option<usize> {
         let ends = self.ends.as_ref()?;
         let window = ends.shared.policies.recv_window(ends.to);
         let room = self
@@ -371,15 +385,10 @@ impl Pipe {
             .get()
             .map(|rec| rec.state().buf.tcp_recv_space())
             .or_else(|| self.pending_recv_space.get().copied());
-        let window = match (window, room) {
-            (Some(w), Some(r)) => w.min(r),
-            (w, r) => w.or(r)?,
-        };
-        let send = self
-            .writer
-            .get()
-            .map_or(0, |rec| rec.state().buf.tcp_send_space());
-        Some(window.saturating_add(send))
+        match (window, room) {
+            (Some(w), Some(r)) => Some(w.min(r)),
+            (w, r) => w.or(r),
+        }
     }
 
     /// How much of a `len`-byte write a pipe holding `used` of `cap` takes, as the host's send
@@ -976,11 +985,17 @@ impl Pipe {
             || (inner.closed && !inner.pending() && self.held().is_none())
     }
 
-    /// Whether everything written has crossed to the reader (or the stream was reset).
-    pub(crate) fn delivered(&self) -> bool {
+    /// Whether everything written has crossed to the reader and fits the room its end takes, so
+    /// its TCP has acknowledged it all (or the stream was reset): what a socket lingering on
+    /// close waits for (man 7 socket, `SO_LINGER`: close "will not return until all queued
+    /// messages for the socket have been successfully sent or the linger timeout has been
+    /// reached"). Bytes past that room wait unsent in the writer's send buffer while the peer's
+    /// window is shut.
+    pub(crate) fn acknowledged(&self) -> bool {
+        let room = self.recv_room();
         let mut inner = self.inner.lock().unwrap();
         self.land(&mut inner);
-        !inner.pending() || inner.reset
+        inner.reset || (!inner.pending() && room.is_none_or(|room| inner.used() <= room))
     }
 
     /// Free room in the window, `None` while the pipe is unbounded.
@@ -1091,19 +1106,25 @@ impl Pipe {
             }
             let rest = bytes.len() - sent;
             let (keys, len) = self.wake_keys();
-            let woke = if len == 0 {
-                readiness().wait_until("tcp send", deadline, || self.can_write(rest) || error())
-            } else {
-                readiness().wait_until_on(
-                    "tcp send",
-                    deadline,
-                    &keys[..len],
-                    || self.pending_time(),
-                    || self.can_write(rest) || error(),
-                )
-            };
+            let restart = crate::signals::socket_restart(deadline.is_some());
+            let (woke, interrupted) = snare_interpose::interruptible(restart, || {
+                if len == 0 {
+                    readiness().wait_until("tcp send", deadline, || self.can_write(rest) || error())
+                } else {
+                    readiness().wait_until_on(
+                        "tcp send",
+                        deadline,
+                        &keys[..len],
+                        || self.pending_time(),
+                        || self.can_write(rest) || error(),
+                    )
+                }
+            });
             if sent > 0 && (!woke || error()) {
                 return Sent::Bytes(sent);
+            }
+            if interrupted {
+                return Sent::Interrupted;
             }
             if !woke {
                 return if deadline.is_some_and(|d| d.passed()) {

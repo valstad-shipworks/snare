@@ -1,4 +1,4 @@
-//! The Windows hooks: replacements for kernel32, the synch API set, winmm, bcrypt,
+//! The Windows hooks: replacements for kernel32, the synch API set, winmm, powrprof, bcrypt,
 //! bcryptprimitives, ws2_32, Npcap's wpcap and the UCRT, patched into each module's import address
 //! table (`patch::pe`).
 //!
@@ -20,7 +20,7 @@
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{FILETIME, GetLastError, HANDLE, HMODULE, SetLastError};
@@ -36,6 +36,8 @@ use crate::layer::{ClockKind, SleepRequest};
 use crate::net::{Net, NetResult};
 use crate::state;
 
+#[path = "windows_env.rs"]
+mod env;
 #[path = "windows_iocp.rs"]
 mod iocp;
 #[path = "windows_locks.rs"]
@@ -101,6 +103,21 @@ static SET_PROCESS_DEFAULT_CPU_SETS: AtomicUsize = AtomicUsize::new(0);
 static GET_PROCESS_DEFAULT_CPU_SETS: AtomicUsize = AtomicUsize::new(0);
 static SET_THREAD_SELECTED_CPU_SETS: AtomicUsize = AtomicUsize::new(0);
 static GET_THREAD_SELECTED_CPU_SETS: AtomicUsize = AtomicUsize::new(0);
+static GET_SYSTEM_INFO: AtomicUsize = AtomicUsize::new(0);
+static GET_NATIVE_SYSTEM_INFO: AtomicUsize = AtomicUsize::new(0);
+static GET_ACTIVE_PROCESSOR_COUNT: AtomicUsize = AtomicUsize::new(0);
+static GET_MAXIMUM_PROCESSOR_COUNT: AtomicUsize = AtomicUsize::new(0);
+static GET_ACTIVE_PROCESSOR_GROUP_COUNT: AtomicUsize = AtomicUsize::new(0);
+static GET_MAXIMUM_PROCESSOR_GROUP_COUNT: AtomicUsize = AtomicUsize::new(0);
+static GET_LOGICAL_PROCESSOR_INFORMATION: AtomicUsize = AtomicUsize::new(0);
+static GET_LOGICAL_PROCESSOR_INFORMATION_EX: AtomicUsize = AtomicUsize::new(0);
+static GET_PROCESS_AFFINITY_MASK: AtomicUsize = AtomicUsize::new(0);
+static SET_PROCESS_AFFINITY_MASK: AtomicUsize = AtomicUsize::new(0);
+static GET_NUMA_HIGHEST_NODE_NUMBER: AtomicUsize = AtomicUsize::new(0);
+static GET_NUMA_NODE_PROCESSOR_MASK: AtomicUsize = AtomicUsize::new(0);
+static GET_NUMA_NODE_PROCESSOR_MASK_EX: AtomicUsize = AtomicUsize::new(0);
+static GET_NUMA_NODE_PROCESSOR_MASK_2: AtomicUsize = AtomicUsize::new(0);
+static CALL_NT_POWER_INFORMATION: AtomicUsize = AtomicUsize::new(0);
 static WAIT_FOR_SINGLE_OBJECT: AtomicUsize = AtomicUsize::new(0);
 static WAIT_ON_ADDRESS: AtomicUsize = AtomicUsize::new(0);
 static SWITCH_TO_THREAD: AtomicUsize = AtomicUsize::new(0);
@@ -113,8 +130,8 @@ static GENERATE_CONSOLE_CTRL_EVENT: AtomicUsize = AtomicUsize::new(0);
 static CRT_SIGNAL: AtomicUsize = AtomicUsize::new(0);
 static CRT_RAISE: AtomicUsize = AtomicUsize::new(0);
 
-/// Every Windows hook: the clock, sleep, thread, loader, random, priority and pcap hooks here,
-/// then the signal, Winsock, DNS and IP-helper hooks, then the observed-only ones.
+/// Every Windows hook: the clock, sleep, thread, loader, random, priority, processor and pcap
+/// hooks here, then the signal, Winsock, DNS and IP-helper hooks, then the observed-only ones.
 ///
 /// Order matters: `hooks::find` returns the first entry with a name, so a modelled hook listed
 /// here shadows an observed entry of the same name further down (as `SetConsoleCtrlHandler` and
@@ -376,6 +393,96 @@ pub(crate) fn hooks() -> Vec<Hook> {
             get_thread_selected_cpu_sets,
             GET_THREAD_SELECTED_CPU_SETS
         ),
+        hook!(
+            "GetSystemInfo",
+            "kernel32.dll",
+            get_system_info,
+            GET_SYSTEM_INFO
+        ),
+        hook!(
+            "GetNativeSystemInfo",
+            "kernel32.dll",
+            get_native_system_info,
+            GET_NATIVE_SYSTEM_INFO
+        ),
+        hook!(
+            "GetActiveProcessorCount",
+            "kernel32.dll",
+            get_active_processor_count,
+            GET_ACTIVE_PROCESSOR_COUNT
+        ),
+        hook!(
+            "GetMaximumProcessorCount",
+            "kernel32.dll",
+            get_maximum_processor_count,
+            GET_MAXIMUM_PROCESSOR_COUNT
+        ),
+        hook!(
+            "GetActiveProcessorGroupCount",
+            "kernel32.dll",
+            get_active_processor_group_count,
+            GET_ACTIVE_PROCESSOR_GROUP_COUNT
+        ),
+        hook!(
+            "GetMaximumProcessorGroupCount",
+            "kernel32.dll",
+            get_maximum_processor_group_count,
+            GET_MAXIMUM_PROCESSOR_GROUP_COUNT
+        ),
+        hook!(
+            "GetLogicalProcessorInformation",
+            "kernel32.dll",
+            get_logical_processor_information,
+            GET_LOGICAL_PROCESSOR_INFORMATION
+        ),
+        hook!(
+            "GetLogicalProcessorInformationEx",
+            "kernel32.dll",
+            get_logical_processor_information_ex,
+            GET_LOGICAL_PROCESSOR_INFORMATION_EX
+        ),
+        hook!(
+            "GetProcessAffinityMask",
+            "kernel32.dll",
+            get_process_affinity_mask,
+            GET_PROCESS_AFFINITY_MASK
+        ),
+        hook!(
+            "SetProcessAffinityMask",
+            "kernel32.dll",
+            set_process_affinity_mask,
+            SET_PROCESS_AFFINITY_MASK
+        ),
+        hook!(
+            "GetNumaHighestNodeNumber",
+            "kernel32.dll",
+            get_numa_highest_node_number,
+            GET_NUMA_HIGHEST_NODE_NUMBER
+        ),
+        hook!(
+            "GetNumaNodeProcessorMask",
+            "kernel32.dll",
+            get_numa_node_processor_mask,
+            GET_NUMA_NODE_PROCESSOR_MASK
+        ),
+        hook!(
+            "GetNumaNodeProcessorMaskEx",
+            "kernel32.dll",
+            get_numa_node_processor_mask_ex,
+            GET_NUMA_NODE_PROCESSOR_MASK_EX
+        ),
+        hook!(
+            "GetNumaNodeProcessorMask2",
+            "kernel32.dll",
+            get_numa_node_processor_mask_2,
+            GET_NUMA_NODE_PROCESSOR_MASK_2
+        ),
+        hook!(
+            "CallNtPowerInformation",
+            "powrprof.dll",
+            call_nt_power_information,
+            CALL_NT_POWER_INFORMATION
+        ),
         hook!("pcap_create", "wpcap.dll", pcap_create, PCAP_CREATE),
         hook!(
             "pcap_open_live",
@@ -430,6 +537,7 @@ pub(crate) fn hooks() -> Vec<Hook> {
         ),
         hook!("pcap_geterr", "wpcap.dll", pcap_geterr, PCAP_GETERR),
     ];
+    hooks.extend(env::hooks());
     hooks.extend(iocp::hooks());
     hooks.extend(timers::hooks());
     hooks.extend(locks::hooks());
@@ -439,6 +547,7 @@ pub(crate) fn hooks() -> Vec<Hook> {
     hooks.extend(crate::os::dns_windows::hooks());
     hooks.extend(crate::os::iphlp_windows::hooks());
     hooks.extend(crate::os::devices_windows::hooks());
+    hooks.extend(crate::os::tz_windows::hooks());
     hooks.extend(observed_hooks());
     hooks
 }
@@ -1589,6 +1698,302 @@ unsafe extern "system" fn get_thread_selected_cpu_sets(
     unsafe { original::<GetCpuSetsFn>(&GET_THREAD_SELECTED_CPU_SETS)(thread, ids, count, required) }
 }
 
+/// `GetSystemInfo`: the real `SYSTEM_INFO`, with the processor fields the host models rewritten
+/// ([Microsoft Learn: GetSystemInfo](https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsysteminfo)).
+unsafe extern "system" fn get_system_info(info: *mut c_void) {
+    // SAFETY: GET_SYSTEM_INFO holds kernel32's GetSystemInfo; `info` is the caller's.
+    unsafe { original::<unsafe extern "system" fn(*mut c_void)>(&GET_SYSTEM_INFO)(info) };
+    // SAFETY: the real call filled the caller's SYSTEM_INFO.
+    dispatch_host(|h| unsafe { h.system_info(info.cast()) });
+}
+
+/// `GetNativeSystemInfo`, as [`get_system_info`]
+/// ([Microsoft Learn: GetNativeSystemInfo](https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getnativesysteminfo)).
+unsafe extern "system" fn get_native_system_info(info: *mut c_void) {
+    // SAFETY: GET_NATIVE_SYSTEM_INFO holds kernel32's GetNativeSystemInfo.
+    unsafe { original::<unsafe extern "system" fn(*mut c_void)>(&GET_NATIVE_SYSTEM_INFO)(info) };
+    // SAFETY: the real call filled the caller's SYSTEM_INFO.
+    dispatch_host(|h| unsafe { h.system_info(info.cast()) });
+}
+
+/// `ERROR_INSUFFICIENT_BUFFER` (winerror.h).
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+/// A processor or group count the host answered: 0 with the error for an `Err`; otherwise the
+/// count, with `ERROR_INSUFFICIENT_BUFFER` left as the last error, as the four count functions
+/// leave it when they succeed (measured on Windows 11).
+fn finish_count(handled: i64) -> u32 {
+    if handled < 0 {
+        // SAFETY: setting the calling thread's last-error.
+        unsafe { SetLastError((-handled) as u32) };
+        0
+    } else {
+        // SAFETY: as above.
+        unsafe { SetLastError(ERROR_INSUFFICIENT_BUFFER) };
+        handled as u32
+    }
+}
+
+/// `GetActiveProcessorCount(group)`: the count, 0 on failure
+/// ([Microsoft Learn: GetActiveProcessorCount](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getactiveprocessorcount)).
+unsafe extern "system" fn get_active_processor_count(group: u16) -> u32 {
+    if let Some(r) = dispatch_host(|h| h.processor_count(false, group)) {
+        return finish_count(r);
+    }
+    // SAFETY: GET_ACTIVE_PROCESSOR_COUNT holds kernel32's GetActiveProcessorCount.
+    unsafe {
+        original::<unsafe extern "system" fn(u16) -> u32>(&GET_ACTIVE_PROCESSOR_COUNT)(group)
+    }
+}
+
+/// `GetMaximumProcessorCount(group)`: the count, 0 on failure
+/// ([Microsoft Learn: GetMaximumProcessorCount](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getmaximumprocessorcount)).
+unsafe extern "system" fn get_maximum_processor_count(group: u16) -> u32 {
+    if let Some(r) = dispatch_host(|h| h.processor_count(true, group)) {
+        return finish_count(r);
+    }
+    // SAFETY: GET_MAXIMUM_PROCESSOR_COUNT holds kernel32's GetMaximumProcessorCount.
+    unsafe {
+        original::<unsafe extern "system" fn(u16) -> u32>(&GET_MAXIMUM_PROCESSOR_COUNT)(group)
+    }
+}
+
+/// `GetActiveProcessorGroupCount()`
+/// ([Microsoft Learn: GetActiveProcessorGroupCount](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getactiveprocessorgroupcount)).
+unsafe extern "system" fn get_active_processor_group_count() -> u16 {
+    if let Some(r) = dispatch_host(|h| h.processor_group_count(false)) {
+        return finish_count(r) as u16;
+    }
+    // SAFETY: GET_ACTIVE_PROCESSOR_GROUP_COUNT holds kernel32's GetActiveProcessorGroupCount.
+    unsafe { original::<unsafe extern "system" fn() -> u16>(&GET_ACTIVE_PROCESSOR_GROUP_COUNT)() }
+}
+
+/// `GetMaximumProcessorGroupCount()`
+/// ([Microsoft Learn: GetMaximumProcessorGroupCount](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getmaximumprocessorgroupcount)).
+unsafe extern "system" fn get_maximum_processor_group_count() -> u16 {
+    if let Some(r) = dispatch_host(|h| h.processor_group_count(true)) {
+        return finish_count(r) as u16;
+    }
+    // SAFETY: GET_MAXIMUM_PROCESSOR_GROUP_COUNT holds kernel32's GetMaximumProcessorGroupCount.
+    unsafe {
+        original::<unsafe extern "system" fn() -> u16>(&GET_MAXIMUM_PROCESSOR_GROUP_COUNT)()
+    }
+}
+
+/// `GetLogicalProcessorInformation(info, len)`; returns a `BOOL`
+/// ([Microsoft Learn: GetLogicalProcessorInformation](https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getlogicalprocessorinformation)).
+unsafe extern "system" fn get_logical_processor_information(
+    info: *mut c_void,
+    len: *mut u32,
+) -> i32 {
+    // SAFETY: `info` holds `*len` bytes, the caller's.
+    if let Some(r) =
+        dispatch_host(|h| unsafe { h.logical_processor_information(None, info.cast(), len) })
+    {
+        return finish_bool(r);
+    }
+    // SAFETY: GET_LOGICAL_PROCESSOR_INFORMATION holds kernel32's GetLogicalProcessorInformation.
+    unsafe {
+        original::<unsafe extern "system" fn(*mut c_void, *mut u32) -> i32>(
+            &GET_LOGICAL_PROCESSOR_INFORMATION,
+        )(info, len)
+    }
+}
+
+/// `GetLogicalProcessorInformationEx(relationship, info, len)`; returns a `BOOL`
+/// ([Microsoft Learn: GetLogicalProcessorInformationEx](https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getlogicalprocessorinformationex)).
+unsafe extern "system" fn get_logical_processor_information_ex(
+    relationship: i32,
+    info: *mut c_void,
+    len: *mut u32,
+) -> i32 {
+    // SAFETY: `info` holds `*len` bytes, the caller's.
+    if let Some(r) = dispatch_host(|h| unsafe {
+        h.logical_processor_information(Some(relationship), info.cast(), len)
+    }) {
+        return finish_bool(r);
+    }
+    // SAFETY: GET_LOGICAL_PROCESSOR_INFORMATION_EX holds kernel32's
+    // GetLogicalProcessorInformationEx.
+    unsafe {
+        original::<unsafe extern "system" fn(i32, *mut c_void, *mut u32) -> i32>(
+            &GET_LOGICAL_PROCESSOR_INFORMATION_EX,
+        )(relationship, info, len)
+    }
+}
+
+/// `GetProcessAffinityMask(process, process_mask, system_mask)`; returns a `BOOL`
+/// ([Microsoft Learn: GetProcessAffinityMask](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getprocessaffinitymask)).
+unsafe extern "system" fn get_process_affinity_mask(
+    process: HANDLE,
+    process_mask: *mut usize,
+    system_mask: *mut usize,
+) -> i32 {
+    // SAFETY: both masks are the caller's to write.
+    if let Some(r) = dispatch_host(|h| unsafe {
+        h.get_process_affinity_mask(process as u64, process_mask, system_mask)
+    }) {
+        return finish_bool(r);
+    }
+    type AffinityFn = unsafe extern "system" fn(HANDLE, *mut usize, *mut usize) -> i32;
+    // SAFETY: GET_PROCESS_AFFINITY_MASK holds kernel32's GetProcessAffinityMask.
+    unsafe {
+        original::<AffinityFn>(&GET_PROCESS_AFFINITY_MASK)(process, process_mask, system_mask)
+    }
+}
+
+/// `SetProcessAffinityMask(process, mask)`; returns a `BOOL`
+/// ([Microsoft Learn: SetProcessAffinityMask](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setprocessaffinitymask)).
+unsafe extern "system" fn set_process_affinity_mask(process: HANDLE, mask: usize) -> i32 {
+    if let Some(r) = dispatch_host(|h| h.set_process_affinity_mask(process as u64, mask as u64)) {
+        return finish_bool(r);
+    }
+    // SAFETY: SET_PROCESS_AFFINITY_MASK holds kernel32's SetProcessAffinityMask.
+    unsafe {
+        original::<unsafe extern "system" fn(HANDLE, usize) -> i32>(&SET_PROCESS_AFFINITY_MASK)(
+            process, mask,
+        )
+    }
+}
+
+/// `GetNumaHighestNodeNumber(highest)`; returns a `BOOL`. A null `highest` goes to the real
+/// function, which faults on it
+/// ([Microsoft Learn: GetNumaHighestNodeNumber](https://learn.microsoft.com/en-us/windows/win32/api/systemtopologyapi/nf-systemtopologyapi-getnumahighestnodenumber)).
+unsafe extern "system" fn get_numa_highest_node_number(highest: *mut u32) -> i32 {
+    if !highest.is_null()
+        && let Some(r) = dispatch_host(|h| h.numa_highest_node())
+    {
+        if r < 0 {
+            return finish_bool(r);
+        }
+        // SAFETY: the caller's ULONG.
+        unsafe { highest.write_unaligned(r as u32) };
+        return 1;
+    }
+    // SAFETY: GET_NUMA_HIGHEST_NODE_NUMBER holds kernel32's GetNumaHighestNodeNumber.
+    unsafe {
+        original::<unsafe extern "system" fn(*mut u32) -> i32>(&GET_NUMA_HIGHEST_NODE_NUMBER)(
+            highest,
+        )
+    }
+}
+
+/// The size of a `GROUP_AFFINITY`: `Mask`, `Group` and three reserved `WORD`s.
+const GROUP_AFFINITY: usize = 16;
+
+/// `GetNumaNodeProcessorMaskEx(node, affinity)`; returns a `BOOL`. A null `affinity` goes to the
+/// real function, which faults on it
+/// ([Microsoft Learn: GetNumaNodeProcessorMaskEx](https://learn.microsoft.com/en-us/windows/win32/api/systemtopologyapi/nf-systemtopologyapi-getnumanodeprocessormaskex)).
+unsafe extern "system" fn get_numa_node_processor_mask_ex(node: u16, affinity: *mut c_void) -> i32 {
+    if !affinity.is_null()
+        // SAFETY: the caller's GROUP_AFFINITY.
+        && let Some(r) =
+            dispatch_host(|h| unsafe { h.numa_node_processor_mask(node, affinity.cast()) })
+    {
+        return finish_bool(r);
+    }
+    // SAFETY: GET_NUMA_NODE_PROCESSOR_MASK_EX holds kernel32's GetNumaNodeProcessorMaskEx.
+    unsafe {
+        original::<unsafe extern "system" fn(u16, *mut c_void) -> i32>(
+            &GET_NUMA_NODE_PROCESSOR_MASK_EX,
+        )(node, affinity)
+    }
+}
+
+/// `GetNumaNodeProcessorMask(node, mask)`: the mask [`get_numa_node_processor_mask_ex`] reports;
+/// returns a `BOOL`
+/// ([Microsoft Learn: GetNumaNodeProcessorMask](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getnumanodeprocessormask)).
+unsafe extern "system" fn get_numa_node_processor_mask(node: u8, mask: *mut u64) -> i32 {
+    let mut affinity = [0u8; GROUP_AFFINITY];
+    if !mask.is_null()
+        // SAFETY: a local GROUP_AFFINITY.
+        && let Some(r) = dispatch_host(|h| unsafe {
+            h.numa_node_processor_mask(u16::from(node), affinity.as_mut_ptr())
+        })
+    {
+        if r < 0 {
+            return finish_bool(r);
+        }
+        let value = u64::from_ne_bytes(affinity[..8].try_into().unwrap());
+        // SAFETY: the caller's ULONGLONG.
+        unsafe { mask.write_unaligned(value) };
+        return 1;
+    }
+    // SAFETY: GET_NUMA_NODE_PROCESSOR_MASK holds kernel32's GetNumaNodeProcessorMask.
+    unsafe {
+        original::<unsafe extern "system" fn(u8, *mut u64) -> i32>(&GET_NUMA_NODE_PROCESSOR_MASK)(
+            node, mask,
+        )
+    }
+}
+
+/// `GetNumaNodeProcessorMask2(node, affinities, count, required)`: the node's one
+/// `GROUP_AFFINITY`, with `*required` 1, and `ERROR_INSUFFICIENT_BUFFER` for a `count` of 0, as
+/// on Windows 11; returns a `BOOL`
+/// ([Microsoft Learn: GetNumaNodeProcessorMask2](https://learn.microsoft.com/en-us/windows/win32/api/systemtopologyapi/nf-systemtopologyapi-getnumanodeprocessormask2)).
+unsafe extern "system" fn get_numa_node_processor_mask_2(
+    node: u16,
+    affinities: *mut c_void,
+    count: u16,
+    required: *mut u16,
+) -> i32 {
+    let mut affinity = [0u8; GROUP_AFFINITY];
+    if !required.is_null()
+        && (count == 0 || !affinities.is_null())
+        // SAFETY: a local GROUP_AFFINITY.
+        && let Some(r) =
+            dispatch_host(|h| unsafe { h.numa_node_processor_mask(node, affinity.as_mut_ptr()) })
+    {
+        if r < 0 {
+            return finish_bool(r);
+        }
+        // SAFETY: the caller's USHORT.
+        unsafe { required.write_unaligned(1) };
+        if count == 0 {
+            return finish_bool(-i64::from(ERROR_INSUFFICIENT_BUFFER));
+        }
+        // SAFETY: `affinities` has room for `count` GROUP_AFFINITY records.
+        unsafe {
+            std::ptr::copy_nonoverlapping(affinity.as_ptr(), affinities.cast(), GROUP_AFFINITY)
+        };
+        return 1;
+    }
+    type Mask2Fn = unsafe extern "system" fn(u16, *mut c_void, u16, *mut u16) -> i32;
+    // SAFETY: GET_NUMA_NODE_PROCESSOR_MASK_2 holds kernel32's GetNumaNodeProcessorMask2.
+    unsafe {
+        original::<Mask2Fn>(&GET_NUMA_NODE_PROCESSOR_MASK_2)(node, affinities, count, required)
+    }
+}
+
+/// `CallNtPowerInformation(level, input, input_len, output, output_len)`; returns an `NTSTATUS`.
+/// Only `ProcessorInformation` (11), one `PROCESSOR_POWER_INFORMATION` per processor, is offered
+/// to the host
+/// ([Microsoft Learn: CallNtPowerInformation](https://learn.microsoft.com/en-us/windows/win32/api/powerbase/nf-powerbase-callntpowerinformation)).
+unsafe extern "system" fn call_nt_power_information(
+    level: i32,
+    input: *mut c_void,
+    input_len: u32,
+    output: *mut c_void,
+    output_len: u32,
+) -> i32 {
+    const PROCESSOR_INFORMATION: i32 = 11;
+    if level == PROCESSOR_INFORMATION
+        // SAFETY: the caller's buffers, of the lengths it gave.
+        && let Some(r) = dispatch_host(|h| unsafe {
+            h.processor_power_information(input.cast(), input_len, output.cast(), output_len)
+        })
+    {
+        return r as u32 as i32;
+    }
+    type PowerFn = unsafe extern "system" fn(i32, *mut c_void, u32, *mut c_void, u32) -> i32;
+    // SAFETY: CALL_NT_POWER_INFORMATION holds powrprof's CallNtPowerInformation.
+    unsafe {
+        original::<PowerFn>(&CALL_NT_POWER_INFORMATION)(
+            level, input, input_len, output, output_len,
+        )
+    }
+}
+
 /// A host `time_period` result as the `MMRESULT` the caller reads: the code itself, or
 /// `TIMERR_NOCANDO` (97, `TIMERR_BASE` + 1 in timeapi.h/mmsystem.h) for a host `Err`, the only
 /// failure `timeBeginPeriod`/`timeEndPeriod` document.
@@ -2351,18 +2756,137 @@ impl Drop for AddressWaitValue {
     }
 }
 
-/// How many `WakeByAddressSingle`/`WakeByAddressAll` calls have reached each address, hashed into
-/// a fixed table, so a timed wait can tell whether any wake was made on its address while it
-/// waited. Two addresses sharing a slot only make a spurious return look like a wake.
-static ADDRESS_WAKES: [AtomicU64; 65536] = [const { AtomicU64::new(0) }; 65536];
+/// A `WaitOnAddress` waiting on the real OS, which a `WakeByAddressSingle`/`WakeByAddressAll` on
+/// its address marks: a return with the comparand still in place is a wake if the watch is marked,
+/// and spurious if not. It lives on its waiter's stack and is listed in [`ADDRESS_WATCHES`] while
+/// [`Watching`] lasts.
+struct AddressWatch {
+    addr: usize,
+    woken: AtomicBool,
+    next: AtomicPtr<AddressWatch>,
+}
 
-fn address_wakes(addr: usize) -> &'static AtomicU64 {
-    let hash = (addr as u64 >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 48;
-    &ADDRESS_WAKES[hash as usize]
+/// The [`AddressWatch`]es of the waits in progress, in lists by a hash of their address. A list's
+/// lock is held only to link, unlink or mark watches, which neither allocates nor calls another
+/// function, so a wait or wake made inside an allocator's critical section never waits on a holder
+/// that allocates.
+struct WatchList {
+    locked: AtomicBool,
+    head: AtomicPtr<AddressWatch>,
+}
+
+static ADDRESS_WATCHES: [WatchList; 4096] = [const {
+    WatchList {
+        locked: AtomicBool::new(false),
+        head: AtomicPtr::new(std::ptr::null_mut()),
+    }
+}; 4096];
+
+fn watch_list(addr: usize) -> &'static WatchList {
+    let hash = (addr as u64 >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 52;
+    &ADDRESS_WATCHES[hash as usize]
+}
+
+struct WatchListLock<'a>(&'a WatchList);
+
+impl WatchList {
+    fn lock(&self) -> WatchListLock<'_> {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            while self.locked.load(Ordering::Relaxed) {
+                std::hint::spin_loop();
+            }
+        }
+        WatchListLock(self)
+    }
+}
+
+impl Drop for WatchListLock<'_> {
+    fn drop(&mut self) {
+        self.0.locked.store(false, Ordering::Release);
+    }
+}
+
+impl AddressWatch {
+    fn new(addr: usize) -> Self {
+        AddressWatch {
+            addr,
+            woken: AtomicBool::new(false),
+            next: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+
+    /// Lists this watch until the returned guard drops; a wake on its address before then marks it.
+    fn watch(&self) -> Watching<'_> {
+        let list = watch_list(self.addr);
+        let _lock = list.lock();
+        self.next
+            .store(list.head.load(Ordering::Relaxed), Ordering::Relaxed);
+        list.head
+            .store(std::ptr::from_ref(self).cast_mut(), Ordering::Release);
+        Watching(self)
+    }
+
+    /// Whether a `WakeByAddress*` reached this watch's address since it was listed.
+    fn woken(&self) -> bool {
+        self.woken.load(Ordering::Acquire)
+    }
+}
+
+struct Watching<'a>(&'a AddressWatch);
+
+impl Drop for Watching<'_> {
+    fn drop(&mut self) {
+        let list = watch_list(self.0.addr);
+        let _lock = list.lock();
+        let this = std::ptr::from_ref(self.0).cast_mut();
+        let mut link = &list.head;
+        loop {
+            let watch = link.load(Ordering::Relaxed);
+            if watch.is_null() {
+                break;
+            }
+            if watch == this {
+                link.store(self.0.next.load(Ordering::Relaxed), Ordering::Relaxed);
+                break;
+            }
+            // SAFETY: a listed watch stays alive until its own `Watching` unlinks it under this lock.
+            link = unsafe { &(*watch).next };
+        }
+    }
+}
+
+/// Marks every listed watch on `addr`: a wake reached the address. A wake that finds the list empty
+/// has no watch to mark, as any wait listed since began after it.
+fn mark_address_woken(addr: usize) {
+    let list = watch_list(addr);
+    if list.head.load(Ordering::Acquire).is_null() {
+        return;
+    }
+    let _lock = list.lock();
+    let mut watch = list.head.load(Ordering::Relaxed);
+    // SAFETY: a listed watch stays alive until its own `Watching` unlinks it under this lock.
+    while let Some(listed) = unsafe { watch.as_ref() } {
+        if listed.addr == addr {
+            listed.woken.store(true, Ordering::Release);
+        }
+        watch = listed.next.load(Ordering::Relaxed);
+    }
 }
 
 /// winerror.h: ERROR_TIMEOUT (1460), what a timed-out WaitOnAddress leaves in GetLastError.
 const ERROR_TIMEOUT: u32 = 1460;
+
+/// How long an untimed `WaitOnAddress` of a participant waits in the OS at a time before it looks
+/// whether a wake was counted on it ([`domain::wait_woken`]). A wake its caller had already
+/// seen the value of before it waited again (std's parker, unparked while it returns from its last
+/// park) is counted on the new wait but may reach the OS before the wait does, which then never
+/// returns by itself while the domain counts it released and so never goes quiescent. A snare
+/// choice: rare enough to cost an idle thread nothing to speak of.
+const RELEASE_RECHECK_MS: u32 = 50;
 
 /// How long a wait on a word in static data, or one a lock's back-off spin leads into (see
 /// `domain::backing_off`), first waits in real time, for a holder outside the simulation, before
@@ -2400,10 +2924,22 @@ unsafe fn outside_grace(
             &WAIT_ON_ADDRESS,
         )
     };
-    // SAFETY: the caller's address and comparand, with the grace as the timeout.
-    let woke = unsafe { wait(address, compare, size, grace_ms) };
-    // SAFETY: reading this thread's last-error value.
-    (woke != 0 || unsafe { GetLastError() } != ERROR_TIMEOUT).then_some(woke)
+    let (woke, error) = domain::uncounted_wait(
+        address as usize,
+        || {
+            // SAFETY: the caller's address and comparand, with the grace as the timeout.
+            let woke = unsafe { wait(address, compare, size, grace_ms) };
+            // SAFETY: reading this thread's last-error value.
+            (woke, unsafe { GetLastError() })
+        },
+        |&(woke, _)| woken_at(address as usize, woke),
+    );
+    if woke == 0 && error == ERROR_TIMEOUT {
+        return None;
+    }
+    // SAFETY: restoring this thread's last-error value as the wait left it.
+    unsafe { SetLastError(error) };
+    Some(woke)
 }
 
 /// The body of [`wait_on_address`] for a wait not nested in another on the same address.
@@ -2426,7 +2962,6 @@ unsafe fn wait_on_address_call(
     const INFINITE: u32 = u32::MAX;
     let _label = crate::accounting::wait_label_on("WaitOnAddress", address as usize);
     let addr = address as usize;
-    let wakes = address_wakes(addr).load(Ordering::Acquire);
     let _value = if domain::counts_native_waits()
         && !address.is_null()
         && !compare.is_null()
@@ -2485,11 +3020,22 @@ unsafe fn wait_on_address_call(
         }
         return 1;
     }
+    let watch = AddressWatch::new(addr);
+    let _watching = watch.watch();
+    // A wait that is not a participant's (one made under passthrough, the census lock's own among
+    // them) must not look at the census.
+    let counted = domain::counts_native_waits();
     if millis == INFINITE {
         if domain::counts_native_waits()
             && (domain::in_static_image(addr) || domain::backing_off())
             && let Some(woke) =
                 unsafe { outside_grace(OUTSIDE_HOLDER_GRACE_MS, address, compare, size) }
+                    .or_else(|| {
+                        domain::hold_off_while(|| unsafe {
+                            outside_grace(OUTSIDE_HOLDER_GRACE_MS, address, compare, size)
+                        })
+                        .ok()
+                    })
         {
             return woke;
         }
@@ -2504,16 +3050,19 @@ unsafe fn wait_on_address_call(
                     .then_some(1)
             },
             || loop {
-                if crate::os::nested::spoiled(addr) {
+                if crate::os::nested::spoiled(addr) || counted && domain::wait_woken() {
                     break 1;
                 }
-                let woke = unsafe { wait(address, compare, size, millis) };
+                let slice = if counted { RELEASE_RECHECK_MS } else { INFINITE };
+                let woke = unsafe { wait(address, compare, size, slice) };
+                // SAFETY: reading this thread's last-error value.
+                if woke == 0 && unsafe { GetLastError() } == ERROR_TIMEOUT {
+                    continue;
+                }
                 // A return with the comparand in place and no wake made on the address since the
                 // wait began is spurious: waiting on would be the same wait, and returning would
                 // hand the caller (std's condition variable) a wake no thread made.
-                if woke != 0
-                    && !woken_at(addr, woke)
-                    && address_wakes(addr).load(Ordering::Acquire) == wakes
+                if woke != 0 && !woken_at(addr, woke) && !watch.woken() && !(counted && domain::wait_woken())
                 {
                     continue;
                 }
@@ -2541,11 +3090,16 @@ unsafe fn wait_on_address_call(
             let error = unsafe { GetLastError() };
             // A return with the comparand in place and no wake made on the address since the
             // wait began is spurious, and std's `park_timeout` would end early on it rather than
-            // outlast its virtual timeout.
-            if woke != 0
-                && !woken_at(addr, woke)
-                && address_wakes(addr).load(Ordering::Acquire) == wakes
-            {
+            // outlast its virtual timeout. A wake counted on this wait ends it, though, whether
+            // the OS's wake reached it (with the comparand back in place and its watch unmarked:
+            // the waker marked the address before this wait began, after its caller saw the value
+            // the wake was for) or came between two slices (see `RELEASE_RECHECK_MS`).
+            let released =
+                (woke != 0 || error == ERROR_TIMEOUT) && counted && domain::wait_woken();
+            if released {
+                return Some((1, error));
+            }
+            if woke != 0 && !woken_at(addr, woke) && !watch.woken() {
                 return None;
             }
             (woke != 0 || error != ERROR_TIMEOUT).then_some((woke, error))
@@ -2568,7 +3122,7 @@ unsafe fn wait_on_address_call(
 /// runs.
 unsafe extern "system" fn wake_by_address_single(address: *const c_void) {
     domain::note_hook_effect("WakeByAddressSingle");
-    address_wakes(address as usize).fetch_add(1, Ordering::Release);
+    mark_address_woken(address as usize);
     domain::det_wake_addr(address as usize, 1);
     // SAFETY: WAKE_BY_ADDRESS_SINGLE holds the system's function; argument forwarded.
     domain::release_native(address as usize, 1, || unsafe {
@@ -2581,7 +3135,7 @@ unsafe extern "system" fn wake_by_address_single(address: *const c_void) {
 /// ([Microsoft Learn: WakeByAddressAll](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-wakebyaddressall)).
 unsafe extern "system" fn wake_by_address_all(address: *const c_void) {
     domain::note_hook_effect("WakeByAddressAll");
-    address_wakes(address as usize).fetch_add(1, Ordering::Release);
+    mark_address_woken(address as usize);
     domain::det_wake_addr(address as usize, usize::MAX);
     // SAFETY: WAKE_BY_ADDRESS_ALL holds the system's function; argument forwarded.
     domain::release_native(address as usize, usize::MAX, || unsafe {
@@ -2814,7 +3368,7 @@ fn is_semaphore(handle: HANDLE) -> bool {
             returned: *mut u32,
         ) -> i32;
     }
-    static KINDS: std::sync::Mutex<Option<std::collections::HashMap<usize, bool>>> =
+    static KINDS: std::sync::Mutex<Option<crate::HashMap<usize, bool>>> =
         std::sync::Mutex::new(None);
     let _passthrough = state::Passthrough::enter();
     let key = handle as usize;
@@ -2893,19 +3447,25 @@ fn semaphore_wait(
             return WAIT_TIMEOUT;
         }
     }
+    // SAFETY: a non-blocking take on the caller's semaphore.
+    let take = || Some(unsafe { wait(handle, 0) }).filter(|&r| r != WAIT_TIMEOUT);
     if timeout == INFINITE_WAIT {
         // SAFETY: forwarding the caller's arguments unchanged.
-        return domain::native_wait_on(crate::DetKey::Addr(handle as usize), || unsafe {
-            wait(handle, timeout)
+        return domain::native_wait_on_checked(crate::DetKey::Addr(handle as usize), take, || {
+            unsafe { wait(handle, timeout) }
         });
     }
-    let outcome =
-        domain::timed_native_wait(Duration::from_millis(timeout.into()), None, None, |slice| {
+    let outcome = domain::timed_native_wait_checked(
+        Duration::from_millis(timeout.into()),
+        take,
+        |slice| {
             let millis = u32::try_from(slice.as_micros().div_ceil(1000)).unwrap_or(u32::MAX - 1);
             // SAFETY: the caller's handle, waited on for one slice.
             let r = unsafe { wait(handle, millis) };
             (r != WAIT_TIMEOUT).then_some(r)
-        });
+        },
+        |_| true,
+    );
     match outcome {
         domain::TimedWait::Woken(r) => r,
         domain::TimedWait::TimedOut => WAIT_TIMEOUT,
@@ -2920,13 +3480,12 @@ fn semaphore_wait(
 unsafe extern "system" fn release_semaphore(handle: HANDLE, count: i32, previous: *mut i32) -> i32 {
     domain::note_hook_effect("ReleaseSemaphore");
     let n = usize::try_from(count).unwrap_or(0);
-    domain::note_release(handle as usize, n);
     // SAFETY: RELEASE_SEMAPHORE holds kernel32's ReleaseSemaphore; arguments forwarded unchanged.
-    let r = unsafe {
+    let r = domain::release_native(handle as usize, n, || unsafe {
         original::<unsafe extern "system" fn(HANDLE, i32, *mut i32) -> i32>(&RELEASE_SEMAPHORE)(
             handle, count, previous,
         )
-    };
+    });
     if r != 0 {
         // SAFETY: reading and restoring this thread's last-error value.
         let saved = unsafe { GetLastError() };

@@ -29,12 +29,12 @@
 //! scheduler's own mutexes and condition variables are not hooked back into it. The domain's
 //! census lock, when both are needed, is taken first (see `Domain::if_quiescent`).
 
-#[cfg(windows)]
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
+#[cfg(windows)]
+use crate::HashMap;
 #[cfg(any(unix, windows))]
 use crate::pending::MutexRecord;
 use crate::pending::Pending;
@@ -64,6 +64,9 @@ pub enum ReadinessKey {
     CompletionPort(u64),
     /// A thread's park token: its unpark is the only event that changes it.
     Thread(u64),
+    /// A wait's watch on real descriptors (a pipe, a child process's output).
+    #[cfg(unix)]
+    Real(u64),
 }
 
 /// Which subscriptions a readiness notification reaches.
@@ -191,46 +194,184 @@ enum Grant {
 /// shared by `Arc` so a grant can be made after the state lock is released.
 #[derive(Default)]
 struct Parker {
-    /// The pending grant, taken by the parked thread. A one-slot latch: a grant made before the
-    /// thread parks is kept, so none is lost to the race between granting and waiting.
-    grant: Mutex<Option<Grant>>,
-    /// Signalled when `grant` is filled.
+    /// The pending grant, and whether the thread sleeps waiting for one.
+    latch: Mutex<Latch>,
+    /// Signalled when a grant is made while the thread sleeps on it.
     granted: Condvar,
+    /// Whether `latch` holds a grant, for the parked thread to watch while it spins.
+    pending: AtomicBool,
+    /// The thread just handed the baton to the thread it had it from, so it is likely to come
+    /// straight back: the thread's next park spins before it sleeps.
+    handback: AtomicBool,
+    /// How many of the thread's next handback parks sleep at once, without spinning (see
+    /// [`MAX_MISSES`]). Read and written only by the parked thread, as is `misses`.
+    skip: AtomicU32,
+    /// Spins in a row that ended in sleep.
+    misses: AtomicU32,
+    /// Woken while asleep to spin for a grant it is next in line for (see [`Parker::nudge`]).
+    nudged: AtomicBool,
+    /// [`Latch::sleeping`], readable without the lock, so a nudge passes over a thread that is
+    /// awake or spinning at the cost of one load.
+    asleep: AtomicBool,
+    /// How many of the next nudges to pass up, after nudged spins that found no grant. Counted
+    /// down by the nudging thread and set by the parked one.
+    nudge_skip: AtomicU32,
+    /// Nudged spins in a row that ended in sleep.
+    nudge_misses: AtomicU32,
 }
 
+#[derive(Default)]
+struct Latch {
+    /// The pending grant, taken by the parked thread. A one-slot latch: a grant made before the
+    /// thread parks is kept, so none is lost to the race between granting and waiting.
+    grant: Option<Grant>,
+    /// The thread is blocked on [`Parker::granted`], so a grant must signal it.
+    sleeping: bool,
+}
+
+/// How many times a thread parked expecting a handback checks for its grant before it sleeps: a
+/// few microseconds. Two threads passing the baton back and forth take less, so the thread handed
+/// it is usually still spinning and needs no kernel wake. A snare choice, not an OS value.
+const PARK_SPINS: u32 = 1 << 9;
+
+/// How long a nudged thread spins for its grant at most before it sleeps again: past the holder's
+/// usual way from making it runnable to letting go, a few microseconds. Measured in real time, as
+/// a spin step's length differs between CPUs many times over. A snare choice.
+const NUDGE_SPIN: Duration = Duration::from_micros(10);
+
+/// After spins in a row that found no grant, a thread sleeps at once through up to
+/// `2^MAX_MISSES - 1` handback parks before it spins again, so a peer slowed by long work or a
+/// loaded host costs little CPU spinning. A snare choice.
+const MAX_MISSES: u32 = 2;
+
 impl Parker {
+    /// Applies `fill` to the pending grant, waking the thread if it sleeps and a grant is now
+    /// pending. The signal is sent with the lock let go, so the woken thread does not block on it.
+    fn fill(&self, fill: impl FnOnce(&mut Option<Grant>)) {
+        let mut latch = self.latch.lock().unwrap();
+        fill(&mut latch.grant);
+        let sleeping = latch.sleeping && latch.grant.is_some();
+        self.pending.store(latch.grant.is_some(), Ordering::Release);
+        drop(latch);
+        if sleeping {
+            self.granted.notify_one();
+        }
+    }
+
     /// Hands the thread the baton, overwriting a pending [`Grant::Dispatch`]: running supersedes
     /// the duty to move the schedule on.
     fn grant(&self, why: DetWake) {
-        *self.grant.lock().unwrap() = Some(Grant::Run(why));
-        self.granted.notify_one();
+        self.fill(|grant| *grant = Some(Grant::Run(why)));
     }
 
     /// Hands the thread the duty of dispatching, unless a grant is already pending (a pending run
     /// grant must not be replaced, and a pending dispatch need not be repeated).
     fn delegate(&self) {
-        let mut grant = self.grant.lock().unwrap();
-        if grant.is_none() {
-            *grant = Some(Grant::Dispatch);
-            self.granted.notify_one();
-        }
+        self.fill(|grant| {
+            grant.get_or_insert(Grant::Dispatch);
+        });
     }
 
     /// Drops a pending grant, as the thread leaves the schedule: one made meanwhile went to a
     /// thread no longer waiting for it.
     fn forget(&self) {
-        *self.grant.lock().unwrap() = None;
+        self.fill(|grant| *grant = None);
     }
 
-    /// Blocks until a grant is pending and takes it, looping over the condition variable's
-    /// spurious wakeups (POSIX `pthread_cond_wait`; std's `Condvar::wait` documents the same).
+    /// Marks the thread's next park as likely to be short (see [`Parker::handback`]).
+    fn expect_handback(&self) {
+        self.handback.store(true, Ordering::Relaxed);
+    }
+
+    /// Wakes the thread, if it sleeps without a grant, to spin for one: it was made the only
+    /// runnable thread while another holds the baton, so it is next in line once the holder lets
+    /// go, and the kernel wake it needs then is taken while the holder still runs. Passes up
+    /// nudges after spins that found nothing, as [`spin`](Self::spin) does.
+    fn nudge(&self) {
+        if !self.asleep.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.nudge_skip.load(Ordering::Relaxed) > 0 {
+            self.nudge_skip.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+        let latch = self.latch.lock().unwrap();
+        if !latch.sleeping || latch.grant.is_some() {
+            return;
+        }
+        self.nudged.store(true, Ordering::Relaxed);
+        drop(latch);
+        self.granted.notify_one();
+    }
+
+    /// The spin a [`nudge`](Self::nudge) asks for: until the grant is pending or [`NUDGE_SPIN`]
+    /// has passed.
+    fn spin_nudged(&self) {
+        let start = crate::accounting::real_elapsed();
+        let granted = loop {
+            if (0..64).any(|_| {
+                std::hint::spin_loop();
+                self.pending.load(Ordering::Acquire)
+            }) {
+                break true;
+            }
+            if crate::accounting::real_elapsed().saturating_sub(start) >= NUDGE_SPIN {
+                break false;
+            }
+        };
+        if granted {
+            self.nudge_misses.store(0, Ordering::Relaxed);
+        } else {
+            let misses = (self.nudge_misses.load(Ordering::Relaxed) + 1).min(MAX_MISSES);
+            self.nudge_misses.store(misses, Ordering::Relaxed);
+            self.nudge_skip.store((1 << misses) - 1, Ordering::Relaxed);
+        }
+    }
+
+    /// Blocks until a grant is pending and takes it, looping over the condition variable's spurious
+    /// wakeups (POSIX `pthread_cond_wait`; std's `Condvar::wait` documents the same). A park that
+    /// expects a handback spins briefly first, and a thread nudged awake with no grant yet spins
+    /// before it sleeps again. A nudge the grant overtook is dropped with it.
     fn wait(&self) -> Grant {
-        let mut grant = self.grant.lock().unwrap();
+        if self.handback.swap(false, Ordering::Relaxed) {
+            self.spin();
+        }
+        let mut latch = self.latch.lock().unwrap();
         loop {
-            if let Some(grant) = grant.take() {
+            let nudged = self.nudged.swap(false, Ordering::Relaxed);
+            if let Some(grant) = latch.grant.take() {
+                self.pending.store(false, Ordering::Relaxed);
                 return grant;
             }
-            grant = self.granted.wait(grant).unwrap();
+            if nudged {
+                drop(latch);
+                self.spin_nudged();
+                latch = self.latch.lock().unwrap();
+                continue;
+            }
+            latch.sleeping = true;
+            self.asleep.store(true, Ordering::Relaxed);
+            latch = self.granted.wait(latch).unwrap();
+            latch.sleeping = false;
+            self.asleep.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Spins until a grant is pending or [`PARK_SPINS`] checks pass, unless earlier spins found
+    /// nothing (see [`MAX_MISSES`]).
+    fn spin(&self) {
+        let skip = self.skip.load(Ordering::Relaxed);
+        if skip > 0 {
+            self.skip.store(skip - 1, Ordering::Relaxed);
+        } else if (0..PARK_SPINS).any(|_| {
+            std::hint::spin_loop();
+            self.pending.load(Ordering::Acquire)
+        }) {
+            self.misses.store(0, Ordering::Relaxed);
+        } else {
+            let misses = (self.misses.load(Ordering::Relaxed) + 1).min(MAX_MISSES);
+            self.misses.store(misses, Ordering::Relaxed);
+            self.skip.store((1 << misses) - 1, Ordering::Relaxed);
         }
     }
 }
@@ -329,6 +470,8 @@ pub(crate) struct State {
     next_wait: u64,
     /// The last thread handed the baton: the round-robin cursor.
     last: u64,
+    /// The thread handed the baton before `last`, to tell two threads passing it back and forth.
+    before_last: u64,
     /// Threads that have left the domain, in order, so a late join on one returns at once and
     /// [`Scheduler::lineage_of`] no longer names a handle the OS may have reused: a `pthread_t`'s
     /// lifetime ends once the thread has terminated and been joined or detached, after which it
@@ -360,6 +503,9 @@ pub(crate) struct State {
     owners: MutexOwners,
     #[cfg(windows)]
     shared_owners: HashMap<usize, std::collections::BTreeSet<u64>>,
+    /// Keys a re-polled waiter made progress on that no wake of the schedule's own has yet
+    /// explained (see [`State::settle_repoll`]).
+    unexplained: Unexplained,
 }
 
 /// One thread's share of the schedule.
@@ -498,6 +644,45 @@ impl ForeignKeys {
     }
 }
 
+/// How many keys [`Unexplained`] holds. A snare choice, far past the waiters an idle re-poll
+/// releases at once; past it a key is counted an outside wake at once.
+const UNEXPLAINED_KEYS: usize = 16;
+
+/// [`State::unexplained`]: a fixed list, as a wake may come from a thread inside an allocator.
+/// A key appears once per re-polled waiter it holds back.
+struct Unexplained([Option<DetKey>; UNEXPLAINED_KEYS]);
+
+impl Default for Unexplained {
+    fn default() -> Self {
+        Self([None; UNEXPLAINED_KEYS])
+    }
+}
+
+impl Unexplained {
+    /// Holds back `key`; `false` if the list is full.
+    fn note(&mut self, key: DetKey) -> bool {
+        let Some(free) = self.0.iter_mut().find(|k| k.is_none()) else {
+            return false;
+        };
+        *free = Some(key);
+        true
+    }
+
+    /// A wake of the schedule's own on `key` explains every waiter held back on it.
+    fn explain(&mut self, key: DetKey) {
+        for held in self.0.iter_mut().filter(|k| **k == Some(key)) {
+            *held = None;
+        }
+    }
+
+    /// Empties the list, returning how many it held.
+    fn take(&mut self) -> u64 {
+        let held = self.0.iter().filter(|k| k.is_some()).count();
+        self.0 = [None; UNEXPLAINED_KEYS];
+        held as u64
+    }
+}
+
 impl State {
     /// The thread that holds the baton or is next to, if any: the schedule is not idle.
     pub(crate) fn running(&self) -> Option<u64> {
@@ -557,12 +742,29 @@ impl State {
     }
 
     /// A re-polled waiter did something: progress, unless it only blocked again on the same key.
+    /// What the re-poll found changed may be a wake of the schedule's own still under way (a
+    /// condition variable's signal count or a futex word moves before the wake that follows it
+    /// reaches the schedule), so the key is held back until such a wake explains it
+    /// ([`explain`](Self::explain)), and counts as an outside wake only if none has once the count
+    /// is read ([`Scheduler::take_unexplained`]).
     fn settle_repoll(&mut self, t: u64, blocked_on: Option<DetKey>) {
         if let Some(key) = self.threads.get_mut(t).and_then(|slot| slot.repolled.take())
             && blocked_on != Some(key)
+            && !self.unexplained.note(key)
         {
             crate::domain::count_outside_wake();
         }
+    }
+
+    /// A wake of the schedule's own on `key`: the progress of a waiter re-polled on it, whether it
+    /// has yet to run or already made it, is the schedule's, not an outside wake.
+    fn explain(&mut self, key: DetKey) {
+        for (_, slot) in self.threads.iter_mut() {
+            if slot.repolled == Some(key) {
+                slot.repolled = None;
+            }
+        }
+        self.unexplained.explain(key);
     }
 
     /// Makes `t` ready to run with `why`, replacing why it was made ready if it already was.
@@ -571,6 +773,7 @@ impl State {
             && slot.runnable.replace(why).is_none()
         {
             self.runnable += 1;
+            self.nudge_next(t);
         }
     }
 
@@ -581,6 +784,21 @@ impl State {
         {
             slot.runnable = Some(why);
             self.runnable += 1;
+            self.nudge_next(t);
+        }
+    }
+
+    /// Nudges `t`, just made runnable, when it is the only runnable thread and another holds the
+    /// baton: unless the holder makes another thread runnable first, `t` is granted next when the
+    /// holder lets go (see [`Parker::nudge`]).
+    fn nudge_next(&self, t: u64) {
+        if self.runnable == 1
+            && self.holder.is_some_and(|holder| holder != t && holder != EXTERNAL)
+            && let Some(slot) = self.threads.get(t)
+            && slot.blocked.is_none()
+            && slot.outside.is_none()
+        {
+            slot.parker.nudge();
         }
     }
 
@@ -1249,6 +1467,16 @@ impl Scheduler {
         }
     }
 
+    /// Moves the participant with lineage `t`, if it is blocked, to the run queue, whatever it
+    /// waits on: it re-checks its wait and finds a signal left pending for it.
+    #[cfg(unix)]
+    pub(crate) fn wake_thread(&self, t: u64) {
+        let _passthrough = Passthrough::enter();
+        let mut st = self.lock();
+        Self::unblock(&mut st, t, DetWake::Woken);
+        Self::grant_if_idle(st);
+    }
+
     /// Moves up to `n` of `key`'s waiters, oldest first, to the run queue. Returns how many. A
     /// thread outside the schedule waking one while no thread holds the baton hands it on.
     pub(crate) fn wake(&self, key: DetKey, n: usize) -> usize {
@@ -1264,6 +1492,7 @@ impl Scheduler {
     ) -> usize {
         let _passthrough = Passthrough::enter();
         let mut st = self.lock();
+        st.explain(key);
         let mut woken = Self::wake_key_matching(&mut st, key, n, DetWake::Woken, |wait| {
             wait.mask & mask != 0 && private.is_none_or(|scope| wait.futex_private == Some(scope))
         });
@@ -1274,6 +1503,13 @@ impl Scheduler {
             Self::grant_if_idle(st);
         }
         woken
+    }
+
+    /// How many re-polled waiters made progress that no wake of the schedule's own explained since
+    /// last asked: outside wakes.
+    pub(crate) fn take_unexplained(&self) -> u64 {
+        let _passthrough = Passthrough::enter();
+        self.lock().unexplained.take()
     }
 
     /// As [`wake_masked`](Self::wake_masked), for a wake made by a thread outside the schedule (of
@@ -1708,6 +1944,13 @@ impl Scheduler {
         };
         let why = st.take_runnable(t).unwrap_or(DetWake::Woken);
         st.holder = Some(t);
+        if st.before_last == t
+            && last != t
+            && let Some(slot) = st.threads.get(last)
+        {
+            slot.parker.expect_handback();
+        }
+        st.before_last = last;
         st.last = t;
         st.end_idle();
         drop(st);
@@ -1727,6 +1970,7 @@ impl Scheduler {
     /// [`dispatch`](Self::dispatch), reporting whether it moved virtual time.
     fn dispatch_inner<'a>(&'a self, mut st: MutexGuard<'a, State>) -> bool {
         let mut skipped = false;
+        let mut holders_cleared = false;
         loop {
             self.take_foreign(&mut st);
             st = match Self::grant_next(st) {
@@ -1755,6 +1999,30 @@ impl Scheduler {
                 Self::repoll_addr_waiters(&mut st);
                 continue;
             }
+            #[cfg(unix)]
+            if Self::wake_real_ready(&mut st) {
+                continue;
+            }
+            if !holders_cleared && crate::domain::shares_statics() {
+                // Telling whether a thread of another sim may still carry a wake here takes that
+                // sim's census lock, and an executive takes a census lock before a schedule's.
+                drop(st);
+                let held_off = crate::domain::skip_held_off();
+                st = self.lock();
+                if st.holder.is_some() {
+                    return skipped;
+                }
+                if held_off {
+                    match self.idle(st, crate::domain::HOLDER_POLL, Idle::HeldOff) {
+                        Some(next) => st = next,
+                        None => return skipped,
+                    }
+                } else {
+                    holders_cleared = true;
+                }
+                continue;
+            }
+            holders_cleared = false;
             if crate::domain::time_skip() {
                 skipped = true;
                 Self::release_due(&mut st, crate::domain::virtual_now());
@@ -1768,7 +2036,12 @@ impl Scheduler {
             if let Some(span) = crate::domain::idle_wait() {
                 // The clock is held: every thread waits on time that only something outside the
                 // simulation can move, which is not a deadlock. Idle until it moves.
-                match self.idle(st, span, Idle::Held) {
+                let why = if crate::domain::waits_outside() {
+                    Idle::Process
+                } else {
+                    Idle::Held
+                };
+                match self.idle(st, span, why) {
                     Some(next) => st = next,
                     None => return skipped,
                 }
@@ -1809,6 +2082,17 @@ impl Scheduler {
             }
             Self::repoll_addr_waiters(&mut st);
         }
+    }
+
+    /// Wakes the readiness waits whose real descriptors are ready (see `Layer::real_ready`),
+    /// returning whether any thread became runnable.
+    #[cfg(unix)]
+    fn wake_real_ready(st: &mut State) -> bool {
+        let mut woken = 0;
+        crate::domain::real_ready(&mut |key| {
+            woken += Self::wake_readiness_key(st, ReadinessWake::Keys(&[key]));
+        });
+        woken > 0
     }
 
     /// Whether a blocked thread waits on a word in a loaded image: a lock in static data (std's

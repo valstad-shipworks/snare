@@ -465,6 +465,7 @@ fn synthetic_metadata_matches_proc_and_sysfs_os_truth() {
     let sim = Sim::builder()
         .host(
             snare::HostProfile::new()
+                .root(unsafe { libc::geteuid() } == 0)
                 .nic(snare::Nic::new("eth0", 7))
                 .build(),
         )

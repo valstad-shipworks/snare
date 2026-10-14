@@ -18,7 +18,6 @@
 //! Only PE32+ images (64-bit) are handled; header offsets and table layouts follow
 //! ([Microsoft Learn: PE Format](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format)).
 
-use std::collections::HashSet;
 use std::ffi::CStr;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
@@ -30,6 +29,7 @@ use windows_sys::Win32::System::ProcessStatus::EnumProcessModules;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use super::record;
+use crate::HashSet;
 use crate::hooks::{self, Hook};
 
 /// Index of the Import Table in the optional header's data directories (winnt.h
@@ -139,7 +139,7 @@ pub(crate) fn patch_new_modules() {
     modules.truncate(count as usize / size_of::<HMODULE>());
 
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    let seen = seen.get_or_insert_with(HashSet::new);
+    let seen = seen.get_or_insert_with(HashSet::default);
     for module in modules {
         let base = module as usize;
         if base == 0 || !seen.insert(base) {

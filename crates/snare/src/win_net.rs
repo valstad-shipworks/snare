@@ -29,7 +29,7 @@
 //! Where Winsock's behaviour differs from the BSD sockets the unix fabric models, the Winsock rule
 //! is followed and cited at the point it applies.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::{c_char, c_int};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
@@ -37,12 +37,17 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use snare_interpose::{Net, NetResult};
+
 #[path = "win_iocp.rs"]
 mod iocp;
 
+use crate::HashMap;
+use crate::ancillary::Header;
 use crate::faults::{ConnectAttempt, Outcome, Syn};
 use crate::limits::{Arrival, Buf, RxQueue};
-use crate::netif::{Cand, Hop, LinkState, Op, Sender, Wire};
+use crate::netif::{
+    Cand, Hop, LinkState, Op, Sender, Share, Wire, code, pick_shared, reported, toward, unmapped,
+};
 use crate::pcapng::{Dir, TcpTap};
 use crate::readiness::{Deadline, readiness};
 use crate::scope::SimShared;
@@ -91,6 +96,8 @@ const WSAECONNRESET: c_int = 10054;
 const WSAETIMEDOUT: c_int = 10060;
 /// The direction was shut down.
 const WSAESHUTDOWN: c_int = 10058;
+/// An address of the other family: a `SOCKADDR_IN6` given an IPv4 socket.
+const WSAEAFNOSUPPORT: c_int = 10047;
 /// A datagram longer than the receive buffer, cut to it
 /// ([Microsoft Learn: recvfrom](https://learn.microsoft.com/en-us/windows/win32/api/winsock/nf-winsock-recvfrom)),
 /// or one that may not be fragmented and does not fit the egress MTU.
@@ -123,12 +130,6 @@ const MSG_CTRUNC: u32 = 0x0200;
 const MSG_BCAST: u32 = 0x0400;
 /// `WSARecvMsg` output: the datagram was sent to a multicast address.
 const MSG_MCAST: u32 = 0x0800;
-/// `SO_TIMESTAMP` (`mstcpip.h`, 0x300A), the control message of a receive stamp
-/// ([Microsoft Learn: Winsock timestamping](https://learn.microsoft.com/en-us/windows/win32/winsock/winsock-timestamping)).
-const SO_TIMESTAMP: c_int = 0x300A;
-/// `SO_TIMESTAMP_ID` (`mstcpip.h`, 0x300B), the control message tagging a datagram for a
-/// transmit stamp.
-const SO_TIMESTAMP_ID: c_int = 0x300B;
 
 // Winsock address families and socket types (`<winsock2.h>`): AF_INET = 2, AF_INET6 = 23,
 // SOCK_STREAM = 1, SOCK_DGRAM = 2. The IPv6 family value differs from unix (10/30).
@@ -160,6 +161,9 @@ const SO_SNDTIMEO: c_int = 0x1005;
 const SO_ERROR: c_int = 0x1007;
 /// `SO_REUSEADDR`: a `DWORD` boolean that lets a bind share an address and port in use.
 const SO_REUSEADDR: c_int = 0x0004;
+/// `<winsock2.h>`: `(int)(~SO_REUSEADDR)`, a `DWORD` boolean that keeps every other socket off
+/// the address and port the socket binds.
+const SO_EXCLUSIVEADDRUSE: c_int = !SO_REUSEADDR;
 /// `SO_ACCEPTCONN`: whether the socket is listening, read-only.
 const SO_ACCEPTCONN: c_int = 0x0002;
 /// `SO_LINGER`: a `struct linger` governing `closesocket` with unsent data.
@@ -191,6 +195,8 @@ const SD_BOTH: c_int = 2;
 const IPPROTO_IP: c_int = 0;
 /// `IPPROTO_IPV6`, the IPv6 option level (`ws2def.h`).
 const IPPROTO_IPV6: c_int = 41;
+/// `IPV6_V6ONLY` (`ws2ipdef.h`).
+const IPV6_V6ONLY: c_int = 27;
 /// `IP_ADD_MEMBERSHIP` (`ws2ipdef.h`), taking an `ip_mreq`.
 const IP_ADD_MEMBERSHIP: c_int = 12;
 /// `IPV6_ADD_MEMBERSHIP`, the same value as `IPV6_JOIN_GROUP` (`ws2ipdef.h`), taking an
@@ -413,6 +419,8 @@ pub(crate) struct ListenerState {
     occupied: AtomicUsize,
     /// A tester's: a station at its address rather than a socket of the host.
     tester: bool,
+    /// A dual-stack socket at the IPv6 wildcard: it takes IPv4 connections too.
+    dual: bool,
 }
 
 impl Conn {
@@ -465,6 +473,8 @@ struct Datagram {
     arrives: Option<Deadline>,
     /// The link it crosses and that link's down epoch when it was sent.
     via: Option<(Arc<LinkState>, u64)>,
+    /// What its IP header carries, and the interface it arrived on.
+    ip: Header,
 }
 
 /// How the receive queue sees a datagram: its source, size, arrival time, and whether the link
@@ -499,6 +509,8 @@ pub(crate) struct DgramQueue {
     packets: Mutex<RxQueue<Datagram>>,
     /// The code under test's socket this queue belongs to; `None` for a tester endpoint.
     rec: Option<Arc<SockRec>>,
+    /// The address it is registered at in [`Registry::udp`].
+    bound_at: Mutex<Option<SocketAddr>>,
 }
 
 impl DgramQueue {
@@ -509,14 +521,23 @@ impl DgramQueue {
         let queue = Arc::new(DgramQueue {
             packets: Mutex::default(),
             rec: Some(rec.clone()),
+            bound_at: Mutex::default(),
         });
         rec.set_probe(Arc::downgrade(&queue) as Weak<dyn RxProbe>);
         queue
     }
 
-    /// Queues a datagram from `src` to `dest`, sent at monotonic time `sent`, that becomes
-    /// receivable `delay` from now (its link latency), and bumps readiness for `domain`, the key
-    /// of the sim the queue belongs to.
+    /// Whether this is a dual-stack socket's queue at `addr`.
+    fn dual_at(&self, addr: SocketAddr) -> bool {
+        self.rec
+            .as_ref()
+            .is_some_and(|rec| rec.state().dual_at(addr))
+    }
+
+    /// Queues a datagram from `src` to `dest` with header `ip`, sent at monotonic time `sent`,
+    /// that becomes receivable `delay` from now (its link latency), and bumps readiness for
+    /// `domain`, the key of the sim the queue belongs to.
+    #[allow(clippy::too_many_arguments)]
     fn push_after(
         &self,
         (src, dest): (SocketAddr, SocketAddr),
@@ -524,6 +545,7 @@ impl DgramQueue {
         data: Vec<u8>,
         delay: std::time::Duration,
         via: Option<(Arc<LinkState>, u64)>,
+        ip: Header,
         domain: usize,
     ) {
         let arrives = (!delay.is_zero()).then(|| Deadline::after(delay));
@@ -538,6 +560,7 @@ impl DgramQueue {
             data,
             arrives,
             via,
+            ip,
         };
         self.packets.lock().unwrap().push(dg, self.rec.as_deref());
         if let Some(rec) = &self.rec {
@@ -671,49 +694,203 @@ impl Sock {
     }
 }
 
-/// The error binding TCP address `want` (with SO_REUSEADDR as `reuse`) fails with over a socket
-/// that holds `held` (with SO_REUSEADDR as `held_reuse`). Measured: a wildcard and a specific
-/// address on one port coexist; an equal address is WSAEADDRINUSE without SO_REUSEADDR, and
-/// WSAEACCES with it unless the held socket set it too.
-///
-/// The table is pinned against the host by `bind_os_truth`'s `overlapping_binds_match_the_host`,
-/// which runs every combination in the sim and on the real OS and requires equal results. Microsoft
-/// describes the rules in
-/// [Microsoft Learn: Using SO_REUSEADDR and SO_EXCLUSIVEADDRUSE](https://learn.microsoft.com/en-us/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse).
-fn tcp_bind_conflict(
-    (held, held_reuse): (SocketAddr, bool),
-    want: SocketAddr,
+/// One socket's hold on an address, or a bind's want of one.
+#[derive(Clone, Copy)]
+struct Claim {
+    /// The address, a v4-mapped one as IPv4.
+    addr: SocketAddr,
+    /// `SO_REUSEADDR`.
     reuse: bool,
-) -> Option<c_int> {
-    match (held == want, reuse, held_reuse) {
-        (false, _, _) | (true, true, true) => None,
-        (true, false, _) => Some(WSAEADDRINUSE),
-        (true, true, false) => Some(WSAEACCES),
+    /// `SO_EXCLUSIVEADDRUSE`.
+    exclusive: bool,
+    /// A dual-stack IPv6 wildcard.
+    dual: bool,
+    /// At a station address: a socket standing in for another host, whose addresses the host's
+    /// wildcard does not cover.
+    station: bool,
+}
+
+impl Claim {
+    /// A bind of `rec`'s socket to `addr`.
+    fn of(rec: &SockRec, addr: SocketAddr) -> Self {
+        let state = rec.state();
+        Claim {
+            addr,
+            reuse: state.opts.reuseaddr,
+            exclusive: state.opts.exclusive,
+            dual: state.dual_at(addr),
+            station: state.station,
+        }
     }
+
+    /// What a tester's listener at `addr` holds: the address alone.
+    fn tester(addr: SocketAddr, dual: bool) -> Self {
+        Claim {
+            addr,
+            reuse: false,
+            exclusive: false,
+            dual,
+            station: false,
+        }
+    }
+}
+
+/// The error binding `want` fails with over a socket that holds `held`. Measured for TCP and UDP
+/// alike, listening or not (bind_os_truth.rs, dual_stack_os_truth.rs, reuseport_os_truth.rs):
+/// a v4-mapped address is its IPv4 one, and a dual-stack wildcard and the IPv4 or IPv6-only
+/// wildcard are different addresses. An equal address is WSAEADDRINUSE unless the new socket sets
+/// SO_REUSEADDR, then WSAEACCES unless the held socket set it too; with SO_EXCLUSIVEADDRUSE it is
+/// WSAEADDRINUSE whatever the held socket set. An address under a held wildcard ([`covers`]) is
+/// WSAEACCES only when the wildcard's socket set SO_EXCLUSIVEADDRUSE, and a wildcard over a held
+/// address WSAEADDRINUSE only when the new socket did; otherwise the two coexist. A socket at a
+/// station address stands in for another host, so it and a socket of the host never collide.
+///
+/// Microsoft describes the rules in
+/// [Microsoft Learn: Using SO_REUSEADDR and SO_EXCLUSIVEADDRUSE](https://learn.microsoft.com/en-us/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse).
+fn bind_conflict(held: Claim, want: Claim) -> Option<c_int> {
+    if held.station != want.station {
+        return None;
+    }
+    if (held.addr, held.dual) == (want.addr, want.dual) {
+        return match (want.reuse && !want.exclusive, held.reuse) {
+            (false, _) => Some(WSAEADDRINUSE),
+            (true, true) => None,
+            (true, false) => Some(WSAEACCES),
+        };
+    }
+    if held.addr.port() != want.addr.port() {
+        None
+    } else if held.exclusive && covers(held, want) {
+        Some(WSAEACCES)
+    } else if want.exclusive && covers(want, held) {
+        Some(WSAEADDRINUSE)
+    } else {
+        None
+    }
+}
+
+/// Whether wildcard claim `wide` covers `narrow` for `SO_EXCLUSIVEADDRUSE`: a specific address of
+/// its family, or for a dual-stack wildcard any address of either family, the IPv4 and IPv6-only
+/// wildcards included (measured).
+fn covers(wide: Claim, narrow: Claim) -> bool {
+    wide.addr.ip().is_unspecified()
+        && (wide.dual
+            || (wide.addr.is_ipv4() == narrow.addr.is_ipv4() && !narrow.addr.ip().is_unspecified()))
 }
 
 /// Where traffic to an address goes, for one sim. Lives behind [`Registries::lock`].
 #[derive(Default)]
 pub(crate) struct Registry {
-    /// The datagram queue bound at each address: sockets of the code under test and tester
-    /// endpoints alike. At most one queue per exact address.
-    udp: HashMap<SocketAddr, Arc<DgramQueue>>,
-    /// The listener at each address, the host's own and testers' alike.
-    listeners: HashMap<SocketAddr, Arc<ListenerState>>,
+    /// The datagram queues bound at each address, in bind order: sockets of the code under test
+    /// and tester endpoints alike.
+    udp: HashMap<SocketAddr, Vec<Arc<DgramQueue>>>,
+    /// The addresses in `udp` at each port, in the order they were first bound.
+    udp_ports: HashMap<u16, Vec<SocketAddr>>,
+    /// How many tester endpoints are bound at each IP.
+    endpoints: HashMap<IpAddr, usize>,
+    /// The listeners at each address, in the order they listened, the host's own and testers'
+    /// alike.
+    listeners: HashMap<SocketAddr, Vec<Arc<ListenerState>>>,
+    /// How many testers' listeners listen at each IP.
+    testers: HashMap<IpAddr, usize>,
 }
 
 impl Registry {
-    /// A free ephemeral port for `ip` — on every address for the wildcard.
+    /// Registers `queue` at `addr`, beside any other socket's there.
+    fn bind_udp(&mut self, addr: SocketAddr, queue: &Arc<DgramQueue>) {
+        *queue.bound_at.lock().unwrap() = Some(addr);
+        if queue.rec.is_none() {
+            count(&mut self.endpoints, addr.ip(), true);
+        }
+        let held = self.udp.entry(addr).or_default();
+        if held.is_empty() {
+            self.udp_ports.entry(addr.port()).or_default().push(addr);
+        }
+        held.push(queue.clone());
+    }
+
+    /// Withdraws `queue` from where it is registered, if anywhere.
+    fn unbind_udp(&mut self, queue: &Arc<DgramQueue>) {
+        let Some(addr) = queue.bound_at.lock().unwrap().take() else {
+            return;
+        };
+        let Some(held) = self.udp.get_mut(&addr) else {
+            return;
+        };
+        let before = held.len();
+        held.retain(|q| !Arc::ptr_eq(q, queue));
+        if held.len() < before && queue.rec.is_none() {
+            count(&mut self.endpoints, addr.ip(), false);
+        }
+        if held.is_empty() {
+            self.udp.remove(&addr);
+            if let Some(addrs) = self.udp_ports.get_mut(&addr.port()) {
+                addrs.retain(|a| *a != addr);
+                if addrs.is_empty() {
+                    self.udp_ports.remove(&addr.port());
+                }
+            }
+        }
+    }
+
+    /// The datagram queues bound at `port`, with their addresses, each address's in bind order.
+    fn udp_on_port(&self, port: u16) -> impl Iterator<Item = (&SocketAddr, &Arc<DgramQueue>)> {
+        self.udp_ports
+            .get(&port)
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .flat_map(|addr| self.udp[addr].iter().map(move |q| (addr, q)))
+    }
+
+    /// Adds `listener` at `addr`. A tester's replaces every listener there: it stands in for
+    /// another host, which holds the address alone.
+    fn listen(&mut self, addr: SocketAddr, listener: Arc<ListenerState>) {
+        if listener.tester {
+            for replaced in self.listeners.remove(&addr).into_iter().flatten() {
+                if replaced.tester {
+                    count(&mut self.testers, addr.ip(), false);
+                }
+            }
+        }
+        let held = self.listeners.entry(addr).or_default();
+        if !held.iter().any(|l| Arc::ptr_eq(l, &listener)) {
+            if listener.tester {
+                count(&mut self.testers, addr.ip(), true);
+            }
+            held.push(listener);
+        }
+    }
+
+    /// Withdraws `listener` wherever it is registered.
+    fn unlisten(&mut self, listener: &Arc<ListenerState>) {
+        let testers = &mut self.testers;
+        self.listeners.retain(|addr, held| {
+            let before = held.len();
+            held.retain(|l| !Arc::ptr_eq(l, listener));
+            if listener.tester {
+                for _ in held.len()..before {
+                    count(testers, addr.ip(), false);
+                }
+            }
+            !held.is_empty()
+        });
+    }
+
+    /// A free ephemeral port for `ip` — on every address for the wildcard, on `ip` and its
+    /// family's wildcard for a specific address, in both families for a `dual`-stack socket, and
+    /// clear of dual-stack sockets for an IPv4 one. A specific address could share a port with a
+    /// wildcard one, but an ephemeral port is one no socket of the family holds, so the new socket
+    /// never takes a wildcard socket's unicast datagrams.
     ///
     /// Searches Windows' default dynamic port range, 49152-65535, lowest first, considering only
-    /// datagram bindings of the same family; 0 if every port is taken
+    /// datagram bindings; 0 if every port is taken
     /// ([Microsoft Learn: The default dynamic port range for TCP/IP has changed in Windows Vista and in Windows Server 2008](https://learn.microsoft.com/en-us/troubleshoot/windows-server/networking/default-dynamic-port-range-tcpip-chang)).
-    fn alloc_port(&self, ip: IpAddr) -> u16 {
+    fn alloc_port(&self, ip: IpAddr, dual: bool) -> u16 {
         let taken = |port: u16| {
-            self.udp.keys().any(|a| {
-                a.port() == port
-                    && a.is_ipv4() == ip.is_ipv4()
-                    && (a.ip() == ip || ip.is_unspecified())
+            self.udp_on_port(port).any(|(a, q)| {
+                dual || (a.is_ipv4() == ip.is_ipv4()
+                    && (a.ip() == ip || ip.is_unspecified() || a.ip().is_unspecified()))
+                    || (ip.is_ipv4() && q.dual_at(*a))
             })
         };
         (49152..=65535).find(|&p| !taken(p)).unwrap_or(0)
@@ -731,12 +908,12 @@ impl Registry {
                 .rec
                 .as_ref()
                 .and_then(|r| r.state().device.as_ref().map(|d| d.0)),
+            dual: q.dual_at(addr),
+            share: q.rec.as_deref().map(Share::of).unwrap_or_default(),
             q: q.clone(),
         };
         let group = dest.ip();
-        self.udp
-            .iter()
-            .filter(|(addr, _)| addr.port() == dest.port())
+        self.udp_on_port(dest.port())
             .filter(|(addr, q)| {
                 !group.is_multicast()
                     || q.rec
@@ -749,13 +926,19 @@ impl Registry {
 
     /// Whether a tester's endpoint or listener is bound at `ip`, making it a station.
     fn station_at(&self, ip: IpAddr) -> bool {
-        self.udp
-            .iter()
-            .any(|(addr, q)| addr.ip() == ip && q.rec.is_none())
-            || self
-                .listeners
-                .iter()
-                .any(|(addr, l)| l.tester && addr.ip() == ip)
+        self.endpoints.contains_key(&ip) || self.testers.contains_key(&ip)
+    }
+}
+
+/// Counts one more or one fewer at `ip` in `counts`, dropping a count that reaches zero.
+fn count(counts: &mut HashMap<IpAddr, usize>, ip: IpAddr, up: bool) {
+    if up {
+        *counts.entry(ip).or_default() += 1;
+    } else if let Some(n) = counts.get_mut(&ip) {
+        *n -= 1;
+        if *n == 0 {
+            counts.remove(&ip);
+        }
     }
 }
 
@@ -770,13 +953,17 @@ fn unspecified_like(ip: IpAddr) -> IpAddr {
 /// The addresses the bound datagram sockets in `socks` claim against a new bind: the address each
 /// one's `bind` named, at the port it got, wherever a connect has since rehashed it for delivery.
 /// A socket a send or connect bound implicitly claims where that put it.
-fn dgram_claims(socks: &HashMap<c_int, Sock>) -> impl Iterator<Item = SocketAddr> + '_ {
+fn dgram_claims(socks: &HashMap<c_int, Sock>) -> impl Iterator<Item = Claim> + '_ {
     socks.values().filter_map(|sock| match sock {
         Sock::Dgram {
             local: Some(local),
             requested,
+            rec,
             ..
-        } => Some(requested.map_or(*local, |r| SocketAddr::new(r.ip(), local.port()))),
+        } => {
+            let addr = requested.map_or(*local, |r| SocketAddr::new(r.ip(), local.port()));
+            Some(Claim::of(rec, addr))
+        }
         _ => None,
     })
 }
@@ -802,44 +989,49 @@ fn loopback_for(domain: c_int) -> IpAddr {
 fn tcp_bind_addr(
     socks: &HashMap<c_int, Sock>,
     regs: &Registries,
-    mut want: SocketAddr,
-    reuse: bool,
+    mut want: Claim,
 ) -> Result<SocketAddr, c_int> {
-    let mut held: Vec<(SocketAddr, bool)> = socks
+    let mut held: Vec<Claim> = socks
         .values()
-        .filter_map(|sock| match sock {
-            Sock::Fresh {
-                local: Some(local),
-                rec,
-                ..
-            }
-            | Sock::Connecting {
-                local: Some(local),
-                rec,
-                ..
-            } => Some((*local, rec.opts().reuseaddr)),
-            Sock::Listener { addr, rec, .. } => Some((*addr, rec.opts().reuseaddr)),
-            _ => None,
+        .filter_map(|sock| {
+            let addr = match sock {
+                Sock::Fresh {
+                    local: Some(local), ..
+                }
+                | Sock::Connecting {
+                    local: Some(local), ..
+                } => *local,
+                Sock::Listener { addr, .. } => *addr,
+                _ => return None,
+            };
+            Some(Claim::of(sock.rec(), addr))
         })
         .collect();
-    let testers: Vec<SocketAddr> = regs
+    let testers: Vec<Claim> = regs
         .lock()
         .listeners
-        .keys()
-        .filter(|&addr| !held.iter().any(|&(h, _)| h == *addr))
-        .copied()
+        .iter()
+        .flat_map(|(addr, held)| held.iter().map(move |l| (addr, l)))
+        .filter(|(_, listener)| listener.tester)
+        .map(|(addr, listener)| Claim::tester(*addr, listener.dual))
         .collect();
-    held.extend(testers.into_iter().map(|addr| (addr, false)));
-    let conflict = |addr: SocketAddr| held.iter().find_map(|&h| tcp_bind_conflict(h, addr, reuse));
-    if want.port() != 0 {
-        return conflict(want).map_or(Ok(want), Err);
+    held.extend(testers);
+    let conflict = |want: Claim| held.iter().find_map(|&h| bind_conflict(h, want));
+    if want.addr.port() != 0 {
+        return conflict(want).map_or(Ok(want.addr), Err);
     }
     let port = (0..=u16::MAX - crate::scope::EPHEMERAL_FIRST)
         .map(|_| regs.shared.ephemeral_port())
-        .find(|&port| conflict(SocketAddr::new(want.ip(), port)).is_none())
+        .find(|&port| {
+            conflict(Claim {
+                addr: SocketAddr::new(want.addr.ip(), port),
+                ..want
+            })
+            .is_none()
+        })
         .ok_or(WSAEADDRINUSE)?;
-    want.set_port(port);
-    Ok(want)
+    want.addr.set_port(port);
+    Ok(want.addr)
 }
 
 /// One npcap capture handle on a virtual link: whole Ethernet frames, fanned out to every handle
@@ -862,6 +1054,53 @@ struct PcapHandle {
     last_hdr: Vec<u8>,
 }
 
+/// [`WinNet::socks`]: each handle's [`Sock`], with how many are connecting, so that a sweep of
+/// the connecting sockets costs nothing while there are none.
+#[derive(Default)]
+struct SockTable {
+    socks: HashMap<c_int, Sock>,
+    connecting: usize,
+}
+
+impl std::ops::Deref for SockTable {
+    type Target = HashMap<c_int, Sock>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.socks
+    }
+}
+
+impl SockTable {
+    fn insert(&mut self, fd: c_int, sock: Sock) -> Option<Sock> {
+        self.connecting += usize::from(matches!(sock, Sock::Connecting { .. }));
+        let replaced = self.socks.insert(fd, sock);
+        self.forget(replaced.as_ref());
+        replaced
+    }
+
+    fn remove(&mut self, fd: &c_int) -> Option<Sock> {
+        let removed = self.socks.remove(fd);
+        self.forget(removed.as_ref());
+        removed
+    }
+
+    fn forget(&mut self, sock: Option<&Sock>) {
+        if matches!(sock, Some(Sock::Connecting { .. })) {
+            self.connecting -= 1;
+        }
+    }
+
+    /// `fd`'s socket, to change in place, never into or out of [`Sock::Connecting`].
+    fn get_mut(&mut self, fd: &c_int) -> Option<&mut Sock> {
+        self.socks.get_mut(fd)
+    }
+
+    /// Every socket, to change in place as [`get_mut`](Self::get_mut) allows.
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut Sock> {
+        self.socks.values_mut()
+    }
+}
+
 /// The [`Net`] Windows managed threads' sockets route through.
 ///
 /// Installed per sim on Windows; every managed thread of the sim offers its Winsock and npcap
@@ -869,7 +1108,7 @@ struct PcapHandle {
 /// OS.
 pub(crate) struct WinNet {
     /// Every handle the sim minted and has not closed. The outermost lock of the fabric.
-    socks: Mutex<HashMap<c_int, Sock>>,
+    socks: Mutex<SockTable>,
     /// The sim's address registry, shared with its testers.
     regs: Arc<Registries>,
     /// The next `SOCKET` value to mint; handles are never reused within a sim.
@@ -888,13 +1127,13 @@ impl WinNet {
     /// taken for the sim's.
     pub(crate) fn new(shared: Arc<SimShared>) -> Self {
         WinNet {
-            socks: Mutex::new(HashMap::new()),
+            socks: Mutex::default(),
             regs: Arc::new(Registries {
                 reg: Mutex::default(),
                 shared,
             }),
             next_handle: AtomicI32::new(0x2000),
-            pcaps: Mutex::new(HashMap::new()),
+            pcaps: Mutex::new(HashMap::default()),
             completions: Mutex::default(),
             // pcap_t handles are opaque pointers to the code under test; mint distinctive values.
             next_pcap: std::sync::atomic::AtomicU64::new(0x9000_0000),
@@ -947,21 +1186,35 @@ impl WinNet {
 
     /// Sends one datagram from UDP socket `fd` to `dest`; `None` if `fd` is not one.
     ///
-    /// A pending error is reported first. The route decides the egress interface and source
-    /// address; an unbound socket is then bound implicitly to its family's wildcard address at an
+    /// `msgs` are a `WSASendMsg`'s control messages, empty for the other sends; with the socket's
+    /// options they give the datagram's header, source address, segment size and transmit stamp
+    /// tag ([`win_sockopt::send_ctl`]), and a message Windows refuses fails the send before
+    /// anything else. A datagram sent whole that is larger than the family allows, or a segment
+    /// size that is, fails next ([`win_sockopt::segment`]). Then a pending error is reported. The
+    /// route decides the egress interface and source address, unless `IP_PKTINFO` chose the
+    /// source; an unbound socket is then bound implicitly to its family's wildcard address at an
     /// ephemeral port, as `sendto` does on Windows
     /// ([Microsoft Learn: bind](https://learn.microsoft.com/en-us/windows/win32/api/winsock/nf-winsock-bind)).
     /// A stalled send queue (`UdpPolicy::send_queue_depth == Some(0)`) makes a nonblocking send
     /// `WSAEWOULDBLOCK` and a blocking one wait. A datagram that reaches no socket may bring an
     /// ICMP port unreachable back to the sender (`unreachable_port`). A datagram the
     /// don't-fragment options keep whole that does not fit the egress MTU fails with
-    /// `WSAEMSGSIZE` ([`win_sockopt::check_send`]). Called with no lock held.
-    fn udp_send(&self, fd: c_int, data: Vec<u8>, dest: SocketAddr) -> Option<NetResult> {
-        let (local, queue, domain, broadcast, nonblocking, rec) = {
+    /// `WSAEMSGSIZE` ([`win_sockopt::check_send`]); a segmented send is checked by its segment
+    /// size. A segmented send leaves as its segments, except through loopback, where it stays one
+    /// send that each receiver reads as [`win_sockopt::coalesce`] says. Called with no lock held.
+    fn udp_send(
+        &self,
+        fd: c_int,
+        data: Vec<u8>,
+        dest: SocketAddr,
+        msgs: &[(c_int, c_int, Vec<u8>)],
+    ) -> Option<NetResult> {
+        let (local, requested, queue, domain, broadcast, nonblocking, rec) = {
             let socks = self.socks.lock().unwrap();
             match socks.get(&fd) {
                 Some(Sock::Dgram {
                     local,
+                    requested,
                     queue,
                     domain,
                     broadcast,
@@ -970,6 +1223,7 @@ impl WinNet {
                     ..
                 }) => (
                     *local,
+                    *requested,
                     queue.clone(),
                     *domain,
                     *broadcast,
@@ -979,32 +1233,52 @@ impl WinNet {
                 _ => return None,
             }
         };
-        if let Some(code) = rec.take_error_as(&self.regs.shared, Taker::Send) {
+        let shared = &self.regs.shared;
+        let ctl = match win_sockopt::send_ctl(shared, &rec, dest, msgs) {
+            Ok(ctl) => ctl,
+            Err(code) => return err(code),
+        };
+        let seg = match win_sockopt::segment(&ctl, dest, data.len()) {
+            Ok(seg) => usize::from(seg),
+            Err(code) => return err(code),
+        };
+        if let Some(code) = rec.take_error_as(shared, Taker::Send) {
+            return err(code);
+        }
+        if domain == AF_INET6
+            && let Err(code) = crossing(&rec, requested, dest)
+        {
+            if local.is_none() {
+                self.autobind(fd, &queue, &rec, Ipv6Addr::UNSPECIFIED.into());
+            }
             return err(code);
         }
         let station = self.regs.lock().station_at(dest.ip());
-        let sender =
-            match self
-                .regs
-                .shared
-                .route_send(&rec.view(local), dest, Op::Send, station, broadcast)
-            {
-                Ok(sender) => sender,
-                Err(code) => return err(code),
-            };
-        if let Err(code) =
-            win_sockopt::check_send(&self.regs.shared, &rec, &sender, dest, data.len())
-        {
+        let sender = match shared.route_send(
+            &rec.view(local.map(|l| toward(l, dest))),
+            dest,
+            Op::Send,
+            station,
+            broadcast,
+        ) {
+            Ok(sender) => sender,
+            Err(code) => return err(code),
+        };
+        let longest = if seg == 0 { data.len() } else { seg };
+        if let Err(code) = win_sockopt::check_send(shared, &rec, &sender, dest, longest) {
             return err(code);
         }
         let local = match local {
             Some(local) => local,
             None => self.autobind(fd, &queue, &rec, unspecified_like(loopback_for(domain))),
         };
-        let src = sender.source(local);
+        let src = match ctl.src {
+            Some(ip) => SocketAddr::new(ip, local.port()),
+            None => sender.source(toward(local, dest)),
+        };
         // A stalled link (`UdpPolicy::send_queue_depth == Some(0)`) holds the send back.
         let stalled = || {
-            let policies = &self.regs.shared.policies;
+            let policies = &shared.policies;
             policies.send_stalled(local) || policies.send_stalled(src)
         };
         if stalled() {
@@ -1017,18 +1291,29 @@ impl WinNet {
                 return err(WSAEWOULDBLOCK);
             }
         }
-        self.regs
-            .shared
-            .capture_udp(&sender, src, dest, Dir::Out, &data, None);
-        if self.regs.deliver(&sender, src, dest, &data) == 0 {
-            self.regs
-                .shared
-                .unreachable_port(&rec, &sender, src, dest, &data, station);
+        let looped = matches!(&sender, Sender::Host(path) if path.local);
+        let packets: Vec<&[u8]> = if seg == 0 || looped {
+            vec![&data]
+        } else {
+            data.chunks(seg).collect()
+        };
+        let ip = Header {
+            gso: if looped { seg as u16 } else { 0 },
+            ..win_sockopt::header(&ctl, dest)
+        };
+        for packet in packets {
+            shared.capture_udp(&sender, src, dest, Dir::Out, packet, None);
+            if self.regs.deliver(&sender, src, dest, packet, ip) == 0 {
+                shared.unreachable_port(&rec, &sender, src, dest, packet, station);
+            }
+            rec.count_udp_sent(dest, &sender);
         }
         rec.note_tx_nic(sender.egress_name());
-        rec.count_udp_sent(dest, &sender);
+        if let Some(id) = ctl.tx_id {
+            win_sockopt::note_tx_stamp(&rec, id, monotonic(shared));
+        }
         if rec.has_error_reports() {
-            self.regs.shared.bump_keys(&[rec.wake_key()]);
+            shared.bump_keys(&[rec.wake_key()]);
         }
         ok(data.len() as i64)
     }
@@ -1043,9 +1328,11 @@ impl WinNet {
         rec: &Arc<SockRec>,
         ip: IpAddr,
     ) -> SocketAddr {
+        let dual = rec.state().dual_at(SocketAddr::new(ip, 0));
         let mut regs = self.regs.lock();
-        let sa = SocketAddr::new(ip, regs.alloc_port(ip));
-        regs.udp.insert(sa, queue.clone());
+        let sa = SocketAddr::new(ip, regs.alloc_port(ip, dual));
+        rec.state().bound_order = self.regs.shared.bind_order();
+        regs.bind_udp(sa, queue);
         drop(regs);
         if let Some(Sock::Dgram { local, .. }) = self.socks.lock().unwrap().get_mut(&fd) {
             *local = Some(sa);
@@ -1054,26 +1341,13 @@ impl WinNet {
         sa
     }
 
-    /// Moves the datagram socket on `queue` from `from` to `to` in the delivery map, for every
-    /// descriptor of it, when a connect or disconnect changes its local address. An address
-    /// another socket holds leaves it where it is.
-    fn rehash(
-        &self,
-        queue: &Arc<DgramQueue>,
-        rec: &Arc<SockRec>,
-        from: SocketAddr,
-        to: SocketAddr,
-    ) {
-        if from == to {
-            return;
-        }
-        let mut regs = self.regs.lock();
-        if regs.udp.contains_key(&to) {
-            return;
-        }
-        regs.udp.remove(&from);
-        regs.udp.insert(to, queue.clone());
-        drop(regs);
+    /// Moves the local address of the datagram socket on `queue` to `to`, for every descriptor of
+    /// it, when a connect or disconnect changes it. The delivery map keeps the socket where it was
+    /// bound: of sockets sharing a wildcard address, a datagram goes to the earliest bound even
+    /// when a later one is connected to its sender, and a connected wildcard socket still receives
+    /// at the wildcard's other addresses (measured by tests/reuseport_os_truth.rs and
+    /// tests/udp_connect_source.rs).
+    fn relocate(&self, queue: &Arc<DgramQueue>, rec: &Arc<SockRec>, to: SocketAddr) {
         for sock in self.socks.lock().unwrap().values_mut() {
             if let Sock::Dgram {
                 queue: q, local, ..
@@ -1088,10 +1362,11 @@ impl WinNet {
 
     /// Dissolves a datagram socket's association on a connect to an `AF_UNSPEC` address or the
     /// all-zero address: the peer is cleared and the local address returns to the one `bind`
-    /// named, else the wildcard, keeping its port (measured by tests/udp_connect_source.rs).
+    /// named, else the socket family's wildcard, keeping its port (measured by
+    /// tests/udp_connect_source.rs and tests/dual_stack_os_truth.rs).
     /// False when `fd` is not a datagram socket.
     fn disconnect_dgram(&self, fd: c_int) -> bool {
-        let (queue, rec, local, requested) = {
+        let (queue, rec, local, requested, domain) = {
             let mut socks = self.socks.lock().unwrap();
             let Some(Sock::Dgram {
                 queue,
@@ -1099,18 +1374,19 @@ impl WinNet {
                 local,
                 requested,
                 peer,
+                domain,
                 ..
             }) = socks.get_mut(&fd)
             else {
                 return false;
             };
             *peer = None;
-            (queue.clone(), rec.clone(), *local, *requested)
+            (queue.clone(), rec.clone(), *local, *requested, *domain)
         };
         rec.set_peer(None);
         if let Some(bound) = local {
-            let ip = requested.map_or(unspecified_like(bound.ip()), |r| r.ip());
-            self.rehash(&queue, &rec, bound, SocketAddr::new(ip, bound.port()));
+            let ip = requested.map_or(unspecified_like(loopback_for(domain)), |r| r.ip());
+            self.relocate(&queue, &rec, SocketAddr::new(ip, bound.port()));
         }
         true
     }
@@ -1249,22 +1525,41 @@ unsafe fn write_fd_set(set: *mut u8, fds: &[c_int]) {
 
 impl WinNet {
     /// The listener a connect to `dest` reaches: one on the exact address, else — for one of the
-    /// host's own addresses — one on the wildcard address of that port.
+    /// host's own addresses — one on the wildcard address of that port, an IPv4 socket's before a
+    /// dual-stack one's (measured). Of several listening on one address, the earliest to bind
+    /// ([`pick_shared`]).
     ///
     /// Takes the registry lock.
     fn listener_for(&self, dest: SocketAddr, host_local: bool) -> Option<Arc<ListenerState>> {
         let reg = self.regs.lock();
-        reg.listeners
-            .get(&dest)
-            .or_else(|| {
-                host_local
-                    .then(|| {
-                        reg.listeners
-                            .get(&SocketAddr::new(unspecified_like(dest.ip()), dest.port()))
-                    })
-                    .flatten()
-            })
-            .cloned()
+        let pick = |held: Vec<&Arc<ListenerState>>| {
+            let shares: Vec<Share> = held.iter().map(|l| l.share()).collect();
+            let i = match held.len() {
+                0 => return None,
+                1 => 0,
+                _ => pick_shared(&shares, false, dest, dest, self.regs.shared.seed),
+            };
+            Some(held[i].clone())
+        };
+        let at = |ip| {
+            reg.listeners
+                .get(&SocketAddr::new(ip, dest.port()))
+                .into_iter()
+                .flatten()
+        };
+        if let Some(listener) = pick(at(dest.ip()).collect()) {
+            return Some(listener);
+        }
+        if !host_local {
+            return None;
+        }
+        pick(at(unspecified_like(dest.ip())).collect()).or_else(|| {
+            pick(
+                at(Ipv6Addr::UNSPECIFIED.into())
+                    .filter(|listener| dest.is_ipv4() && listener.dual)
+                    .collect(),
+            )
+        })
     }
 
     /// The address a connect to `dest` along `sender` leaves from, from a socket bound at
@@ -1451,16 +1746,18 @@ impl WinNet {
     /// `None` means every connecting socket. Snapshots the handles first, so the table is not held
     /// while each connect advances.
     fn advance_connecting(&self, fds: Option<&[c_int]>) {
-        let connecting: Vec<c_int> = self
-            .socks
-            .lock()
-            .unwrap()
+        let socks = self.socks.lock().unwrap();
+        if socks.connecting == 0 {
+            return;
+        }
+        let connecting: Vec<c_int> = socks
             .iter()
             .filter(|(fd, sock)| {
                 matches!(sock, Sock::Connecting { .. }) && fds.is_none_or(|fds| fds.contains(fd))
             })
             .map(|(fd, _)| *fd)
             .collect();
+        drop(socks);
         for fd in connecting {
             self.advance_connect(fd);
         }
@@ -1656,86 +1953,137 @@ unsafe fn gather(buffers: &[WsaBuf]) -> Vec<u8> {
 
 /// Writes `messages` (level, type, data) into `msg`'s control buffer as `WSACMSGHDR`s, each
 /// header and its data aligned to a pointer (`WSA_CMSG_SPACE`, with `cmsg_len` the unpadded
-/// `WSA_CMSG_LEN`), and sets `Control.len` to the bytes used. A message that does not fit is
-/// dropped and `MSG_CTRUNC` returned (snare's choice: Microsoft does not say how much of a
-/// message that does not fit is written).
+/// `WSA_CMSG_LEN`), and sets `Control.len` to their whole length. When they do not all fit, the
+/// buffer takes as much of them as it holds, cut mid-message if need be, `Control.len` still
+/// gives their whole length and `MSG_CTRUNC` is returned: the receive then fails with
+/// `WSAEMSGSIZE`, its data copied and the datagram taken (measured on Windows 11 build
+/// 26200.9457, `cmsg_win_os_truth`).
 ///
 /// # Safety
-/// `msg.Control.buf` is null with length 0, or writable for `msg.Control.len` bytes.
+/// `msg.Control.buf` is null, or writable for `msg.Control.len` bytes.
 unsafe fn write_cmsgs(msg: &mut WsaMsg, messages: &[(c_int, c_int, Vec<u8>)]) -> u32 {
-    let cap = msg.Control.len as usize;
-    let header = size_of::<CmsgHdr>();
-    let mut used = 0usize;
-    let mut flags = 0;
+    let header = cmsg_align(size_of::<CmsgHdr>());
+    let mut bytes = Vec::new();
     for (level, ty, data) in messages {
-        let space = cmsg_align(header) + cmsg_align(data.len());
-        if msg.Control.buf.is_null() || used + space > cap {
-            flags |= MSG_CTRUNC;
-            continue;
-        }
-        let at = unsafe { msg.Control.buf.add(used) };
+        let at = bytes.len();
+        bytes.resize(at + header + cmsg_align(data.len()), 0);
         let hdr = CmsgHdr {
-            cmsg_len: cmsg_align(header) + data.len(),
+            cmsg_len: header + data.len(),
             cmsg_level: *level,
             cmsg_type: *ty,
         };
         unsafe {
-            std::ptr::write_bytes(at, 0, space);
-            at.cast::<CmsgHdr>().write_unaligned(hdr);
-            std::ptr::copy_nonoverlapping(data.as_ptr(), at.add(cmsg_align(header)), data.len());
-        }
-        used += space;
+            bytes
+                .as_mut_ptr()
+                .add(at)
+                .cast::<CmsgHdr>()
+                .write_unaligned(hdr)
+        };
+        bytes[at + header..at + header + data.len()].copy_from_slice(data);
     }
-    msg.Control.len = used as u32;
-    flags
+    let cap = if msg.Control.buf.is_null() {
+        0
+    } else {
+        msg.Control.len as usize
+    };
+    let n = cap.min(bytes.len());
+    if n > 0 {
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), msg.Control.buf, n) };
+    }
+    msg.Control.len = bytes.len() as u32;
+    if bytes.len() > cap { MSG_CTRUNC } else { 0 }
 }
 
-/// The control messages in `msg`'s control buffer: level, type and data, walked as
-/// `WSA_CMSG_FIRSTHDR`/`WSA_CMSG_NXTHDR` walk them; a header that runs past the buffer ends the
-/// walk.
+/// The control messages in a `WSASendMsg`'s control buffer: level, type and data, walked as
+/// `WSA_CMSG_FIRSTHDR`/`WSA_CMSG_NXTHDR` walk them. A buffer, or what is left of one, shorter than
+/// a `WSACMSGHDR` holds none; a header whose `cmsg_len` is shorter than a header or runs past the
+/// buffer is `WSAEINVAL` (measured on Windows 11 build 26200.9457, `cmsg_win_os_truth`).
 ///
 /// # Safety
 /// `msg.Control.buf` is null or readable for `msg.Control.len` bytes.
-unsafe fn read_cmsgs(msg: &WsaMsg) -> Vec<(c_int, c_int, Vec<u8>)> {
+unsafe fn read_cmsgs(msg: &WsaMsg) -> Result<Vec<(c_int, c_int, Vec<u8>)>, c_int> {
     let mut out = Vec::new();
     if msg.Control.buf.is_null() {
-        return out;
+        return Ok(out);
     }
     let control = unsafe { std::slice::from_raw_parts(msg.Control.buf, msg.Control.len as usize) };
     let header = size_of::<CmsgHdr>();
     let mut at = 0usize;
     while at + header <= control.len() {
         let hdr = unsafe { control.as_ptr().add(at).cast::<CmsgHdr>().read_unaligned() };
-        let data_at = at + cmsg_align(header);
-        if hdr.cmsg_len < cmsg_align(header) || at + hdr.cmsg_len > control.len() {
-            break;
+        if hdr.cmsg_len < cmsg_align(header) || hdr.cmsg_len > control.len() - at {
+            return Err(WSAEINVAL);
         }
         out.push((
             hdr.cmsg_level,
             hdr.cmsg_type,
-            control[data_at..at + hdr.cmsg_len].to_vec(),
+            control[at + cmsg_align(header)..at + hdr.cmsg_len].to_vec(),
         ));
         at += cmsg_align(hdr.cmsg_len);
     }
-    out
+    Ok(out)
 }
 
 impl WinNet {
+    /// `setsockopt(IPV6_V6ONLY)`: whether an IPv6 socket bound to the wildcard takes IPv4 traffic
+    /// too, on by default ([Microsoft Learn: Dual-Stack
+    /// Sockets](https://learn.microsoft.com/en-us/windows/win32/winsock/dual-stack-sockets)) and
+    /// taken only before the socket is bound (`WSAEINVAL`). A datagram socket reads the value's
+    /// first byte, refusing an empty one; a stream socket reads a `DWORD`, refusing a shorter one
+    /// (`WSAEFAULT` both). An IPv4 socket keeps the flag, to no effect, under the same rules.
+    /// Measured by tests/dual_stack_os_truth.rs, as is `getsockopt`, which gives a datagram
+    /// socket's as one byte and a stream socket's as a `DWORD`.
+    ///
+    /// # Safety
+    /// `val` is null or points to `len` readable bytes.
+    unsafe fn set_v6only(
+        &self,
+        fd: c_int,
+        rec: &SockRec,
+        kind: win_sockopt::Kind,
+        val: *const u8,
+        len: u32,
+    ) -> Result<(), c_int> {
+        let size = if kind.stream { 4 } else { 1 };
+        if val.is_null() || (len as usize) < size {
+            return Err(WSAEFAULT);
+        }
+        let bound = match self.socks.lock().unwrap().get(&fd) {
+            Some(Sock::Dgram { local, .. } | Sock::Fresh { local, .. }) => local.is_some(),
+            _ => true,
+        };
+        if bound {
+            return Err(WSAEINVAL);
+        }
+        let on = if kind.stream {
+            (unsafe { val.cast::<u32>().read_unaligned() }) != 0
+        } else {
+            (unsafe { *val }) != 0
+        };
+        rec.state().v6only = on;
+        Ok(())
+    }
+
     /// How `fd` stands for its options: stream or datagram, connecting, and its family.
     fn kind(&self, fd: c_int) -> Option<win_sockopt::Kind> {
         let socks = self.socks.lock().unwrap();
         let sock = socks.get(&fd)?;
         Some(match sock {
-            Sock::Dgram { domain, .. } => win_sockopt::Kind {
+            Sock::Dgram { domain, rec, .. } => win_sockopt::Kind {
                 stream: false,
                 connecting: false,
                 v6: *domain == AF_INET6,
+                v6only: rec.state().v6only,
             },
-            _ => win_sockopt::Kind {
-                stream: true,
-                connecting: matches!(sock, Sock::Connecting { .. }),
-                v6: sock.rec().state().win.v6,
-            },
+            _ => {
+                let state = sock.rec().state();
+                win_sockopt::Kind {
+                    stream: true,
+                    connecting: matches!(sock, Sock::Connecting { .. }),
+                    v6: state.win.v6,
+                    v6only: state.v6only,
+                }
+            }
         })
     }
 
@@ -1982,7 +2330,7 @@ impl WinNet {
         let n = len.min(dg.data.len());
         out[..n].copy_from_slice(&dg.data[..n]);
         if !addr.is_null() && !addr_len.is_null() {
-            unsafe { write_addr(dg.src, addr, addr_len) };
+            unsafe { write_addr(reported(rec.state().inet6, dg.src), addr, addr_len) };
         }
         Some(if dg.data.len() > len {
             Err(WSAEMSGSIZE)
@@ -2035,7 +2383,12 @@ impl Net for WinNet {
         };
         let fd = self.mint();
         let rec = self.regs.shared.new_socket(kind, fd);
-        rec.state().win.v6 = domain == AF_INET6;
+        {
+            let mut state = rec.state();
+            state.win.v6 = domain == AF_INET6;
+            state.inet6 = domain == AF_INET6;
+            state.v6only = self.regs.shared.sys.limits().bindv6only;
+        }
         let sock = match kind {
             SocketKind::Udp => Sock::Dgram {
                 queue: DgramQueue::for_socket(&rec),
@@ -2057,43 +2410,51 @@ impl Net for WinNet {
         ok(fd as i64)
     }
 
-    /// `bind`. A malformed address is `WSAEFAULT`, an address the host does not have fails as
-    /// `claim_address` says, a bound socket is `WSAEINVAL`
+    /// `bind`. A malformed address or one of the other family is refused ([`family_addr`]), a
+    /// v4-mapped one on an IPv6 socket with `IPV6_V6ONLY` on is `WSAEADDRNOTAVAIL` (measured), an
+    /// address the host does not have fails as `claim_address` says, a bound socket is `WSAEINVAL`
     /// ([Microsoft Learn: bind](https://learn.microsoft.com/en-us/windows/win32/api/winsock/nf-winsock-bind)).
-    /// TCP follows [`tcp_bind_addr`]; UDP refuses an exact duplicate of an address a socket was
-    /// bound to (`WSAEADDRINUSE`) — the address `bind` named, not where a connect since rehashed
-    /// it — and takes port 0 from [`Registry::alloc_port`]. Holds the handle table throughout, then the
-    /// registry.
+    /// TCP follows [`tcp_bind_addr`]; UDP applies [`bind_conflict`] to the address each
+    /// datagram socket's `bind` named, not where a connect since rehashed it, and takes port 0
+    /// from [`Registry::alloc_port`]. An exact address takes one datagram socket only, as the
+    /// registry holds one queue per address, so a bind the host would let share it is
+    /// `WSAEADDRINUSE` here. Holds the handle table throughout, then the registry.
     unsafe fn bind(&self, fd: c_int, addr: *const u8, len: u32) -> Option<NetResult> {
-        let Some(want) = (unsafe { parse_addr(addr, len) }) else {
-            return err(WSAEFAULT);
-        };
         let mut socks = self.socks.lock().unwrap();
+        let rec = socks.get(&fd)?.rec().clone();
+        let inet6 = rec.state().inet6;
+        let want = match unsafe { family_addr(inet6, addr, len) } {
+            Ok(want) => want,
+            Err(code) => return err(code),
+        };
+        if inet6 && want.is_ipv4() && rec.state().v6only {
+            return err(code::EADDRNOTAVAIL);
+        }
+        let station = self.regs.shared.topo().is_station_ip(want.ip());
+        let claim = |want: SocketAddr| Claim {
+            station,
+            ..Claim::of(&rec, want)
+        };
         match socks.get(&fd)? {
-            Sock::Fresh {
-                local: None, rec, ..
-            } => {
-                let rec = rec.clone();
+            Sock::Fresh { local: None, .. } => {
                 if let Err(code) = self.regs.shared.claim_address(want.ip()) {
                     return err(code);
                 }
-                let want = match tcp_bind_addr(&socks, &self.regs, want, rec.opts().reuseaddr) {
+                let want = match tcp_bind_addr(&socks, &self.regs, claim(want)) {
                     Ok(want) => want,
                     Err(code) => return err(code),
                 };
                 if let Some(Sock::Fresh { local, .. }) = socks.get_mut(&fd) {
                     *local = Some(want);
                 }
+                rec.state().bound_order = self.regs.shared.bind_order();
                 rec.set_local(want);
                 ok(0)
             }
             Sock::Dgram {
-                local: None,
-                queue,
-                rec,
-                ..
+                local: None, queue, ..
             } => {
-                let (queue, rec) = (queue.clone(), rec.clone());
+                let queue = queue.clone();
                 if let Err(code) = self.regs.shared.claim_address(want.ip()) {
                     return err(code);
                 }
@@ -2101,11 +2462,24 @@ impl Net for WinNet {
                 let mut want = want;
                 let mut regs = self.regs.lock();
                 if want.port() == 0 {
-                    want.set_port(regs.alloc_port(want.ip()));
-                } else if regs.udp.contains_key(&want) || dgram_claims(&socks).any(|c| c == want) {
-                    return err(WSAEADDRINUSE);
+                    want.set_port(regs.alloc_port(want.ip(), rec.state().dual_at(want)));
+                } else {
+                    let wanted = claim(want);
+                    if let Some(code) =
+                        dgram_claims(&socks).find_map(|held| bind_conflict(held, wanted))
+                    {
+                        return err(code);
+                    }
+                    if regs
+                        .udp
+                        .get(&want)
+                        .is_some_and(|held| held.iter().any(|q| q.rec.is_none()))
+                    {
+                        return err(WSAEADDRINUSE);
+                    }
                 }
-                regs.udp.insert(want, queue);
+                rec.state().bound_order = self.regs.shared.bind_order();
+                regs.bind_udp(want, &queue);
                 drop(regs);
                 if let Some(Sock::Dgram {
                     local, requested, ..
@@ -2139,8 +2513,10 @@ impl Net for WinNet {
             Sock::Stream { .. } | Sock::Connecting { .. } => return err(WSAEISCONN),
             Sock::Dgram { .. } => return err(WSAEOPNOTSUPP),
         };
+        let dual = rec.state().dual_at(addr);
         let state = Arc::new(ListenerState {
             rec: Some(Arc::downgrade(&rec)),
+            dual,
             capacity: AtomicUsize::new(if backlog == i32::MAX {
                 self.regs.shared.sys.limits().listen_backlog_max
             } else if backlog < 0 {
@@ -2150,7 +2526,7 @@ impl Net for WinNet {
             }),
             ..ListenerState::default()
         });
-        self.regs.lock().listeners.insert(addr, state.clone());
+        self.regs.lock().listen(addr, state.clone());
         rec.set_kind(SocketKind::TcpListener);
         socks.insert(
             fd,
@@ -2215,7 +2591,14 @@ impl Net for WinNet {
         rec.set_ends(conn.server, conn.client);
         rec.set_listener(lrec.id);
         rec.inherit_buffers(&lrec);
-        rec.state().win.v6 = lrec.state().win.v6;
+        let inet6 = {
+            let listener = lrec.state();
+            let mut state = rec.state();
+            state.win.v6 = listener.win.v6;
+            state.inet6 = listener.inet6;
+            state.v6only = listener.v6only;
+            listener.inet6
+        };
         rec.note_conn_nic(self.regs.shared.hop_name(conn.hop.as_ref()).as_deref());
         conn.a_to_b.read_by(&rec);
         conn.b_to_a.write_by(&rec);
@@ -2229,7 +2612,7 @@ impl Net for WinNet {
             },
         );
         if !addr.is_null() && !addr_len.is_null() {
-            unsafe { write_addr(peer, addr, addr_len) };
+            unsafe { write_addr(reported(inet6, peer), addr, addr_len) };
         }
         ok(new_fd as i64)
     }
@@ -2263,8 +2646,10 @@ impl Net for WinNet {
         {
             return ok(0);
         }
-        let Some(dest) = (unsafe { parse_addr(addr, len) }) else {
-            return err(WSAEFAULT);
+        let inet6 = self.rec(fd)?.state().inet6;
+        let dest = match unsafe { family_addr(inet6, addr, len) } {
+            Ok(dest) => dest,
+            Err(code) => return err(code),
         };
         if dest.ip().is_unspecified() && dest.port() == 0 && self.disconnect_dgram(fd) {
             return ok(0);
@@ -2283,16 +2668,20 @@ impl Net for WinNet {
                 }
                 Sock::Dgram {
                     local,
+                    requested,
                     queue,
                     rec,
                     broadcast,
                     ..
                 } => {
-                    let (local, queue, rec, broadcast) =
-                        (*local, queue.clone(), rec.clone(), *broadcast);
+                    let (local, requested, queue, rec, broadcast) =
+                        (*local, *requested, queue.clone(), rec.clone(), *broadcast);
                     drop(socks);
+                    if inet6 && let Err(code) = crossing(&rec, requested, dest) {
+                        return err(code);
+                    }
                     let sender = match self.regs.shared.route_send(
-                        &rec.view(local),
+                        &rec.view(local.map(|l| toward(l, dest))),
                         dest,
                         Op::Connect,
                         station,
@@ -2309,7 +2698,8 @@ impl Net for WinNet {
                             self.autobind(fd, &queue, &rec, ip);
                         }
                         Some(bound) => {
-                            self.rehash(&queue, &rec, bound, sender.connected_local(bound))
+                            let to = sender.connected_local(toward(bound, dest));
+                            self.relocate(&queue, &rec, to);
                         }
                     }
                     if let Some(Sock::Dgram { peer, .. }) = self.socks.lock().unwrap().get_mut(&fd)
@@ -2343,11 +2733,26 @@ impl Net for WinNet {
                 _ => return err(WSAEISCONN),
             }
         };
+        if inet6 {
+            let refused = if dest.is_ipv4() {
+                rec.state().v6only || bound.is_some_and(|b| b.is_ipv6() && !b.ip().is_unspecified())
+            } else {
+                bound.is_some_and(|b| b.is_ipv4())
+            };
+            if refused {
+                return err(if dest.is_ipv4() {
+                    code::EADDRNOTAVAIL
+                } else {
+                    code::ENETUNREACH
+                });
+            }
+        }
+        let from = bound.map(|b| toward(b, dest));
         let sender =
             match self
                 .regs
                 .shared
-                .route_send(&rec.view(bound), dest, Op::Connect, station, true)
+                .route_send(&rec.view(from), dest, Op::Connect, station, true)
             {
                 Ok(sender) => sender,
                 Err(code) => return err(code),
@@ -2370,7 +2775,7 @@ impl Net for WinNet {
         if host_local && matches!(syn, Syn::Rst) {
             crate::netstats::bump(&self.regs.shared.stats.tcp(dest.ip()).out_rsts);
         }
-        let client = self.client_addr(dest, bound, &sender);
+        let client = self.client_addr(dest, from, &sender);
         if let (Syn::Accept, Some(listener)) = (syn, &listener) {
             let conn = self.establish(&rec, dest, client, &sender, listener.tester);
             if let Some(tap) = &conn.tap {
@@ -2502,7 +2907,7 @@ impl Net for WinNet {
                     }
                     Sent::Closed if conn.a_to_b.is_reset() => err(WSAECONNRESET),
                     Sent::Closed => err(WSAESHUTDOWN),
-                    Sent::WouldBlock | Sent::Stuck => err(WSAEWOULDBLOCK),
+                    Sent::WouldBlock | Sent::Stuck | Sent::Interrupted => err(WSAEWOULDBLOCK),
                     Sent::TimedOut => err(WSAETIMEDOUT),
                     Sent::Error => err(rec
                         .take_error_as(&self.regs.shared, Taker::Send)
@@ -2516,7 +2921,7 @@ impl Net for WinNet {
                     return err(WSAEDESTADDRREQ);
                 };
                 let data = unsafe { std::slice::from_raw_parts(buf, len) }.to_vec();
-                self.udp_send(fd, data, dest)
+                self.udp_send(fd, data, dest, &[])
             }
             Some(_) => err(WSAENOTCONN),
             None => None,
@@ -2543,11 +2948,13 @@ impl Net for WinNet {
         if flags & MSG_OOB != 0 {
             return err(WSAEOPNOTSUPP);
         }
-        let Some(dest) = (unsafe { parse_addr(addr, addr_len) }) else {
-            return err(WSAEFAULT);
+        let inet6 = self.rec(fd)?.state().inet6;
+        let dest = match unsafe { family_addr(inet6, addr, addr_len) } {
+            Ok(dest) => dest,
+            Err(code) => return err(code),
         };
         let data = unsafe { std::slice::from_raw_parts(buf, len) }.to_vec();
-        self.udp_send(fd, data, dest)
+        self.udp_send(fd, data, dest, &[])
     }
 
     /// `recv`
@@ -2634,7 +3041,7 @@ impl Net for WinNet {
                 nonblocking: true,
             } => {
                 rec.opts().linger.is_some_and(|l| !l.is_zero())
-                    && !conn.write_pipe(*end).delivered()
+                    && !conn.write_pipe(*end).acknowledged()
             }
             _ => false,
         };
@@ -2652,7 +3059,7 @@ impl Net for WinNet {
                 );
                 if !shared {
                     // MS closesocket: SO_LINGER with a zero timeout aborts with a reset; another
-                    // waits for what was written to cross, up to that long.
+                    // waits for what was written to be sent, up to that long.
                     match rec.opts().linger {
                         Some(linger) if linger.is_zero() => conn.reset(end),
                         Some(linger) => {
@@ -2661,38 +3068,32 @@ impl Net for WinNet {
                             readiness().wait_until(
                                 "linger",
                                 Some(Deadline::timeout(linger)),
-                                || pipe.delivered(),
+                                || pipe.acknowledged(),
                             );
                         }
                         None => conn.close(end),
                     }
                 }
             }
-            Sock::Listener { state, addr, .. } => {
+            Sock::Listener { state, .. } => {
                 let shared = self.socks.lock().unwrap().values().any(
                     |o| matches!(o, Sock::Listener { state: s, .. } if Arc::ptr_eq(s, &state)),
                 );
                 if !shared {
-                    self.regs
-                        .lock()
-                        .listeners
-                        .retain(|a, l| *a != addr || !Arc::ptr_eq(l, &state));
+                    self.regs.lock().unlisten(&state);
                     let orphans: Vec<_> = state.pending.lock().unwrap().drain(..).collect();
                     for conn in orphans {
                         conn.reset(End::B);
                     }
                 }
             }
-            Sock::Dgram { local, queue, .. } => {
+            Sock::Dgram { queue, .. } => {
                 let shared =
                     self.socks.lock().unwrap().values().any(
                         |o| matches!(o, Sock::Dgram { queue: q, .. } if Arc::ptr_eq(q, &queue)),
                     );
                 if !shared {
-                    let mut regs = self.regs.lock();
-                    if let Some(local) = local {
-                        regs.udp.remove(&local);
-                    }
+                    self.regs.lock().unbind_udp(&queue);
                 }
             }
             Sock::Fresh { .. } | Sock::Connecting { .. } => {}
@@ -2714,7 +3115,8 @@ impl Net for WinNet {
         addr_len: *mut u32,
     ) -> Option<NetResult> {
         let socks = self.socks.lock().unwrap();
-        let local = match socks.get(&fd)? {
+        let sock = socks.get(&fd)?;
+        let local = match sock {
             Sock::Stream { conn, end, .. } => Some(conn.local(*end)),
             Sock::Listener { addr, .. } => Some(*addr),
             Sock::Dgram { local, .. } | Sock::Fresh { local, .. } => *local,
@@ -2725,8 +3127,9 @@ impl Net for WinNet {
         let Some(local) = local else {
             return err(WSAEINVAL);
         };
+        let inet6 = sock.rec().state().inet6;
         drop(socks);
-        unsafe { write_addr(local, addr, addr_len) };
+        unsafe { write_addr(reported(inet6, local), addr, addr_len) };
         ok(0)
     }
 
@@ -2738,13 +3141,15 @@ impl Net for WinNet {
         addr_len: *mut u32,
     ) -> Option<NetResult> {
         let socks = self.socks.lock().unwrap();
-        let peer = match socks.get(&fd)? {
+        let sock = socks.get(&fd)?;
+        let peer = match sock {
             Sock::Stream { conn, end, .. } => conn.peer(*end),
             Sock::Dgram { peer: Some(p), .. } => *p,
             _ => return err(WSAENOTCONN),
         };
+        let inet6 = sock.rec().state().inet6;
         drop(socks);
-        unsafe { write_addr(peer, addr, addr_len) };
+        unsafe { write_addr(reported(inet6, peer), addr, addr_len) };
         ok(0)
     }
 
@@ -2772,6 +3177,9 @@ impl Net for WinNet {
     ) -> Option<NetResult> {
         let rec = self.rec(fd)?;
         let kind = self.kind(fd)?;
+        if (level, name) == (IPPROTO_IPV6, IPV6_V6ONLY) {
+            return done(unsafe { self.set_v6only(fd, &rec, kind, val, len) }.map(|()| 0));
+        }
         if let Err(code) = win_sockopt::level_applies(kind, level, name) {
             return err(code);
         }
@@ -2789,9 +3197,18 @@ impl Net for WinNet {
                 WSAENOPROTOOPT
             });
         }
+        if level == IPPROTO_IP
+            && kind.v6
+            && let Err(code) = win_sockopt::ip_on_v6(&rec, name)
+        {
+            return err(code);
+        }
         if level == IPPROTO_TCP
             && let Some(result) = unsafe { crate::faults::sockopt::set(&rec, name, val, len) }
         {
+            return done(result.map(|()| 0));
+        }
+        if let Some(result) = unsafe { win_sockopt::set_anc(&rec, level, name, val, len) } {
             return done(result.map(|()| 0));
         }
         if let Some(result) = unsafe { self.interface_opt(&rec, level, name, val, len) } {
@@ -2825,13 +3242,28 @@ impl Net for WinNet {
                 Err(code) => return err(code),
             };
             rec.state().buf.set(which, stored);
+            crate::notices::notice(self.regs.shared.domain_key(), rec.wake_key());
+            return ok(0);
+        }
+        // Measured: either of SO_REUSEADDR and SO_EXCLUSIVEADDRUSE turned on while the other is
+        // on is WSAEINVAL.
+        if level == SOL_SOCKET && (name == SO_REUSEADDR || name == SO_EXCLUSIVEADDRUSE) {
+            let on = unsafe { read_int(val, len) } != 0;
+            let mut state = rec.state();
+            let opts = &mut state.opts;
+            let (this, other) = if name == SO_REUSEADDR {
+                (&mut opts.reuseaddr, opts.exclusive)
+            } else {
+                (&mut opts.exclusive, opts.reuseaddr)
+            };
+            if on && other {
+                return err(WSAEINVAL);
+            }
+            *this = on;
             return ok(0);
         }
         if level == SOL_SOCKET
-            && matches!(
-                name,
-                SO_RCVTIMEO | SO_SNDTIMEO | SO_REUSEADDR | SO_LINGER | SO_DONTLINGER
-            )
+            && matches!(name, SO_RCVTIMEO | SO_SNDTIMEO | SO_LINGER | SO_DONTLINGER)
         {
             let millis = || {
                 let ms = unsafe { read_int(val, len) } as u32;
@@ -2841,7 +3273,6 @@ impl Net for WinNet {
             match name {
                 SO_RCVTIMEO => state.opts.rcvtimeo = millis(),
                 SO_SNDTIMEO => state.opts.sndtimeo = millis(),
-                SO_REUSEADDR => state.opts.reuseaddr = unsafe { read_int(val, len) } != 0,
                 SO_LINGER => state.opts.linger = unsafe { parse_linger(val, len) },
                 _ if unsafe { read_int(val, len) } != 0 => state.opts.linger = None,
                 _ => {}
@@ -2885,6 +3316,18 @@ impl Net for WinNet {
         }
         let rec = self.rec(fd)?;
         let kind = self.kind(fd)?;
+        if (level, name) == (IPPROTO_IPV6, IPV6_V6ONLY) {
+            let size = if kind.stream { 4 } else { 1 };
+            if val.is_null() || len.is_null() || (unsafe { *len } as usize) < size {
+                return err(WSAEFAULT);
+            }
+            let value = c_int::from(rec.state().v6only).to_ne_bytes();
+            unsafe {
+                std::ptr::copy_nonoverlapping(value.as_ptr(), val, size);
+                *len = size as u32;
+            }
+            return ok(0);
+        }
         if let Err(code) = win_sockopt::level_applies(kind, level, name) {
             return err(code);
         }
@@ -2902,6 +3345,13 @@ impl Net for WinNet {
             && let Some(value) = crate::faults::sockopt::get(&self.regs.shared, &rec, name)
         {
             unsafe { write_opt(value, val, len) };
+            return ok(0);
+        }
+        if let Some(value) = win_sockopt::get_anc(&rec, level, name) {
+            if val.is_null() || len.is_null() || unsafe { *len } < 4 {
+                return err(WSAEFAULT);
+            }
+            unsafe { write_opt(value as i32, val, len) };
             return ok(0);
         }
         let millis = |d: Option<Duration>| {
@@ -2935,6 +3385,7 @@ impl Net for WinNet {
             }
             (SOL_SOCKET, SO_DONTLINGER) => Some(rec.opts().linger.is_none() as i32),
             (SOL_SOCKET, SO_REUSEADDR) => Some(rec.opts().reuseaddr as i32),
+            (SOL_SOCKET, SO_EXCLUSIVEADDRUSE) => Some(rec.opts().exclusive as i32),
             (SOL_SOCKET, SO_RCVBUF) => Some(rec.state().buf.rcvbuf),
             (SOL_SOCKET, SO_SNDBUF) => Some(rec.state().buf.sndbuf),
             (SOL_SOCKET, SO_TYPE) => Some(if kind.stream { SOCK_STREAM } else { SOCK_DGRAM }),
@@ -3173,12 +3624,14 @@ impl Net for WinNet {
     /// On a datagram socket the source goes to `name` (`WSAEFAULT` when `namelen` is too short
     /// for it, or nonzero with a null `name`, as LPFN_WSARECVMSG documents) and `namelen` is set
     /// to its size; a datagram cut to the buffers fails with `WSAEMSGSIZE` after filling them.
-    /// `WSARecvMsg` also returns an `SO_TIMESTAMP` control message, the arrival as a
-    /// `QueryPerformanceCounter` value, while receive stamps are on (`SIO_TIMESTAMPING`), and the
+    /// `WSARecvMsg` also returns the control messages the socket asked for
+    /// ([`win_sockopt::rx_cmsgs`]: packet info, ECN, TTL, TOS, the `SO_TIMESTAMP` receive stamp
+    /// while `SIO_TIMESTAMPING` has them on, the segment size of a coalesced datagram) and the
     /// output flags `MSG_TRUNC`, `MSG_MCAST` and `MSG_BCAST`, with `MSG_CTRUNC` for a control
-    /// buffer too short; the other calls' output flags are 0. A control buffer that is null with a
-    /// nonzero length is `WSAEFAULT`. On a stream `name` is ignored, as `recvfrom` documents for
-    /// connection-oriented sockets, and `Control.len` comes back 0.
+    /// buffer too short, which fails the receive with `WSAEMSGSIZE` as well ([`write_cmsgs`]);
+    /// the other calls' output flags are 0. A control buffer that is null with a nonzero length is
+    /// `WSAEFAULT`. On a stream `name` is ignored, as `recvfrom` documents for connection-oriented
+    /// sockets, and `Control.len` comes back 0.
     unsafe fn wsa_recv(&self, fd: c_int, msg: *mut u8, extension: bool) -> Option<NetResult> {
         let (nonblocking, rec, dgram) = self.recv_state(fd)?;
         let msg = unsafe { &mut *msg.cast::<WsaMsg>() };
@@ -3237,21 +3690,19 @@ impl Net for WinNet {
         let truncated = dg.data.len() > total;
         if !msg.name.is_null() {
             let mut len = msg.namelen as u32;
-            unsafe { write_addr(dg.src, msg.name.cast(), &mut len) };
+            let src = reported(rec.state().inet6, dg.src);
+            unsafe { write_addr(src, msg.name.cast(), &mut len) };
             msg.namelen = len as i32;
         }
+        let mut cut = 0;
         if extension {
-            let stamps: Vec<(c_int, c_int, Vec<u8>)> = win_sockopt::rx_stamp(&rec, dg.at)
-                .map(|stamp| (SOL_SOCKET, SO_TIMESTAMP, stamp.to_ne_bytes().to_vec()))
-                .into_iter()
-                .collect();
-            let cut = unsafe { write_cmsgs(msg, &stamps) };
+            cut = unsafe { write_cmsgs(msg, &win_sockopt::rx_cmsgs(&rec, &dg.ip, dg.at)) };
             msg.dwFlags = self.msg_flags(&dg, truncated) | cut;
         } else {
             msg.Control.len = 0;
             msg.dwFlags = 0;
         }
-        if truncated {
+        if truncated || cut != 0 {
             return err(WSAEMSGSIZE);
         }
         ok(n as i64)
@@ -3261,9 +3712,11 @@ impl Net for WinNet {
     /// and sent as one `send` (the connected peer, or any stream, when `name` is null) or one
     /// datagram to `name`. `WSASendMsg` takes datagram sockets only and fails with `WSAEINVAL` on
     /// a stream (measured, tests/winsock_os_truth.rs `msg_calls_on_tcp_on_windows`); its control
-    /// data may carry an `SO_TIMESTAMP_ID` (a `UINT32`), which asks for a transmit stamp while
-    /// `SIO_TIMESTAMPING` has them on; other control messages (`IP_PKTINFO` source selection
-    /// among them) fail with `WSAEOPNOTSUPP`. `MSG_OOB` is `WSAEOPNOTSUPP` as for `send`,
+    /// messages ([`read_cmsgs`]) are the datagram's, as [`win_sockopt::send_ctl`] takes them: ECN,
+    /// TOS and hop limit, source selection, a segment size, and an `SO_TIMESTAMP_ID` (a
+    /// `UINT32`), which asks for a transmit stamp while `SIO_TIMESTAMPING` has them on. A null
+    /// `name` sends to the connected peer (`WSAEDESTADDRREQ` without one, as `send`).
+    /// `MSG_OOB` is `WSAEOPNOTSUPP` as for `send`,
     /// and `MSG_PARTIAL` too ("returned by transports that do not support partial message
     /// transmissions", [Microsoft Learn: WSASend](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsasend));
     /// `MSG_DONTROUTE` is ignored. A null `name` with a nonzero `namelen`, or a null control
@@ -3293,37 +3746,34 @@ impl Net for WinNet {
             return err(WSAEFAULT);
         }
         let data = unsafe { gather(buffers) };
-        let tx_id = if extension {
-            let controls = unsafe { read_cmsgs(msg) };
-            if controls
-                .iter()
-                .any(|(level, ty, _)| *level != SOL_SOCKET || *ty != SO_TIMESTAMP_ID)
-            {
-                return err(WSAEOPNOTSUPP);
+        let msgs = if extension {
+            match unsafe { read_cmsgs(msg) } {
+                Ok(msgs) => msgs,
+                Err(code) => return err(code),
             }
-            if controls.iter().any(|(_, _, data)| data.len() != 4) {
-                return err(WSAEINVAL);
-            }
-            controls
-                .first()
-                .map(|(_, _, data)| u32::from_ne_bytes([data[0], data[1], data[2], data[3]]))
         } else {
-            None
+            Vec::new()
         };
         let flags = flags as c_int & !MSG_DONTROUTE;
-        let sent = if msg.name.is_null() || !dgram {
-            unsafe { self.send(fd, data.as_ptr(), data.len(), flags) }
-        } else {
-            let Some(dest) = (unsafe { parse_addr(msg.name.cast(), msg.namelen.max(0) as u32) })
-            else {
-                return err(WSAEFAULT);
-            };
-            self.udp_send(fd, data, dest)
-        };
-        if let (Some(id), Some(NetResult::Ok(_))) = (tx_id, &sent) {
-            win_sockopt::note_tx_stamp(&rec, id, monotonic(&self.regs.shared));
+        if !dgram {
+            return unsafe { self.send(fd, data.as_ptr(), data.len(), flags) };
         }
-        sent
+        let dest = if msg.name.is_null() {
+            match self.socks.lock().unwrap().get(&fd)? {
+                Sock::Dgram {
+                    peer: Some(peer), ..
+                } => *peer,
+                _ => return err(WSAEDESTADDRREQ),
+            }
+        } else {
+            let inet6 = rec.state().inet6;
+            let name = msg.name.cast();
+            match unsafe { family_addr(inet6, name, msg.namelen.max(0) as u32) } {
+                Ok(dest) => dest,
+                Err(code) => return err(code),
+            }
+        };
+        self.udp_send(fd, data, dest, &msgs)
     }
 
     /// Duplicates handle `fd` (`WSADuplicateSocket`, which `std`'s `try_clone` uses): a new handle
@@ -3730,6 +4180,40 @@ unsafe fn parse_linger(val: *const u8, len: u32) -> Option<Duration> {
     (onoff != 0).then(|| Duration::from_secs(secs.into()))
 }
 
+/// The address a call on a socket (IPv6 if `inet6`) names, a v4-mapped one as the IPv4 address
+/// it carries. A malformed address is `WSAEFAULT`, as is a `SOCKADDR_IN` given an IPv6 socket,
+/// shorter than its family's; a `SOCKADDR_IN6` given an IPv4 socket is `WSAEAFNOSUPPORT`
+/// (measured by tests/dual_stack_os_truth.rs).
+///
+/// # Safety
+/// `ptr` is null or points to `len` readable bytes.
+unsafe fn family_addr(inet6: bool, ptr: *const u8, len: u32) -> Result<SocketAddr, c_int> {
+    let addr = unsafe { parse_addr(ptr, len) }.ok_or(WSAEFAULT)?;
+    match (inet6, addr.is_ipv6()) {
+        (true, true) => Ok(unmapped(addr)),
+        (false, false) => Ok(addr),
+        (true, false) => Err(WSAEFAULT),
+        (false, true) => Err(WSAEAFNOSUPPORT),
+    }
+}
+
+/// Whether IPv6 datagram socket `rec`, which `bind` put at `bound`, may send to or connect to
+/// `dest`: IPv4 needs a dual-stack socket not bound to an IPv6 address, IPv6 one not bound to a
+/// v4-mapped address; `WSAEADDRNOTAVAIL` otherwise. The address a connect took does not count
+/// (measured by tests/dual_stack_os_truth.rs).
+fn crossing(rec: &SockRec, bound: Option<SocketAddr>, dest: SocketAddr) -> Result<(), c_int> {
+    let refused = if dest.is_ipv4() {
+        rec.state().v6only || bound.is_some_and(|b| b.is_ipv6() && !b.ip().is_unspecified())
+    } else {
+        bound.is_some_and(|b| b.is_ipv4())
+    };
+    if refused {
+        Err(code::EADDRNOTAVAIL)
+    } else {
+        Ok(())
+    }
+}
+
 /// Reads a `SOCKADDR_IN`/`SOCKADDR_IN6` from `ptr`. The sockaddr layout is the BSD-sockets ABI
 /// shared across platforms; only the IPv6 family tag differs (23 on Windows). Port and address are
 /// network byte order.
@@ -3862,9 +4346,18 @@ impl Registries {
     }
 
     /// Delivers one datagram from `src` to every queue `dest` reaches, through the links it
-    /// crosses and each receiving address's link policy.
+    /// crosses and each receiving address's link policy, with header `ip` and the receiving
+    /// interface's index. A segmented send through loopback (`ip.gso` its segment size) is read
+    /// at each socket as [`win_sockopt::coalesce`] says.
     /// Returns how many sockets and endpoints it reached, lost on the way or not.
-    fn deliver(&self, sender: &Sender, src: SocketAddr, dest: SocketAddr, data: &[u8]) -> usize {
+    fn deliver(
+        &self,
+        sender: &Sender,
+        src: SocketAddr,
+        dest: SocketAddr,
+        data: &[u8],
+        ip: Header,
+    ) -> usize {
         let sent = monotonic(&self.shared);
         let (cands, station) = {
             let reg = self.lock();
@@ -3890,15 +4383,37 @@ impl Registries {
                     rec.note_rx_nic(copy.nic.as_deref());
                 }
             }
+            let seg = usize::from(ip.gso);
+            let reads = match seg {
+                0 => vec![data.len()],
+                seg => win_sockopt::coalesce(
+                    copy.q.rec.as_deref(),
+                    seg,
+                    data.len(),
+                    win_sockopt::max_payload(dest),
+                ),
+            };
+            let ip = Header {
+                ifindex: copy.ingress.unwrap_or(0),
+                ..ip
+            };
             for delay in copy.delays {
-                copy.q.push_after(
-                    (src, dest),
-                    sent,
-                    data.to_vec(),
-                    delay,
-                    copy.via.clone(),
-                    self.shared.domain_key(),
-                );
+                let mut at = 0;
+                for &len in &reads {
+                    copy.q.push_after(
+                        (src, dest),
+                        sent,
+                        data[at..at + len].to_vec(),
+                        delay,
+                        copy.via.clone(),
+                        Header {
+                            gso: if len > seg { ip.gso } else { 0 },
+                            ..ip
+                        },
+                        self.shared.domain_key(),
+                    );
+                    at += len;
+                }
             }
         }
         reached
@@ -3958,20 +4473,25 @@ pub(crate) fn listen_at(addr: SocketAddr) -> Arc<Listener> {
         ..Listener::default()
     });
     let regs = registries_here();
-    snare_interpose::real(|| regs.lock().listeners.insert(addr, listener.clone()));
+    snare_interpose::real(|| regs.lock().listen(addr, listener.clone()));
     listener
 }
 
 /// Withdraws `listener`, so later connects to its address are refused (WSAECONNREFUSED).
 pub(crate) fn unlisten(regs: &Registries, listener: &Arc<Listener>) {
-    snare_interpose::real(|| {
-        regs.lock()
-            .listeners
-            .retain(|_, l| !Arc::ptr_eq(l, listener))
-    });
+    snare_interpose::real(|| regs.lock().unlisten(listener));
 }
 
 impl ListenerState {
+    /// How it shares its address with other listeners there.
+    fn share(&self) -> Share {
+        self.rec
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .map(|rec| Share::of(&rec))
+            .unwrap_or_default()
+    }
+
     fn reserve(self: &Arc<Self>) -> Option<ListenerAdmission> {
         let mut used = self.occupied.load(Ordering::Acquire);
         loop {
@@ -4095,7 +4615,7 @@ impl UdpEndpoint {
                 !reg.udp.contains_key(&addr),
                 "udp tester address {addr} is already bound"
             );
-            reg.udp.insert(addr, queue.clone());
+            reg.bind_udp(addr, &queue);
         });
         UdpEndpoint { regs, addr, queue }
     }
@@ -4118,7 +4638,11 @@ impl UdpEndpoint {
             self.regs
                 .shared
                 .capture_udp(&sender, self.addr, dest, Dir::In, data, None);
-            if self.regs.deliver(&sender, self.addr, dest, data) == 0 {
+            if self
+                .regs
+                .deliver(&sender, self.addr, dest, data, Header::plain(dest.ip()))
+                == 0
+            {
                 let station = self.regs.lock().station_at(dest.ip());
                 self.regs.shared.count_unreceived(dest, station);
             }
@@ -4126,18 +4650,9 @@ impl UdpEndpoint {
     }
 }
 
-/// Unbinds the address, unless something else was bound there since.
+/// Unbinds the address.
 impl Drop for UdpEndpoint {
     fn drop(&mut self) {
-        snare_interpose::real(|| {
-            let mut reg = self.regs.lock();
-            if reg
-                .udp
-                .get(&self.addr)
-                .is_some_and(|q| Arc::ptr_eq(q, &self.queue))
-            {
-                reg.udp.remove(&self.addr);
-            }
-        });
+        snare_interpose::real(|| self.regs.lock().unbind_udp(&self.queue));
     }
 }

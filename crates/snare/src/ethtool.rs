@@ -68,7 +68,9 @@ const ETHTOOL_GEEE: u32 = 0x44;
 /// `ETHTOOL_SEEE`.
 const ETHTOOL_SEEE: u32 = 0x45;
 
-/// `ETH_SS_STATS`: the driver-statistics string set (`enum ethtool_stringset`).
+/// `ETH_SS_TEST`: the self-test string set (`enum ethtool_stringset`).
+const ETH_SS_TEST: u32 = 0;
+/// `ETH_SS_STATS`: the driver-statistics string set.
 const ETH_SS_STATS: u32 = 1;
 const ETH_SS_PRIV_FLAGS: u32 = 2;
 /// `ETH_GSTRING_LEN`: the width of one statistic's name.
@@ -391,6 +393,9 @@ pub struct NicEthtool {
     pub eeprom_len: u32,
     /// `ETHTOOL_GDRVINFO` `n_priv_flags` and the `ETH_SS_PRIV_FLAGS` string-set count.
     pub private_flags_count: u32,
+    /// `ETHTOOL_GDRVINFO` `testinfo_len` and the `ETH_SS_TEST` string-set count: the driver's
+    /// self-tests (`ethtool -t`).
+    pub self_test_count: u32,
     /// The descriptor rings, with their maxima.
     pub rings: Option<Rings>,
     /// Interrupt coalescing: what the driver accepts and the current values.
@@ -701,6 +706,7 @@ impl NicEthtool {
                     std::ptr::write_bytes(data.add(4), 0, 12);
                     let mut offset = 16;
                     for (set, count) in [
+                        (ETH_SS_TEST, self.self_test_count),
                         (ETH_SS_STATS, self.stats.len() as u32),
                         (ETH_SS_PRIV_FLAGS, self.private_flags_count),
                     ] {
@@ -746,8 +752,9 @@ impl NicEthtool {
     /// `ETHTOOL_GDRVINFO`: `struct ethtool_drvinfo` is `cmd` @0, then 32-byte strings `driver`
     /// @4, `version` @36, `fw_version` @68, `bus_info` @100, `erom_version` @132, 12 reserved
     /// bytes, and `n_priv_flags` @176, `n_stats` @180, `testinfo_len` @184, `eedump_len` @188,
-    /// `regdump_len` @192 (196 bytes). `ethtool_get_drvinfo` fills `n_stats` from the driver's
-    /// `ETH_SS_STATS` count.
+    /// `regdump_len` @192 (196 bytes). `ethtool_get_drvinfo` (net/ethtool/ioctl.c) fills
+    /// `testinfo_len`, `n_stats` and `n_priv_flags` from the driver's `ETH_SS_TEST`,
+    /// `ETH_SS_STATS` and `ETH_SS_PRIV_FLAGS` counts.
     fn drvinfo(&self, ctx: &Ctx<'_>, data: *mut u8) {
         unsafe {
             write_cstr(data, 4, 32, ctx.driver);
@@ -758,6 +765,7 @@ impl NicEthtool {
             std::ptr::write_bytes(data.add(164), 0, 32);
             (data.add(176) as *mut u32).write_unaligned(self.private_flags_count);
             (data.add(180) as *mut u32).write_unaligned(self.stats.len() as u32);
+            (data.add(184) as *mut u32).write_unaligned(self.self_test_count);
             (data.add(188) as *mut u32).write_unaligned(self.eeprom_len);
             (data.add(192) as *mut u32).write_unaligned(self.register_dump_len);
         }

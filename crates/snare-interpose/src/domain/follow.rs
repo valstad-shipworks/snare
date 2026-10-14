@@ -615,6 +615,8 @@ pub(super) fn place_in(
         label,
         lineage,
         held,
+        #[cfg(unix)]
+        signal_mask: 0,
     }
 }
 
@@ -677,6 +679,13 @@ pub(super) fn follow(to: &Domain) -> bool {
     accounting::swap_class(place.class, place.label);
     // SAFETY: the place holds a strong count on its domain, now the thread's.
     let joined = unsafe { &*place.domain };
+    #[cfg(unix)]
+    crate::signals::moved(
+        from.signals.is_some().then_some(&from.signal_state),
+        lineage,
+        joined.signals.is_some().then_some(&joined.signal_state),
+        place.lineage,
+    );
     joined.accounting.record_handle(handle, place.lineage);
     if name.is_some() {
         joined.accounting.set_name(place.lineage, name);

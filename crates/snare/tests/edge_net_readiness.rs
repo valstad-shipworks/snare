@@ -616,9 +616,30 @@ mod epoll {
         );
     }
 
+    /// Whether a scenario's new descriptor took the closed one's number, and what the set reported.
+    type Reuse = (bool, Vec<(u32, u64)>);
+
+    /// Runs a scenario that closes a registered descriptor and opens another hoping for its
+    /// number, until it gets the number: a thread of the process opening a descriptor in between
+    /// takes it.
+    fn until_reused(scenario: fn() -> Reuse) -> Reuse {
+        let mut last = scenario();
+        for _ in 0..20 {
+            if last.0 {
+                break;
+            }
+            last = scenario();
+        }
+        last
+    }
+
     /// A registered socket closed and a new one opened on the same fd number, never registered,
     /// then sent a datagram: whether the number was reused, and what the set reports.
     fn closed_then_reused() -> (bool, Vec<(u32, u64)>) {
+        until_reused(closed_then_reused_once)
+    }
+
+    fn closed_then_reused_once() -> (bool, Vec<(u32, u64)>) {
         let ep = create();
         let a = UdpSocket::bind("127.0.0.1:0").unwrap();
         let fd = a.as_raw_fd();
@@ -794,6 +815,10 @@ mod epoll {
     }
 
     fn closed_eventfd_reused() -> (bool, Vec<(u32, u64)>) {
+        until_reused(closed_eventfd_reused_once)
+    }
+
+    fn closed_eventfd_reused_once() -> (bool, Vec<(u32, u64)>) {
         let ep = create();
         let fd = efd(0, libc::EFD_NONBLOCK);
         ctl(ep, libc::EPOLL_CTL_ADD, fd, IN, 1).unwrap();

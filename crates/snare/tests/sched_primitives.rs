@@ -339,8 +339,10 @@ fn dropped_sleeps_leave_no_timer_entries() {
 
         let sleeps: Vec<_> = (0..3).map(|_| polled(Waker::noop())).collect();
         assert_eq!(exec.timers(8).len(), 3);
+        assert_eq!(exec.timer_count(), 3);
         drop(sleeps);
         assert!(exec.timers(8).is_empty());
+        assert_eq!(exec.timer_count(), 0);
 
         thread::spawn(move || {
             sched::mark_background("sampler");

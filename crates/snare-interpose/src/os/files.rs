@@ -128,6 +128,24 @@ fn mode_u32(mode: mode_t) -> u32 {
     u32::from(mode)
 }
 
+/// The mode a call creating a file asks for, masked by the sim's umask where the domain's host
+/// keeps one. The OS masks a real file's mode with the process's umask as well.
+fn masked(mode: mode_t) -> mode_t {
+    match domain::dispatch_host(|h| h.umask(None)) {
+        Some(mask) if mask >= 0 => mode & !(mask as mode_t),
+        _ => mode,
+    }
+}
+
+/// Whether open `flags` create a file, so the mode argument counts (man 2 open).
+fn creates(flags: c_int) -> bool {
+    #[cfg(target_os = "linux")]
+    if flags & libc::O_TMPFILE == libc::O_TMPFILE {
+        return true;
+    }
+    flags & libc::O_CREAT != 0
+}
+
 /// Declares the `AtomicUsize` that holds one hooked function's original address.
 macro_rules! slot {
     ($name:ident) => {
@@ -144,6 +162,7 @@ slot!(PWRITE);
 slot!(FTRUNCATE);
 slot!(FSYNC);
 slot!(FLOCK);
+slot!(MMAP);
 slot!(UNLINK);
 slot!(UNLINKAT);
 slot!(RMDIR);
@@ -198,6 +217,14 @@ slot!(FUTIMES);
 slot!(SETATTRLIST);
 #[cfg(target_os = "macos")]
 slot!(FSETATTRLIST);
+slot!(CHMOD);
+slot!(FCHMOD);
+slot!(FCHMODAT);
+slot!(LCHMOD);
+slot!(CHOWN);
+slot!(FCHOWN);
+slot!(LCHOWN);
+slot!(FCHOWNAT);
 
 /// The file hooks for this target, under each OS's exported symbol names.
 pub(crate) fn hooks() -> Vec<Hook> {
@@ -217,6 +244,7 @@ pub(crate) fn hooks() -> Vec<Hook> {
         hook!("ftruncate", ftruncate, FTRUNCATE),
         hook!("fsync", fsync, FSYNC),
         hook!("flock", flock, FLOCK),
+        hook!("mmap", mmap, MMAP),
         hook!("unlink", unlink, UNLINK),
         hook!("unlinkat", unlinkat, UNLINKAT),
         hook!("rmdir", rmdir, RMDIR),
@@ -252,6 +280,8 @@ pub(crate) fn hooks() -> Vec<Hook> {
         hook!("pwrite64", pwrite, PWRITE),
         #[cfg(target_os = "linux")]
         hook!("ftruncate64", ftruncate, FTRUNCATE),
+        #[cfg(target_os = "linux")]
+        hook!("mmap64", mmap, MMAP),
         // stat family — names differ by OS and arch. man 2 stat.
         // macOS x86_64 exports `stat$INODE64` etc.: the `$INODE64` suffix selects the 64-bit-inode
         // `struct stat` (Apple <sys/cdefs.h> __DARWIN_INODE64); arm64 has only the 64-bit layout
@@ -336,6 +366,14 @@ pub(crate) fn hooks() -> Vec<Hook> {
         hook!("setattrlist", setattrlist, SETATTRLIST),
         #[cfg(target_os = "macos")]
         hook!("fsetattrlist", fsetattrlist, FSETATTRLIST),
+        hook!("chmod", chmod, CHMOD),
+        hook!("fchmod", fchmod, FCHMOD),
+        hook!("fchmodat", fchmodat, FCHMODAT),
+        hook!("lchmod", lchmod, LCHMOD),
+        hook!("chown", chown, CHOWN),
+        hook!("fchown", fchown, FCHOWN),
+        hook!("lchown", lchown, LCHOWN),
+        hook!("fchownat", fchownat, FCHOWNAT),
     ]
 }
 
@@ -346,6 +384,7 @@ pub(crate) fn hooks() -> Vec<Hook> {
 /// contains O_CREAT (or O_TMPFILE); a backend should ignore it otherwise.
 unsafe fn do_open(slot: &AtomicUsize, path: *const c_char, flags: c_int, mode: mode_t) -> c_int {
     path_argument!(path, resolved_path, libc::AT_FDCWD);
+    let mode = if creates(flags) { masked(mode) } else { mode };
 
     // SAFETY: `path` is the caller's C string.
     if let Some(r) = crate::domain::descriptor_transaction(|| {
@@ -407,6 +446,7 @@ unsafe fn do_openat(
     mode: mode_t,
 ) -> c_int {
     path_argument!(path, resolved_path, dirfd);
+    let mode = if creates(flags) { masked(mode) } else { mode };
 
     // SAFETY: `path` is the caller's C string.
     if let Some(r) = crate::domain::descriptor_transaction(|| {
@@ -489,6 +529,7 @@ pub(crate) unsafe extern "C" fn openat(
 /// trampoline is needed on any target.
 unsafe extern "C" fn creat(path: *const c_char, mode: mode_t) -> c_int {
     path_argument!(path, resolved_path, libc::AT_FDCWD);
+    let mode = masked(mode);
 
     // man 2 creat: creat(path, mode) == open(path, O_CREAT|O_WRONLY|O_TRUNC, mode).
     // SAFETY: `path` is the caller's C string.
@@ -545,6 +586,7 @@ unsafe extern "C" fn openat64(
 /// Hook for glibc's `creat64`, the LFS alias of `creat`.
 unsafe extern "C" fn creat64(path: *const c_char, mode: mode_t) -> c_int {
     path_argument!(path, resolved_path, libc::AT_FDCWD);
+    let mode = masked(mode);
 
     // SAFETY: `path` is the caller's C string.
     if let Some(r) = dispatch_fs(|fs| unsafe {
@@ -648,6 +690,36 @@ unsafe extern "C" fn pwrite(
     }
 }
 
+/// Hook for `mmap(2)` (and glibc's `mmap64`). Only a file mapping is offered to the plane: an
+/// anonymous one (`MAP_ANONYMOUS`) names no file, and on macOS its fd argument may carry a VM tag
+/// (`VM_MAKE_TAG`, `<mach/vm_statistics.h>`) rather than -1.
+unsafe extern "C" fn mmap(
+    addr: *mut libc::c_void,
+    len: usize,
+    prot: c_int,
+    flags: c_int,
+    fd: c_int,
+    offset: off_t,
+) -> *mut libc::c_void {
+    if flags & libc::MAP_ANON == 0
+        && fd >= 0
+        && let Some(r) = dispatch_fs_fd(fd, |fs| unsafe {
+            fs.mmap(addr.cast(), len, prot, flags, fd, offset)
+        })
+    {
+        return if finish(r) < 0 {
+            libc::MAP_FAILED
+        } else {
+            r as *mut libc::c_void
+        };
+    }
+    unsafe {
+        original::<
+            unsafe extern "C" fn(*mut libc::c_void, usize, c_int, c_int, c_int, off_t) -> *mut libc::c_void,
+        >(&MMAP)(addr, len, prot, flags, fd, offset)
+    }
+}
+
 unsafe extern "C" fn ftruncate(fd: c_int, len: off_t) -> c_int {
     if let Some(r) = dispatch_fs_fd(fd, |fs| unsafe { fs.ftruncate(fd, len) }) {
         return finish(r) as c_int;
@@ -681,6 +753,7 @@ unsafe extern "C" fn unlink(path: *const c_char) -> c_int {
 
 unsafe extern "C" fn mkdir(path: *const c_char, mode: mode_t) -> c_int {
     path_argument!(path, resolved_path, libc::AT_FDCWD);
+    let mode = masked(mode);
 
     if let Some(result) = dispatch_fs(|fs| unsafe { fs.mkdir(path, mode_u32(mode)) }) {
         return finish(result) as c_int;
@@ -805,6 +878,7 @@ unsafe extern "C" fn unlinkat(fd: c_int, path: *const c_char, flags: c_int) -> c
 
 unsafe extern "C" fn mkdirat(fd: c_int, path: *const c_char, mode: mode_t) -> c_int {
     path_argument!(path, resolved_path, fd);
+    let mode = masked(mode);
 
     if let Some(result) = dispatch_fs(|fs| unsafe { fs.mkdirat(fd, path, mode_u32(mode)) }) {
         return finish(result) as c_int;
@@ -1119,11 +1193,21 @@ unsafe extern "C" fn chdir(path: *const c_char) -> c_int {
     result
 }
 
+/// Hook for `fchdir(2)`. A working directory names where the sim's relative paths resolve, and
+/// they resolve in the sim's own planes, so a directory another sim's plane opened cannot become
+/// it: such a call fails with `EXDEV`, as a symlink out of a plane's namespace does, and one of a
+/// sim that is gone with `EBADF`.
 unsafe extern "C" fn fchdir(fd: c_int) -> c_int {
-    if fs_owns(fd)
-        && let Some(result) = dispatch_fs(|fs| unsafe { fs.fchdir(fd) })
-    {
+    let owned = fs_owns(fd);
+    if owned && let Some(result) = dispatch_fs(|fs| unsafe { fs.fchdir(fd) }) {
         return finish(result) as c_int;
+    }
+    if !owned {
+        match domain::file_plane(fd) {
+            Some(FilePlane::Served(..)) => return finish(-i64::from(libc::EXDEV)) as c_int,
+            Some(FilePlane::Gone) => return finish(-i64::from(libc::EBADF)) as c_int,
+            None => {}
+        }
     }
     let result = unsafe { original::<unsafe extern "C" fn(c_int) -> c_int>(&FCHDIR)(fd) };
     if result == 0 {
@@ -1487,4 +1571,163 @@ unsafe extern "C" fn fsetattrlist(
         Some((set, _)) => unsafe { set_times(fd, std::ptr::null(), set, 0, real) },
         None => real(std::ptr::null()),
     }
+}
+
+type ServeStatus<'a> = &'a dyn Fn(&dyn crate::Fs, *const c_char) -> Option<crate::fs::FsResult>;
+
+/// The body of every mode- and ownership-changing hook: offers the call to the plane serving the
+/// file, else runs `real` (with the path resolved against a virtual working directory) and, when
+/// the OS changed the file's status, tells the domain's plane. A null `path` names the
+/// descriptor `dirfd`.
+unsafe fn change_status(
+    dirfd: c_int,
+    path: *const c_char,
+    flags: c_int,
+    serve: ServeStatus<'_>,
+    real: impl FnOnce(*const c_char) -> c_int,
+    stamps: bool,
+) -> c_int {
+    if path.is_null()
+        && let Some(r) = dispatch_fs_fd(dirfd, |fs| serve(fs, path))
+    {
+        return finish(r) as c_int;
+    }
+    path_argument!(path, resolved_path, dirfd);
+    if !path.is_null()
+        && let Some(r) = dispatch_fs(|fs| serve(fs, path))
+    {
+        return finish(r) as c_int;
+    }
+    path_fallback!(resolved_path);
+    let result = real(path);
+    if result == 0 && stamps {
+        dispatch_fs(|fs| {
+            unsafe { fs.host_status_changed(dirfd, path, flags) };
+            None
+        });
+    }
+    result
+}
+
+type ChmodFn = unsafe extern "C" fn(*const c_char, mode_t) -> c_int;
+
+/// Hook for `chmod(2)`, following a final symlink.
+unsafe extern "C" fn chmod(path: *const c_char, mode: mode_t) -> c_int {
+    let real = |path| unsafe { original::<ChmodFn>(&CHMOD)(path, mode) };
+    if path.is_null() {
+        return real(path);
+    }
+    let serve =
+        |fs: &dyn crate::Fs, path| unsafe { fs.chmod(libc::AT_FDCWD, path, mode_u32(mode), 0) };
+    unsafe { change_status(libc::AT_FDCWD, path, 0, &serve, real, true) }
+}
+
+/// Hook for `fchmod(2)`.
+unsafe extern "C" fn fchmod(fd: c_int, mode: mode_t) -> c_int {
+    let real =
+        |_| unsafe { original::<unsafe extern "C" fn(c_int, mode_t) -> c_int>(&FCHMOD)(fd, mode) };
+    let serve = |fs: &dyn crate::Fs, path| unsafe { fs.chmod(fd, path, mode_u32(mode), 0) };
+    unsafe { change_status(fd, std::ptr::null(), 0, &serve, real, true) }
+}
+
+/// Hook for `fchmodat(2)`; `flags` may carry `AT_SYMLINK_NOFOLLOW`.
+unsafe extern "C" fn fchmodat(
+    dirfd: c_int,
+    path: *const c_char,
+    mode: mode_t,
+    flags: c_int,
+) -> c_int {
+    type FchmodatFn = unsafe extern "C" fn(c_int, *const c_char, mode_t, c_int) -> c_int;
+    let real = |path| unsafe { original::<FchmodatFn>(&FCHMODAT)(dirfd, path, mode, flags) };
+    if path.is_null() {
+        return real(path);
+    }
+    let serve = |fs: &dyn crate::Fs, path| unsafe { fs.chmod(dirfd, path, mode_u32(mode), flags) };
+    unsafe { change_status(dirfd, path, flags, &serve, real, true) }
+}
+
+/// Hook for `lchmod(2)`, `fchmodat` with `AT_SYMLINK_NOFOLLOW`: on macOS it changes a symlink's
+/// own mode; glibc's fails on a symlink with `EOPNOTSUPP`.
+unsafe extern "C" fn lchmod(path: *const c_char, mode: mode_t) -> c_int {
+    let real = |path| unsafe { original::<ChmodFn>(&LCHMOD)(path, mode) };
+    if path.is_null() {
+        return real(path);
+    }
+    let flags = libc::AT_SYMLINK_NOFOLLOW;
+    let serve =
+        |fs: &dyn crate::Fs, path| unsafe { fs.chmod(libc::AT_FDCWD, path, mode_u32(mode), flags) };
+    unsafe { change_status(libc::AT_FDCWD, path, flags, &serve, real, true) }
+}
+
+/// Whether a `chown` family call that the OS completed changed the file's change time: always on
+/// Linux (`chown_common` in fs/open.c sets `ATTR_CTIME`), on macOS only when it names an id
+/// (measured on APFS; tests/fs_permissions.rs).
+fn chown_stamps(uid: libc::uid_t, gid: libc::gid_t) -> bool {
+    cfg!(target_os = "linux") || uid != libc::uid_t::MAX || gid != libc::gid_t::MAX
+}
+
+type ChownFn = unsafe extern "C" fn(*const c_char, libc::uid_t, libc::gid_t) -> c_int;
+
+/// Hook for `chown(2)`, following a final symlink.
+unsafe extern "C" fn chown(path: *const c_char, uid: libc::uid_t, gid: libc::gid_t) -> c_int {
+    let real = |path| unsafe { original::<ChownFn>(&CHOWN)(path, uid, gid) };
+    if path.is_null() {
+        return real(path);
+    }
+    let serve = |fs: &dyn crate::Fs, path| unsafe { fs.chown(libc::AT_FDCWD, path, uid, gid, 0) };
+    unsafe { change_status(libc::AT_FDCWD, path, 0, &serve, real, chown_stamps(uid, gid)) }
+}
+
+/// Hook for `fchown(2)`.
+unsafe extern "C" fn fchown(fd: c_int, uid: libc::uid_t, gid: libc::gid_t) -> c_int {
+    type FchownFn = unsafe extern "C" fn(c_int, libc::uid_t, libc::gid_t) -> c_int;
+    let real = |_| unsafe { original::<FchownFn>(&FCHOWN)(fd, uid, gid) };
+    let serve = |fs: &dyn crate::Fs, path| unsafe { fs.chown(fd, path, uid, gid, 0) };
+    unsafe { change_status(fd, std::ptr::null(), 0, &serve, real, chown_stamps(uid, gid)) }
+}
+
+/// Hook for `lchown(2)`, which changes a final symlink itself.
+unsafe extern "C" fn lchown(path: *const c_char, uid: libc::uid_t, gid: libc::gid_t) -> c_int {
+    let real = |path| unsafe { original::<ChownFn>(&LCHOWN)(path, uid, gid) };
+    if path.is_null() {
+        return real(path);
+    }
+    let flags = libc::AT_SYMLINK_NOFOLLOW;
+    let serve =
+        |fs: &dyn crate::Fs, path| unsafe { fs.chown(libc::AT_FDCWD, path, uid, gid, flags) };
+    unsafe { change_status(libc::AT_FDCWD, path, flags, &serve, real, chown_stamps(uid, gid)) }
+}
+
+/// Hook for `fchownat(2)`; `flags` may carry `AT_SYMLINK_NOFOLLOW`, and on Linux `AT_EMPTY_PATH`,
+/// with which an empty `path` names `dirfd` itself.
+unsafe extern "C" fn fchownat(
+    dirfd: c_int,
+    path: *const c_char,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    flags: c_int,
+) -> c_int {
+    type FchownatFn =
+        unsafe extern "C" fn(c_int, *const c_char, libc::uid_t, libc::gid_t, c_int) -> c_int;
+    if path.is_null() {
+        return unsafe { original::<FchownatFn>(&FCHOWNAT)(dirfd, path, uid, gid, flags) };
+    }
+    let given = path;
+    let real = |path: *const c_char| unsafe {
+        original::<FchownatFn>(&FCHOWNAT)(
+            dirfd,
+            if path.is_null() { given } else { path },
+            uid,
+            gid,
+            flags,
+        )
+    };
+    #[cfg(target_os = "linux")]
+    let path = if flags & libc::AT_EMPTY_PATH != 0 && unsafe { path.read() } == 0 {
+        std::ptr::null()
+    } else {
+        path
+    };
+    let serve = |fs: &dyn crate::Fs, path| unsafe { fs.chown(dirfd, path, uid, gid, flags) };
+    unsafe { change_status(dirfd, path, flags, &serve, real, chown_stamps(uid, gid)) }
 }

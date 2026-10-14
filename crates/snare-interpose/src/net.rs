@@ -158,6 +158,27 @@ pub trait Net: Send + Sync + 'static {
         None
     }
 
+    /// Makes a pipe (`pipe(2)`, or `pipe2` with `flags`): on success writes its read and write
+    /// ends to `fds` and returns `Ok(0)`. A pipe stays a real descriptor, so a child process can
+    /// inherit it; a backend that answers makes the real pipe itself and keeps track of it.
+    ///
+    /// # Safety
+    /// `fds` points to two writable `c_int`s.
+    #[cfg(unix)]
+    unsafe fn pipe(&self, fds: *mut c_int, flags: c_int) -> Option<NetResult> {
+        None
+    }
+
+    /// A child process is about to be made that may hold `fd` (a `posix_spawn` file action
+    /// names it), or, with `None`, any descriptor of the process (a `fork`). A notice only: the
+    /// call goes on to the OS.
+    #[cfg(unix)]
+    fn spawning(&self, fd: Option<c_int>) {}
+
+    /// The calling thread made child process `pid` (a `fork` or `posix_spawn`). A notice only.
+    #[cfg(unix)]
+    fn spawned(&self, pid: c_int) {}
+
     /// Models `connect(2)`; `addr` is a `struct sockaddr` (`<sys/socket.h>`; `sockaddr_in` in
     /// `<netinet/in.h>`) and `len` its `socklen_t` length.
     ///
@@ -403,10 +424,13 @@ pub trait Net: Send + Sync + 'static {
     /// `fcntl(fd, cmd, arg)` for an owned fd (nonblocking flag, fd flags, dup).
     ///
     /// Models `fcntl(2)`: `F_GETFL`/`F_SETFL` (`O_NONBLOCK`), `F_GETFD`/`F_SETFD` (`FD_CLOEXEC`),
-    /// `F_DUPFD`/`F_DUPFD_CLOEXEC` (`<fcntl.h>`). `arg` is the call's third word as an integer.
+    /// `F_DUPFD`/`F_DUPFD_CLOEXEC` (`<fcntl.h>`), and whatever else the backend models. `arg` is
+    /// the call's third word as an integer. A successful value is returned as it is, negative
+    /// included (`F_GETOWN` reports a process group as one).
     ///
     /// # Safety
-    /// The modelled commands take no pointer.
+    /// `arg` is what the caller passed for `cmd`: a pointer for a command that takes one (a
+    /// `struct flock *`, a Linux `struct f_owner_ex *`).
     unsafe fn fcntl(&self, fd: c_int, cmd: c_int, arg: i64) -> Option<NetResult> {
         None
     }
@@ -460,6 +484,56 @@ pub trait Net: Send + Sync + 'static {
     /// (`<sys/eventfd.h>`).
     unsafe fn eventfd(&self, initval: u32, flags: c_int) -> Option<NetResult> {
         let _ = (initval, flags);
+        None
+    }
+
+    /// A blocking `read` of real descriptor `fd` (one no backend owns) is about to wait in the OS
+    /// for it to turn readable. The backend may wait for that itself, as a wait a signal handler
+    /// interrupts (see [`crate::interruptible`]), restarted under `SA_RESTART` as the hosts restart
+    /// a pipe read: `Some(Err(EINTR))` when a handler interrupted it, `Some(Ok(_))` once `fd` is
+    /// readable, for the read to go to the OS, and `None` to leave the wait to the OS.
+    fn await_readable(&self, fd: c_int) -> Option<NetResult> {
+        let _ = fd;
+        None
+    }
+
+    /// A blocking `waitpid` or `wait4` of child process `pid`, which a thread of the domain made,
+    /// is about to wait in the OS for it to end. As [`await_readable`](Self::await_readable): the
+    /// hosts restart `waitpid` under `SA_RESTART` too.
+    fn await_child(&self, pid: c_int) -> Option<NetResult> {
+        let _ = pid;
+        None
+    }
+
+    /// A blocking `write` or `writev` of real descriptor `fd` (one no backend owns) is about to
+    /// write it in the OS, which blocks while a pipe has no room. As
+    /// [`await_readable`](Self::await_readable), for `fd` turning writable: the hosts restart a
+    /// pipe write under `SA_RESTART` too.
+    fn await_writable(&self, fd: c_int) -> Option<NetResult> {
+        let _ = fd;
+        None
+    }
+
+    /// A blocking wait for any of several child processes (`wait`, `waitpid` of -1 or a process
+    /// group, `waitid`) is about to wait in the OS for one to end. `children` lists the children
+    /// the wait is for, asked again whenever the backend looks, and `ready` says whether the OS
+    /// call would return at once: a child has ended, or none is left. As
+    /// [`await_readable`](Self::await_readable): the hosts restart these under `SA_RESTART` too.
+    fn await_children(
+        &self,
+        children: &mut dyn FnMut() -> Vec<c_int>,
+        ready: &mut dyn FnMut() -> bool,
+    ) -> Option<NetResult> {
+        let _ = (children, ready);
+        None
+    }
+
+    /// `signalfd(fd, mask, flags)`: a descriptor that reads pending signals (Linux). Models
+    /// `signalfd(2)`; `mask` holds the virtual signals of the caller's set (see
+    /// [`crate::virtual_bits`]), `fd` is -1 for a new descriptor or one whose set to replace, and
+    /// `flags` are `SFD_NONBLOCK`/`SFD_CLOEXEC` (`<sys/signalfd.h>`). No pointers.
+    unsafe fn signalfd(&self, fd: c_int, mask: u64, flags: c_int) -> Option<NetResult> {
+        let _ = (fd, mask, flags);
         None
     }
 

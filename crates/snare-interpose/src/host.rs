@@ -62,6 +62,23 @@ pub trait Host: Send + Sync + 'static {
     fn getuid(&self) -> Option<u32> {
         None
     }
+    /// The effective group id the code under test runs as. Models `getegid(2)` and `getgid(2)`;
+    /// `None` reports the real id.
+    fn getegid(&self) -> Option<u32> {
+        None
+    }
+    /// The supplementary groups. Models `getgroups(2)`: fills up to `size` entries of `list`
+    /// (none when `size` is 0) and returns the count, or `EINVAL` when `size` is too small.
+    unsafe fn getgroups(&self, size: c_int, list: *mut u32) -> Option<HostResult> {
+        None
+    }
+
+    /// Models `umask(2)`: sets the file mode creation mask to `mask` (or, for `None`, leaves it)
+    /// and returns the mask before the call. The file hooks consult it with `None` to mask the
+    /// mode of a file or directory they create.
+    fn umask(&self, mask: Option<u32>) -> Option<HostResult> {
+        None
+    }
 
     /// Models `sysconf(3)` for `_SC_NPROCESSORS_CONF` and `_SC_NPROCESSORS_ONLN`, the processors
     /// configured and online; the Unix `sysconf` hook offers no other name.
@@ -71,7 +88,18 @@ pub trait Host: Send + Sync + 'static {
 
     /// Models `uname(2)`; `buf` is a `struct utsname` (`<sys/utsname.h>`). Consulted by the Unix
     /// `uname` hook and, on Linux, reachable as `SYS_uname` through [`syscall`](Host::syscall).
+    /// The Unix `gethostname` hook copies the `nodename` it fills, as glibc builds `gethostname`
+    /// from `uname` (sysdeps/posix/gethostname.c) and macOS from `kern.hostname`, the node
+    /// macOS's `uname` reads its `nodename` from (Libc gen/FreeBSD/gethostname.c, uname.c).
     unsafe fn uname(&self, buf: *mut u8) -> Option<HostResult> {
+        None
+    }
+
+    /// Models `sethostname(2)`: `name` holds `len` bytes, not necessarily NUL-terminated, and
+    /// `len` keeps its sign (an `int` to the kernel on Linux and to libc on macOS). Consulted by
+    /// the Unix `sethostname` hook and, on Linux, reachable as `SYS_sethostname` through
+    /// [`syscall`](Host::syscall).
+    unsafe fn sethostname(&self, name: *const u8, len: i64) -> Option<HostResult> {
         None
     }
 
@@ -293,6 +321,25 @@ pub trait Host: Send + Sync + 'static {
         None
     }
 
+    /// macOS `host_processor_info(host, flavor, count, info, info_count)`: one record of `flavor`
+    /// per processor, in an array the call allocates with `vm_allocate` and the caller frees with
+    /// `vm_deallocate` (`<mach/mach_host.h>`, `<mach/processor_info.h>`). The hook offers only
+    /// calls on the task's own host port (`mach_host_self`); any other port reaches the real call.
+    /// It returns `Ok`'s value as the `kern_return_t`, so a host reports failure as
+    /// `Ok(KERN_*)`, as for [`thread_policy_set`](Self::thread_policy_set).
+    ///
+    /// # Safety
+    /// `count`, `info` and `info_count` are writable.
+    unsafe fn host_processor_info(
+        &self,
+        flavor: c_int,
+        count: *mut u32,
+        info: *mut *mut c_int,
+        info_count: *mut u32,
+    ) -> Option<HostResult> {
+        None
+    }
+
     /// Windows `SetThreadPriority(thread, priority)` — returns a `BOOL`.
     ///
     /// The Windows methods model the `SetThreadPriority` family, not POSIX `sched_*`. Handles are
@@ -506,6 +553,94 @@ pub trait Host: Send + Sync + 'static {
         ids: *mut u32,
         count: u32,
         required: *mut u32,
+    ) -> Option<HostResult> {
+        None
+    }
+
+    /// Windows `GetSystemInfo(info)` / `GetNativeSystemInfo(info)`, offered after the real call
+    /// filled the `SYSTEM_INFO` at `info`: a host rewrites the fields it models and returns
+    /// `Ok(0)`
+    /// ([Microsoft Learn: SYSTEM_INFO](https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/ns-sysinfoapi-system_info)).
+    ///
+    /// # Safety
+    /// `info` is a writable `SYSTEM_INFO`.
+    unsafe fn system_info(&self, info: *mut u8) -> Option<HostResult> {
+        None
+    }
+    /// Windows `GetActiveProcessorCount(group)` (`maximum` false) or
+    /// `GetMaximumProcessorCount(group)`: `Ok` is the count, `Err(e)` returns 0 with
+    /// `SetLastError(e)`
+    /// ([Microsoft Learn: GetActiveProcessorCount](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getactiveprocessorcount)).
+    fn processor_count(&self, maximum: bool, group: u16) -> Option<HostResult> {
+        None
+    }
+    /// Windows `GetActiveProcessorGroupCount()` (`maximum` false) or
+    /// `GetMaximumProcessorGroupCount()`: `Ok` is the count
+    /// ([Microsoft Learn: GetActiveProcessorGroupCount](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getactiveprocessorgroupcount)).
+    fn processor_group_count(&self, maximum: bool) -> Option<HostResult> {
+        None
+    }
+    /// Windows `GetLogicalProcessorInformation(info, len)` (`relationship` `None`) or
+    /// `GetLogicalProcessorInformationEx(relationship, info, len)`; returns a `BOOL`
+    /// ([Microsoft Learn: GetLogicalProcessorInformationEx](https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getlogicalprocessorinformationex)).
+    ///
+    /// # Safety
+    /// `len` is null or a readable and writable `DWORD`; `info` is null or valid for `*len`
+    /// bytes.
+    unsafe fn logical_processor_information(
+        &self,
+        relationship: Option<i32>,
+        info: *mut u8,
+        len: *mut u32,
+    ) -> Option<HostResult> {
+        None
+    }
+    /// Windows `GetProcessAffinityMask(process, process_mask, system_mask)`; returns a `BOOL`
+    /// ([Microsoft Learn: GetProcessAffinityMask](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getprocessaffinitymask)).
+    ///
+    /// # Safety
+    /// `process_mask` and `system_mask` are writable.
+    unsafe fn get_process_affinity_mask(
+        &self,
+        process: u64,
+        process_mask: *mut usize,
+        system_mask: *mut usize,
+    ) -> Option<HostResult> {
+        None
+    }
+    /// Windows `SetProcessAffinityMask(process, mask)`; returns a `BOOL`
+    /// ([Microsoft Learn: SetProcessAffinityMask](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setprocessaffinitymask)).
+    fn set_process_affinity_mask(&self, process: u64, mask: u64) -> Option<HostResult> {
+        None
+    }
+    /// Windows `GetNumaHighestNodeNumber`: `Ok` is the highest node number
+    /// ([Microsoft Learn: GetNumaHighestNodeNumber](https://learn.microsoft.com/en-us/windows/win32/api/systemtopologyapi/nf-systemtopologyapi-getnumahighestnodenumber)).
+    fn numa_highest_node(&self) -> Option<HostResult> {
+        None
+    }
+    /// The processors of NUMA node `node`, as the `GROUP_AFFINITY` that
+    /// `GetNumaNodeProcessorMaskEx` writes to `affinity`; `Ok(1)`, or `Err(e)` for a node the
+    /// machine does not have. `GetNumaNodeProcessorMask` and `GetNumaNodeProcessorMask2` are
+    /// answered from it
+    /// ([Microsoft Learn: GetNumaNodeProcessorMaskEx](https://learn.microsoft.com/en-us/windows/win32/api/systemtopologyapi/nf-systemtopologyapi-getnumanodeprocessormaskex)).
+    ///
+    /// # Safety
+    /// `affinity` is a writable `GROUP_AFFINITY`.
+    unsafe fn numa_node_processor_mask(&self, node: u16, affinity: *mut u8) -> Option<HostResult> {
+        None
+    }
+    /// powrprof `CallNtPowerInformation(ProcessorInformation, input, input_len, output,
+    /// output_len)`: `Ok` is the `NTSTATUS` the call returns, as its unsigned bit pattern
+    /// ([Microsoft Learn: CallNtPowerInformation](https://learn.microsoft.com/en-us/windows/win32/api/powerbase/nf-powerbase-callntpowerinformation)).
+    ///
+    /// # Safety
+    /// `input` is null or valid for `input_len` bytes, `output` null or valid for `output_len`.
+    unsafe fn processor_power_information(
+        &self,
+        input: *const u8,
+        input_len: u32,
+        output: *mut u8,
+        output_len: u32,
     ) -> Option<HostResult> {
         None
     }

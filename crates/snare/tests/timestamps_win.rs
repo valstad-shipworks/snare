@@ -76,8 +76,10 @@ fn tx_timestamp_before_configuring_os_truth() {
     assert_eq!(sim, real);
 }
 
+/// A `WSASendMsg` whose control message Windows refuses (an unknown `IPPROTO_IP` type,
+/// `WSAEINVAL`) sends nothing.
 #[test]
-fn unsupported_outbound_control_messages_fail_without_sending() {
+fn refused_outbound_control_messages_send_nothing() {
     for deterministic in [false, true] {
         let mut builder = Sim::builder();
         if deterministic {
@@ -87,15 +89,15 @@ fn unsupported_outbound_control_messages_fail_without_sending() {
             let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
             rx.set_nonblocking(true).unwrap();
             let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-            let mut control = cmsg(ws::IPPROTO_IP, ws::IP_PKTINFO, &[0; 8]);
+            let mut control = cmsg(ws::IPPROTO_IP, 99, &[0; 4]);
             assert_eq!(
                 send_msg(
                     raw(&tx),
-                    b"unselected",
+                    b"refused",
                     Some(rx.local_addr().unwrap()),
                     &mut control
                 ),
-                Err(ws::WSAEOPNOTSUPP)
+                Err(ws::WSAEINVAL)
             );
             assert_eq!(
                 rx.recv(&mut [0; 16]).unwrap_err().kind(),

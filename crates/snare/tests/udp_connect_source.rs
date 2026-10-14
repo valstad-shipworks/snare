@@ -1,6 +1,7 @@
 //! A UDP socket bound to the wildcard address takes the route's source address when it connects,
 //! as every host does (Linux `ip4_datagram_connect`/`ip6_datagram_dst_update`, macOS
-//! `in_pcbconnect`, Winsock), and receives only there while connected. Dissolving the association
+//! `in_pcbconnect`, Winsock), and on Linux and macOS receives only there while connected (Windows
+//! keeps receiving at the wildcard's other addresses). Dissolving the association
 //! (`connect` to an `AF_UNSPEC` address) follows each host: Linux returns the address to the
 //! wildcard unless `bind` named one and gives up a port `bind` did not name; macOS returns the
 //! address to the wildcard, keeps the port and fails with `EAFNOSUPPORT`; Windows returns it to
@@ -200,30 +201,43 @@ fn zero_address_disconnect_os_truth() {
     assert_eq!(Sim::new().run(probe), real);
 }
 
-/// While connected, a socket that took the route's source receives what is sent there and
-/// nothing sent to its old wildcard's other addresses.
+/// What a connected wildcard socket receives of a datagram its peer sends to another loopback
+/// address at its port and of one sent to the route's source, in that order.
+fn connected_wildcard_probe() -> (SocketAddr, Vec<String>) {
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let s = UdpSocket::bind("0.0.0.0:0").unwrap();
+    let port = s.local_addr().unwrap().port();
+    s.connect("127.0.0.3:9").unwrap();
+    let local = s.local_addr().unwrap();
+    s.connect(peer.local_addr().unwrap()).unwrap();
+    s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    peer.send_to(b"to", SocketAddr::from(([127, 0, 0, 2], port)))
+        .unwrap();
+    peer.send_to(b"source", SocketAddr::from(([127, 0, 0, 1], port)))
+        .unwrap();
+    let mut buf = [0; 16];
+    let got = (0..3)
+        .map(|_| match s.recv(&mut buf) {
+            Ok(n) => String::from_utf8_lossy(&buf[..n]).into_owned(),
+            Err(e) => format!("{:?}", e.kind()),
+        })
+        .collect();
+    (SocketAddr::new(local.ip(), local.port() - port), got)
+}
+
+/// While connected, a socket that took the route's source receives what is sent there and, on
+/// Linux and macOS, nothing sent to its old wildcard's other addresses. Windows keeps delivering
+/// to it as it was bound, compared with the host there, where all of 127/8 is loopback.
 #[test]
 fn connected_wildcard_receives_only_at_its_source() {
-    Sim::new().run(|| {
-        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let s = UdpSocket::bind("0.0.0.0:0").unwrap();
-        let port = s.local_addr().unwrap().port();
-        s.connect("127.0.0.3:9").unwrap();
-        assert_eq!(
-            s.local_addr().unwrap(),
-            SocketAddr::from(([127, 0, 0, 1], port))
-        );
-        s.connect(peer.local_addr().unwrap()).unwrap();
-        s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
-        peer.send_to(b"to", SocketAddr::from(([127, 0, 0, 2], port)))
-            .unwrap();
-        peer.send_to(b"source", SocketAddr::from(([127, 0, 0, 1], port)))
-            .unwrap();
-        let mut buf = [0; 16];
-        let n = s.recv(&mut buf).unwrap();
-        assert_eq!(&buf[..n], b"source");
-        assert!(s.recv(&mut buf).is_err(), "127.0.0.2 is not its address");
-    });
+    let sim = Sim::new().run(connected_wildcard_probe);
+    if cfg!(windows) {
+        assert_eq!(sim, snare::real(connected_wildcard_probe));
+        return;
+    }
+    assert_eq!(sim.0, SocketAddr::from(([127, 0, 0, 1], 0)));
+    assert_eq!(sim.1[0], "source");
+    assert_ne!(sim.1[1], "to", "127.0.0.2 is not its address");
 }
 
 fn nic_sim() -> Sim {

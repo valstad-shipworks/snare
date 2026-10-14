@@ -10,11 +10,11 @@
 //! these. The draws from the generator are in a fixed order per decision, so a given seed and a
 //! given sequence of sends replay the same faults.
 
-use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::HashMap;
 use crate::events::{Direction, LinkFault};
 use crate::readiness::Deadline;
 

@@ -11,6 +11,9 @@ use std::time::Duration;
 
 use snare::{HostProfile, Line, Sim, TesterAction, connect_tester, run_testers};
 
+#[path = "support/shared_port.rs"]
+mod shared_port;
+
 fn host_sim() -> Sim {
     Sim::builder().host(HostProfile::new().build()).build()
 }
@@ -97,8 +100,8 @@ fn broadcast_and_multi_ip() {
             .local_addr()
             .unwrap()
             .port();
-        let a = UdpSocket::bind(("0.0.0.0", port)).unwrap();
-        let b = UdpSocket::bind(("127.0.0.2", port)).unwrap();
+        let a = shared_port::udp_reuse(("0.0.0.0", port)).unwrap();
+        let b = shared_port::udp_reuse(("127.0.0.2", port)).unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
         assert!(sender.send_to(b"x", ("255.255.255.255", port)).is_err());
         sender.set_broadcast(true).unwrap();

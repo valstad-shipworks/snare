@@ -114,3 +114,60 @@ fn storage_limits_count_allocated_pages_and_last_inode_reference() {
         }
     });
 }
+
+/// A mapped file keeps its accounting: pages written through `pwrite` are allocated as before, a
+/// page a shared mapping first fills counts once a `stat` or `statfs` finds data in it, past the
+/// storage limit if need be (a full disk would raise `SIGBUS` instead), and truncation frees them.
+#[test]
+fn pages_a_shared_mapping_fills_count_as_allocated() {
+    let path = "/snare-mapped-pages";
+    let fs = FsBuilder::new()
+        .dir(path)
+        .own_prefix(path)
+        .storage_limit(3 * 4096)
+        .build();
+    Sim::builder().fs(fs).build().run(|| {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(format!("{path}/file"))
+            .unwrap();
+        let fd = file.as_raw_fd();
+        let len = 8 * 4096;
+        file.set_len(len as u64).unwrap();
+        file.write_at(b"a", 0).unwrap();
+        assert_eq!(file.metadata().unwrap().blocks(), 8);
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(map, libc::MAP_FAILED);
+        let bytes = map.cast::<u8>();
+        unsafe {
+            assert_eq!(bytes.read_volatile(), b'a');
+            bytes.add(2 * 4096 + 5).write_volatile(b'b');
+            bytes.add(3 * 4096).write_volatile(0);
+        }
+        assert_eq!(file.metadata().unwrap().blocks(), 16);
+        assert_eq!(space(fd), (4096, 3, 1));
+        file.write_at(b"c", 4 * 4096).unwrap();
+        unsafe { bytes.add(5 * 4096).write_volatile(b'd') };
+        assert_eq!(space(fd), (4096, 3, 0));
+        assert_eq!(file.metadata().unwrap().blocks(), 32);
+        assert_eq!(unsafe { libc::munmap(map, len) }, 0);
+        let mut back = [0; 1];
+        assert_eq!(file.read_at(&mut back, 2 * 4096 + 5).unwrap(), 1);
+        assert_eq!(back, *b"b");
+        file.set_len(4096).unwrap();
+        assert_eq!(file.metadata().unwrap().blocks(), 8);
+        assert_eq!(space(fd), (4096, 3, 2));
+    });
+}

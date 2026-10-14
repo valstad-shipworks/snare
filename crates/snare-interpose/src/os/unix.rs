@@ -1,5 +1,6 @@
 //! The Unix hooks for clocks, local time, sleeps, threads, randomness, the environment, user ids,
-//! processor counts and symbol lookup, plus the table of every Unix hook (see [`hooks()`]).
+//! the kernel identity and host name, processor counts and symbol lookup, plus the table of every
+//! Unix hook (see [`hooks()`]).
 //!
 //! Each replacement offers its call to the managed thread's layers through `domain::dispatch` and
 //! its relatives, and makes the real call through the saved original when no layer handles it, or
@@ -31,7 +32,15 @@ static SETENV: AtomicUsize = AtomicUsize::new(0);
 static UNSETENV: AtomicUsize = AtomicUsize::new(0);
 static GETEUID: AtomicUsize = AtomicUsize::new(0);
 static GETUID: AtomicUsize = AtomicUsize::new(0);
+static GETEGID: AtomicUsize = AtomicUsize::new(0);
+static GETGID: AtomicUsize = AtomicUsize::new(0);
+static GETGROUPS: AtomicUsize = AtomicUsize::new(0);
+static UMASK: AtomicUsize = AtomicUsize::new(0);
 static UNAME: AtomicUsize = AtomicUsize::new(0);
+static GETHOSTNAME: AtomicUsize = AtomicUsize::new(0);
+static SETHOSTNAME: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "linux")]
+static GETHOSTNAME_CHK: AtomicUsize = AtomicUsize::new(0);
 static TIME: AtomicUsize = AtomicUsize::new(0);
 static SYSCONF: AtomicUsize = AtomicUsize::new(0);
 static LOCALTIME_R: AtomicUsize = AtomicUsize::new(0);
@@ -41,6 +50,10 @@ static TIMELOCAL: AtomicUsize = AtomicUsize::new(0);
 static TZSET: AtomicUsize = AtomicUsize::new(0);
 static CTIME_R: AtomicUsize = AtomicUsize::new(0);
 static CTIME: AtomicUsize = AtomicUsize::new(0);
+static STRFTIME: AtomicUsize = AtomicUsize::new(0);
+static STRFTIME_L: AtomicUsize = AtomicUsize::new(0);
+static WCSFTIME: AtomicUsize = AtomicUsize::new(0);
+static WCSFTIME_L: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(target_os = "linux")]
 static CLOCK_NANOSLEEP: AtomicUsize = AtomicUsize::new(0);
@@ -85,6 +98,10 @@ pub(crate) fn hooks() -> Vec<Hook> {
         hook!("tzset", tzset, TZSET),
         hook!("ctime_r", ctime_r, CTIME_R),
         hook!("ctime", ctime, CTIME),
+        hook!("strftime", strftime, STRFTIME),
+        hook!("strftime_l", strftime_l, STRFTIME_L),
+        hook!("wcsftime", wcsftime, WCSFTIME),
+        hook!("wcsftime_l", wcsftime_l, WCSFTIME_L),
         hook!("sysconf", sysconf, SYSCONF),
         hook!("nanosleep", nanosleep, NANOSLEEP),
         hook!("usleep", usleep, USLEEP),
@@ -100,7 +117,15 @@ pub(crate) fn hooks() -> Vec<Hook> {
         hook!("_NSGetEnviron", ns_get_environ, NS_GET_ENVIRON),
         hook!("geteuid", geteuid, GETEUID),
         hook!("getuid", getuid, GETUID),
+        hook!("getegid", getegid, GETEGID),
+        hook!("getgid", getgid, GETGID),
+        hook!("getgroups", getgroups, GETGROUPS),
+        hook!("umask", umask, UMASK),
         hook!("uname", uname, UNAME),
+        hook!("gethostname", gethostname, GETHOSTNAME),
+        hook!("sethostname", sethostname, SETHOSTNAME),
+        #[cfg(target_os = "linux")]
+        hook!("__gethostname_chk", gethostname_chk, GETHOSTNAME_CHK),
         #[cfg(target_os = "linux")]
         hook!("clock_nanosleep", clock_nanosleep, CLOCK_NANOSLEEP),
         #[cfg(target_os = "linux")]
@@ -154,12 +179,7 @@ pub(crate) fn hooks() -> Vec<Hook> {
 /// are file I/O, and a socket reaching them was already reported when it was created.
 fn observed_hooks() -> Vec<Hook> {
     vec![
-        observed!("fork", []),
         observed!("execve", [path, arguments, environment]),
-        observed!(
-            "posix_spawn",
-            [pid, path, actions, attributes, arguments, environment]
-        ),
         #[cfg(target_os = "linux")]
         observed!("ppoll", [fds, count, timeout, mask]),
         #[cfg(target_os = "linux")]
@@ -348,7 +368,7 @@ unsafe extern "C" fn localtime_r(t: *const libc::time_t, tm: *mut libc::tm) -> *
         && let Some(zone) = crate::os::tz::current(false)
     {
         // SAFETY: the caller passed a readable time_t and a writable struct tm.
-        return unsafe { local_tm(&zone.zone, *t, &mut *tm) };
+        return unsafe { local_tm(&zone, *t, &mut *tm) };
     }
     // SAFETY: LOCALTIME_R holds libc's localtime_r.
     unsafe {
@@ -358,9 +378,11 @@ unsafe extern "C" fn localtime_r(t: *const libc::time_t, tm: *mut libc::tm) -> *
     }
 }
 
-/// Breaks `t` down into `tm`, returning `tm`, or null with `EOVERFLOW`.
-fn local_tm(zone: &crate::os::tz::Zone, t: libc::time_t, tm: &mut libc::tm) -> *mut libc::tm {
-    if crate::os::tz::break_down(zone, t, tm) {
+/// Breaks `t` down into `tm`, returning `tm`, or null with `EOVERFLOW`. The conversion moves
+/// the sim's `tzname` as the C library's would.
+fn local_tm(zone: &crate::os::tz::Resolved, t: libc::time_t, tm: &mut libc::tm) -> *mut libc::tm {
+    if crate::os::tz::break_down(&zone.zone, t, tm) {
+        crate::os::tz::note_conversion(zone, t);
         return tm;
     }
     // SAFETY: setting the calling thread's errno.
@@ -384,7 +406,7 @@ unsafe extern "C" fn localtime(t: *const libc::time_t) -> *mut libc::tm {
         && let Ok(tm) = LOCAL_TM.try_with(std::cell::UnsafeCell::get)
     {
         // SAFETY: the caller passed a readable time_t; `tm` is this thread's.
-        return unsafe { local_tm(&zone.zone, *t, &mut *tm) };
+        return unsafe { local_tm(&zone, *t, &mut *tm) };
     }
     // SAFETY: LOCALTIME holds libc's localtime.
     unsafe {
@@ -395,30 +417,40 @@ unsafe extern "C" fn localtime(t: *const libc::time_t) -> *mut libc::tm {
 /// `mktime` (man 3 mktime): the local time `tm` names, normalizing and completing `tm`, or `-1`;
 /// see [`crate::os::tz::make_time`].
 unsafe extern "C" fn mktime(tm: *mut libc::tm) -> libc::time_t {
-    if let Some(r) = sim_mktime(tm) {
+    if let Some(r) = sim_mktime(tm, false) {
         return r;
     }
     // SAFETY: MKTIME holds libc's mktime.
     unsafe { original::<unsafe extern "C" fn(*mut libc::tm) -> libc::time_t>(&MKTIME)(tm) }
 }
 
-/// `timelocal`, the BSD and glibc name for `mktime` (man 3 timelocal).
+/// `timelocal`, the BSD and glibc name for `mktime` (man 3 timelocal). macOS's sets
+/// `tm_isdst` to -1 first (tzcode localtime.c `timelocal`, "in case it wasn't initialized").
 unsafe extern "C" fn timelocal(tm: *mut libc::tm) -> libc::time_t {
-    if let Some(r) = sim_mktime(tm) {
+    if let Some(r) = sim_mktime(tm, cfg!(target_os = "macos")) {
         return r;
     }
     // SAFETY: TIMELOCAL holds libc's timelocal.
     unsafe { original::<unsafe extern "C" fn(*mut libc::tm) -> libc::time_t>(&TIMELOCAL)(tm) }
 }
 
-fn sim_mktime(tm: *mut libc::tm) -> Option<libc::time_t> {
+/// mktime(3) in the sim's zone, `tm_isdst` reset to -1 first when `undetermined`; `None` when
+/// the sim decides no zone.
+fn sim_mktime(tm: *mut libc::tm, undetermined: bool) -> Option<libc::time_t> {
     if tm.is_null() {
         return None;
     }
     let zone = crate::os::tz::current(true)?;
     // SAFETY: the caller passed a readable and writable struct tm.
-    match crate::os::tz::make_time(&zone.zone, unsafe { &mut *tm }) {
-        Ok(t) => Some(t),
+    let tm = unsafe { &mut *tm };
+    if undetermined {
+        tm.tm_isdst = -1;
+    }
+    match crate::os::tz::make_time(&zone.zone, tm) {
+        Ok(t) => {
+            crate::os::tz::note_conversion(&zone, t);
+            Some(t)
+        }
         Err(errno) => {
             if let Some(errno) = errno {
                 // SAFETY: setting the calling thread's errno.
@@ -446,7 +478,7 @@ unsafe extern "C" fn ctime_r(t: *const libc::time_t, buf: *mut c_char) -> *mut c
         // SAFETY: all-zero is a valid struct tm.
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
         // SAFETY: the caller passed a readable time_t.
-        if local_tm(&zone.zone, unsafe { *t }, &mut tm).is_null() {
+        if local_tm(&zone, unsafe { *t }, &mut tm).is_null() {
             return std::ptr::null_mut();
         }
         // SAFETY: `buf` holds at least 26 bytes, as ctime_r requires.
@@ -475,7 +507,7 @@ unsafe extern "C" fn ctime(t: *const libc::time_t) -> *mut c_char {
         // SAFETY: all-zero is a valid struct tm.
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
         // SAFETY: the caller passed a readable time_t.
-        if local_tm(&zone.zone, unsafe { *t }, &mut tm).is_null() {
+        if local_tm(&zone, unsafe { *t }, &mut tm).is_null() {
             return std::ptr::null_mut();
         }
         // SAFETY: `buf` is this thread's 26 bytes.
@@ -485,17 +517,162 @@ unsafe extern "C" fn ctime(t: *const libc::time_t) -> *mut c_char {
     unsafe { original::<unsafe extern "C" fn(*const libc::time_t) -> *mut c_char>(&CTIME)(t) }
 }
 
+/// The format and `struct tm` a sim that decides its zone hands strftime(3); see
+/// [`crate::os::tz::strftime_inputs`]. `None` passes the caller's on.
+fn sim_strftime<C: crate::os::tz::FormatUnit>(
+    format: *const C,
+    tm: *const libc::tm,
+) -> Option<(Option<Vec<C>>, libc::tm)> {
+    if format.is_null() || tm.is_null() {
+        return None;
+    }
+    let zone = crate::os::tz::current(false)?;
+    // SAFETY: the caller's readable struct tm.
+    crate::os::tz::strftime_inputs(&zone, format, unsafe { &*tm })
+}
+
+/// The arguments to hand on: the sim's format and `struct tm` where it has its own.
+fn strftime_args<C>(
+    sim: &Option<(Option<Vec<C>>, libc::tm)>,
+    format: *const C,
+    tm: *const libc::tm,
+) -> (*const C, *const libc::tm) {
+    match sim {
+        Some((rewritten, named)) => (
+            rewritten.as_ref().map_or(format, |f| f.as_ptr()),
+            named as *const libc::tm,
+        ),
+        None => (format, tm),
+    }
+}
+
+/// `strftime` (man 3 strftime): the C library's, with the zone it reads inside itself — `%Z`
+/// of a `struct tm` without a zone name, `%s`, and on macOS `%z` — answered by the sim's.
+unsafe extern "C" fn strftime(
+    s: *mut c_char,
+    max: usize,
+    format: *const c_char,
+    tm: *const libc::tm,
+) -> usize {
+    let sim = sim_strftime(format, tm);
+    let (format, tm) = strftime_args(&sim, format, tm);
+    // SAFETY: STRFTIME holds libc's strftime; the arguments are the caller's or the sim's.
+    unsafe {
+        original::<unsafe extern "C" fn(*mut c_char, usize, *const c_char, *const libc::tm) -> usize>(
+            &STRFTIME,
+        )(s, max, format, tm)
+    }
+}
+
+/// `strftime_l`: as [`strftime`], in `locale`.
+unsafe extern "C" fn strftime_l(
+    s: *mut c_char,
+    max: usize,
+    format: *const c_char,
+    tm: *const libc::tm,
+    locale: libc::locale_t,
+) -> usize {
+    let sim = sim_strftime(format, tm);
+    let (format, tm) = strftime_args(&sim, format, tm);
+    // SAFETY: STRFTIME_L holds libc's strftime_l; the arguments are the caller's or the sim's.
+    unsafe {
+        original::<
+            unsafe extern "C" fn(
+                *mut c_char,
+                usize,
+                *const c_char,
+                *const libc::tm,
+                libc::locale_t,
+            ) -> usize,
+        >(&STRFTIME_L)(s, max, format, tm, locale)
+    }
+}
+
+/// `wcsftime` (man 3 wcsftime): as [`strftime`], in wide characters.
+unsafe extern "C" fn wcsftime(
+    s: *mut libc::wchar_t,
+    max: usize,
+    format: *const libc::wchar_t,
+    tm: *const libc::tm,
+) -> usize {
+    let sim = sim_strftime(format, tm);
+    let (format, tm) = strftime_args(&sim, format, tm);
+    // SAFETY: WCSFTIME holds libc's wcsftime; the arguments are the caller's or the sim's.
+    unsafe {
+        original::<
+            unsafe extern "C" fn(
+                *mut libc::wchar_t,
+                usize,
+                *const libc::wchar_t,
+                *const libc::tm,
+            ) -> usize,
+        >(&WCSFTIME)(s, max, format, tm)
+    }
+}
+
+/// `wcsftime_l`: as [`wcsftime`], in `locale`.
+unsafe extern "C" fn wcsftime_l(
+    s: *mut libc::wchar_t,
+    max: usize,
+    format: *const libc::wchar_t,
+    tm: *const libc::tm,
+    locale: libc::locale_t,
+) -> usize {
+    let sim = sim_strftime(format, tm);
+    let (format, tm) = strftime_args(&sim, format, tm);
+    // SAFETY: WCSFTIME_L holds libc's wcsftime_l; the arguments are the caller's or the sim's.
+    unsafe {
+        original::<
+            unsafe extern "C" fn(
+                *mut libc::wchar_t,
+                usize,
+                *const libc::wchar_t,
+                *const libc::tm,
+                libc::locale_t,
+            ) -> usize,
+        >(&WCSFTIME_L)(s, max, format, tm, locale)
+    }
+}
+
+/// Sleeps as `request` asks on the calling thread's domain, as a call a signal handler interrupts
+/// and that never restarts (man 7 signal: `nanosleep`, `clock_nanosleep` and `usleep` "always
+/// fail with the error EINTR"). `None` when no layer models the sleep, else the time a relative
+/// request had left when a handler cut it short, zero for one slept out.
+fn sleep_interruptibly(request: SleepRequest) -> Option<Option<Duration>> {
+    let start = domain::now(ClockKind::Monotonic);
+    let (slept, interrupted) =
+        crate::signals::interruptible(crate::signals::Restart::Never, || {
+            dispatch(|layer| layer.sleep(request))
+        });
+    slept?;
+    if !interrupted {
+        return Some(None);
+    }
+    let left = match (request, start, domain::now(ClockKind::Monotonic)) {
+        (SleepRequest::For(span), Some(start), Some(now)) => {
+            span.saturating_sub(now.saturating_sub(start))
+        }
+        _ => Duration::ZERO,
+    };
+    Some(Some(left))
+}
+
 /// `nanosleep` (man 2 nanosleep): relative sleep; on early return (`EINTR`) the unslept time is
-/// written to `remaining`. The sim never interrupts a sleep, so `remaining` is always zero.
+/// written to `remaining`.
 unsafe extern "C" fn nanosleep(request: *const timespec, remaining: *mut timespec) -> c_int {
     // SAFETY: a non-null request points to a readable timespec.
     let duration = unsafe { request.as_ref() }.and_then(from_timespec);
     if let Some(duration) = duration
-        && dispatch(|layer| layer.sleep(SleepRequest::For(duration))).is_some()
+        && let Some(left) = sleep_interruptibly(SleepRequest::For(duration))
     {
-        if !remaining.is_null() {
-            // SAFETY: the caller passed a writable timespec.
-            unsafe { remaining.write(to_timespec(Duration::ZERO)) };
+        if let Some(left) = left {
+            if !remaining.is_null() {
+                // SAFETY: the caller passed a writable timespec.
+                unsafe { remaining.write(to_timespec(left)) };
+            }
+            // SAFETY: setting the calling thread's errno.
+            unsafe { crate::os::sockets::set_errno(libc::EINTR) };
+            return -1;
         }
         return 0;
     }
@@ -510,9 +687,13 @@ unsafe extern "C" fn nanosleep(request: *const timespec, remaining: *mut timespe
 /// `usleep` (man 3 usleep): suspend for a microsecond interval (removed from POSIX.1-2008, still
 /// widely linked).
 unsafe extern "C" fn usleep(micros: libc::useconds_t) -> c_int {
-    if dispatch(|layer| layer.sleep(SleepRequest::For(Duration::from_micros(micros.into()))))
-        .is_some()
+    if let Some(left) = sleep_interruptibly(SleepRequest::For(Duration::from_micros(micros.into())))
     {
+        if left.is_some() {
+            // SAFETY: setting the calling thread's errno.
+            unsafe { crate::os::sockets::set_errno(libc::EINTR) };
+            return -1;
+        }
         return 0;
     }
     // SAFETY: USLEEP holds libc's usleep.
@@ -521,7 +702,8 @@ unsafe extern "C" fn usleep(micros: libc::useconds_t) -> c_int {
 
 /// `clock_nanosleep` (man 2 clock_nanosleep): sleep against a named clock. `TIMER_ABSTIME` (1 in
 /// `include/uapi/linux/time.h`) selects an absolute deadline, for which no remaining time is
-/// reported; otherwise the request is relative.
+/// reported; otherwise the request is relative. It returns its error rather than setting
+/// `errno`: `EINTR` when a handler cuts it short.
 #[cfg(target_os = "linux")]
 unsafe extern "C" fn clock_nanosleep(
     id: clockid_t,
@@ -537,12 +719,12 @@ unsafe extern "C" fn clock_nanosleep(
         } else {
             SleepRequest::For(time)
         };
-        if dispatch(|layer| layer.sleep(sleep)).is_some() {
+        if let Some(left) = sleep_interruptibly(sleep) {
             if !remaining.is_null() && flags & libc::TIMER_ABSTIME == 0 {
                 // SAFETY: the caller passed a writable timespec.
-                unsafe { remaining.write(to_timespec(Duration::ZERO)) };
+                unsafe { remaining.write(to_timespec(left.unwrap_or(Duration::ZERO))) };
             }
-            return 0;
+            return if left.is_some() { libc::EINTR } else { 0 };
         }
     }
     // SAFETY: CLOCK_NANOSLEEP holds libc's clock_nanosleep.
@@ -855,6 +1037,49 @@ unsafe extern "C" fn getuid() -> libc::uid_t {
     unsafe { original::<unsafe extern "C" fn() -> libc::uid_t>(&GETUID)() }
 }
 
+/// `getegid` (man 2 getegid): the effective group id, as the domain's host models it.
+unsafe extern "C" fn getegid() -> libc::gid_t {
+    if let Some(gid) = host_uid(|h| h.getegid()) {
+        return gid;
+    }
+    // SAFETY: GETEGID holds libc's getegid.
+    unsafe { original::<unsafe extern "C" fn() -> libc::gid_t>(&GETEGID)() }
+}
+
+/// `getgid` (man 2 getgid): the real group id, which a host modelling the group keeps equal to
+/// the effective one.
+unsafe extern "C" fn getgid() -> libc::gid_t {
+    if let Some(gid) = host_uid(|h| h.getegid()) {
+        return gid;
+    }
+    // SAFETY: GETGID holds libc's getgid.
+    unsafe { original::<unsafe extern "C" fn() -> libc::gid_t>(&GETGID)() }
+}
+
+/// `getgroups` (man 2 getgroups): the supplementary groups, as the domain's host models them.
+unsafe extern "C" fn getgroups(size: c_int, list: *mut libc::gid_t) -> c_int {
+    // SAFETY: `list` holds `size` entries (man 2 getgroups).
+    if let Some(r) = domain::dispatch_host(|h| unsafe { h.getgroups(size, list.cast()) }) {
+        return crate::os::sockets::finish(r) as c_int;
+    }
+    // SAFETY: GETGROUPS holds libc's getgroups.
+    unsafe {
+        original::<unsafe extern "C" fn(c_int, *mut libc::gid_t) -> c_int>(&GETGROUPS)(size, list)
+    }
+}
+
+/// `umask` (man 2 umask): the sim's own file mode creation mask where the domain's host keeps
+/// one, so a sim setting it changes neither the process's mask nor another sim's.
+unsafe extern "C" fn umask(mask: libc::mode_t) -> libc::mode_t {
+    #[allow(clippy::useless_conversion)]
+    let requested = u32::from(mask) & 0o777;
+    if let Some(old) = domain::dispatch_host(|h| h.umask(Some(requested))) {
+        return old as libc::mode_t;
+    }
+    // SAFETY: UMASK holds libc's umask.
+    unsafe { original::<unsafe extern "C" fn(libc::mode_t) -> libc::mode_t>(&UMASK)(mask) }
+}
+
 /// `uname` (man 2 uname): the kernel identity, as the domain's host models it.
 unsafe extern "C" fn uname(buf: *mut libc::utsname) -> c_int {
     // SAFETY: `buf` is the caller's `struct utsname`.
@@ -863,6 +1088,101 @@ unsafe extern "C" fn uname(buf: *mut libc::utsname) -> c_int {
     }
     // SAFETY: UNAME holds libc's uname.
     unsafe { original::<unsafe extern "C" fn(*mut libc::utsname) -> c_int>(&UNAME)(buf) }
+}
+
+/// `gethostname` (man 2 gethostname): the `nodename` the domain's host gives `uname`, copied as
+/// each libc does. glibc copies at most `len` bytes and fails with `ENAMETOOLONG` when the name
+/// and its NUL do not fit, leaving the truncated name unterminated (sysdeps/posix/gethostname.c).
+/// macOS `strncpy`s into a buffer shorter than `MAXHOSTNAMELEN + 1`, zero-filling it, and ends it
+/// with a NUL in the last byte, succeeding (Libc gen/FreeBSD/gethostname.c); a zero `len` makes
+/// it write the byte before `name`, so here it writes nothing.
+unsafe extern "C" fn gethostname(name: *mut c_char, len: usize) -> c_int {
+    // SAFETY: `name` is the caller's, writable for `len` bytes.
+    if let Some(rc) = unsafe { host_gethostname(name, len) } {
+        return rc;
+    }
+    // SAFETY: GETHOSTNAME holds libc's gethostname.
+    unsafe { original::<unsafe extern "C" fn(*mut c_char, usize) -> c_int>(&GETHOSTNAME)(name, len) }
+}
+
+/// glibc's `__gethostname_chk`, which `_FORTIFY_SOURCE` substitutes for `gethostname`: it
+/// aborts when `len` exceeds the `real` size of the buffer and is otherwise `gethostname`
+/// (debug/gethostname_chk.c). An overlong `len` is left to the original to abort on.
+#[cfg(target_os = "linux")]
+unsafe extern "C" fn gethostname_chk(name: *mut c_char, len: usize, real: usize) -> c_int {
+    // SAFETY: `name` is the caller's, writable for `len` bytes when `len` fits in `real`.
+    if len <= real
+        && let Some(rc) = unsafe { host_gethostname(name, len) }
+    {
+        return rc;
+    }
+    // SAFETY: GETHOSTNAME_CHK holds glibc's __gethostname_chk.
+    unsafe {
+        original::<unsafe extern "C" fn(*mut c_char, usize, usize) -> c_int>(&GETHOSTNAME_CHK)(
+            name, len, real,
+        )
+    }
+}
+
+/// [`gethostname`] as the domain's host answers it, or `None` when no host models `uname`.
+///
+/// # Safety
+/// `name` is writable for `len` bytes.
+unsafe fn host_gethostname(name: *mut c_char, len: usize) -> Option<c_int> {
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: `uts` is a `struct utsname`.
+    let r = domain::dispatch_host(|h| unsafe { h.uname((&raw mut uts).cast()) })?;
+    if r < 0 {
+        return Some(crate::os::sockets::finish(r) as c_int);
+    }
+    // SAFETY: the host filled `nodename` with a NUL-terminated name.
+    let node = unsafe { CStr::from_ptr(uts.nodename.as_ptr()) }.to_bytes_with_nul();
+    let out = name.cast::<u8>();
+    if cfg!(target_os = "macos") {
+        const MAXHOSTNAMELEN: usize = 256;
+        // SAFETY: the caller's `name` is writable for `len` bytes, and a macOS `nodename` holds
+        // at most `MAXHOSTNAMELEN` bytes with its NUL.
+        unsafe {
+            if len > MAXHOSTNAMELEN {
+                out.copy_from_nonoverlapping(node.as_ptr(), node.len());
+            } else if len > 0 {
+                let n = node.len().min(len);
+                out.copy_from_nonoverlapping(node.as_ptr(), n);
+                out.add(n).write_bytes(0, len - n);
+                out.add(len - 1).write(0);
+            }
+        }
+        return Some(0);
+    }
+    // SAFETY: the caller's `name` is writable for `len` bytes.
+    unsafe { out.copy_from_nonoverlapping(node.as_ptr(), node.len().min(len)) };
+    if node.len() > len {
+        return Some(crate::os::sockets::finish(-i64::from(libc::ENAMETOOLONG)) as c_int);
+    }
+    Some(0)
+}
+
+/// The length type of `sethostname`: `size_t` in glibc, `int` on macOS (`<unistd.h>`).
+#[cfg(target_os = "linux")]
+type HostNameLen = usize;
+#[cfg(target_os = "macos")]
+type HostNameLen = c_int;
+
+/// `sethostname` (man 2 sethostname): renames the domain's host when it models that. glibc
+/// passes `len` to a system call whose argument is an `int` (kernel/sys.c), so only its low 32
+/// bits count; macOS's libc takes an `int`.
+unsafe extern "C" fn sethostname(name: *const c_char, len: HostNameLen) -> c_int {
+    let signed = len as c_int as i64;
+    // SAFETY: `name` is the caller's, valid for `len` bytes.
+    if let Some(r) = domain::dispatch_host(|h| unsafe { h.sethostname(name.cast(), signed) }) {
+        return crate::os::sockets::finish(r) as c_int;
+    }
+    // SAFETY: SETHOSTNAME holds libc's sethostname.
+    unsafe {
+        original::<unsafe extern "C" fn(*const c_char, HostNameLen) -> c_int>(&SETHOSTNAME)(
+            name, len,
+        )
+    }
 }
 
 /// `getenv` (man 3 getenv): returns a pointer into the environment (not a copy); a later

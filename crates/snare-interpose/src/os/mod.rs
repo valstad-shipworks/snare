@@ -34,6 +34,8 @@ pub(crate) mod sync;
 pub(crate) mod tz;
 #[cfg(target_os = "macos")]
 mod tz_macos;
+#[cfg(windows)]
+pub(crate) mod tz_windows;
 #[cfg(unix)]
 mod unix;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

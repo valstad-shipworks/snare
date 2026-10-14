@@ -99,6 +99,8 @@ macro_rules! on_supported_targets {
 on_supported_targets! {
     mod accounting;
     mod census;
+    #[cfg(unix)]
+    mod children;
     #[cfg(windows)]
     mod detour;
     mod domain;
@@ -121,6 +123,14 @@ on_supported_targets! {
     mod stall;
     mod state;
 
+    /// std's `RandomState` draws its keys once per thread and keeps them, so a map made with it
+    /// on a thread outside a sim, or under passthrough, would fix that thread's keys from the
+    /// OS's entropy rather than the sim's seed, and the code under test's hash order there would
+    /// no longer replay.
+    type FixedState = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
+    type HashMap<K, V> = std::collections::HashMap<K, V, FixedState>;
+    type HashSet<T> = std::collections::HashSet<T, FixedState>;
+
     pub use accounting::{
         AuditReport, BlockerKind, ClassEffect, EpochBump, LeaseId, LeaseInfo, LeaseKind, PState,
         ParticipantInfo, Quiescence, QuiescenceViolation, ThreadClass, WaitLabel, current_wait_label,
@@ -139,12 +149,15 @@ on_supported_targets! {
         mark_sim_waiting, mark_waiting, note_effect, now, parked_on_shared_word, pass_gate, quiescent,
         real, real_span,
         recorded_thread_class, register_event_timer, register_timer, register_wake, set_thread_class,
-        set_thread_name, SimLocals, sim_local, stalled, thread_class, thread_lineage, thread_name, time_skip,
-        try_leave_sim_wait, unregister_event_timer, unregister_timer, virtual_now,
+        set_thread_name, settling_gauge, SimLocals, sim_local, stalled, thread_class, thread_lineage,
+        thread_name, time_skip, try_leave_sim_wait_settled,
+        try_leave_sim_wait, unregister_event_timer, unregister_timer, virtual_now, waits_outside,
     };
     #[cfg(unix)]
-    pub use domain::{defer_descriptor_cleanup, descriptor_transaction};
+    pub use domain::{defer_descriptor_cleanup, descriptor_transaction, share_statics};
     pub use env::Env;
+    #[cfg(windows)]
+    pub use env::windows::WinEnv;
     pub use fs::{Fs, SetTimes, TimeSet};
     #[cfg(windows)]
     pub use host::DevCall;
@@ -167,6 +180,16 @@ on_supported_targets! {
     pub use resolve::{Lookup, Resolver, Reverse};
     pub use sched::{DetKey, DetWake, ReadinessKey, ReadinessWake};
     #[cfg(unix)]
-    pub use signals::{Disposition, deliver_here, is_virtual};
-    pub use signals::{SignalOutcome, SignalSource, Signals, simulated};
+    pub use children::{adopt as adopt_child, exit_of as child_exit_of, process_action as process_sigchld_action, set_domains_action as set_domains_sigchld_action};
+    #[cfg(unix)]
+    pub use signals::{
+        ChildExit, Disposition, SignalInfo, close_interrupted, deliver_child_exit, deliver_here,
+        is_virtual, virtual_bits,
+    };
+    #[cfg(target_os = "linux")]
+    pub use signals::{signal_generation, signals_pending, take_signals};
+    pub use signals::{
+        Restart, SignalOutcome, SignalSource, Signals, deliver_interrupting, interrupt_pending, interrupted,
+        interruptible, simulated,
+    };
 }

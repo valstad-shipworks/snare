@@ -37,7 +37,7 @@ mod os {
     /// A socket-level option the sim keeps as harmless, on a datagram socket.
     pub const HARMLESS_AT_SOCKET: i32 = libc::SO_KEEPALIVE;
     /// A socket-level option the sim does not model.
-    pub const UNMODELLED_AT_SOCKET: i32 = libc::SO_REUSEPORT;
+    pub const UNMODELLED_AT_SOCKET: i32 = libc::SO_RCVLOWAT;
 
     pub fn raw(s: &impl AsRawFd) -> Raw {
         s.as_raw_fd()
@@ -106,7 +106,7 @@ mod os {
     /// stream-only on Windows).
     pub const HARMLESS_AT_SOCKET: i32 = ws::SO_DEBUG;
     /// A socket-level option the sim does not model.
-    pub const UNMODELLED_AT_SOCKET: i32 = ws::SO_EXCLUSIVEADDRUSE;
+    pub const UNMODELLED_AT_SOCKET: i32 = ws::SO_CONDITIONAL_ACCEPT;
     /// A `WSAIoctl` code the sim does not carry out.
     pub const UNMODELLED_WSAIOCTL: u32 = ws::SIO_ADDRESS_LIST_QUERY;
 

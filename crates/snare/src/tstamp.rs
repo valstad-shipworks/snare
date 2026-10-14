@@ -235,7 +235,7 @@ pub(crate) struct TsState {
     /// Linux `SOCK_TXTIME` with `sk_clockid` and the `SOF_TXTIME_*` flags, once `SO_TXTIME` was
     /// set; `None` before.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    txtime: Option<(c_int, u32)>,
+    pub(crate) txtime: Option<(c_int, u32)>,
 }
 
 impl TsState {
@@ -406,6 +406,10 @@ mod linux {
     /// `sock_set_timestamping`); measured on Linux 7.0 by tests/timestamps.rs
     /// `option_validation_os_truth`.
     const MASK: u32 = (1 << 19) - 1;
+    /// `SOF_TIMESTAMPING_TX_RECORD_MASK`: the flags a `SO_TIMESTAMPING` control message may ask of
+    /// one send (net/core/sock.c `__sock_cmsg_send`): `TX_HARDWARE`, `TX_SOFTWARE`, `TX_SCHED`,
+    /// `TX_ACK` and `TX_COMPLETION` (bit 18).
+    pub(crate) const TX_RECORD_MASK: u32 = TX_HARDWARE | TX_SOFTWARE | TX_SCHED | TX_ACK | 1 << 18;
     /// `SCM_TSTAMP_SND` (include/uapi/linux/errqueue.h): the driver sent the packet.
     pub(crate) const SCM_TSTAMP_SND: u32 = 0;
     /// `SCM_TSTAMP_SCHED`: the packet entered the packet scheduler.
@@ -474,50 +478,6 @@ mod linux {
         }
         rec.state().ts.txtime = Some((clockid, flags));
         Some(Ok(()))
-    }
-
-    /// The launch time of a `sendmsg`'s `SCM_TXTIME` control message on `rec`, checked as
-    /// net/core/sock.c `__sock_cmsg_send` does (Linux 7.0): `EINVAL` on a socket without
-    /// `SO_TXTIME` (`SOCK_TXTIME` clear) or for a `cmsg_len` other than `CMSG_LEN(sizeof(u64))`.
-    /// The last such message wins, as each one overwrites `sockc->transmit_time`. `Ok(None)`
-    /// without one. Walks with `CMSG_*` (man 3 cmsg), never past `msg_controllen`.
-    ///
-    /// # Safety
-    /// `hdr` is the caller's `msghdr`, its control buffer `msg_controllen` bytes.
-    pub(crate) unsafe fn txtime_cmsg(
-        rec: &SockRec,
-        hdr: *const libc::msghdr,
-    ) -> Result<Option<u64>, c_int> {
-        // SAFETY: forwarded contract.
-        let (control, controllen) = unsafe { ((*hdr).msg_control, (*hdr).msg_controllen) };
-        if control.is_null() || controllen == 0 {
-            return Ok(None);
-        }
-        let enabled = rec.state().ts.txtime.is_some();
-        let mut at = None;
-        // SAFETY: the CMSG_* walk stays inside the control buffer.
-        let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(hdr) };
-        while !cmsg.is_null() {
-            // SAFETY: `cmsg` is a header inside the buffer.
-            let (level, ty, len) = unsafe {
-                (
-                    (*cmsg).cmsg_level,
-                    (*cmsg).cmsg_type,
-                    (*cmsg).cmsg_len as usize,
-                )
-            };
-            if level == libc::SOL_SOCKET && ty == SO_TXTIME {
-                // SAFETY: CMSG_LEN is arithmetic.
-                if !enabled || len != unsafe { libc::CMSG_LEN(8) } as usize {
-                    return Err(libc::EINVAL);
-                }
-                // SAFETY: `cmsg_len` covers the eight data bytes.
-                at = Some(unsafe { libc::CMSG_DATA(cmsg).cast::<u64>().read_unaligned() });
-            }
-            // SAFETY: as above.
-            cmsg = unsafe { libc::CMSG_NXTHDR(hdr, cmsg) };
-        }
-        Ok(at)
     }
 
     /// Sets `SO_TIMESTAMP`, `SO_TIMESTAMPNS` or `SO_TIMESTAMPING` on `rec` (a socket of `kind`),
@@ -733,11 +693,13 @@ mod linux {
     /// skbuff.c `__skb_tstamp_tx` (Linux 7.0) then drops the software one unless
     /// `OPT_TX_SWHW` asks for both. Every report is keyed by the socket's next `OPT_ID` key
     /// (which only a send asking for a stamp takes). `packet` is what is looped back without
-    /// `OPT_TSONLY`.
+    /// `OPT_TSONLY`. `tx_flags`, a `SO_TIMESTAMPING` control message's flags, replace the
+    /// socket's [`TX_RECORD_MASK`] flags for this send.
     pub(crate) fn udp_sent(
         rec: &SockRec,
         at: Stamp,
         hw: Option<Duration>,
+        tx_flags: Option<u32>,
         packet: impl FnOnce() -> Vec<u8>,
     ) {
         let mut state = rec.state();
@@ -746,13 +708,14 @@ mod linux {
             let state = &mut *state;
             (&mut state.buf, &mut state.ts)
         };
-        if ts.flags & (TX_SCHED | TX_SOFTWARE | TX_HARDWARE) == 0 {
+        let flags = tx_flags.map_or(ts.flags, |f| ts.flags & !TX_RECORD_MASK | f);
+        if flags & (TX_SCHED | TX_SOFTWARE | TX_HARDWARE) == 0 {
             return;
         }
-        let hw = hw.filter(|_| ts.flags & TX_HARDWARE != 0);
-        let software = ts.flags & TX_SOFTWARE != 0 && (hw.is_none() || ts.flags & OPT_TX_SWHW != 0);
+        let hw = hw.filter(|_| flags & TX_HARDWARE != 0);
+        let software = flags & TX_SOFTWARE != 0 && (hw.is_none() || flags & OPT_TX_SWHW != 0);
         let mut reports = Vec::new();
-        if ts.flags & TX_SCHED != 0 {
+        if flags & TX_SCHED != 0 {
             reports.push((SCM_TSTAMP_SCHED, at));
         }
         if software {

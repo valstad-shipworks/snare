@@ -8,11 +8,12 @@
 //! threads, which run unmanaged by design, announce themselves with [`service_thread`]. The OS's
 //! list is read under passthrough, so none of it reaches a sim's own file or thread model.
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::HashSet;
 use crate::accounting::ThreadClass;
 use crate::domain::{Domain, WeakDomain};
+use crate::room::RoomVec;
 use crate::state::Passthrough;
 
 /// Identifies one domain (one `Sim`) for the life of the process: an id is never reused.
@@ -109,6 +110,27 @@ pub(crate) fn find(serial: u64) -> Option<Domain> {
         .and_then(|(_, weak)| weak.upgrade())
 }
 
+/// How many domains [`each_other`] visits without allocating. A snare choice, past the sims a
+/// process runs at once.
+const OTHERS_ROOM: usize = 32;
+
+/// Calls `each` with every live domain but the one with id `own`, without holding the list of
+/// domains meanwhile.
+pub(crate) fn each_other(own: SimId, mut each: impl FnMut(&Domain)) {
+    let _passthrough = Passthrough::enter();
+    let mut others = RoomVec::<Domain, OTHERS_ROOM>::new();
+    for (id, weak) in lock(&DOMAINS).iter() {
+        if *id != own
+            && let Some(domain) = weak.upgrade()
+        {
+            others.push(domain);
+        }
+    }
+    for domain in others.iter() {
+        each(domain);
+    }
+}
+
 thread_local! {
     /// Whether the calling thread is one of snare's service threads (see [`service_thread`]).
     static SERVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -137,7 +159,7 @@ pub fn service_thread() -> ServiceThread {
     let os_id = current_os_thread_id();
     if let Some(id) = os_id {
         let _passthrough = Passthrough::enter();
-        lock(&SERVICE).get_or_insert_with(HashSet::new).insert(id);
+        lock(&SERVICE).get_or_insert_with(HashSet::default).insert(id);
     }
     let was = SERVING.try_with(|s| s.replace(true)).unwrap_or(false);
     ServiceThread { os_id, was }
@@ -178,7 +200,7 @@ pub fn census(sim: Option<&Domain>) -> Option<ThreadCensus> {
         .iter()
         .filter_map(|(_, weak)| weak.upgrade())
         .collect();
-    let mut managed = std::collections::HashMap::new();
+    let mut managed = crate::HashMap::default();
     for domain in &domains {
         for (os_id, lineage, class) in domain.os_threads() {
             managed.insert(os_id, (domain, lineage, class));
@@ -222,6 +244,12 @@ pub fn current_os_thread_id() -> Option<u64> {
     imp::current()
 }
 
+/// The CPU time, user and system, the thread of the process with OS id `id` has used so far;
+/// `None` once it has exited, or where it cannot be read. Called under passthrough.
+pub(crate) fn thread_cpu_time(id: u64) -> Option<std::time::Duration> {
+    imp::cpu_time(id)
+}
+
 /// Every thread of the process as (OS id, the name the OS holds for it); `None` where the OS's
 /// threads cannot be listed. Called under passthrough.
 fn os_threads() -> Option<Vec<(u64, Option<String>)>> {
@@ -234,6 +262,22 @@ mod imp {
     pub(super) fn current() -> Option<u64> {
         // SAFETY: gettid has no preconditions and cannot fail.
         u64::try_from(unsafe { libc::gettid() }).ok()
+    }
+
+    /// The thread's CPU clock, the id glibc's `pthread_getcpuclockid` makes for its kernel id
+    /// (`MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED)`, Linux include/linux/posix-timers_types.h),
+    /// which `clock_gettime` reads for any thread of the caller's process (man 3
+    /// pthread_getcpuclockid).
+    pub(super) fn cpu_time(id: u64) -> Option<std::time::Duration> {
+        let tid = u32::try_from(id).ok()?;
+        let clock = ((!tid) << 3 | 6) as libc::clockid_t;
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is writable; an id naming no live thread fails with EINVAL.
+        (unsafe { libc::clock_gettime(clock, &mut ts) } == 0)
+            .then(|| std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
     }
 
     /// The entries of `/proc/self/task`, one directory per thread named by its id, and each one's
@@ -273,6 +317,28 @@ mod imp {
         let mut id = 0u64;
         // SAFETY: a null thread names the caller; `id` is writable.
         (unsafe { libc::pthread_threadid_np(0 as libc::pthread_t, &mut id) } == 0).then_some(id)
+    }
+
+    /// `proc_pidinfo`'s `PROC_PIDTHREADID64INFO` (15, XNU bsd/sys/proc_info.h) takes a thread id
+    /// as `pthread_threadid_np` gives it and fills a `proc_threadinfo`, whose user and system
+    /// times are in nanoseconds; it fails for an id no thread of the process has.
+    pub(super) fn cpu_time(id: u64) -> Option<std::time::Duration> {
+        const PROC_PIDTHREADID64INFO: libc::c_int = 15;
+        // SAFETY: a plain C struct; all zeroes is valid.
+        let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_threadinfo>() as libc::c_int;
+        // SAFETY: `info` is writable for `size` bytes.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                PROC_PIDTHREADID64INFO,
+                id,
+                (&raw mut info).cast(),
+                size,
+            )
+        };
+        let nanos = info.pth_user_time.saturating_add(info.pth_system_time);
+        (n == size).then(|| std::time::Duration::from_nanos(nanos))
     }
 
     /// `task_threads` lists the task's threads as ports, each a send right the caller drops with
@@ -371,6 +437,36 @@ mod imp {
         Some(u64::from(unsafe { GetCurrentThreadId() }))
     }
 
+    /// `GetThreadTimes` on a handle `OpenThread` gives with `THREAD_QUERY_LIMITED_INFORMATION`,
+    /// in 100 ns units
+    /// ([Microsoft Learn: GetThreadTimes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getthreadtimes)).
+    pub(super) fn cpu_time(id: u64) -> Option<std::time::Duration> {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::{
+            GetThreadTimes, OpenThread, THREAD_QUERY_LIMITED_INFORMATION,
+        };
+        let id = u32::try_from(id).ok()?;
+        // SAFETY: OpenThread has no preconditions; it fails for an id no thread has.
+        let thread = unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, id) };
+        if thread.is_null() {
+            return None;
+        }
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        // SAFETY: `thread` is open with query rights and the four outputs are writable.
+        let ok = unsafe {
+            GetThreadTimes(thread, &mut created, &mut exited, &mut kernel, &mut user)
+        };
+        // SAFETY: closes the handle opened above.
+        unsafe { crate::os::windows::close_internal_handle(thread) };
+        let ticks = |t: FILETIME| u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime);
+        let nanos = ticks(kernel).saturating_add(ticks(user)).saturating_mul(100);
+        (ok != 0).then(|| std::time::Duration::from_nanos(nanos))
+    }
+
     /// A `TH32CS_SNAPTHREAD` snapshot lists every thread of the system; those whose
     /// `th32OwnerProcessID` is this process's are its threads. `dwSize` must be set before the
     /// first `Thread32First`, and the snapshot is closed with `CloseHandle`
@@ -416,6 +512,10 @@ mod imp {
 )))]
 mod imp {
     pub(super) fn current() -> Option<u64> {
+        None
+    }
+
+    pub(super) fn cpu_time(_id: u64) -> Option<std::time::Duration> {
         None
     }
 

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -7,6 +7,7 @@ use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
 
 use windows_sys::Win32::System::Threading::CRITICAL_SECTION;
 
+use crate::HashMap;
 use crate::domain;
 use crate::hooks::{Hook, hook, original};
 

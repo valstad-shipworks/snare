@@ -5,11 +5,17 @@
 //! a signal as the host OS would: on unix the handler runs synchronously, as for a signal a process
 //! sends itself; on Windows the handlers run on a new thread, last registered first.
 //!
+//! On unix the sim also delivers `SIGCHLD` for each child process its threads make, once, when the
+//! child ends ([`crate::realfd::watch_child`]), with the `siginfo_t` the kernel would fill; the
+//! kernel's own `SIGCHLD` for that child reaches no handler (`snare_interpose`'s `children`). A
+//! handler the sim delivers interrupts a call its thread is blocked in as the host's would
+//! (see [`snare_interpose::interruptible`]).
+//!
 //! [`SignalTable`] is a sim's dispositions; [`SimSignals`] exposes it to `snare_interpose` as the
-//! domain's [`Signals`], which the interposed `sigaction`/`signal`/`raise`/`kill`/`pthread_kill`
-//! (unix) and `SetConsoleCtrlHandler`/`GenerateConsoleCtrlEvent`/CRT `signal`/`raise` (Windows)
-//! consult. [`forward`] optionally routes real signals the process receives into the sims that
-//! asked for them. Every table lock is taken inside [`snare_interpose::real`] or from a
+//! domain's [`Signals`], which the interposed `sigaction`/`signal`/`raise`/`kill`/`pthread_kill`/
+//! `pause`/`sigsuspend` (unix) and `SetConsoleCtrlHandler`/`GenerateConsoleCtrlEvent`/CRT
+//! `signal`/`raise` (Windows) consult. [`forward`] optionally routes real signals the process
+//! receives into the sims that asked for them. Every table lock is taken inside [`snare_interpose::real`] or from a
 //! [`Signals`] method (already in passthrough), and never held while a handler of the code under
 //! test runs, since a handler may reinstall itself.
 
@@ -32,6 +38,8 @@ pub enum Signal {
     Terminate,
     /// `SIGHUP` (unix only).
     Hangup,
+    /// `SIGCHLD` (unix only). The sim sends it itself when a child process its threads made ends.
+    Child,
     /// `CTRL_BREAK_EVENT` (1, Windows only).
     Break,
     /// `CTRL_CLOSE_EVENT` (2, Windows only).
@@ -55,6 +63,7 @@ impl Signal {
                 Signal::Interrupt => Some(libc::SIGINT),
                 Signal::Terminate => Some(libc::SIGTERM),
                 Signal::Hangup => Some(libc::SIGHUP),
+                Signal::Child => Some(libc::SIGCHLD),
                 _ => None,
             }
         }
@@ -83,6 +92,7 @@ impl Signal {
             Signal::Interrupt,
             Signal::Terminate,
             Signal::Hangup,
+            Signal::Child,
             Signal::Break,
             Signal::Close,
             Signal::Logoff,
@@ -105,6 +115,12 @@ pub enum SignalDelivery {
     DefaultAction,
     /// The signal is ignored.
     Ignored,
+    /// Every thread of the sim it could go to blocks it: it stays pending until one unblocks it
+    /// or takes it with `sigwait` or a `signalfd`.
+    Pending,
+    /// A thread waiting for it in `sigwait`, `sigwaitinfo` or `sigtimedwait` takes it; no handler
+    /// runs.
+    Accepted,
     /// The host OS has no such signal.
     Unavailable,
 }
@@ -120,6 +136,8 @@ pub enum SignalOrigin {
     Process,
     /// A real signal forwarded into the sim (see `SimBuilder::forward_real_signals`).
     Real,
+    /// A child process a thread of the sim made has ended.
+    Child,
 }
 
 impl From<SignalOutcome> for SignalDelivery {
@@ -129,6 +147,8 @@ impl From<SignalOutcome> for SignalDelivery {
             SignalOutcome::HandledThenExit => SignalDelivery::HandledThenExit,
             SignalOutcome::DefaultAction => SignalDelivery::DefaultAction,
             SignalOutcome::Ignored => SignalDelivery::Ignored,
+            SignalOutcome::Pending => SignalDelivery::Pending,
+            SignalOutcome::Accepted => SignalDelivery::Accepted,
         }
     }
 }
@@ -139,6 +159,7 @@ impl From<SignalSource> for SignalOrigin {
             SignalSource::Sim => SignalOrigin::Sim,
             SignalSource::Process => SignalOrigin::Process,
             SignalSource::Real => SignalOrigin::Real,
+            SignalSource::Child => SignalOrigin::Child,
         }
     }
 }
@@ -165,6 +186,10 @@ impl SignalHandle {
     /// Delivers `signal` and returns what it did. From a thread of the sim it is delivered there,
     /// as a signal the process sent itself; from any other thread, on a new thread of the sim,
     /// joined before this returns.
+    ///
+    /// A signal sent this way is sent to the sim's process: one with a handler goes to a root thread
+    /// of the sim blocked in a call it interrupts, if there is one, and is reported handled before
+    /// it runs there (see [`snare_interpose::deliver_here`]).
     ///
     /// [`SignalDelivery::Unavailable`] when the host has no such signal, the sim's domain is gone,
     /// or the delivery thread could not be started. The result slot is written and read inside
@@ -276,7 +301,8 @@ fn deliver(shared: &Arc<SimShared>, raw: i32, source: SignalSource) -> SignalDel
 pub(crate) struct SignalTable {
     /// The `sigaction` installed for each virtual signal, seeded from the process's own (see
     /// [`forward::inherited`]) so an inherited `SIG_IGN` survives, as across exec(2) (man 7
-    /// signal, "Signal dispositions": ignored signals stay ignored across execve).
+    /// signal, "Signal dispositions": ignored signals stay ignored across execve). `SIGCHLD` is not
+    /// seeded: until the sim's code sets it, it follows the process (see [`effective`]).
     #[cfg(unix)]
     actions: Mutex<Actions>,
     /// See `SimBuilder::process_signal_handlers`.
@@ -300,7 +326,7 @@ impl SignalTable {
                     .into_iter()
                     .map(|sig| (sig, forward::inherited(sig)))
                     .collect(),
-                set: std::collections::HashSet::new(),
+                set: crate::HashSet::default(),
             }),
             #[cfg(unix)]
             process_handlers: std::sync::atomic::AtomicBool::new(false),
@@ -313,9 +339,9 @@ impl SignalTable {
 /// A sim's `sigaction` table.
 #[cfg(unix)]
 struct Actions {
-    by_signal: std::collections::HashMap<i32, libc::sigaction>,
+    by_signal: crate::HashMap<i32, libc::sigaction>,
     /// The signals the sim's own code has set an action for.
-    set: std::collections::HashSet<i32>,
+    set: crate::HashSet<i32>,
 }
 
 #[cfg(unix)]
@@ -337,12 +363,77 @@ fn is_handler(action: &libc::sigaction) -> bool {
     action.sa_sigaction != libc::SIG_DFL && action.sa_sigaction != libc::SIG_IGN
 }
 
+/// The action in force for `sig` in the sim whose table is `table`: the one its code set; else,
+/// for a sim built with `SimBuilder::process_signal_handlers` and always for `SIGCHLD`, the handler
+/// the code under test last installed in any sim of the process; else the process's own.
+/// `SIGCHLD` reaches a sim only for the children its own threads made, so a handler installed
+/// once per process (signal-hook-registry's, behind `tokio::process`) is the one the host would
+/// run, in whichever sim it was installed.
+#[cfg(unix)]
+fn effective(table: &SignalTable, actions: &Actions, sig: i32) -> libc::sigaction {
+    if let Some(action) = actions
+        .set
+        .contains(&sig)
+        .then(|| actions.by_signal.get(&sig))
+        .flatten()
+    {
+        return *action;
+    }
+    if (sig == libc::SIGCHLD
+        || table
+            .process_handlers
+            .load(std::sync::atomic::Ordering::Relaxed))
+        && let Some(installed) = process_handlers().get(&sig).copied()
+    {
+        return installed;
+    }
+    actions
+        .by_signal
+        .get(&sig)
+        .copied()
+        .unwrap_or_else(|| forward::inherited(sig))
+}
+
+/// How `action` handles `sig`. The default action of `SIGCHLD` is to ignore it (man 7 signal,
+/// "Standard signals": `SIGCHLD` "Ign").
+#[cfg(unix)]
+fn disposition_of(sig: i32, action: &libc::sigaction) -> snare_interpose::Disposition {
+    use snare_interpose::Disposition;
+    match action.sa_sigaction {
+        libc::SIG_DFL if sig == libc::SIGCHLD => Disposition::Ignore,
+        libc::SIG_DFL => Disposition::Default,
+        libc::SIG_IGN => Disposition::Ignore,
+        address => {
+            let resethand = action.sa_flags & libc::SA_RESETHAND != 0;
+            Disposition::Handler {
+                address,
+                siginfo: action.sa_flags & libc::SA_SIGINFO != 0,
+                // POSIX lets SA_RESETHAND act as if SA_NODEFER were set (IEEE Std 1003.1-2024,
+                // sigaction: "sigaction() may behave as if the SA_NODEFER flag were also set");
+                // the sim takes that option on Linux only. Linux itself does not
+                // (kernel/signal.c signal_delivered blocks the signal unless SA_NODEFER), nor
+                // does XNU (bsd/kern/kern_sig.c postsig_locked checks ps_signodefer only).
+                nodefer: action.sa_flags & libc::SA_NODEFER != 0
+                    || (resethand && cfg!(target_os = "linux")),
+                restart: action.sa_flags & libc::SA_RESTART != 0,
+                blocks: snare_interpose::virtual_bits(&action.sa_mask),
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 impl SignalTable {
     /// Whether a signal the sim's code never set an action for reaches the process's handler.
     pub(crate) fn reach_process_handlers(&self, on: bool) {
         self.process_handlers
             .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The `SIGCHLD` action in force in the sim (see [`effective`]).
+    pub(crate) fn child_action(&self) -> libc::sigaction {
+        let actions = self.actions.lock().unwrap();
+        effective(self, &actions, libc::SIGCHLD)
     }
 }
 
@@ -378,6 +469,15 @@ impl Signals for SimSignals {
             {
                 process.remove(&sig);
             }
+            if sig == libc::SIGCHLD {
+                let installed = process.get(&sig).copied().unwrap_or_else(|| {
+                    let mut none = *act;
+                    none.sa_sigaction = libc::SIG_DFL;
+                    none
+                });
+                drop(process);
+                snare_interpose::set_domains_sigchld_action(&installed);
+            }
         }
         previous
     }
@@ -387,43 +487,55 @@ impl Signals for SimSignals {
     /// the default upon entry to the signal handler").
     #[cfg(unix)]
     fn take_disposition(&self, sig: i32) -> snare_interpose::Disposition {
-        use snare_interpose::Disposition;
         let mut actions = self.table().actions.lock().unwrap();
-        if !actions.set.contains(&sig)
-            && self
-                .table()
-                .process_handlers
-                .load(std::sync::atomic::Ordering::Relaxed)
-            && let Some(installed) = process_handlers().get(&sig).copied()
+        let action = effective(self.table(), &actions, sig);
+        let disposition = disposition_of(sig, &action);
+        if action.sa_flags & libc::SA_RESETHAND != 0
+            && matches!(disposition, snare_interpose::Disposition::Handler { .. })
         {
-            actions.by_signal.insert(sig, installed);
+            let mut reset = action;
+            reset.sa_sigaction = libc::SIG_DFL;
+            actions.by_signal.insert(sig, reset);
             actions.set.insert(sig);
         }
-        let Some(action) = actions.by_signal.get_mut(&sig) else {
-            return Disposition::Default;
-        };
-        match action.sa_sigaction {
-            libc::SIG_DFL => return Disposition::Default,
-            libc::SIG_IGN => return Disposition::Ignore,
-            _ => {}
-        }
-        let address = action.sa_sigaction;
-        let resethand = action.sa_flags & libc::SA_RESETHAND != 0;
-        let disposition = Disposition::Handler {
-            address,
-            siginfo: action.sa_flags & libc::SA_SIGINFO != 0,
-            // POSIX lets SA_RESETHAND act as if SA_NODEFER were set (IEEE Std 1003.1-2024,
-            // sigaction: "sigaction() may behave as if the SA_NODEFER flag were also set"); the sim
-            // takes that option on Linux only. Linux itself does not (kernel/signal.c
-            // signal_delivered blocks the signal unless SA_NODEFER), nor does XNU
-            // (bsd/kern/kern_sig.c postsig_locked checks ps_signodefer only).
-            nodefer: action.sa_flags & libc::SA_NODEFER != 0
-                || (resethand && cfg!(target_os = "linux")),
-        };
-        if resethand {
-            action.sa_sigaction = libc::SIG_DFL;
-        }
         disposition
+    }
+
+    #[cfg(unix)]
+    fn disposition(&self, sig: i32) -> snare_interpose::Disposition {
+        let actions = self.table().actions.lock().unwrap();
+        disposition_of(sig, &effective(self.table(), &actions, sig))
+    }
+
+    /// Wakes every blocked call of the sim to look for a signal left pending for its thread.
+    #[cfg(unix)]
+    fn wake_waiters(&self) {
+        crate::readiness::readiness().bump(self.0.domain_key());
+    }
+
+    /// Waits until a handler interrupts the wait, or the sim is deadlocked with no time left to
+    /// pass, where the host would wait for good.
+    #[cfg(unix)]
+    fn suspend(&self) {
+        snare_interpose::interruptible(snare_interpose::Restart::Never, || {
+            crate::readiness::readiness().wait_until("pause", None, || false)
+        });
+    }
+
+    /// Waits on the sim's readiness, which every signal left pending bumps (see
+    /// [`wake_waiters`](Self::wake_waiters)), with `timeout` on the sim's clock.
+    #[cfg(unix)]
+    fn wait(
+        &self,
+        label: &'static str,
+        timeout: Option<Duration>,
+        ready: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        crate::readiness::readiness().wait_until(
+            label,
+            timeout.map(crate::readiness::Deadline::timeout),
+            ready,
+        )
     }
 
     /// See [`console::Console::set_handler`].
@@ -468,6 +580,36 @@ impl Signals for SimSignals {
     }
 }
 
+/// How a blocked socket call goes on after a signal handler runs on its thread; `timeout` is
+/// whether the socket has one for it (`SO_RCVTIMEO` for a receive or an accept, `SO_SNDTIMEO`
+/// for a send). Restarted under `SA_RESTART`, except that Linux never restarts one with a timeout
+/// (man 7 signal: such "input" and "output" socket interfaces "always fail with the error
+/// EINTR"); macOS restarts it all the same. Pinned against both hosts by
+/// tests/signal_interrupts.rs.
+pub(crate) fn socket_restart(timeout: bool) -> snare_interpose::Restart {
+    if timeout && cfg!(target_os = "linux") {
+        snare_interpose::Restart::Never
+    } else {
+        snare_interpose::Restart::WithSaRestart
+    }
+}
+
+/// How a blocking `connect` goes on after a signal handler runs on its thread; `timeout` is
+/// whether the socket has an `SO_SNDTIMEO`, the timeout Linux's connect waits with. Linux restarts
+/// it under `SA_RESTART`, the restarted call waiting for the same attempt, but not with a timeout
+/// (net/ipv4/af_inet.c `__inet_stream_connect` returns `sock_intr_errno(timeo)`, `-ERESTARTSYS`
+/// only for an endless wait); XNU always fails it with EINTR (bsd/kern/uipc_syscalls.c
+/// `connectit` turns `ERESTART` into `EINTR`). Pinned against both hosts by
+/// tests/signal_interrupts.rs.
+#[cfg(unix)]
+pub(crate) fn connect_restart(timeout: bool) -> snare_interpose::Restart {
+    if cfg!(target_os = "linux") {
+        socket_restart(timeout)
+    } else {
+        snare_interpose::Restart::Never
+    }
+}
+
 /// Logs a delivery of the host-numbered `raw` as a [`RecordedEvent::Signal`]; numbers the sim
 /// does not model are dropped. Callers hold no table lock.
 fn record(shared: &SimShared, raw: i32, source: SignalSource, delivery: SignalDelivery) {
@@ -493,15 +635,16 @@ fn record(shared: &SimShared, raw: i32, source: SignalSource, delivery: SignalDe
 /// or a handler runs: `forward` copies the sims out and releases it first.
 #[cfg(unix)]
 pub(crate) mod forward {
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::{Arc, Mutex};
 
     use snare_interpose::{SignalOutcome, SignalSource};
 
+    use crate::HashMap;
     use crate::scope::SimShared;
 
-    /// The signals forwarded: the virtual ones (see `snare_interpose::is_virtual`).
+    /// The signals forwarded: the virtual ones (see `snare_interpose::is_virtual`) but `SIGCHLD`,
+    /// which the sim sends itself.
     const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
     /// The forwarding state while any sim is registered.
@@ -553,6 +696,9 @@ pub(crate) mod forward {
     /// table starts from, so an inherited `SIG_IGN` reads back. While forwarding, the saved
     /// original; otherwise a query of the live action (man 2 sigaction: a null `act` only reads).
     pub(crate) fn inherited(sig: libc::c_int) -> libc::sigaction {
+        if sig == libc::SIGCHLD {
+            return snare_interpose::real(snare_interpose::process_sigchld_action);
+        }
         snare_interpose::real(|| {
             if let Some(original) = FORWARDER
                 .lock()
@@ -645,7 +791,7 @@ pub(crate) mod forward {
                     read_forwarded(read);
                 });
         });
-        let mut originals = HashMap::new();
+        let mut originals = HashMap::default();
         for sig in SIGNALS {
             // SAFETY: installs a handler that only writes to the pipe; reads back the old action.
             unsafe {
@@ -723,6 +869,8 @@ pub(crate) mod forward {
                     SignalOutcome::Handled
                         | SignalOutcome::HandledThenExit
                         | SignalOutcome::Ignored
+                        | SignalOutcome::Pending
+                        | SignalOutcome::Accepted
                 )
             );
         }
@@ -870,7 +1018,6 @@ pub(crate) mod forward {
 /// [`Signals`] method, and is released before any handler is called.
 #[cfg(windows)]
 mod console {
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::time::Duration;
@@ -881,6 +1028,7 @@ mod console {
     };
 
     use super::SignalDelivery;
+    use crate::HashMap;
     use crate::readiness::{Deadline, readiness};
     use crate::scope::SimShared;
 

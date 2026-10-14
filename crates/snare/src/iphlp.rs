@@ -16,7 +16,6 @@
 //! are marked as snare's choice where they are made.
 
 use std::alloc::Layout;
-use std::collections::HashMap;
 use std::ffi::c_char;
 use std::mem::{offset_of, size_of, zeroed};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -40,6 +39,7 @@ use windows_sys::Win32::Networking::WinSock::{
 };
 use windows_sys::core::GUID;
 
+use crate::HashMap;
 use crate::netif::NicSnapshot;
 use crate::scope::SimShared;
 
@@ -321,7 +321,7 @@ fn alloc_table(size: usize) -> *mut u8 {
     TABLES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(HashMap::new)
+        .get_or_insert_with(HashMap::default)
         .insert(p as usize, layout);
     p
 }

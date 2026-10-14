@@ -69,7 +69,8 @@ pub trait Fs: Send + Sync + 'static {
     fn cwd_changed(&self) {}
 
     /// Models `open(2)`; `flags` are `O_*` and `mode` the `mode_t` create bits (`<fcntl.h>`,
-    /// `<sys/stat.h>`).
+    /// `<sys/stat.h>`), already masked by the sim's umask when its host keeps one
+    /// ([`Host::umask`](crate::Host::umask)), as for `mkdir`.
     unsafe fn open(&self, path: *const c_char, flags: c_int, mode: Mode) -> Option<FsResult> {
         None
     }
@@ -174,7 +175,7 @@ pub trait Fs: Send + Sync + 'static {
     unsafe fn rmdir(&self, path: *const c_char) -> Option<FsResult> {
         None
     }
-    /// Models `mkdir(2)`; `mode` is masked by the process umask by the kernel.
+    /// Models `mkdir(2)`; `mode` comes masked as for [`open`](Self::open).
     unsafe fn mkdir(&self, path: *const c_char, mode: Mode) -> Option<FsResult> {
         None
     }
@@ -269,6 +270,34 @@ pub trait Fs: Send + Sync + 'static {
     ) -> Option<FsResult> {
         None
     }
+    /// Models `fchmodat(2)`, and through it `chmod(2)`, `fchmod(2)` and `lchmod(2)`: a null
+    /// `path` names `dirfd` itself and is offered only to the plane owning `dirfd`; `flags` may
+    /// carry `AT_SYMLINK_NOFOLLOW`. `mode` is the caller's, unmasked.
+    unsafe fn chmod(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        mode: Mode,
+        flags: c_int,
+    ) -> Option<FsResult> {
+        None
+    }
+    /// Models `fchownat(2)`, and through it `chown(2)`, `fchown(2)` and `lchown(2)`, with the
+    /// conventions of [`chmod`](Self::chmod); `u32::MAX` (`-1`) leaves an id alone. On Linux
+    /// `flags` may also carry `AT_EMPTY_PATH`.
+    unsafe fn chown(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        uid: u32,
+        gid: u32,
+        flags: c_int,
+    ) -> Option<FsResult> {
+        None
+    }
+    /// Told after the OS itself changed the status (mode or ownership) of a file no plane served,
+    /// and so its change time, with the call's arguments as [`chmod`](Self::chmod) takes them.
+    unsafe fn host_status_changed(&self, dirfd: c_int, path: *const c_char, flags: c_int) {}
     /// Told after the OS itself set the timestamps of a file no plane served, with the call's
     /// arguments as [`set_times`](Self::set_times) takes them.
     unsafe fn host_times_set(
@@ -343,6 +372,19 @@ pub trait Fs: Send + Sync + 'static {
     }
     /// Models `ioctl(2)` on an owned file fd.
     unsafe fn ioctl(&self, fd: c_int, request: u64, arg: i64) -> Option<FsResult> {
+        None
+    }
+    /// Models `mmap(2)` of an owned file fd: `Ok(address)` of the new mapping. Offered only for
+    /// a mapping of a file, never one with `MAP_ANONYMOUS`.
+    unsafe fn mmap(
+        &self,
+        addr: *mut u8,
+        len: usize,
+        prot: c_int,
+        flags: c_int,
+        fd: c_int,
+        offset: i64,
+    ) -> Option<FsResult> {
         None
     }
 

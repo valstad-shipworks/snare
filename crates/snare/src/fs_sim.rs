@@ -22,19 +22,22 @@
 //! tables are needed. File contents are locked after either table. An inode's advisory locks
 //! ([`Locks`]) are taken with no table held. Locks are plain `std` mutexes; the backend runs inside the interposer's hook, where they are the real OS primitives.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, CString, OsStr, c_char, c_int};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use glob::Pattern;
 use snare_interpose::{Fs, NetResult as FsResult, SetTimes};
 
+use crate::HashMap;
 use crate::clock::Clock;
 use crate::fs_locks::{self, Locks, Target};
+use crate::fs_mmap::{self, Backing};
+use crate::fs_perm::{self, Credentials, Kind, Owner, SET_GID, SET_UID};
 
 pub(crate) struct OpenFiles<T> {
     handles: HashMap<c_int, u64>,
@@ -45,8 +48,8 @@ pub(crate) struct OpenFiles<T> {
 impl<T> Default for OpenFiles<T> {
     fn default() -> Self {
         Self {
-            handles: HashMap::new(),
-            descriptions: HashMap::new(),
+            handles: HashMap::default(),
+            descriptions: HashMap::default(),
             next: 0,
         }
     }
@@ -116,7 +119,7 @@ pub(crate) fn descriptor_fcntl(fd: c_int, cmd: c_int, arg: i64) -> Option<FsResu
     }
 }
 
-/// One declared node of the tree. Permissions use fixed mode bits.
+/// One declared node of the tree.
 #[derive(Clone)]
 enum VNode {
     File(Arc<VInode>),
@@ -126,11 +129,26 @@ enum VNode {
 
 struct VInode {
     number: u64,
+    kind: Kind,
     data: Mutex<SparseFile>,
     links: AtomicU64,
     /// Locked after `data` when both are held, and never held across another lock.
     times: Mutex<Times>,
+    /// The permission bits and owner ([`fs_perm`](crate::fs_perm)); never held across another
+    /// lock.
+    owner: Mutex<Owner>,
     locks: Locks,
+}
+
+/// What `stat` reports of a node besides its times.
+pub(crate) struct Attributes {
+    /// The file type and permission bits.
+    pub(crate) mode: u32,
+    pub(crate) size: u64,
+    pub(crate) ino: u64,
+    pub(crate) nlink: u64,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
 }
 
 /// A timestamp in nanoseconds since the Unix epoch, negative before it.
@@ -274,14 +292,17 @@ impl Volume {
 }
 
 struct SparseFile {
+    /// Allocated pages by index. They hold the file's bytes until it is first mapped; from then on
+    /// [`Backing`] holds the bytes and these are empty, marking what is allocated.
     pages: HashMap<usize, Box<[u8]>>,
     length: usize,
     volume: Option<Arc<Volume>>,
+    backing: Option<Backing>,
 }
 
 impl SparseFile {
     fn new(bytes: Vec<u8>) -> Self {
-        let mut pages = HashMap::new();
+        let mut pages = HashMap::default();
         for (index, chunk) in bytes.chunks(PAGE_SIZE).enumerate() {
             let mut page = vec![0; PAGE_SIZE].into_boxed_slice();
             page[..chunk.len()].copy_from_slice(chunk);
@@ -291,6 +312,7 @@ impl SparseFile {
             pages,
             length: bytes.len(),
             volume: None,
+            backing: None,
         }
     }
 
@@ -310,15 +332,20 @@ impl SparseFile {
         self.length
     }
 
-    fn clear(&mut self) {
-        self.resize(0);
+    fn clear(&mut self) -> Result<(), c_int> {
+        self.resize(0)
     }
 
-    fn resize(&mut self, length: usize) {
+    fn resize(&mut self, length: usize) -> Result<(), c_int> {
+        if let Some(backing) = &mut self.backing {
+            backing.resize(length)?;
+        }
         let before = self.pages.len();
         self.pages
             .retain(|index, _| *index < length.div_ceil(PAGE_SIZE));
-        if let Some(page) = self.pages.get_mut(&(length / PAGE_SIZE)) {
+        if self.backing.is_none()
+            && let Some(page) = self.pages.get_mut(&(length / PAGE_SIZE))
+        {
             page[length % PAGE_SIZE..].fill(0);
         }
         if let Some(volume) = &self.volume {
@@ -327,10 +354,14 @@ impl SparseFile {
                 .fetch_sub((before - self.pages.len()) as u64, Ordering::AcqRel);
         }
         self.length = length;
+        Ok(())
     }
 
-    unsafe fn read(&self, start: usize, buf: *mut u8, len: usize) -> usize {
+    unsafe fn read(&self, start: usize, buf: *mut u8, len: usize) -> Result<usize, c_int> {
         let count = len.min(self.length.saturating_sub(start));
+        if let Some(backing) = &self.backing {
+            return unsafe { backing.read(start, buf, count) };
+        }
         let mut read = 0;
         while read < count {
             let offset = start + read;
@@ -345,7 +376,7 @@ impl SparseFile {
             }
             read += n;
         }
-        count
+        Ok(count)
     }
 
     fn write(&mut self, start: usize, bytes: &[u8]) -> Result<usize, c_int> {
@@ -355,44 +386,94 @@ impl SparseFile {
         {
             return Err(libc::EFBIG);
         }
+        let mut allocated = 0;
+        while allocated < bytes.len() {
+            let offset = start + allocated;
+            if let Err(error) = self.allocate(offset / PAGE_SIZE) {
+                if allocated == 0 {
+                    return Err(error);
+                }
+                break;
+            }
+            allocated += (PAGE_SIZE - offset % PAGE_SIZE).min(bytes.len() - allocated);
+        }
+        let bytes = &bytes[..allocated];
+        if let Some(backing) = &mut self.backing {
+            let written = backing.write(start, bytes)?;
+            self.length = self.length.max(start + written);
+            return Ok(written);
+        }
         let mut written = 0;
         while written < bytes.len() {
             let offset = start + written;
-            let index = offset / PAGE_SIZE;
-            if !self.pages.contains_key(&index) {
-                let error = if self.volume.as_ref().is_some_and(|volume| !volume.reserve()) {
-                    Some(libc::ENOSPC)
-                } else {
-                    let mut page = Vec::new();
-                    if page.try_reserve_exact(PAGE_SIZE).is_err()
-                        || self.pages.try_reserve(1).is_err()
-                    {
-                        if let Some(volume) = &self.volume {
-                            volume.used.fetch_sub(1, Ordering::AcqRel);
-                        }
-                        Some(libc::ENOMEM)
-                    } else {
-                        page.resize(PAGE_SIZE, 0);
-                        self.pages.insert(index, page.into_boxed_slice());
-                        None
-                    }
-                };
-                if let Some(error) = error {
-                    return if written == 0 {
-                        Err(error)
-                    } else {
-                        Ok(written)
-                    };
-                }
-            }
             let within = offset % PAGE_SIZE;
             let count = (PAGE_SIZE - within).min(bytes.len() - written);
-            self.pages.get_mut(&index).unwrap()[within..within + count]
+            self.pages.get_mut(&(offset / PAGE_SIZE)).unwrap()[within..within + count]
                 .copy_from_slice(&bytes[written..written + count]);
             written += count;
-            self.length = self.length.max(start + written);
         }
+        self.length = self.length.max(start + written);
         Ok(written)
+    }
+
+    /// Allocates page `index` unless it already is: `ENOSPC` past the storage limit, `ENOMEM`
+    /// when memory runs out.
+    fn allocate(&mut self, index: usize) -> Result<(), c_int> {
+        if self.pages.contains_key(&index) {
+            return Ok(());
+        }
+        if self.volume.as_ref().is_some_and(|volume| !volume.reserve()) {
+            return Err(libc::ENOSPC);
+        }
+        let mut page = Vec::new();
+        let size = if self.backing.is_some() { 0 } else { PAGE_SIZE };
+        if page.try_reserve_exact(size).is_err() || self.pages.try_reserve(1).is_err() {
+            if let Some(volume) = &self.volume {
+                volume.used.fetch_sub(1, Ordering::AcqRel);
+            }
+            return Err(libc::ENOMEM);
+        }
+        page.resize(size, 0);
+        self.pages.insert(index, page.into_boxed_slice());
+        Ok(())
+    }
+
+    /// The object the file is mapped from, its bytes moved there on the first call.
+    fn share(&mut self) -> Result<&mut Backing, c_int> {
+        if self.backing.is_none() {
+            let backing = Backing::new(
+                self.length,
+                self.pages.iter().map(|(index, page)| (*index, &page[..])),
+            )?;
+            for page in self.pages.values_mut() {
+                *page = Box::default();
+            }
+            self.backing = Some(backing);
+        }
+        Ok(self.backing.as_mut().unwrap())
+    }
+
+    /// Takes in what shared mappings wrote since the last look: pages they filled count as
+    /// allocated, beyond the storage limit if need be. Whether a mapping wrote the file.
+    fn settle(&mut self) -> bool {
+        let Some(backing) = &mut self.backing else {
+            return false;
+        };
+        let mut written = backing.written_through_mapping();
+        let filled: Vec<usize> = backing
+            .exposed(self.length.div_ceil(PAGE_SIZE))
+            .filter(|index| {
+                !self.pages.contains_key(index) && backing.page_has_data(*index, self.length)
+            })
+            .collect();
+        for index in filled {
+            self.pages.insert(index, Box::default());
+            if let Some(volume) = &self.volume {
+                volume.used.fetch_add(1, Ordering::AcqRel);
+            }
+            written = true;
+        }
+        written
     }
 }
 
@@ -408,12 +489,14 @@ impl Drop for SparseFile {
 }
 
 impl VInode {
-    fn new(number: u64, data: Vec<u8>, directory: bool, now: Stamp) -> Arc<Self> {
+    fn new(number: u64, data: Vec<u8>, kind: Kind, now: Stamp, owner: Owner) -> Arc<Self> {
         Arc::new(Self {
             number,
+            kind,
             data: Mutex::new(SparseFile::new(data)),
-            links: AtomicU64::new(if directory { 2 } else { 1 }),
+            links: AtomicU64::new(if kind == Kind::Directory { 2 } else { 1 }),
             times: Mutex::new(Times::at(now)),
+            owner: Mutex::new(owner),
             locks: Locks::default(),
         })
     }
@@ -425,12 +508,53 @@ impl VInode {
     fn touch(&self, change: impl FnOnce(&mut Times)) {
         change(&mut self.times.lock().unwrap());
     }
+
+    fn owner(&self) -> Owner {
+        *self.owner.lock().unwrap()
+    }
+
+    /// The node's attributes, `size` being a symlink's target length (a regular file reports its
+    /// contents', a directory 0).
+    fn attributes(&self, size: u64) -> Attributes {
+        let owner = self.owner();
+        let (kind, size) = match self.kind {
+            Kind::File => (libc::S_IFREG, self.data.lock().unwrap().len() as u64),
+            Kind::Directory => (libc::S_IFDIR, 0),
+            Kind::Symlink => (libc::S_IFLNK, size),
+        };
+        #[allow(clippy::unnecessary_cast)]
+        let kind = kind as u32;
+        Attributes {
+            mode: kind | owner.mode,
+            size,
+            ino: self.number,
+            nlink: self.links.load(Ordering::Acquire),
+            uid: owner.uid,
+            gid: owner.gid,
+        }
+    }
+
+    /// The caller wrote the file's contents (or truncated them): an unprivileged write drops its
+    /// set-user-ID and set-group-ID bits as the host does ([`Credentials::wrote`]).
+    fn wrote(&self, truncate: bool) {
+        let mut owner = self.owner.lock().unwrap();
+        if owner.mode & (SET_UID | SET_GID) != 0 {
+            Credentials::current().wrote(&mut owner, truncate);
+        }
+    }
 }
 
 impl VNode {
     fn inode(&self) -> &Arc<VInode> {
         match self {
             Self::File(inode) | Self::Dir(inode) | Self::Symlink(inode, _) => inode,
+        }
+    }
+
+    fn attributes(&self) -> Attributes {
+        match self {
+            Self::Symlink(inode, target) => inode.attributes(target.len() as u64),
+            node => node.inode().attributes(0),
         }
     }
 }
@@ -470,6 +594,21 @@ pub struct FsBuilder {
     deny: Vec<Pattern>,
     storage_limit: Option<u64>,
     times: BTreeMap<PathBuf, NodeTimes>,
+    modes: BTreeMap<PathBuf, u32>,
+    owners: BTreeMap<PathBuf, (u32, u32)>,
+}
+
+/// The mode a declared node starts with: `0644` for a file and `0755` for a directory, what a
+/// `0666` file and a `0777` directory get under the usual umask of 022 (man 2 umask), and for a
+/// symlink what `symlink` makes under it: `0777` on Linux, which ignores the umask for symlinks,
+/// and `0755` on macOS, which applies it.
+fn declared_mode(kind: Kind) -> u32 {
+    match kind {
+        Kind::File => 0o644,
+        Kind::Directory => 0o755,
+        Kind::Symlink if cfg!(target_os = "macos") => 0o755,
+        Kind::Symlink => 0o777,
+    }
 }
 
 impl FsBuilder {
@@ -491,11 +630,11 @@ impl FsBuilder {
         let mut dir = path.clone();
         while dir.pop() {
             if !self.tree.contains_key(&dir) {
-                let inode = self.inode(Vec::new(), true);
+                let inode = self.inode(Vec::new(), Kind::Directory);
                 self.tree.insert(dir.clone(), VNode::Dir(inode));
             }
         }
-        let inode = self.inode(contents.into(), false);
+        let inode = self.inode(contents.into(), Kind::File);
         self.tree.insert(path, VNode::File(inode));
         self
     }
@@ -503,7 +642,7 @@ impl FsBuilder {
     /// Adds a virtual directory. Unlike [`file`](Self::file) it does not create the parents, so
     /// declare those too if a listing of them should show it.
     pub fn dir(mut self, path: impl AsRef<Path>) -> Self {
-        let inode = self.inode(Vec::new(), true);
+        let inode = self.inode(Vec::new(), Kind::Directory);
         self.tree
             .insert(normalize(path.as_ref()), VNode::Dir(inode));
         self
@@ -515,11 +654,11 @@ impl FsBuilder {
         let mut parent = path.clone();
         while parent.pop() {
             if !self.tree.contains_key(&parent) {
-                let inode = self.inode(Vec::new(), true);
+                let inode = self.inode(Vec::new(), Kind::Directory);
                 self.tree.insert(parent.clone(), VNode::Dir(inode));
             }
         }
-        let inode = self.inode(Vec::new(), false);
+        let inode = self.inode(Vec::new(), Kind::Symlink);
         self.tree.insert(
             path,
             VNode::Symlink(
@@ -537,6 +676,28 @@ impl FsBuilder {
     /// [`build`](Self::build) panics if `path` is not declared.
     pub fn times(mut self, path: impl AsRef<Path>, times: NodeTimes) -> Self {
         self.times.insert(normalize(path.as_ref()), times);
+        self
+    }
+
+    /// Sets the permission bits (`07777`, set-user-ID, set-group-ID and sticky included) a
+    /// declared node starts with. Without a call a file starts at `0644`, a directory at `0755`,
+    /// a symlink at `0777` on Linux and `0755` on macOS.
+    ///
+    /// # Panics
+    /// [`build`](Self::build) panics if `path` is not declared.
+    pub fn mode(mut self, path: impl AsRef<Path>, mode: u32) -> Self {
+        self.modes.insert(normalize(path.as_ref()), mode & 0o7777);
+        self
+    }
+
+    /// Sets the owner and group of a declared node. Without a call every declared node belongs
+    /// to the user the code under test runs as, in its group: what `geteuid` and `getegid` report
+    /// in the first sim the file system is handed to.
+    ///
+    /// # Panics
+    /// [`build`](Self::build) panics if `path` is not declared.
+    pub fn owner(mut self, path: impl AsRef<Path>, uid: u32, gid: u32) -> Self {
+        self.owners.insert(normalize(path.as_ref()), (uid, gid));
         self
     }
 
@@ -570,12 +731,20 @@ impl FsBuilder {
         std::sync::Arc::new(VirtualFs::new(self))
     }
 
-    fn inode(&mut self, data: Vec<u8>, directory: bool) -> Arc<VInode> {
+    fn inode(&mut self, data: Vec<u8>, kind: Kind) -> Arc<VInode> {
         let number = self.next_inode | 1;
         self.next_inode = number + 2;
-        VInode::new(number, data, directory, 0)
+        let owner = Owner {
+            mode: declared_mode(kind),
+            uid: 0,
+            gid: 0,
+        };
+        VInode::new(number, data, kind, 0, owner)
     }
 }
+
+/// A declared node, its builder times, and the owner the builder named for it.
+type Declared = (Arc<VInode>, NodeTimes, Option<(u32, u32)>);
 
 /// An in-memory file system serving the file plane of a [`Sim`](crate::Sim); build one with
 /// [`FsBuilder`] and hand it to [`SimBuilder::fs`](crate::SimBuilder::fs).
@@ -595,11 +764,18 @@ pub struct VirtualFs {
     /// A real `/dev/null` fd, `O_CLOEXEC`, opened once and never closed; -1 if the open failed, in
     /// which case every virtual open fails with `EMFILE`.
     devnull: c_int,
+    /// The `st_dev` of every node, one of its own for each file system, as each mounted file system
+    /// has: code that keys files by (`st_dev`, `st_ino`), as SQLite does its locks and shared
+    /// memory, must not take files of two file systems for one.
+    device: u64,
     /// The clock of the first sim built with this file system (`None` inside: the real clock);
     /// unset, the real clock.
     clock: OnceLock<Option<Arc<Clock>>>,
-    /// The declared nodes, with their builder times, until a sim's clock stamps them.
-    declared: Mutex<Vec<(Arc<VInode>, NodeTimes)>>,
+    /// The declared nodes, with their builder times and owner, until the first sim stamps them
+    /// with its clock and, where the builder named no owner, its user.
+    declared: Mutex<Vec<Declared>>,
+    /// Inodes whose bytes moved to a [`Backing`] to be mapped. Never held with another lock.
+    mapped: Mutex<Vec<Weak<VInode>>>,
 }
 
 /// A directory snapshot with a stable heap address for `readdir` results.
@@ -616,6 +792,9 @@ pub(crate) struct DirStream {
     inode: Option<Arc<VInode>>,
     #[cfg(target_os = "linux")]
     pub(crate) path: Option<PathBuf>,
+    /// Owns the `flock` and OFD locks taken through a `SimHost` stream's descriptor.
+    #[cfg(target_os = "linux")]
+    pub(crate) description: u64,
 }
 
 impl DirStream {
@@ -630,6 +809,8 @@ impl DirStream {
             inode: None,
             #[cfg(target_os = "linux")]
             path: None,
+            #[cfg(target_os = "linux")]
+            description: fs_locks::description(),
         }
     }
 }
@@ -655,6 +836,14 @@ impl VirtualFs {
     fn volume_stats(&self, buf: *mut u8) -> Option<FsResult> {
         if buf.is_null() {
             return err(libc::EFAULT);
+        }
+        let mapped: Vec<Arc<VInode>> = {
+            let mut mapped = self.mapped.lock().unwrap();
+            mapped.retain(|inode| inode.strong_count() > 0);
+            mapped.iter().filter_map(Weak::upgrade).collect()
+        };
+        for inode in &mapped {
+            self.settle(inode);
         }
         let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
         stat.f_bsize = PAGE_SIZE as _;
@@ -706,13 +895,35 @@ impl VirtualFs {
             libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC)
         });
         let mut times = b.times;
+        let mut modes = b.modes;
+        let mut owners = b.owners;
+        let caller = Credentials::current();
         let declared = b
             .tree
             .iter()
-            .map(|(path, node)| (node.inode().clone(), times.remove(path).unwrap_or_default()))
+            .map(|(path, node)| {
+                let named = owners.remove(path);
+                let (uid, gid) = named.unwrap_or((caller.uid, caller.gid));
+                let mut owner = node.inode().owner.lock().unwrap();
+                (owner.uid, owner.gid) = (uid, gid);
+                if let Some(mode) = modes.remove(path) {
+                    owner.mode = mode;
+                }
+                (
+                    node.inode().clone(),
+                    times.remove(path).unwrap_or_default(),
+                    named,
+                )
+            })
             .collect();
-        if let Some(path) = times.keys().next() {
-            panic!("FsBuilder::times for undeclared path {}", path.display());
+        for (call, path) in [
+            ("times", times.keys().next()),
+            ("mode", modes.keys().next()),
+            ("owner", owners.keys().next()),
+        ] {
+            if let Some(path) = path {
+                panic!("FsBuilder::{call} for undeclared path {}", path.display());
+            }
         }
         for (path, node) in &b.tree {
             if matches!(node, VNode::Dir(_))
@@ -733,21 +944,28 @@ impl VirtualFs {
             passthrough: b.passthrough,
             deny: b.deny,
             devnull,
+            device: device(),
             clock: OnceLock::new(),
             declared: Mutex::new(declared),
+            mapped: Mutex::default(),
         }
     }
 
     /// Puts the file system on `clock`, the clock of the sim being built with it (`None`: the
-    /// real clock), and stamps the declared nodes with that sim's start. Only the first sim's
-    /// clock is kept.
-    pub(crate) fn attach_clock(&self, clock: Option<Arc<Clock>>) {
+    /// real clock), stamps the declared nodes with that sim's start, and gives those the builder
+    /// named no owner to the sim's user. Only the first sim's clock and user are kept.
+    pub(crate) fn attach(&self, clock: Option<Arc<Clock>>, shared: &crate::scope::SimShared) {
         if self.clock.set(clock).is_err() {
             return;
         }
         let now = self.now();
-        for (inode, times) in std::mem::take(&mut *self.declared.lock().unwrap()) {
+        let user = Credentials::of(shared);
+        for (inode, times, named) in std::mem::take(&mut *self.declared.lock().unwrap()) {
             *inode.times.lock().unwrap() = times.resolve(now);
+            if named.is_none() {
+                let mut owner = inode.owner.lock().unwrap();
+                (owner.uid, owner.gid) = (user.uid, user.gid);
+            }
         }
     }
 
@@ -789,6 +1007,26 @@ impl VirtualFs {
         }
     }
 
+    /// Stamps a mapped inode modified when its mappings wrote it since the last look.
+    fn settle(&self, inode: &VInode) {
+        if inode.data.lock().unwrap().settle() {
+            let now = self.now();
+            inode.touch(|times| times.modify(now));
+        }
+    }
+
+    fn settle_fd(&self, fd: c_int) {
+        let inode = self
+            .open
+            .lock()
+            .unwrap()
+            .get(&fd)
+            .map(|file| file.inode.clone());
+        if let Some(inode) = inode {
+            self.settle(&inode);
+        }
+    }
+
     /// A directory listing read: Linux (`iterate_dir` calls `file_accessed`) and macOS both mark
     /// the directory's access time, under the same relatime rule as a file read.
     fn list_access(&self, stream: &DirStream) {
@@ -819,39 +1057,21 @@ impl VirtualFs {
             .any(|prefix| path.starts_with(prefix))
     }
 
-    /// (mode, size, nlink, inode number, times) for an owned fd, for `fstat` and
-    /// `statx(AT_EMPTY_PATH)`.
-    fn fd_meta(&self, fd: c_int) -> Option<(u32, u64, u64, u64, Times)> {
+    /// The inode an owned fd or directory stream names.
+    fn fd_inode(&self, fd: c_int) -> Option<Arc<VInode>> {
         let open = self.open.lock().unwrap();
-        let Some(file) = open.get(&fd) else {
-            let dirs = self.dirs.lock().unwrap();
-            let stream = dirs.get(&fd)?.lock().unwrap();
-            let inode = stream.inode.as_ref()?;
-            return Some((
-                dir_mode(),
-                0,
-                inode.links.load(Ordering::Acquire),
-                inode.number,
-                inode.times(),
-            ));
-        };
-        Some(if file.is_dir {
-            (
-                dir_mode(),
-                0,
-                file.inode.links.load(Ordering::Acquire),
-                file.inode.number,
-                file.inode.times(),
-            )
-        } else {
-            (
-                reg_mode(),
-                file.inode.data.lock().unwrap().len() as u64,
-                file.inode.links.load(Ordering::Acquire),
-                file.inode.number,
-                file.inode.times(),
-            )
-        })
+        if let Some(file) = open.get(&fd) {
+            return Some(file.inode.clone());
+        }
+        let dirs = self.dirs.lock().unwrap();
+        let stream = dirs.get(&fd)?.lock().unwrap();
+        stream.inode.clone()
+    }
+
+    /// The attributes and times of an owned fd, for `fstat` and `statx(AT_EMPTY_PATH)`.
+    fn fd_meta(&self, fd: c_int) -> Option<(Attributes, Times)> {
+        let inode = self.fd_inode(fd)?;
+        Some((inode.attributes(0), inode.times()))
     }
 
     /// Whether any of `patterns` matches `path`, with the `glob` crate's default options (`*`
@@ -882,7 +1102,78 @@ impl VirtualFs {
         }
     }
 
-    unsafe fn retained_directory(&self, fd: c_int, raw: *const c_char) -> Option<Arc<VInode>> {
+    /// The status flags of open file `fd`, 0 for any other fd.
+    #[cfg(target_os = "linux")]
+    fn fd_flags(&self, fd: c_int) -> c_int {
+        self.open
+            .lock()
+            .unwrap()
+            .get(&fd)
+            .map_or(0, |file| file.flags)
+    }
+
+    /// Whether the caller may remove `victim`, at `path`, from its directory
+    /// ([`Credentials::may_remove`]); a path with no declared parent is not checked.
+    fn may_remove(
+        &self,
+        tree: &BTreeMap<PathBuf, VNode>,
+        path: &Path,
+        victim: &VInode,
+    ) -> Result<(), c_int> {
+        match path.parent().and_then(|parent| tree.get(parent)) {
+            Some(VNode::Dir(parent)) => {
+                Credentials::current().may_remove(&parent.owner(), &victim.owner())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether the caller may rename `source`, at `from`, to `to`, replacing `target`: it may
+    /// remove the source from its directory, and the target from its directory or, with none,
+    /// create an entry there (`vfs_rename`). A directory moving to another parent must grant write
+    /// permission itself, its `..` entry changing; macOS also asks it of a directory it replaces
+    /// (measured).
+    fn may_rename(
+        &self,
+        tree: &BTreeMap<PathBuf, VNode>,
+        from: &Path,
+        to: &Path,
+        source: &VNode,
+        target: Option<&VNode>,
+    ) -> Result<(), c_int> {
+        self.may_remove(tree, from, source.inode())?;
+        let caller = Credentials::current();
+        match target {
+            Some(target) => {
+                self.may_remove(tree, to, target.inode())?;
+                if cfg!(target_os = "macos") && matches!(target, VNode::Dir(_)) {
+                    caller.check(&target.inode().owner(), Kind::Directory, fs_perm::WRITE)?;
+                }
+            }
+            None => {
+                if let Some(VNode::Dir(parent)) = to.parent().and_then(|parent| tree.get(parent)) {
+                    caller.check(
+                        &parent.owner(),
+                        Kind::Directory,
+                        fs_perm::WRITE | fs_perm::EXEC,
+                    )?;
+                }
+            }
+        }
+        if matches!(source, VNode::Dir(_)) && from.parent() != to.parent() {
+            caller.check(&source.inode().owner(), Kind::Directory, fs_perm::WRITE)?;
+        }
+        Ok(())
+    }
+
+    /// The directory a path of nothing but `.` components names relative to `fd` (or the working
+    /// directory), which has no namespace path of its own once removed; `EACCES` when the caller
+    /// may not search it, as looking up `.` takes.
+    unsafe fn retained_directory(
+        &self,
+        fd: c_int,
+        raw: *const c_char,
+    ) -> Option<Result<Arc<VInode>, c_int>> {
         if raw.is_null() {
             return None;
         }
@@ -895,15 +1186,21 @@ impl VirtualFs {
         {
             return None;
         }
-        if fd == libc::AT_FDCWD {
-            return self.cwd.lock().unwrap().clone();
-        }
-        self.open
-            .lock()
-            .unwrap()
-            .get(&fd)
-            .filter(|file| file.is_dir)
-            .map(|file| file.inode.clone())
+        let inode = if fd == libc::AT_FDCWD {
+            self.cwd.lock().unwrap().clone()
+        } else {
+            self.open
+                .lock()
+                .unwrap()
+                .get(&fd)
+                .filter(|file| file.is_dir)
+                .map(|file| file.inode.clone())
+        }?;
+        Some(
+            Credentials::current()
+                .search(&inode.owner())
+                .map(|()| inode),
+        )
     }
 
     fn open_directory_inode(&self, inode: Arc<VInode>, flags: c_int) -> Option<FsResult> {
@@ -915,6 +1212,11 @@ impl VirtualFs {
         }
         if cfg!(target_os = "linux") && flags & libc::O_CREAT != 0 {
             return err(libc::EISDIR);
+        }
+        if let Err(error) =
+            Credentials::current().check(&inode.owner(), Kind::Directory, open_access(flags))
+        {
+            return err(error);
         }
         let fd = match self.reserve_fd() {
             Ok(fd) => fd,
@@ -980,6 +1282,10 @@ impl VirtualFs {
         )
     }
 
+    /// Resolves `raw` (absolute) through this plane's symlinks to the namespace path it names.
+    /// Each directory looked up in must grant the caller search permission (`EACCES`), counted
+    /// from the root even for a path given relative to a working directory or directory
+    /// descriptor; a trailing slash looks nothing up in its directory.
     unsafe fn traversal(
         &self,
         tree: &BTreeMap<PathBuf, VNode>,
@@ -1003,24 +1309,28 @@ impl VirtualFs {
             .map(<[u8]>::to_vec)
             .collect();
         if raw.ends_with(b"/") && (follow_final || cfg!(target_os = "macos")) {
-            pending.push_back(b".".to_vec());
+            pending.push_back(Vec::new());
         }
+        let caller = Credentials::current();
         let mut current = PathBuf::from("/");
         let mut links = 0;
         while let Some(component) = pending.pop_front() {
             match tree.get(&current) {
                 Some(VNode::File(_) | VNode::Symlink(..))
-                    if strict_dots || !matches!(component.as_slice(), b"." | b"..") =>
+                    if strict_dots || !matches!(component.as_slice(), b"" | b"." | b"..") =>
                 {
                     return Err(libc::ENOTDIR);
                 }
                 None if current != Path::new("/") && self.claims(tree, &current) => {
                     return Err(libc::ENOENT);
                 }
+                Some(VNode::Dir(inode)) if !component.is_empty() => {
+                    caller.search(&inode.owner())?;
+                }
                 _ => {}
             }
             match component.as_slice() {
-                b"." => continue,
+                b"" | b"." => continue,
                 b".." => {
                     current.pop();
                     continue;
@@ -1047,7 +1357,7 @@ impl VirtualFs {
                     .map(<[u8]>::to_vec)
                     .collect();
                 if target.ends_with(b"/") && pending.is_empty() {
-                    components.push_back(b".".to_vec());
+                    components.push_back(Vec::new());
                 }
                 components.append(&mut pending);
                 pending = components;
@@ -1072,15 +1382,13 @@ impl VirtualFs {
         follow: bool,
     ) -> Option<FsResult> {
         if let Some(inode) = unsafe { self.retained_directory(libc::AT_FDCWD, path) } {
+            let inode = match inode {
+                Ok(inode) => inode,
+                Err(error) => return err(error),
+            };
             return with_times(
                 buf,
-                fill_stat(
-                    buf,
-                    dir_mode(),
-                    0,
-                    inode.number,
-                    inode.links.load(Ordering::Acquire),
-                ),
+                fill_stat(buf, self.device, &inode.attributes(0)),
                 &inode.times(),
                 false,
             );
@@ -1111,11 +1419,11 @@ impl VirtualFs {
                 if trailing_slash && matches!(node, VNode::File(_)) {
                     return err(libc::ENOTDIR);
                 }
-                let (mode, size, nlink) = mode_size_nlink(node);
+                self.settle(node.inode());
                 let blocks = node.inode().data.lock().unwrap().pages.len() as u64 * 8;
                 let result = allocated_blocks(
                     buf,
-                    fill_stat(buf, mode, size, node.inode().number, nlink),
+                    fill_stat(buf, self.device, &node.attributes()),
                     blocks,
                     false,
                 );
@@ -1127,15 +1435,18 @@ impl VirtualFs {
     }
 
     /// The node `path` names relative to `dirfd`, resolved as `fstatat` resolves it; `None` for
-    /// a path this plane declines.
+    /// a path this plane declines. A null `path` names `dirfd` itself.
     unsafe fn lookup(
         &self,
         dirfd: c_int,
         path: *const c_char,
         follow: bool,
     ) -> Option<Result<Arc<VInode>, c_int>> {
+        if path.is_null() {
+            return self.fd_inode(dirfd).map(Ok);
+        }
         if let Some(inode) = unsafe { self.retained_directory(dirfd, path) } {
-            return Some(Ok(inode));
+            return Some(inode);
         }
         let resolved = match unsafe { self.resolve_at(dirfd, path) } {
             Ok(path) => path?,
@@ -1277,8 +1588,11 @@ impl Fs for VirtualFs {
     }
 
     unsafe fn chdir(&self, path: *const c_char) -> Option<FsResult> {
-        if unsafe { self.retained_directory(libc::AT_FDCWD, path) }.is_some() {
-            return ok(0);
+        if let Some(inode) = unsafe { self.retained_directory(libc::AT_FDCWD, path) } {
+            return match inode {
+                Ok(_) => ok(0),
+                Err(error) => err(error),
+            };
         }
         let absolute = match unsafe { self.absolute(path) } {
             Ok(path) => path?,
@@ -1305,10 +1619,14 @@ impl Fs for VirtualFs {
             None => return err(libc::ENOENT),
         };
         drop(tree);
+        if let Err(error) = Credentials::current().search(&inode.owner()) {
+            return err(error);
+        }
         *self.cwd.lock().unwrap() = Some(inode);
         ok(0)
     }
 
+    /// `fchdir(2)`, which takes search permission on the directory as `chdir` does.
     unsafe fn fchdir(&self, fd: c_int) -> Option<FsResult> {
         let inode = {
             let open = self.open.lock().unwrap();
@@ -1318,6 +1636,9 @@ impl Fs for VirtualFs {
             }
             file.inode.clone()
         };
+        if let Err(error) = Credentials::current().search(&inode.owner()) {
+            return err(error);
+        }
         *self.cwd.lock().unwrap() = Some(inode);
         ok(0)
     }
@@ -1392,12 +1713,18 @@ impl Fs for VirtualFs {
         if absolute.to_bytes().ends_with(b"/") {
             return err(libc::ENOENT);
         }
+        let caller = Credentials::current();
+        let parent_owner = parent.owner();
+        if let Err(error) = caller.check(&parent_owner, Kind::Directory, fs_perm::WRITE) {
+            return err(error);
+        }
         let now = self.now();
         let inode = VInode::new(
             self.next_inode.fetch_add(2, Ordering::Relaxed),
             Vec::new(),
-            false,
+            Kind::Symlink,
             now,
+            caller.create(&parent_owner, 0o777, Kind::Symlink),
         );
         inode.data.lock().unwrap().attach(&self.volume);
         tree.insert(path, VNode::Symlink(inode, Arc::new(target.to_vec())));
@@ -1446,11 +1773,21 @@ impl Fs for VirtualFs {
         {
             return err(libc::EINVAL);
         }
-        if matches!(result, FsResult::Ok(_))
-            && mode & libc::X_OK != 0
-            && metadata.st_mode & 0o111 == 0
-        {
-            return err(libc::EACCES);
+        if matches!(result, FsResult::Ok(_)) {
+            #[allow(clippy::unnecessary_cast)]
+            let kind = match metadata.st_mode as u32 & libc::S_IFMT as u32 {
+                directory if directory == libc::S_IFDIR as u32 => Kind::Directory,
+                link if link == libc::S_IFLNK as u32 => Kind::Symlink,
+                _ => Kind::File,
+            };
+            let owner = Owner {
+                mode: metadata.st_mode as u32 & 0o7777,
+                uid: metadata.st_uid,
+                gid: metadata.st_gid,
+            };
+            if let Err(error) = Credentials::current().check(&owner, kind, mode as u32) {
+                return err(error);
+            }
         }
         Some(result)
     }
@@ -1516,9 +1853,12 @@ impl Fs for VirtualFs {
     }
 
     /// Opens a virtual path with the requested access and creation flags.
-    unsafe fn open(&self, path: *const c_char, flags: c_int, _mode: u32) -> Option<FsResult> {
+    unsafe fn open(&self, path: *const c_char, flags: c_int, mode: u32) -> Option<FsResult> {
         if let Some(inode) = unsafe { self.retained_directory(libc::AT_FDCWD, path) } {
-            return self.open_directory_inode(inode, flags);
+            return match inode {
+                Ok(inode) => self.open_directory_inode(inode, flags),
+                Err(error) => err(error),
+            };
         }
         let path_absolute = match unsafe { self.absolute(path) } {
             Ok(path) => path?,
@@ -1593,24 +1933,35 @@ impl Fs for VirtualFs {
             return err(libc::EISDIR);
         }
         let creating = node.is_none();
+        let caller = Credentials::current();
         let (data, is_dir, writable) = match node {
-            Some(VNode::File(bytes)) => (bytes, false, writable(flags)),
             Some(VNode::Symlink(..)) => return err(libc::ELOOP),
-            Some(VNode::Dir(inode)) => (inode, true, false),
+            Some(VNode::File(inode) | VNode::Dir(inode)) => {
+                if let Err(error) = caller.check(&inode.owner(), inode.kind, open_access(flags)) {
+                    return err(error);
+                }
+                let is_dir = inode.kind == Kind::Directory;
+                (inode, is_dir, !is_dir && writable(flags))
+            }
             None => {
                 // man 2 open: O_CREAT creates the file if it does not exist.
                 if flags & libc::O_CREAT != 0
                     && (self.owned(&path) || path.parent().is_some_and(|p| tree.contains_key(p)))
                 {
-                    if let Err(error) = Self::parent(&tree, &path) {
+                    let parent = match Self::parent(&tree, &path) {
+                        Ok(parent) => parent.owner(),
+                        Err(error) => return err(error),
+                    };
+                    if let Err(error) = caller.check(&parent, Kind::Directory, fs_perm::WRITE) {
                         return err(error);
                     }
                     (
                         VInode::new(
                             self.next_inode.fetch_add(2, Ordering::Relaxed),
                             Vec::new(),
-                            false,
+                            Kind::File,
                             self.now(),
+                            caller.create(&parent, mode, Kind::File),
                         ),
                         false,
                         writable(flags),
@@ -1634,12 +1985,16 @@ impl Fs for VirtualFs {
             }
         }
         if !is_dir && flags & libc::O_TRUNC != 0 {
-            data.data.lock().unwrap().clear();
+            if let Err(error) = data.data.lock().unwrap().clear() {
+                unsafe { libc::close(fd) };
+                return err(error);
+            }
             if !creating {
                 // POSIX `open`: O_TRUNC on an existing regular file marks st_ctime and st_mtime,
                 // even one already empty on both Linux and macOS (tests/fs_times.rs).
                 let now = self.now();
                 data.touch(|times| times.modify(now));
+                data.wrote(true);
             }
         }
         let directory = is_dir.then(|| {
@@ -1674,7 +2029,10 @@ impl Fs for VirtualFs {
         mode: u32,
     ) -> Option<FsResult> {
         if let Some(inode) = unsafe { self.retained_directory(dirfd, path) } {
-            return self.open_directory_inode(inode, flags);
+            return match inode {
+                Ok(inode) => self.open_directory_inode(inode, flags),
+                Err(error) => err(error),
+            };
         }
         let path = match unsafe { self.resolve_at(dirfd, path) } {
             Ok(path) => path?,
@@ -1755,10 +2113,15 @@ impl Fs for VirtualFs {
         if path == Path::new("/") {
             return err(libc::EBUSY);
         }
-        let inode = match tree.get(&path) {
-            Some(VNode::File(_) | VNode::Symlink(..)) => return err(libc::ENOTDIR),
-            Some(VNode::Dir(inode)) => inode.clone(),
-            None => return err(libc::ENOENT),
+        let Some(node) = tree.get(&path) else {
+            return err(libc::ENOENT);
+        };
+        if let Err(error) = self.may_remove(&tree, &path, node.inode()) {
+            return err(error);
+        }
+        let inode = match node {
+            VNode::File(_) | VNode::Symlink(..) => return err(libc::ENOTDIR),
+            VNode::Dir(inode) => inode.clone(),
         };
         if tree
             .keys()
@@ -1802,20 +2165,21 @@ impl Fs for VirtualFs {
             Err(error) => return err(error),
         };
         match tree.get(&path) {
-            Some(VNode::Dir(_)) => {
-                return err(if cfg!(target_os = "macos") {
-                    libc::EPERM
-                } else {
-                    libc::EISDIR
-                });
-            }
+            Some(VNode::Dir(_)) if cfg!(target_os = "macos") => return err(libc::EPERM),
             Some(VNode::File(_) | VNode::Symlink(..)) if trailing_slash => {
                 return err(libc::ENOTDIR);
             }
             None => {
                 return err(Self::parent(&tree, &path).err().unwrap_or(libc::ENOENT));
             }
-            Some(VNode::File(_) | VNode::Symlink(..)) => {}
+            Some(node) => {
+                if let Err(error) = self.may_remove(&tree, &path, node.inode()) {
+                    return err(error);
+                }
+                if matches!(node, VNode::Dir(_)) {
+                    return err(libc::EISDIR);
+                }
+            }
         }
         let inode = tree.remove(&path).unwrap();
         inode.inode().links.fetch_sub(1, Ordering::AcqRel);
@@ -1827,7 +2191,7 @@ impl Fs for VirtualFs {
         ok(0)
     }
 
-    unsafe fn mkdir(&self, raw: *const c_char, _mode: u32) -> Option<FsResult> {
+    unsafe fn mkdir(&self, raw: *const c_char, mode: u32) -> Option<FsResult> {
         let raw_absolute = match unsafe { self.absolute(raw) } {
             Ok(path) => path?,
             Err(error) => return err(error),
@@ -1875,12 +2239,18 @@ impl Fs for VirtualFs {
             Ok(parent) => parent,
             Err(error) => return err(error),
         };
+        let caller = Credentials::current();
+        let parent_owner = parent.owner();
+        if let Err(error) = caller.check(&parent_owner, Kind::Directory, fs_perm::WRITE) {
+            return err(error);
+        }
         let now = self.now();
         let inode = VInode::new(
             self.next_inode.fetch_add(2, Ordering::Relaxed),
             Vec::new(),
-            true,
+            Kind::Directory,
             now,
+            caller.create(&parent_owner, mode, Kind::Directory),
         );
         inode.data.lock().unwrap().attach(&self.volume);
         tree.insert(path, VNode::Dir(inode));
@@ -1987,6 +2357,9 @@ impl Fs for VirtualFs {
         }
         if directory && to.starts_with(&from) {
             return err(libc::EINVAL);
+        }
+        if let Err(error) = self.may_rename(&tree, &from, &to, &source, target.as_ref()) {
+            return err(error);
         }
         match (&source, &target) {
             (VNode::File(_) | VNode::Symlink(..), Some(VNode::Dir(_))) => return err(libc::EISDIR),
@@ -2106,6 +2479,11 @@ impl Fs for VirtualFs {
             Ok(parent) => parent,
             Err(error) => return err(error),
         };
+        if let Err(error) =
+            Credentials::current().check(&parent.owner(), Kind::Directory, fs_perm::WRITE)
+        {
+            return err(error);
+        }
         node.inode().links.fetch_add(1, Ordering::AcqRel);
         let now = self.now();
         node.inode().touch(|times| times.changed = now);
@@ -2232,15 +2610,13 @@ impl Fs for VirtualFs {
             return unsafe { self.fstat(dirfd, buf) };
         }
         if let Some(inode) = unsafe { self.retained_directory(dirfd, path) } {
+            let inode = match inode {
+                Ok(inode) => inode,
+                Err(error) => return err(error),
+            };
             return with_times(
                 buf,
-                fill_stat(
-                    buf,
-                    dir_mode(),
-                    0,
-                    inode.number,
-                    inode.links.load(Ordering::Acquire),
-                ),
+                fill_stat(buf, self.device, &inode.attributes(0)),
                 &inode.times(),
                 false,
             );
@@ -2254,8 +2630,9 @@ impl Fs for VirtualFs {
 
     /// `fstat(2)` reports the inode's current size.
     unsafe fn fstat(&self, fd: c_int, buf: *mut u8) -> Option<FsResult> {
-        let (mode, size, nlink, ino, times) = self.fd_meta(fd)?;
-        let result = with_times(buf, fill_stat(buf, mode, size, ino, nlink), &times, false);
+        self.settle_fd(fd);
+        let (attributes, times) = self.fd_meta(fd)?;
+        let result = with_times(buf, fill_stat(buf, self.device, &attributes), &times, false);
         if matches!(result, Some(FsResult::Ok(_))) {
             let blocks = self.open.lock().unwrap().get(&fd).map_or(0, |file| {
                 file.inode.data.lock().unwrap().pages.len() as u64 * 8
@@ -2297,28 +2674,29 @@ impl Fs for VirtualFs {
         if empty {
             // man 2 statx: an empty pathname with AT_EMPTY_PATH stats `dirfd` itself. std's
             // `File::metadata` is exactly `statx(fd, "", AT_EMPTY_PATH)`.
+            if flags & libc::AT_EMPTY_PATH != 0 {
+                self.settle_fd(dirfd);
+            }
             if flags & libc::AT_EMPTY_PATH != 0
-                && let Some((mode, size, nlink, ino, times)) = self.fd_meta(dirfd)
+                && let Some((attributes, times)) = self.fd_meta(dirfd)
             {
                 let blocks = self.open.lock().unwrap().get(&dirfd).map_or(0, |file| {
                     file.inode.data.lock().unwrap().pages.len() as u64 * 8
                 });
                 let result =
-                    allocated_blocks(buf, fill_statx(buf, mode, size, ino, nlink), blocks, true);
+                    allocated_blocks(buf, fill_statx(buf, self.device, &attributes), blocks, true);
                 return with_times(buf, result, &times, true);
             }
             return None;
         }
         if let Some(inode) = unsafe { self.retained_directory(dirfd, path) } {
+            let inode = match inode {
+                Ok(inode) => inode,
+                Err(error) => return err(error),
+            };
             return with_times(
                 buf,
-                fill_statx(
-                    buf,
-                    dir_mode(),
-                    0,
-                    inode.number,
-                    inode.links.load(Ordering::Acquire),
-                ),
+                fill_statx(buf, self.device, &inode.attributes(0)),
                 &inode.times(),
                 true,
             );
@@ -2359,11 +2737,11 @@ impl Fs for VirtualFs {
                 if trailing_slash && matches!(node, VNode::File(_)) {
                     return err(libc::ENOTDIR);
                 }
-                let (mode, size, nlink) = mode_size_nlink(node);
+                self.settle(node.inode());
                 let blocks = node.inode().data.lock().unwrap().pages.len() as u64 * 8;
                 let result = allocated_blocks(
                     buf,
-                    fill_statx(buf, mode, size, node.inode().number, nlink),
+                    fill_statx(buf, self.device, &node.attributes()),
                     blocks,
                     true,
                 );
@@ -2375,8 +2753,8 @@ impl Fs for VirtualFs {
     }
 
     /// Sets a node's times (man 2 utimensat): a null `path` names the descriptor `dirfd`, else
-    /// `path` resolves as for `fstatat`. Permission checks are not modelled: the caller owns every
-    /// virtual node.
+    /// `path` resolves as for `fstatat`. Setting a given instant takes ownership, setting the
+    /// current time ownership or write permission ([`Credentials::set_times`]).
     unsafe fn set_times(
         &self,
         dirfd: c_int,
@@ -2384,27 +2762,104 @@ impl Fs for VirtualFs {
         times: &SetTimes,
         flags: c_int,
     ) -> Option<FsResult> {
-        let inode = if path.is_null() {
-            let open = self.open.lock().unwrap();
-            match open.get(&dirfd) {
-                Some(file) => file.inode.clone(),
-                None => {
-                    let dirs = self.dirs.lock().unwrap();
-                    dirs.get(&dirfd)?.lock().unwrap().inode.clone()?
-                }
-            }
-        } else {
+        use snare_interpose::TimeSet;
+        let inode =
             match unsafe { self.lookup(dirfd, path, flags & libc::AT_SYMLINK_NOFOLLOW == 0) }? {
                 Ok(inode) => inode,
                 Err(error) => return err(error),
-            }
-        };
+            };
         if flags & !libc::AT_SYMLINK_NOFOLLOW != 0 {
             return err(libc::EINVAL);
+        }
+        let set = [times.accessed, times.modified, times.created];
+        let explicit = set.iter().any(|time| matches!(time, TimeSet::At(_)));
+        let current = set.contains(&TimeSet::Now);
+        if let Err(error) =
+            Credentials::current().set_times(&inode.owner(), inode.kind, explicit, current)
+        {
+            return err(error);
         }
         let now = self.now();
         inode.touch(|current| current.set(times, now));
         ok(0)
+    }
+
+    /// `fchmodat(2)` and its relatives on a node: the owner (or a privileged caller) sets the
+    /// permission bits ([`Credentials::chmod`]) and marks the change time, even to the bits it
+    /// has. Linux cannot change a symlink's own mode (`EOPNOTSUPP`); macOS's `lchmod` can.
+    unsafe fn chmod(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        mode: u32,
+        flags: c_int,
+    ) -> Option<FsResult> {
+        let inode =
+            match unsafe { self.lookup(dirfd, path, flags & libc::AT_SYMLINK_NOFOLLOW == 0) }? {
+                Ok(inode) => inode,
+                Err(error) => return err(error),
+            };
+        if flags & !libc::AT_SYMLINK_NOFOLLOW != 0 {
+            return err(libc::EINVAL);
+        }
+        #[cfg(target_os = "linux")]
+        if path.is_null() && self.fd_flags(dirfd) & libc::O_PATH != 0 {
+            return err(libc::EBADF);
+        }
+        if cfg!(target_os = "linux") && inode.kind == Kind::Symlink {
+            return err(libc::EOPNOTSUPP);
+        }
+        let changed = {
+            let mut owner = inode.owner.lock().unwrap();
+            Credentials::current().chmod(&mut owner, mode)
+        };
+        if let Err(error) = changed {
+            return err(error);
+        }
+        let now = self.now();
+        inode.touch(|times| times.changed = now);
+        ok(0)
+    }
+
+    /// `fchownat(2)` and its relatives on a node, under [`Credentials::chown`]'s rules; Linux
+    /// takes `AT_EMPTY_PATH` (the hook passes a null `path` for it).
+    unsafe fn chown(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        uid: u32,
+        gid: u32,
+        flags: c_int,
+    ) -> Option<FsResult> {
+        let inode =
+            match unsafe { self.lookup(dirfd, path, flags & libc::AT_SYMLINK_NOFOLLOW == 0) }? {
+                Ok(inode) => inode,
+                Err(error) => return err(error),
+            };
+        #[cfg(target_os = "linux")]
+        let allowed = libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH;
+        #[cfg(not(target_os = "linux"))]
+        let allowed = libc::AT_SYMLINK_NOFOLLOW;
+        if flags & !allowed != 0 {
+            return err(libc::EINVAL);
+        }
+        #[cfg(target_os = "linux")]
+        if path.is_null() && flags == 0 && self.fd_flags(dirfd) & libc::O_PATH != 0 {
+            return err(libc::EBADF);
+        }
+        let changed = {
+            let mut owner = inode.owner.lock().unwrap();
+            Credentials::current().chown(&mut owner, inode.kind, uid, gid)
+        };
+        match changed {
+            Ok(true) => {
+                let now = self.now();
+                inode.touch(|times| times.changed = now);
+                ok(0)
+            }
+            Ok(false) => ok(0),
+            Err(error) => err(error),
+        }
     }
 
     /// Snapshots a directory listing and reserves its descriptor. Files return `ENOTDIR`.
@@ -2510,7 +2965,10 @@ impl Fs for VirtualFs {
             return err(libc::EISDIR);
         }
         let data = file.inode.data.lock().unwrap();
-        let n = unsafe { data.read(file.cursor, buf, len) };
+        let n = match unsafe { data.read(file.cursor, buf, len) } {
+            Ok(n) => n,
+            Err(error) => return err(error),
+        };
         file.cursor += n;
         drop(data);
         self.read_access(&file.inode, len, n);
@@ -2541,6 +2999,7 @@ impl Fs for VirtualFs {
                 drop(data);
                 let now = self.now();
                 file.inode.touch(|times| times.modify(now));
+                file.inode.wrote(false);
                 ok(written as i64)
             }
             Err(error) => err(error),
@@ -2564,7 +3023,10 @@ impl Fs for VirtualFs {
             return err(libc::EISDIR);
         }
         let data = file.inode.data.lock().unwrap();
-        let n = unsafe { data.read(offset as usize, buf, len) };
+        let n = match unsafe { data.read(offset as usize, buf, len) } {
+            Ok(n) => n,
+            Err(error) => return err(error),
+        };
         drop(data);
         self.read_access(&file.inode, len, n);
         ok(n as i64)
@@ -2600,6 +3062,7 @@ impl Fs for VirtualFs {
                 drop(data);
                 let now = self.now();
                 file.inode.touch(|times| times.modify(now));
+                file.inode.wrote(false);
                 ok(written as i64)
             }
             Err(error) => err(error),
@@ -2616,11 +3079,14 @@ impl Fs for VirtualFs {
             return err(libc::EINVAL);
         }
         let len = len as usize;
-        file.inode.data.lock().unwrap().resize(len);
+        if let Err(error) = file.inode.data.lock().unwrap().resize(len) {
+            return err(error);
+        }
         // POSIX `ftruncate` marks st_ctime and st_mtime when the size changes; Linux and macOS
         // mark them even when it does not (tests/fs_times.rs).
         let now = self.now();
         file.inode.touch(|times| times.modify(now));
+        file.inode.wrote(true);
         ok(0)
     }
 
@@ -2794,6 +3260,87 @@ impl Fs for VirtualFs {
             _ => err(libc::EINVAL),
         }
     }
+
+    /// `mmap(2)` of a virtual file maps the object its bytes move to ([`Backing`]) through a
+    /// descriptor of the virtual one's access mode; a directory maps a real directory. A
+    /// successful mapping marks the access time, as `mmap` of a file does on Linux
+    /// (`generic_file_mmap` calls `file_accessed`) and macOS (tests/fs_mmap_os_truth.rs).
+    unsafe fn mmap(
+        &self,
+        addr: *mut u8,
+        len: usize,
+        prot: c_int,
+        flags: c_int,
+        fd: c_int,
+        offset: i64,
+    ) -> Option<FsResult> {
+        let map = |real: c_int| {
+            let address = unsafe { libc::mmap(addr.cast(), len, prot, flags, real, offset as _) };
+            if address == libc::MAP_FAILED {
+                err(last_error())
+            } else {
+                ok(address as i64)
+            }
+        };
+        let file = self
+            .open
+            .lock()
+            .unwrap()
+            .get(&fd)
+            .map(|file| (file.inode.clone(), file.flags, file.is_dir));
+        let Some((inode, mode, is_dir)) = file else {
+            return if self.dirs.lock().unwrap().contains_key(&fd) {
+                map(fs_mmap::directory())
+            } else {
+                None
+            };
+        };
+        if is_dir {
+            return map(fs_mmap::directory());
+        }
+        let (real, first) = {
+            let mut data = inode.data.lock().unwrap();
+            let first = data.backing.is_none();
+            match data.share() {
+                Ok(backing) => (backing.fd(mode), first),
+                Err(error) => return err(error),
+            }
+        };
+        if first {
+            self.mapped.lock().unwrap().push(Arc::downgrade(&inode));
+        }
+        let result = map(real);
+        if let Some(FsResult::Ok(_)) = result {
+            if flags & libc::MAP_SHARED != 0 && mode & libc::O_ACCMODE == libc::O_RDWR {
+                let mut data = inode.data.lock().unwrap();
+                if let Some(backing) = &mut data.backing {
+                    backing.expose(offset as u64, len);
+                }
+            }
+            let now = self.now();
+            inode.touch(|times| times.access(now));
+        }
+        result
+    }
+}
+
+/// The permission opening an existing node with `flags` takes (man 2 open, `EACCES`): read and
+/// write for the access mode, write for `O_TRUNC` too (measured on Linux and macOS), and none for a
+/// Linux `O_PATH` handle.
+fn open_access(flags: c_int) -> u32 {
+    #[cfg(target_os = "linux")]
+    if flags & libc::O_PATH != 0 {
+        return 0;
+    }
+    let mut want = match flags & libc::O_ACCMODE {
+        libc::O_RDONLY => fs_perm::READ,
+        libc::O_WRONLY => fs_perm::WRITE,
+        _ => fs_perm::READ | fs_perm::WRITE,
+    };
+    if flags & libc::O_TRUNC != 0 {
+        want |= fs_perm::WRITE;
+    }
+    want
 }
 
 /// Whether `open` flags grant write access.
@@ -2990,32 +3537,34 @@ unsafe fn statx_times_of(buf: *const u8) -> [Option<Stamp>; 4] {
 /// Fills a caller `struct stat` for a virtual node. `st_mode`/`st_size`/… are field names common
 /// to macOS and Linux `libc::stat` (man 2 stat, inode(7)); `as _` absorbs the u16-vs-u32 `st_mode`
 /// and off_t width splits.
-pub(crate) fn fill_stat(
-    buf: *mut u8,
-    mode: u32,
-    size: u64,
-    ino: u64,
-    nlink: u64,
-) -> Option<FsResult> {
+pub(crate) fn fill_stat(buf: *mut u8, device: u64, node: &Attributes) -> Option<FsResult> {
     if buf.is_null() {
         return err(libc::EFAULT);
     }
     // SAFETY: an all-zero `struct stat` is valid (every field is an integer).
     let mut st: libc::stat = unsafe { core::mem::zeroed() };
-    st.st_mode = mode as _;
-    st.st_size = size as _;
-    st.st_ino = ino as _;
-    st.st_nlink = nlink as _;
-    st.st_uid = unsafe { libc::getuid() };
-    st.st_gid = unsafe { libc::getgid() };
+    st.st_dev = device as _;
+    st.st_mode = node.mode as _;
+    st.st_size = node.size as _;
+    st.st_ino = node.ino as _;
+    st.st_nlink = node.nlink as _;
+    st.st_uid = node.uid;
+    st.st_gid = node.gid;
     // 4096 is a snare choice: st_blksize is only 'the "preferred" blocksize for efficient
     // filesystem I/O' (inode(7)), a hint to buffered readers.
     st.st_blksize = 4096 as _;
     // inode(7): st_blocks counts 512-byte units regardless of st_blksize.
-    st.st_blocks = size.div_ceil(512) as _;
+    st.st_blocks = node.size.div_ceil(512) as _;
     // SAFETY: the caller's `struct stat*` is sized and aligned for one stat.
     unsafe { buf.cast::<libc::stat>().write(st) };
     ok(0)
+}
+
+/// A fresh device number for a [`VirtualFs`]: major 0, which Linux gives the anonymous devices of
+/// memory file systems such as tmpfs, and a minor above those a host commonly hands out.
+fn device() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x8000);
+    libc::makedev(0, NEXT.fetch_add(1, Ordering::Relaxed) as _) as u64
 }
 
 /// A stable synthesized inode for a declared path: a hash of the path, so the same path always
@@ -3028,23 +3577,6 @@ pub(crate) fn ino_of(path: &Path) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut hasher);
     hasher.finish() | 1
-}
-
-/// inode(7): st_mode packs the file-type bits (S_IFREG / S_IFDIR, under S_IFMT) with the
-/// permission bits. `S_IF*` are `mode_t` (u16 on macOS, u32 on Linux); widen without a per-OS cast
-/// lint.
-///
-/// Regular files are `0644` and directories `0755`: a snare choice, matching what a `0666` file
-/// and a `0777` directory get under "the typical default value for the process umask", 022
-/// (man 2 umask).
-#[allow(clippy::unnecessary_cast)]
-fn reg_mode() -> u32 {
-    (libc::S_IFREG | 0o644) as u32
-}
-/// `st_mode` of a virtual directory; see [`reg_mode`].
-#[allow(clippy::unnecessary_cast)]
-fn dir_mode() -> u32 {
-    (libc::S_IFDIR | 0o755) as u32
 }
 
 /// Lists `.` and `..`, then direct children in path order. Scans the whole tree.
@@ -3118,33 +3650,6 @@ pub(crate) fn fill_dirent(dst: &mut Dirent, name: &[u8], ino: u64, dtype: u8) {
     }
 }
 
-fn symlink_mode() -> u32 {
-    #[cfg(target_os = "macos")]
-    {
-        u32::from(libc::S_IFLNK) | 0o777
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        libc::S_IFLNK | 0o777
-    }
-}
-
-fn mode_size_nlink(node: &VNode) -> (u32, u64, u64) {
-    match node {
-        VNode::File(inode) => (
-            reg_mode(),
-            inode.data.lock().unwrap().len() as u64,
-            inode.links.load(Ordering::Acquire),
-        ),
-        VNode::Dir(inode) => (dir_mode(), 0, inode.links.load(Ordering::Acquire)),
-        VNode::Symlink(inode, target) => (
-            symlink_mode(),
-            target.len() as u64,
-            inode.links.load(Ordering::Acquire),
-        ),
-    }
-}
-
 /// Fills a caller `struct statx` by writing the fixed kernel-ABI field offsets directly, so it is
 /// correct regardless of which `libc` version std was built against (the crate's `libc::statx` can
 /// disagree with std's). Layout and the STATX_* result-mask bits are from man 2 statx /
@@ -3157,13 +3662,15 @@ fn mode_size_nlink(node: &VNode) -> (u32, u64, u64) {
 /// units, man 2 statx). `stx_mask` claims type, mode, size, inode, link count, uid, gid and
 /// blocks; the device fields stay zero, and [`with_times`] adds the timestamps.
 #[cfg(target_os = "linux")]
-pub(crate) fn fill_statx(
-    buf: *mut u8,
-    mode: u32,
-    size: u64,
-    ino: u64,
-    nlink: u64,
-) -> Option<FsResult> {
+pub(crate) fn fill_statx(buf: *mut u8, device: u64, node: &Attributes) -> Option<FsResult> {
+    let &Attributes {
+        mode,
+        size,
+        ino,
+        nlink,
+        uid,
+        gid,
+    } = node;
     if buf.is_null() {
         return err(libc::EFAULT);
     }
@@ -3186,12 +3693,14 @@ pub(crate) fn fill_statx(
         );
         put_u32(4, 4096); // stx_blksize, as st_blksize in fill_stat
         put_u32(16, nlink as u32); // stx_nlink
-        put_u32(20, libc::getuid()); // stx_uid
-        put_u32(24, libc::getgid()); // stx_gid
+        put_u32(20, uid); // stx_uid
+        put_u32(24, gid); // stx_gid
         put_u16(28, mode as u16); // stx_mode
         put_u64(32, ino); // stx_ino
         put_u64(40, size); // stx_size
         put_u64(48, size.div_ceil(512)); // stx_blocks
+        put_u32(136, libc::major(device as libc::dev_t)); // stx_dev_major
+        put_u32(140, libc::minor(device as libc::dev_t)); // stx_dev_minor
     }
     ok(0)
 }
@@ -3465,6 +3974,41 @@ impl Fs for FsChain {
         }
     }
 
+    unsafe fn chmod(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        mode: u32,
+        flags: c_int,
+    ) -> Option<FsResult> {
+        if path.is_null() {
+            owner!(self, dirfd, |fs| fs.chmod(dirfd, path, mode, flags))
+        } else {
+            first!(self, |fs| fs.chmod(dirfd, path, mode, flags))
+        }
+    }
+
+    unsafe fn chown(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        uid: u32,
+        gid: u32,
+        flags: c_int,
+    ) -> Option<FsResult> {
+        if path.is_null() {
+            owner!(self, dirfd, |fs| fs.chown(dirfd, path, uid, gid, flags))
+        } else {
+            first!(self, |fs| fs.chown(dirfd, path, uid, gid, flags))
+        }
+    }
+
+    unsafe fn host_status_changed(&self, dirfd: c_int, path: *const c_char, flags: c_int) {
+        for fs in &self.0 {
+            unsafe { fs.host_status_changed(dirfd, path, flags) };
+        }
+    }
+
     unsafe fn host_times_set(
         &self,
         dirfd: c_int,
@@ -3534,6 +4078,18 @@ impl Fs for FsChain {
 
     unsafe fn ioctl(&self, fd: c_int, request: u64, arg: i64) -> Option<FsResult> {
         owner!(self, fd, |fs| fs.ioctl(fd, request, arg))
+    }
+
+    unsafe fn mmap(
+        &self,
+        addr: *mut u8,
+        len: usize,
+        prot: c_int,
+        flags: c_int,
+        fd: c_int,
+        offset: i64,
+    ) -> Option<FsResult> {
+        owner!(self, fd, |fs| fs.mmap(addr, len, prot, flags, fd, offset))
     }
 
     unsafe fn fd_replaced(&self, fd: c_int) -> Option<FsResult> {
@@ -3858,7 +4414,7 @@ impl HostTimes {
 }
 
 /// The last error of a real call, as the plane's result.
-fn last_error() -> c_int {
+pub(crate) fn last_error() -> c_int {
     std::io::Error::last_os_error()
         .raw_os_error()
         .unwrap_or(libc::EIO)
@@ -4085,6 +4641,14 @@ impl Fs for HostTimes {
                 }
             }
         });
+    }
+
+    /// A real `chmod` or `chown` changed the file's status: its change time is the sim's now.
+    unsafe fn host_status_changed(&self, dirfd: c_int, path: *const c_char, flags: c_int) {
+        let follow = flags & libc::AT_SYMLINK_NOFOLLOW == 0;
+        if let Some(st) = unsafe { Self::host_stat(dirfd, path, follow) } {
+            self.record(&st, |file, now| file.sim[CHANGED] = Some(now));
+        }
     }
 
     unsafe fn host_metadata(&self, buf: *mut u8, statx: bool) {

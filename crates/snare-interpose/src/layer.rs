@@ -154,6 +154,8 @@ pub trait Layer: Send + Sync + 'static {
     }
 
     /// Registers a timer for its original thread class when rearmed from an unmanaged callback.
+    /// `waker` is the interposer's own: it signals a native wait object and takes no lock a thread
+    /// moving the clock holds, so the layer may run it on that thread.
     fn register_owned_wake(&self, at: Duration, waker: Waker, _foreign: bool) -> Option<u64> {
         self.register_wake(at, waker)
     }
@@ -226,12 +228,27 @@ pub trait Layer: Send + Sync + 'static {
         None
     }
 
+    /// Whether this layer's clock moves with real time because the sim waits on something outside
+    /// it: a child process the sim made, or a descriptor one may write. A domain blocked on the
+    /// clock meanwhile waits for that, not for the clock to be moved.
+    fn waits_outside(&self) -> bool {
+        false
+    }
+
     /// Wakes the backend's blocked waiters so they re-check quiescence and their deadlines at once,
     /// instead of at their next poll — called after a time skip or when a native wait (a futex, a
     /// condvar) completes quiescence outside the backend's own wait loop. `domain` is the
     /// [`Domain::key`](crate::Domain::key) of the domain asking: a backend shared between domains
     /// wakes only that domain's waiters.
     fn wake_waiters(&self, _domain: usize) {}
+
+    /// Wakes the backend's blocked waiters of the domain with key `domain` that the clock's move to
+    /// where it is now concerns: those whose wait it reached, and those that every move concerns
+    /// (a delayed arrival). Called once a charged call's latency moved the clock past a timer,
+    /// which cannot change whether the domain is quiescent.
+    fn wake_due(&self, domain: usize) {
+        self.wake_waiters(domain);
+    }
 
     /// Wakes this layer's waiters after a full readiness broadcast for `domain`. Layers sharing
     /// that readiness board may omit its publication; other layers retain their own wakeup.
@@ -251,6 +268,14 @@ pub trait Layer: Send + Sync + 'static {
     fn settling(&self, _domain: usize) -> bool {
         false
     }
+
+    /// Passes `ready` the readiness key of each wait of the domain with key `domain` on real
+    /// descriptors (a pipe, a child process's output) that one of them became ready for since the
+    /// wait last looked. A deterministic schedule with nothing left to run asks before it moves
+    /// time or ends waits as deadlocked, so what one of its threads wrote to a pipe reaches the
+    /// waiter first.
+    #[cfg(unix)]
+    fn real_ready(&self, _domain: usize, _ready: &mut dyn FnMut(crate::ReadinessKey)) {}
 
     /// Whether this layer's clock has reached a participant's timed wait that the waiting thread
     /// has yet to take, outside a deterministic schedule. The thread still counts as parked until

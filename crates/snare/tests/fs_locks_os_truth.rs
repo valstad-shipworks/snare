@@ -196,10 +196,208 @@ fn flocks(path: &CStr) -> Vec<Seen> {
     out
 }
 
+/// `flock` locks against record locks of one file: independent on Linux, one lock list on macOS,
+/// where they conflict even with the same description's OFD locks.
+fn mixed(path: &CStr) -> Vec<Seen> {
+    use libc::{F_GETLK, F_OFD_GETLK, F_OFD_SETLK, F_SETLK};
+    let (ex, sh, nb, un) = (libc::LOCK_EX, libc::LOCK_SH, libc::LOCK_NB, libc::LOCK_UN);
+    let mut out = Vec::new();
+    let a = open(path, libc::O_RDWR | libc::O_TRUNC);
+    assert_eq!(
+        unsafe { libc::write(a, b"0123456789".as_ptr().cast(), 10) },
+        10
+    );
+    let b = open(path, libc::O_RDWR);
+
+    out.push(flock("flock exclusive", a, ex | nb));
+    out.push(set("own ofd under flock", a, F_OFD_SETLK, W, (SET, 0, 5)));
+    out.push(set("other ofd under flock", b, F_OFD_SETLK, R, (SET, 0, 5)));
+    out.push(set("process under flock", b, F_SETLK, R, (SET, 8, 1)));
+    out.push(get("ofd query of flock", b, F_OFD_GETLK, W, 6, 1));
+    out.push(get("process query of flock", a, F_GETLK, W, 3, 1));
+    out.push(flock("flock down to shared", a, sh | nb));
+    out.push(get("read query of shared flock", b, F_OFD_GETLK, R, 6, 1));
+    out.push(set("other ofd read", b, F_OFD_SETLK, R, (SET, 6, 1)));
+    out.push(set("own ofd write", a, F_OFD_SETLK, W, (SET, 7, 1)));
+    out.push(flock("flock unlock", a, un));
+    out.push(get(
+        "ofd locks outlive flock unlock",
+        b,
+        F_OFD_GETLK,
+        W,
+        0,
+        0,
+    ));
+    out.push(get("from the other side", a, F_OFD_GETLK, W, 0, 0));
+    out.push(set("clear a", a, F_OFD_SETLK, U, (SET, 0, 0)));
+    out.push(set("clear b", b, F_OFD_SETLK, U, (SET, 0, 0)));
+    out.push(set("clear process", b, F_SETLK, U, (SET, 0, 0)));
+
+    out.push(set("ofd read lock", a, F_OFD_SETLK, R, (SET, 0, 5)));
+    out.push(flock("own shared flock over read ofd", a, sh | nb));
+    out.push(flock("other exclusive flock", b, ex | nb));
+    out.push(flock("own upgrade over read ofd", a, ex | nb));
+    out.push(set("ofd unlock", a, F_OFD_SETLK, U, (SET, 0, 0)));
+    out.push(get("flock left", b, F_OFD_GETLK, W, 0, 0));
+    out.push(flock("other shared flock", b, sh | nb));
+    out.push(set(
+        "ofd write under shared flocks",
+        a,
+        F_OFD_SETLK,
+        W,
+        (SET, 0, 1),
+    ));
+    out.push(flock("unlock a", a, un));
+    out.push(flock("unlock b", b, un));
+
+    out.push(set("process write lock", a, F_SETLK, W, (SET, 2, 1)));
+    out.push(flock("flock over process lock", b, sh | nb));
+    out.push(get(
+        "process query from a flock holder",
+        b,
+        F_GETLK,
+        W,
+        0,
+        0,
+    ));
+    out.push(get("ofd query of process lock", b, F_OFD_GETLK, W, 0, 0));
+    out.push(set("process over own flock", a, F_SETLK, W, (SET, 2, 1)));
+    out.push(flock("unlock flock", b, un));
+    out.push(set("process unlock", a, F_SETLK, U, (SET, 0, 0)));
+
+    let c = open(path, libc::O_RDWR);
+    out.push(flock("shared a", a, sh | nb));
+    out.push(flock("shared b", b, sh | nb));
+    out.push(flock("upgrade conflicts", a, ex | nb));
+    out.push(flock("other shared gone", b, un));
+    out.push(flock("after a failed upgrade", c, ex | nb));
+    close(c);
+    out.push(set(
+        "ofd while a holds flock",
+        b,
+        F_OFD_SETLK,
+        W,
+        (SET, 9, 1),
+    ));
+    let alias = unsafe { libc::dup(a) };
+    close(a);
+    out.push(flock("flock kept by alias", b, ex | nb));
+    close(alias);
+    out.push(flock("flock gone with description", b, ex | nb));
+    close(b);
+    let d = open(path, libc::O_RDWR);
+    out.push(flock("every lock gone", d, ex | nb));
+    out.push(set("record lock after", d, F_OFD_SETLK, W, (SET, 0, 0)));
+    close(d);
+    out
+}
+
+/// Locks on a directory, through a descriptor `open` returned and through a directory stream's.
+fn directories(path: &CStr) -> Vec<Seen> {
+    use libc::{F_GETLK, F_OFD_GETLK, F_OFD_SETLK, F_SETLK};
+    let (ex, sh, nb, un) = (libc::LOCK_EX, libc::LOCK_SH, libc::LOCK_NB, libc::LOCK_UN);
+    assert_eq!(unsafe { libc::mkdir(path.as_ptr(), 0o700) }, 0);
+    let mut out = Vec::new();
+    let opened = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    assert!(opened >= 0);
+    let stream = unsafe { libc::opendir(path.as_ptr()) };
+    assert!(!stream.is_null());
+    let streamed = unsafe { libc::dirfd(stream) };
+    for (fd, other, name) in [(opened, streamed, "opened"), (streamed, opened, "stream")] {
+        let label = |what: &str| -> &'static str { format!("{name}: {what}").leak() };
+        out.push(flock(label("flock"), fd, ex | nb));
+        out.push(flock(label("other flock"), other, sh | nb));
+        out.push(flock(label("unlock"), fd, un));
+        out.push(set(label("process read"), fd, F_SETLK, R, (SET, 0, 1)));
+        out.push(set(label("process write"), fd, F_SETLK, W, (SET, 0, 1)));
+        out.push(get(label("process query"), fd, F_GETLK, W, 0, 0));
+        out.push(set(label("ofd read"), fd, F_OFD_SETLK, R, (SET, 0, 1)));
+        out.push(get(label("ofd query"), other, F_OFD_GETLK, W, 0, 0));
+        out.push(set(label("ofd unlock"), fd, F_OFD_SETLK, U, (SET, 0, 0)));
+        out.push(set(label("process unlock"), fd, F_SETLK, U, (SET, 0, 0)));
+    }
+    assert_eq!(unsafe { libc::closedir(stream) }, 0);
+    close(opened);
+    assert_eq!(unsafe { libc::rmdir(path.as_ptr()) }, 0);
+    out
+}
+
+/// macOS `F_SETLKWTIMEOUT` and `F_OFD_SETLKWTIMEOUT` (`<sys/fcntl.h>`), absent from `libc`.
+#[cfg(target_os = "macos")]
+const F_SETLKWTIMEOUT: c_int = 10;
+#[cfg(target_os = "macos")]
+const F_OFD_SETLKWTIMEOUT: c_int = 93;
+
+/// macOS `struct flocktimeout`.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct FlockTimeout {
+    fl: libc::flock,
+    timeout: libc::timespec,
+}
+
+#[cfg(target_os = "macos")]
+fn set_timed(label: &'static str, fd: c_int, cmd: c_int, kind: c_int, nanos: i64) -> Seen {
+    let mut lock = FlockTimeout {
+        fl: flock_of(kind, SET, 0, 1),
+        timeout: libc::timespec {
+            tv_sec: nanos / 1_000_000_000,
+            tv_nsec: nanos % 1_000_000_000,
+        },
+    };
+    seen(label, unsafe { libc::fcntl(fd, cmd, &mut lock) })
+}
+
+/// The timed lock commands: their argument checks, a wait that times out, and a free lock.
+#[cfg(target_os = "macos")]
+fn timed(path: &CStr) -> Vec<Seen> {
+    let mut out = Vec::new();
+    let a = open(path, libc::O_RDWR);
+    let b = open(path, libc::O_RDWR);
+    let read_only = open(path, libc::O_RDONLY);
+    out.push(set("hold", a, libc::F_OFD_SETLK, W, (SET, 0, 1)));
+    out.push(set_timed(
+        "ofd times out",
+        b,
+        F_OFD_SETLKWTIMEOUT,
+        W,
+        1_000_000,
+    ));
+    out.push(set_timed(
+        "process times out",
+        b,
+        F_SETLKWTIMEOUT,
+        R,
+        1_000_000,
+    ));
+    out.push(set_timed(
+        "write on read-only",
+        read_only,
+        F_OFD_SETLKWTIMEOUT,
+        W,
+        1_000,
+    ));
+    out.push(set_timed("bad type", b, F_OFD_SETLKWTIMEOUT, 7, 1_000));
+    out.push(seen("null", unsafe {
+        libc::fcntl(b, F_SETLKWTIMEOUT, std::ptr::null_mut::<FlockTimeout>())
+    }));
+    out.push(set("release", a, libc::F_OFD_SETLK, U, (SET, 0, 0)));
+    out.push(set_timed("free", b, F_OFD_SETLKWTIMEOUT, W, 1_000));
+    out.push(get("taken", a, libc::F_OFD_GETLK, W, 0, 0));
+    for fd in [a, b, read_only] {
+        close(fd);
+    }
+    out
+}
+
 fn observe(dir: &Path) -> Vec<Seen> {
     let path = |name: &str| CString::new(dir.join(name).into_os_string().into_encoded_bytes());
     let mut out = records(&path("records").unwrap());
     out.extend(flocks(&path("flock").unwrap()));
+    out.extend(mixed(&path("mixed").unwrap()));
+    out.extend(directories(&path("directory").unwrap()));
+    #[cfg(target_os = "macos")]
+    out.extend(timed(&path("timed").unwrap()));
     out
 }
 
@@ -271,5 +469,34 @@ fn a_blocked_lock_waits_in_a_deterministic_schedule() {
             .fs(locks_fs())
             .build(),
     );
+    assert!(real.elapsed() < Duration::from_secs(2));
+}
+
+/// A timed lock wait gives up at its timeout on the sim's clock, not in real time, and one whose
+/// lock is let go first takes it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_timed_lock_wait_times_out_on_the_sim_clock() {
+    let real = Instant::now();
+    Sim::builder().fs(locks_fs()).build().run(|| {
+        let holder = open(c"/locks/timed", libc::O_RDWR);
+        let waiter = open(c"/locks/timed", libc::O_RDWR);
+        assert_eq!(set("hold", holder, libc::F_OFD_SETLK, W, (SET, 0, 0)).1, 0);
+        let start = Instant::now();
+        let five = 5_000_000_000;
+        let timed_out = set_timed("wait", waiter, F_OFD_SETLKWTIMEOUT, W, five);
+        assert_eq!((timed_out.1, timed_out.2), (-1, libc::ETIMEDOUT));
+        assert!(start.elapsed() >= Duration::from_secs(5));
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            close(holder);
+        });
+        let start = Instant::now();
+        assert_eq!(set_timed("wait", waiter, F_OFD_SETLKWTIMEOUT, W, five).1, 0);
+        let waited = start.elapsed();
+        assert!(waited >= Duration::from_secs(1) && waited < Duration::from_secs(5));
+        release.join().unwrap();
+        close(waiter);
+    });
     assert!(real.elapsed() < Duration::from_secs(2));
 }

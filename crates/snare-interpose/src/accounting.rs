@@ -16,11 +16,12 @@
 //! leaf during native admission; that leaf is released before scheduler or timestamp-gate waits.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use crate::HashMap;
 #[cfg(any(unix, windows))]
 use crate::pending::MutexRecord;
 use crate::pending::Pending;
@@ -557,6 +558,10 @@ pub(crate) struct Row {
     pub(crate) since: (Duration, Duration),
     /// The label of the last wait it blocked in, kept after the wait ends.
     pub(crate) last_wait: Option<&'static str>,
+    /// While it is held off in a wait for what threads of other sims may yet do, or waits counted
+    /// after one such, the place that wait drew among every such wait of the process, which grows
+    /// with each (see `domain::Holders`); zero otherwise.
+    pub(crate) holding_off: u64,
 }
 
 /// The wait a [`Row`]'s thread is blocked in.
@@ -582,6 +587,10 @@ pub(crate) struct RowWait {
     pub(crate) futex_private: Option<bool>,
     #[cfg(target_os = "linux")]
     pub(crate) pre_released: bool,
+    /// The futex word moved under the wait before any wake reached it, so the wait returned
+    /// without one: who moved it is known only once that mover's wake arrives.
+    #[cfg(target_os = "linux")]
+    pub(crate) moved: bool,
     #[cfg(target_os = "linux")]
     pub(crate) claimed: bool,
     /// A wake on `key` that reached every waiter parked there when it was made reached this one.
@@ -959,7 +968,7 @@ struct WatchedMutexes(HashMap<usize, Watched>);
 
 impl Default for WatchedMutexes {
     fn default() -> Self {
-        Self(HashMap::with_capacity(WATCHED_MUTEXES))
+        Self(HashMap::with_capacity_and_hasher(WATCHED_MUTEXES, Default::default()))
     }
 }
 
@@ -1068,7 +1077,22 @@ pub(crate) struct Core {
     /// manages) that its released waiters have yet to take: a waiter they woke was woken from
     /// outside, though the release is counted like any other.
     foreign: HashMap<usize, u32>,
+    /// Participants in a real wait on each address that the domain does not count (a grace for a
+    /// holder outside the sim, or an attempt of a wait held off for another sim's threads). The OS
+    /// hands a wake on the address to any of its waiters, so one of these may take a wake counted
+    /// as releasing a parked waiter (see [`Core::end_uncounted`]).
+    uncounted: HashMap<usize, u32>,
+    /// Futex waits that ended because their word moved while the domain was quiescent, as (word,
+    /// the waiter's lineage), held back until a wake of the domain's own on the word explains
+    /// them; those still here when outside wakes are read were moved from outside.
+    #[cfg(target_os = "linux")]
+    unexplained: [Option<(usize, u64)>; UNEXPLAINED_ROOM],
 }
+
+/// How many waits [`Core::unexplained`] holds back. A snare choice, far past the waiters one
+/// quiescent stretch releases at once; past it a wait counts as woken from outside at once.
+#[cfg(target_os = "linux")]
+const UNEXPLAINED_ROOM: usize = 16;
 
 impl Core {
     /// A wake on `key` made outside the domain (see `domain::release_elsewhere`), noted as well as
@@ -1172,7 +1196,8 @@ impl Core {
                             && private.is_none_or(|scope| wait.futex_private == Some(scope))
                     })
             })
-            .count();
+            .count()
+            + self.uncounted_on(key);
         let record = Release {
             mask,
             futex_private: private,
@@ -1256,6 +1281,7 @@ impl Core {
                         self.ready_rows += 1;
                     }
                     wait.pre_released = true;
+                    wait.moved = false;
                 }
             }
         }
@@ -1273,7 +1299,47 @@ impl Core {
                 self.ready_rows += 1;
             }
             wait.pre_released = true;
+            wait.moved = !wait.claimed;
         }
+    }
+
+    /// The word of `lineage`'s wait, if it moved under the wait with no wake to account for it.
+    #[cfg(target_os = "linux")]
+    fn moved_key(&self, lineage: u64) -> Option<usize> {
+        self.rows
+            .get(&lineage)?
+            .wait
+            .filter(|wait| wait.moved && !wait.claimed)?
+            .key
+    }
+
+    /// Holds back `lineage`'s wait on `key` until a wake explains it; `false` if there is no room.
+    #[cfg(target_os = "linux")]
+    fn hold_unexplained(&mut self, key: usize, lineage: u64) -> bool {
+        let Some(free) = self.unexplained.iter_mut().find(|held| held.is_none()) else {
+            return false;
+        };
+        *free = Some((key, lineage));
+        true
+    }
+
+    /// A wake on `key` by `lineage`, a thread of the domain: the move of the word that ended
+    /// another thread's wait held back on it was the domain's own.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn explain_moved(&mut self, key: usize, lineage: u64) {
+        for held in &mut self.unexplained {
+            if held.is_some_and(|(word, waiter)| word == key && waiter != lineage) {
+                *held = None;
+            }
+        }
+    }
+
+    /// Empties the held-back waits, returning how many there were.
+    #[cfg(target_os = "linux")]
+    fn take_unexplained(&mut self) -> u64 {
+        let held = self.unexplained.iter().filter(|held| held.is_some()).count();
+        self.unexplained = [None; UNEXPLAINED_ROOM];
+        held as u64
     }
 
     #[cfg(target_os = "linux")]
@@ -1297,7 +1363,8 @@ impl Core {
                                 )
                         })
                 })
-                .count();
+                .count()
+                + self.uncounted.get(&key).map_or(0, |&n| n as usize);
             releases.first.remaining = releases.first.remaining.min(count);
         } else {
             let candidates: Vec<_> = self
@@ -1458,6 +1525,8 @@ impl Core {
         if eligible == 0 || n == 0 {
             return;
         }
+        let uncounted = self.uncounted_on(key);
+        let (parked, eligible) = (parked + uncounted, eligible + uncounted);
         #[cfg(windows)]
         if n >= eligible {
             for row in self.rows.values_mut() {
@@ -1480,6 +1549,59 @@ impl Core {
         }
     }
 
+    fn uncounted_on(&self, key: usize) -> usize {
+        self.uncounted.get(&key).map_or(0, |&n| n as usize)
+    }
+
+    /// A participant begins a real wait on `key` that the domain does not count.
+    pub(crate) fn begin_uncounted(&mut self, key: usize) {
+        *self.uncounted.entry(key).or_default() += 1;
+    }
+
+    /// A participant's uncounted wait on `key` ended, `woken` by a wake there. That wake may be one
+    /// counted as releasing a waiter parked on `key`, which then has none to take: the release
+    /// goes, and no more stay pending than there are waiters left to take them.
+    pub(crate) fn end_uncounted(&mut self, key: usize, woken: bool) {
+        if let Some(waiting) = self.uncounted.get_mut(&key) {
+            *waiting -= 1;
+            if *waiting == 0 {
+                self.uncounted.remove(&key);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if woken {
+                self.consume_release(key);
+            }
+            let waiting = self
+                .rows
+                .values()
+                .filter(|row| {
+                    row.class == ThreadClass::Participant
+                        && row.wait.is_some_and(|wait| wait.key == Some(key))
+                })
+                .count()
+                + self.uncounted_on(key);
+            if let Some(pending) = self.signalled.get_mut(&key) {
+                *pending = (*pending).min(u32::try_from(waiting).unwrap_or(u32::MAX));
+                if *pending == 0 {
+                    self.signalled.remove(&key);
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if woken
+                && let Some(releases) = self.signalled.get_mut(&key)
+                && releases.rest.is_empty()
+                && releases.claims.is_empty()
+            {
+                releases.first.remaining = releases.first.remaining.saturating_sub(1);
+            }
+            self.prune_releases(key);
+        }
+    }
+
     /// The first participant parked in a native wait that is free to return: woken on its
     /// address, and holding or able to take the mutex it returns holding; or in a contended lock
     /// no other thread of the domain holds.
@@ -1488,30 +1610,47 @@ impl Core {
             if row.class != ThreadClass::Participant {
                 return None;
             }
-            let wait = row.wait?;
-            let released = match (wait.key, wait.mutex) {
-                (Some(key), mutex) => {
-                    #[cfg(target_os = "linux")]
-                    let released = wait.pre_released
-                        || wait.claimed
-                        || self.signalled.get(&key).is_some_and(|releases| {
-                            releases.can_claim((
-                                wait.token,
-                                u64::MAX,
-                                wait.mask,
-                                wait.futex_private,
-                            ))
-                        });
-                    #[cfg(not(target_os = "linux"))]
-                    let released = self.signalled.contains_key(&key);
-                    #[cfg(windows)]
-                    let released = released || wait.woken || self.timer_released(wait);
-                    released && !mutex.is_some_and(|m| self.held_by_other(m, lineage))
-                }
-                (None, Some(mutex)) => self.lock_unheld(mutex, lineage),
-                (None, None) => false,
-            };
-            released.then_some(lineage)
+            self.released(lineage, row.wait?).then_some(lineage)
+        })
+    }
+
+    /// Whether `lineage` is parked in a native wait that a wake reaching every waiter on its
+    /// address released ([`RowWait::woken`]).
+    #[cfg(windows)]
+    pub(crate) fn wait_woken(&self, lineage: u64) -> bool {
+        self.rows
+            .get(&lineage)
+            .and_then(|row| row.wait)
+            .is_some_and(|wait| wait.woken)
+    }
+
+    /// Whether `lineage`'s native `wait` is free to return (see
+    /// [`first_released`](Self::first_released)).
+    fn released(&self, lineage: u64, wait: RowWait) -> bool {
+        match (wait.key, wait.mutex) {
+            (Some(key), mutex) => {
+                #[cfg(target_os = "linux")]
+                let released = wait.pre_released
+                    || wait.claimed
+                    || self.signalled.get(&key).is_some_and(|releases| {
+                        releases.can_claim((wait.token, u64::MAX, wait.mask, wait.futex_private))
+                    });
+                #[cfg(not(target_os = "linux"))]
+                let released = self.signalled.contains_key(&key);
+                #[cfg(windows)]
+                let released = released || wait.woken || self.timer_released(wait);
+                released && !mutex.is_some_and(|m| self.held_by_other(m, lineage))
+            }
+            (None, Some(mutex)) => self.lock_unheld(mutex, lineage),
+            (None, None) => false,
+        }
+    }
+
+    /// Whether `lineage` is a participant that runs, or is free to return from its native wait.
+    fn running_or_released(&self, lineage: u64) -> Option<&Row> {
+        self.rows.get(&lineage).filter(|row| {
+            row.class == ThreadClass::Participant
+                && row.wait.is_none_or(|wait| self.released(lineage, wait))
         })
     }
 
@@ -1739,8 +1878,13 @@ impl Core {
         for row in self.rows.values_mut() {
             if let Some(wait) = row.wait.as_mut() {
                 wait.pre_released = false;
+                wait.moved = false;
                 wait.claimed = false;
             }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.unexplained = [None; UNEXPLAINED_ROOM];
         }
     }
 
@@ -1845,8 +1989,11 @@ pub(crate) struct Accounting {
     next_lease: AtomicU64,
     /// `leases.len()`, readable without the lock; a time skip checks it under `skip_gate`.
     lease_count: AtomicUsize,
-    /// Moves on with every change an observer of quiescence may care about.
+    /// Moves on with every change that may make the domain quiescent or end its quiescence.
     epoch: AtomicU64,
+    /// Moves on with every epoch move and every participant parking or waking, whether or not it
+    /// can change quiescence: the stall watchdog's sign of progress.
+    activity: AtomicU64,
     /// The callback waiting for the epoch to move; see [`arm`](Self::arm).
     armed: Mutex<Option<Callback>>,
     /// Whether `armed` holds a callback, so [`bump`](Self::bump) skips the lock when it does not.
@@ -2064,9 +2211,28 @@ impl Accounting {
         core.quiet = Some((self.epoch(), self.effects.load(Ordering::SeqCst)));
     }
 
+    /// Notes that something the sim sees happened without moving the epoch, so no wake after it
+    /// reads as an outside one.
+    pub(crate) fn note_stirred(&self, core: &mut Core) {
+        core.quiet = None;
+    }
+
     /// A participant left a native wait woken: an outside wake if nothing the sim sees happened
-    /// since the domain became quiescent.
+    /// since the domain became quiescent. A Linux futex wait whose word moved before any wake
+    /// reached it is held back instead, until a wake of the domain's own explains it or outside
+    /// wakes are read ([`Core::unexplained`]): the word moves before the wake that follows, and the
+    /// wait can return in between.
     pub(crate) fn note_wake(&self, core: &mut Core) {
+        #[cfg(target_os = "linux")]
+        if let Some(key) = core.moved_key(crate::thread_lineage()) {
+            if core.quiet == Some((self.epoch(), self.effects.load(Ordering::SeqCst))) {
+                core.quiet = None;
+                if !core.hold_unexplained(key, crate::thread_lineage()) {
+                    self.count_outside_wake();
+                }
+            }
+            return;
+        }
         #[cfg(target_os = "linux")]
         let owned = core.claim_release(crate::thread_lineage());
         #[cfg(not(target_os = "linux"))]
@@ -2096,12 +2262,26 @@ impl Accounting {
     /// Counts an outside wake, such as one a deterministic schedule found, without taking the
     /// census lock.
     pub(crate) fn count_outside_wake(&self) {
-        self.outside_wakes.fetch_add(1, Ordering::Relaxed);
+        self.count_outside_wakes(1);
+    }
+
+    pub(crate) fn count_outside_wakes(&self, n: u64) {
+        self.outside_wakes.fetch_add(n, Ordering::Relaxed);
     }
 
     /// The outside wakes counted since the domain was made or an executive last attached.
     pub(crate) fn outside_wakes(&self) -> u64 {
+        let _passthrough = Passthrough::enter();
+        self.settle_unexplained(&mut self.core());
         self.outside_wakes.load(Ordering::Relaxed)
+    }
+
+    /// Counts the held-back waits no wake of the domain's own has explained as outside wakes.
+    fn settle_unexplained(&self, core: &mut Core) {
+        #[cfg(target_os = "linux")]
+        self.count_outside_wakes(core.take_unexplained());
+        #[cfg(not(target_os = "linux"))]
+        let _ = core;
     }
 
     /// Counts an effect of a non-participant thread, and logs it for a background or helper one.
@@ -2134,12 +2314,13 @@ impl Accounting {
     /// What the audit has seen so far; empty when none is kept.
     pub(crate) fn audit_report(&self) -> AuditReport {
         let _passthrough = Passthrough::enter();
-        let core = self.core();
+        let mut core = self.core();
+        self.settle_unexplained(&mut core);
         let Some(audit) = &core.audit else {
             return AuditReport::default();
         };
         AuditReport {
-            outside_wakes: self.outside_wakes(),
+            outside_wakes: self.outside_wakes.load(Ordering::Relaxed),
             violations: audit.violations.iter().cloned().collect(),
             total_violations: audit.total_violations,
             class_effects: audit.class_effects.iter().cloned().collect(),
@@ -2162,6 +2343,7 @@ impl Accounting {
                 wait: None,
                 since: (Duration::ZERO, Duration::ZERO),
                 last_wait: None,
+                holding_off: 0,
             },
         );
         core.held.insert(lineage, held);
@@ -2233,6 +2415,7 @@ impl Accounting {
     /// read after the increment, and [`arm`](Self::arm) sets it before re-reading the epoch, so an
     /// arm racing a bump either sees the new epoch or is seen by it.
     pub(crate) fn bump(&self) -> EpochBump {
+        self.activity.fetch_add(1, Ordering::Relaxed);
         self.epoch.fetch_add(1, Ordering::SeqCst);
         if !self.is_armed.load(Ordering::SeqCst) {
             return EpochBump::NONE;
@@ -2241,6 +2424,18 @@ impl Accounting {
         let mut armed = lock(&self.armed);
         self.is_armed.store(false, Ordering::SeqCst);
         EpochBump(armed.take())
+    }
+
+    /// Notes a participant parking or waking that cannot change whether the domain is quiescent,
+    /// as it is not quiescent before or after: the epoch stays.
+    pub(crate) fn stir(&self) -> EpochBump {
+        self.activity.fetch_add(1, Ordering::Relaxed);
+        EpochBump::NONE
+    }
+
+    /// [`epoch`](Self::epoch) moves and [`stir`](Self::stir)s so far.
+    pub(crate) fn activity(&self) -> u64 {
+        self.activity.load(Ordering::Relaxed)
     }
 
     /// Runs `callback` once the epoch moves past `seen`: now if it already has, else on the
@@ -2399,6 +2594,63 @@ impl Accounting {
         }
     }
 
+    /// The CPU time used so far by the participants outside any wait, summed; `None` if one's
+    /// cannot be read. A participant with no OS thread id yet was counted live by the thread that
+    /// spawned it and has yet to run its first instruction, so it adds nothing.
+    pub(crate) fn running_cpu_time(&self) -> Option<Duration> {
+        let _passthrough = Passthrough::enter();
+        let ids: Vec<(u64, u64)> = lock(&self.os_ids).iter().map(|(&id, &l)| (id, l)).collect();
+        let core = self.core();
+        let mut total = Duration::ZERO;
+        for (lineage, row) in &core.rows {
+            if row.class != ThreadClass::Participant || row.wait.is_some() {
+                continue;
+            }
+            let Some(&(id, _)) = ids.iter().find(|&&(_, l)| l == *lineage) else {
+                continue;
+            };
+            total += crate::census::thread_cpu_time(id)?;
+        }
+        Some(total)
+    }
+
+    /// Calls `each` with the lineage, OS thread id and [`Row::holding_off`] of every participant
+    /// outside any wait or free to return from one, with the census held. The OS ids are taken
+    /// after the census, as a contended lock's watch takes them (`domain::watch_mutex`).
+    pub(crate) fn each_running(&self, mut each: impl FnMut(u64, u64, u64)) {
+        let _passthrough = Passthrough::enter();
+        let core = self.core();
+        let os_ids = lock(&self.os_ids);
+        for (&id, &lineage) in os_ids.iter() {
+            if let Some(row) = core.running_or_released(lineage) {
+                each(lineage, id, row.holding_off);
+            }
+        }
+    }
+
+    /// Whether the participant with `lineage` runs or is free to return from its wait, and its
+    /// [`Row::holding_off`]; `None` if it is not a participant of the domain.
+    pub(crate) fn holder_state(&self, lineage: u64) -> Option<(bool, u64)> {
+        let _passthrough = Passthrough::enter();
+        let core = self.core();
+        let row = core
+            .rows
+            .get(&lineage)
+            .filter(|row| row.class == ThreadClass::Participant)?;
+        Some((
+            core.running_or_released(lineage).is_some(),
+            row.holding_off,
+        ))
+    }
+
+    /// Sets the [`Row::holding_off`] of the thread with `lineage`.
+    pub(crate) fn set_holding_off(&self, lineage: u64, holding_off: u64) {
+        let _passthrough = Passthrough::enter();
+        if let Some(row) = self.core().rows.get_mut(&lineage) {
+            row.holding_off = holding_off;
+        }
+    }
+
     /// Every live thread's OS thread id with its lineage and class.
     pub(crate) fn os_threads(&self) -> Vec<(u64, u64, ThreadClass)> {
         let _passthrough = Passthrough::enter();
@@ -2432,6 +2684,7 @@ mod release_tests {
             wait: None,
             since: (Duration::ZERO, Duration::ZERO),
             last_wait: None,
+            holding_off: 0,
         });
         core.set_waiting(
             lineage,
@@ -2446,6 +2699,7 @@ mod release_tests {
                 expected: Some(0),
                 futex_private: Some(true),
                 pre_released: false,
+                moved: false,
                 claimed: false,
             }),
             None,
@@ -2595,6 +2849,97 @@ mod release_tests {
         core.set_waiting(2, None, None);
         assert!(!core.has_pending_releases());
     }
+
+    #[test]
+    fn an_uncounted_waiter_takes_the_wake_counted_for_a_parked_one() {
+        let mut core = Core::default();
+        park(&mut core, 1, u32::MAX);
+        core.begin_uncounted(1);
+        core.signal_futex(1, 1, u32::MAX, true, || None);
+        assert!(core.has_pending_releases());
+        core.end_uncounted(1, true);
+        assert!(!core.has_pending_releases());
+        assert!(!core.claim_release(1));
+    }
+
+    #[test]
+    fn a_parked_waiter_keeps_the_wakes_an_uncounted_one_did_not_take() {
+        let mut core = Core::default();
+        park(&mut core, 1, u32::MAX);
+        core.begin_uncounted(1);
+        core.signal_futex(1, 1, u32::MAX, true, || None);
+        core.end_uncounted(1, false);
+        assert!(core.claim_release(1));
+        core.set_waiting(1, None, None);
+        assert!(!core.has_pending_releases());
+
+        park(&mut core, 1, u32::MAX);
+        core.begin_uncounted(1);
+        core.signal_futex(1, 2, u32::MAX, true, || None);
+        core.end_uncounted(1, true);
+        assert!(core.claim_release(1));
+        core.set_waiting(1, None, None);
+        assert!(!core.has_pending_releases());
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod uncounted_tests {
+    use super::*;
+
+    fn park(core: &mut Core, lineage: u64) {
+        core.rows.entry(lineage).or_insert(Row {
+            class: ThreadClass::Participant,
+            wait: None,
+            since: (Duration::ZERO, Duration::ZERO),
+            last_wait: None,
+            holding_off: 0,
+        });
+        core.set_waiting(
+            lineage,
+            Some(RowWait {
+                label: Some("cond"),
+                deadline: None,
+                key: Some(1),
+                mutex: None,
+                scheduled: false,
+            }),
+            None,
+        );
+    }
+
+    #[test]
+    fn an_uncounted_waiter_takes_the_signal_counted_for_a_parked_one() {
+        let mut core = Core::default();
+        park(&mut core, 1);
+        park(&mut core, 2);
+        core.begin_uncounted(1);
+        core.signal(1, 1);
+        assert_eq!(core.first_released(), Some(1));
+        core.end_uncounted(1, true);
+        assert!(!core.has_pending_releases());
+        assert_eq!(core.first_released(), None);
+    }
+
+    #[test]
+    fn parked_waiters_keep_the_signals_an_uncounted_one_did_not_take() {
+        let mut core = Core::default();
+        park(&mut core, 1);
+        core.begin_uncounted(1);
+        core.signal(1, 1);
+        core.end_uncounted(1, false);
+        assert_eq!(core.first_released(), Some(1));
+        core.set_waiting(1, None, None);
+        assert!(!core.has_pending_releases());
+
+        park(&mut core, 1);
+        core.begin_uncounted(1);
+        core.signal(1, usize::MAX);
+        core.end_uncounted(1, true);
+        assert_eq!(core.first_released(), Some(1));
+        core.set_waiting(1, None, None);
+        assert!(!core.has_pending_releases());
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -2618,6 +2963,7 @@ mod timer_release_tests {
             wait: None,
             since: (Duration::ZERO, Duration::ZERO),
             last_wait: None,
+            holding_off: 0,
         });
         core.set_waiting(lineage, Some(wait), None);
         accounting.keyed.fetch_add(1, Ordering::SeqCst);

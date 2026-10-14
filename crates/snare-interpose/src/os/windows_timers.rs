@@ -1,6 +1,6 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Wake, Waker};
 use std::time::Duration;
@@ -9,9 +9,10 @@ use windows_sys::Win32::Foundation::{
     ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, HANDLE, SetLastError,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateEventExW, ResetEvent, SetEvent, TIMER_ALL_ACCESS,
+    CreateEventExW, ResetEvent, SetEvent, TIMER_ALL_ACCESS, TIMER_MODIFY_STATE,
 };
 
+use crate::HashMap;
 use crate::domain::{self, Domain, WeakDomain};
 use crate::hooks::{Hook, hook, original};
 use crate::state::{self, Passthrough};
@@ -33,7 +34,18 @@ struct Timer {
     manual: bool,
     owner: WeakDomain,
     state: Mutex<TimerState>,
+    /// The signals posted to the event so far, in units of [`SIGNAL`], with [`SIGNALED`] and
+    /// [`CLOSED`]. Read without `state`, which a probe under the census lock may not take.
+    signals: AtomicU64,
 }
+
+/// [`Timer::signals`]: the event may be signaled. Clear only while no signal has been posted since
+/// it was last reset or a wait was seen to take one.
+const SIGNALED: u64 = 1;
+/// [`Timer::signals`]: one of the timer's handles was closed, so a wait on any must ask the OS.
+const CLOSED: u64 = 2;
+/// [`Timer::signals`]: one signal posted.
+const SIGNAL: u64 = 4;
 
 #[derive(Default)]
 struct TimerState {
@@ -45,6 +57,8 @@ struct TimerState {
     period: Option<Duration>,
     foreign: bool,
     groups: Vec<Weak<WaitGroup>>,
+    /// A handle known to carry `TIMER_MODIFY_STATE`, the right `SetWaitableTimer` checks.
+    modifiable: Option<usize>,
 }
 
 #[derive(Default)]
@@ -106,16 +120,24 @@ fn probe_timer(
     handle: HANDLE,
     native: unsafe extern "system" fn(HANDLE, u32) -> u32,
 ) -> u32 {
-    let Some(owner) = timer.owner.upgrade() else {
-        return unsafe { native(handle, 0) };
+    let signals = timer.signals.load(Ordering::Acquire);
+    if signals & (SIGNALED | CLOSED) == 0 {
+        return 258;
+    }
+    let result = match timer.owner.upgrade() {
+        Some(owner) => owner.timer_probe(|consumed| {
+            let result = unsafe { native(handle, 0) };
+            if result == 0 && !timer.manual {
+                consumed(timer.key());
+            }
+            result
+        }),
+        None => unsafe { native(handle, 0) },
     };
-    owner.timer_probe(|consumed| {
-        let result = unsafe { native(handle, 0) };
-        if result == 0 && !timer.manual {
-            consumed(timer.key());
-        }
-        result
-    })
+    if result == 0 {
+        timer.consumed(signals);
+    }
+    result
 }
 
 fn probe_timers(timers: &[Option<Arc<Timer>>], all: bool, probe: impl FnOnce() -> u32) -> u32 {
@@ -145,6 +167,32 @@ fn probe_timers(timers: &[Option<Arc<Timer>>], all: bool, probe: impl FnOnce() -
 impl Timer {
     fn key(&self) -> usize {
         std::ptr::from_ref(self) as usize
+    }
+
+    /// Notes that a wait took the event's signal, unless anything changed since it read
+    /// `signals`.
+    fn consumed(&self, signals: u64) {
+        if !self.manual {
+            let _ = self.signals.compare_exchange(
+                signals,
+                signals & !SIGNALED,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Notes a signal posted to the event.
+    fn posted(&self) {
+        let mut word = self.signals.load(Ordering::Acquire);
+        while let Err(current) = self.signals.compare_exchange_weak(
+            word,
+            (word | SIGNALED).wrapping_add(SIGNAL),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            word = current;
+        }
     }
 
     fn notify_groups(&self, wake_det: bool) {
@@ -238,6 +286,7 @@ impl Timer {
             } else {
                 unsafe { SetEvent(handle as HANDLE) };
             }
+            self.posted();
             let now = owner
                 .as_ref()
                 .and_then(Domain::timer_now)
@@ -412,8 +461,10 @@ fn create_model(attributes: *const c_void, named: bool, flags: u32, access: u32)
             Arc::new(Timer {
                 manual: flags & 1 != 0,
                 owner,
+                signals: AtomicU64::new(0),
                 state: Mutex::new(TimerState {
                     handles: BTreeSet::from([handle as usize]),
+                    modifiable: (access & TIMER_MODIFY_STATE != 0).then_some(handle as usize),
                     ..TimerState::default()
                 }),
             }),
@@ -472,9 +523,13 @@ unsafe extern "system" fn set(
             unsafe { SetLastError(6) };
             return 0;
         }
-        if unsafe { ResetEvent(handle) } == 0 {
+        if (timer.signals.load(Ordering::Acquire) & (SIGNALED | CLOSED) != 0
+            || state.modifiable != Some(handle as usize))
+            && unsafe { ResetEvent(handle) } == 0
+        {
             return 0;
         }
+        timer.signals.fetch_and(!SIGNALED, Ordering::AcqRel);
         let previous = state.wake.take();
         state.generation += 1;
         state.deadline = Some(deadline);
@@ -557,7 +612,11 @@ unsafe extern "system" fn close(handle: HANDLE) -> i32 {
         if result != 0 {
             timers.remove(&(handle as usize));
             if let Some(state) = &mut state {
+                timer.as_ref().unwrap().signals.fetch_or(CLOSED, Ordering::AcqRel);
                 state.handles.remove(&(handle as usize));
+                if state.modifiable == Some(handle as usize) {
+                    state.modifiable = None;
+                }
             }
         }
         let last = state.as_ref().is_some_and(|state| state.handles.is_empty());
@@ -701,8 +760,12 @@ unsafe extern "system" fn duplicate(
         let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
         if let Some(state) = &mut state {
             if options & 1 != 0 {
+                timer.as_ref().unwrap().signals.fetch_or(CLOSED, Ordering::AcqRel);
                 timers.remove(&(source as usize));
                 state.handles.remove(&(source as usize));
+                if state.modifiable == Some(source as usize) {
+                    state.modifiable = None;
+                }
             }
             if result != 0 && !target.is_null() && !target_process.is_null() {
                 let handle = unsafe { *target };
@@ -792,31 +855,53 @@ pub(super) fn wait(
                 return Some(result);
             }
         } else {
-            let result = domain::native_wait_at_checked(
-                deadline,
-                || {
-                    let result = probe_timer(&timer, handle, native);
-                    (result != 258).then_some(result)
-                },
-                || loop {
-                    let result = unsafe { native(handle, 2) };
-                    if result != 258 {
-                        break result;
-                    }
-                    if domain::dormant() {
-                        domain::foreign_time_skip();
-                    }
-                    let _pass = Passthrough::enter();
-                    let (deadline, generation) = {
-                        let state = timer.state.lock().unwrap();
-                        (state.deadline, state.generation)
-                    };
-                    if deadline.is_some_and(|at| domain::virtual_now().unwrap() >= at) {
-                        timer.signal(generation);
-                    }
-                },
-                |result| *result != 258,
-            );
+            let signal_due = || {
+                let _pass = Passthrough::enter();
+                let (deadline, generation) = {
+                    let state = timer.state.lock().unwrap();
+                    (state.deadline, state.generation)
+                };
+                if deadline.is_some_and(|at| domain::virtual_now().unwrap() >= at) {
+                    timer.signal(generation);
+                }
+            };
+            let skipping = domain::counts_native_waits() && !domain::executive_attached();
+            let preflight = || {
+                let result = probe_timer(&timer, handle, native);
+                (result != 258).then_some(result)
+            };
+            let mut notified = !skipping;
+            let wait = || loop {
+                // A wait that leaves its domain quiescent moves time on to the timer itself
+                // rather than first waiting out a real slice, or offers the domain an idle skip
+                // once when it cannot.
+                if domain::counts_native_waits()
+                    && !domain::executive_attached()
+                    && domain::time_skip()
+                {
+                    signal_due();
+                } else if !std::mem::replace(&mut notified, true) {
+                    domain::notify_native_wait();
+                }
+                let signals = timer.signals.load(Ordering::Acquire);
+                let result = unsafe { native(handle, 2) };
+                if result == 0 {
+                    timer.consumed(signals);
+                }
+                if result != 258 {
+                    break result;
+                }
+                if domain::dormant() {
+                    domain::foreign_time_skip();
+                }
+                signal_due();
+            };
+            let woken = |result: &u32| *result != 258;
+            let result = if skipping {
+                domain::native_wait_at_skipping(deadline, preflight, wait, woken)
+            } else {
+                domain::native_wait_at_checked(deadline, preflight, wait, woken)
+            };
             if result != 258 {
                 return Some(result);
             }

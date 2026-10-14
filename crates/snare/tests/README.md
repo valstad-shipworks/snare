@@ -9,7 +9,10 @@ top-level `README.md`.
 
 Every `*.rs` here is its own test binary. Most run the code under test inside a `Sim` and assert
 on what it observed; a test binary of its own is used whenever a test needs process-wide state to
-itself (`dns_chains.rs`, `pcapng_env*.rs`, `signals_ctrlc*.rs`).
+itself (`dns_chains.rs`, `pcapng_env*.rs`, `signals_ctrlc*.rs`). `signal_masks.rs` has no test
+harness (`harness = false`), so its main thread blocks the simulated signals before any other
+thread starts and a signal it sends the process reaches only the threads a scenario lets it; it
+takes test names as filters and ignores libtest's flags.
 
 `support/` holds helpers pulled in with `#[path = "support/…"] mod …;`:
 
@@ -62,9 +65,10 @@ cargo clippy --workspace --all-targets
 docker run --rm -v "$PWD":/work:ro -w /work -v snare-lxtarget:/tmp/lxtarget \
     -e CARGO_TARGET_DIR=/tmp/lxtarget rust:latest cargo test --workspace --no-fail-fast
 
-# Windows, cross-checked from macOS (no Windows machine needed)
-cargo clippy -p snare -p snare-interpose --all-targets --target aarch64-pc-windows-msvc
-cargo xwin test --no-run --no-fail-fast --target aarch64-pc-windows-msvc -p snare -p snare-interpose
+# Windows, cross-checked from macOS (no Windows machine needed); clang, not clang-cl, compiles
+# ring (the quinn tests' crypto) for aarch64 Windows
+cargo xwin clippy --cross-compiler clang -p snare -p snare-interpose --all-targets --target aarch64-pc-windows-msvc
+cargo xwin test --cross-compiler clang --no-run --no-fail-fast --target aarch64-pc-windows-msvc -p snare -p snare-interpose
 
 # Windows, run in the Parallels VM "Windows 11" (SNARE_WINDOWS_VM overrides the name)
 scripts/test-windows.sh aarch64-pc-windows-msvc
@@ -101,7 +105,7 @@ still be runtime-unverified; consult [Windows run triage](#windows-run-triage).
 | Native waits, quiescence | `native_waits`, `quiescence`, `quiescence_win`, `demo_tcp_quiescence`, `sem_waits` | ✅ | ✅ | ✅ | Scaled futex `WAIT_BITSET` (Linux) and `dispatch_semaphore` (macOS) only there; `sem_waits` covers Linux and Windows, not macOS named semaphores (✗). |
 | Locks held outside the sim | `outside_locks`, `critical_sections_win`, `win_sync_shared` | ✅ | ✅ | ◐ | Windows shared/exclusive SRW locks and critical sections track known holders; raw condition-variable waits cover all three lock modes. A std `Mutex` held outside is only detectable on macOS (Linux/Windows words name no holder). |
 | Windows waitable timers | `win_waitable_timers` | — | — | ✅ | Relative/absolute deadlines, periodic auto/manual signals, same-process aliases and access rights, extended sets, atomic timer-only any/all waits, concurrent clock moves and off-run cleanup. |
-| Deterministic schedule | `deterministic` | ✅ | ✅ | ✅ | SimHost replay Linux only. |
+| Deterministic schedule | `deterministic`, `deterministic_processes` | ✅ | ✅ | ✅ | SimHost replay Linux only. `deterministic_processes` replays one workload in fresh child processes of the binary. |
 | Stuck runs | `stuck` | ✅ | ✅ | ✅ | |
 | Executive | `executive`, `executive_classes`, `executive_det`, `executive_simhost` | ✅ | ✅ | ✅ | `executive_simhost` Linux. |
 | Thread classes, cooperative primitives | `thread_classes`, `sched_primitives` | ✅ | ✅ | ✅ | |
@@ -115,6 +119,7 @@ still be runtime-unverified; consult [Windows run triage](#windows-run-triage).
 | Readiness syscalls | `kqueue_raw`, `mio_kqueue`, `mio_readiness`, `demo_tcp_mio`, `wsapoll_win`, `tcp_server` | ✅ | ✅ | ✅ | `WSAPoll`/`select` on Windows. |
 | timerfd, raw descriptor syscalls | `timerfd` | — | ✅ | — | Expiry on the sim's clock bounds epoll and poll waits; `syscall(SYS_eventfd2)`/`SYS_epoll_*` reach the model; host-checked. |
 | Real descriptors in a simulated kqueue | `kqueue_real_fds`, `tokio_runtime` | ✅ | — | — | `EVFILT_READ`/`EVFILT_WRITE` on a pipe or socketpair the sim does not serve read the OS's readiness and refusals; timeouts stay on the sim clock; host-checked. |
+| Real descriptors in sim waits, child processes | `real_fds_in_waits` | ✅ | ✅ | — | A pipe beside sim sockets in `poll`, epoll or a kqueue ends the wait when a sim thread writes or closes it (at the write's sim time; deterministic runs replay) or a child process does; a running child holds the clock to real time; `tokio::process` output and wait, `std::process::Command::output`. |
 | Process-wide reactors across sims | `async_io_reactor`, `process_local_fds` | ✅ | ✅ | ⛔ | Epoll sets, kqueues, eventfds and timerfds move to the next sim with the threads blocked on them; another sim's socket is a connection that is gone (reset, end of stream, `EPIPE`, hang-up), closed in the sim that made it from any thread; a sim's socketpair is a real pair outside every sim, so a tokio runtime builds there after a sim built one; a sim socket reached unhooked fails rather than succeeding against `/dev/null`. Tests sharing one take turns. |
 | Process-wide pools across sims | `leftover_wakes` | ✅ | ✅ | ✅ | Leftover workers woken by a later sim follow it (channel, condition variable, shared queue, locked receiver), in deterministic schedules too; outside wakes reach a busy deterministic schedule. |
 | mio edge-triggered events | `mio_waker`, `backpressure`, `connect_faults`, `pcapng`, `windows_iocp` | ✅ | ✅ | ✅ | Windows supports Mio's single-socket, infinite, non-exclusive AFD poll profile; wakeups, edges, backpressure and connection errors run by default. |
@@ -123,14 +128,18 @@ still be runtime-unverified; consult [Windows run triage](#windows-run-triage).
 | Socket table | `socket_table`, `socket_table_win` | ✅ | ✅ | ✅ | |
 | Socket limits, buffers | `socket_limits`, `socket_limits_win`, `os_parity`, `tcp_buffers`, `tcp_buffers_os_truth` | ✅ | ✅ | ✅ | |
 | Bind rules | `bind_os_truth` | ✅ | ✅ | ✅ | |
+| Dual-stack IPv6 | `dual_stack_os_truth`, `quinn_udp` | ✅ | ✅ | ✅ | `IPV6_V6ONLY`, v4-mapped binds, sends, connects and reported addresses, TCP and UDP binds across families under every `SO_REUSEADDR` combination, TTL/TOS and control messages, host-checked, in a plain sim and (Linux) under a `SimHost`; a tokio IPv6 listener taking an IPv4 client and a dual-stack `quinn` client (unix). |
+| Port sharing | `reuseport_os_truth` | ✅ | ✅ | ✅ | `SO_REUSEADDR`/`SO_REUSEPORT` (Windows `SO_EXCLUSIVEADDRUSE`) binds and listens across kinds and families, which of the sockets sharing an address takes unicast datagrams and connections, multicast receivers sharing a port, host-checked in a plain sim and (Linux) under a `SimHost`; Linux's seeded `SO_REUSEPORT` spread. |
 | Winsock call codes and options | `winsock_os_truth` | — | — | ✅ | Wrong-state codes, `SOL_SOCKET` and other-level defaults and round trips, unbound `getsockname`, `WSARecvMsg`/`WSASendMsg` on TCP. |
 | Privileges | `privileges`, `os_parity` | ✅ | ✅ | — | No reserved ports or capabilities on Windows. |
 | Process limits | `rlimits`, `nic_adapter_props_win`, `win_host_os_truth` | ✅ | ✅ | ✅ | Windows: working-set bounds and process-handle type/access checks. |
 | Raw clock, sleep and entropy syscalls | `raw_clock_syscalls` | — | ✅ | — | `SYS_getrandom`, `SYS_clock_gettime`, `SYS_gettimeofday`, `SYS_time` (x86_64), `SYS_nanosleep`, `SYS_clock_nanosleep`, `SYS_gettid`. |
-| Local time zone | `local_time`, `local_time_os_truth` | ✅ | ✅ | ⛔ | `TZ` and `/etc/localtime` per sim; `localtime_r`/`mktime` compared with glibc and tzcode over a year of instants and every hour of 2024 in twelve zones; macOS CoreFoundation's system zone. The UCRT's local time reads the machine's zone. |
-| CPU count | `simhost_cpus`, `simhost_macos_sysctl` | ✅ | ✅ | ⛔ | `sysconf`, `available_parallelism`; macOS `hw.*` counts and their read conventions against the host. `WinHost` does not answer `GetSystemInfo`. |
+| Local time zone | `local_time`, `local_time_os_truth`, `local_time_win` | ✅ | ✅ | ✅ | `TZ` and `/etc/localtime` per sim (unix), `SimBuilder::time_zone` (Windows); `localtime_r`, `mktime` (every hour of 2024 and around every offset change from 1900 to 2100, with each `tm_isdst`) and strftime's zone conversions compared with glibc and tzcode in sixteen zones; macOS CoreFoundation's system zone. Windows: the Win32 zone and conversion calls, the UCRT's zone state, `_localtime64_s`, `_mktime64`, `strftime` and `_ftime64_s` compared with the machine's zone (and measured in nine others), chrono, `time` and jiff. |
+| CPU count | `simhost_cpus`, `simhost_macos_sysctl`, `win_cpus_os_truth` | ✅ | ✅ | ✅ | `sysconf`, `available_parallelism`; macOS `hw.*` counts and their read conventions against the host. Windows: `GetSystemInfo`, the processor and group counts, `GetLogicalProcessorInformation(Ex)` for every relationship, the process affinity mask, the NUMA masks and `CallNtPowerInformation` against the host (package and die records only on a one-package host), other shapes and tokio/rayon pool sizes sim-only. |
 | Multicast | `multicast`, `multicast_os_truth` | ✅ | ✅ | ✅ | `IP_MULTICAST_ALL` Linux only. |
 | Don't-fragment | `dontfrag`, `dontfrag_win` | ✅ | ✅ | ✅ | `IP_DONTFRAGMENT`, `IPV6_DONTFRAG`, `IP_MTU_DISCOVER`. |
+| Control messages, QUIC | `cmsg_os_truth`, `cmsg_win_os_truth`, `quinn_udp` | ✅ | ✅ | ✅ | TOS/ECN, TTL, packet info, Linux GSO/GRO and Windows USO/URO on send and receive, host-checked (Linux also through a `SimHost`; Windows with the receive options, refused messages, truncated control buffers and the coalescing rule); `quinn-udp` and a `quinn` connection, all under `strict_sockopts`. |
+| Socket `fcntl` | `fcntl_os_truth`, `descriptor_ops` | ✅ | ✅ | — | Kept status flags, signal-driven I/O owner and signal, socket record locks, macOS `F_SETNOSIGPIPE`; host-checked. |
 | Packet timestamps | `timestamps`, `timestamp_startup`, `demo_udp_timestamping`, `simhost_*`, `timestamps_win` | ✅ | ✅ | ✅ | Linux configurable software RX startup, arrival-time eligibility and legacy datagram fallback; Windows `SIO_TIMESTAMPING`/`SO_TIMESTAMP`/`SIO_GET_TX_TIMESTAMP`, in the sim only; one real code pinned. |
 | Unmodelled options, strict mode | `strict_sockopts` | ✅ | ✅ | ✅ | Real Winsock codes pinned by `unknown_option_codes_on_windows`. |
 | Interfaces and routing | `nic_routing`, `nic_link`, `nic_policy`, `nic_bind_device`, `nic_os_truth` | ✅ | ✅ | ✅ | |
@@ -140,6 +149,8 @@ still be runtime-unverified; consult [Windows run triage](#windows-run-triage).
 | Protocol counters | `proto_counters`, `proto_counters_os_truth` | ✅ | ✅ | ✅ | |
 | Names | `dns`, `dns_chains`, `dns_win` | ✅ | ✅ | ✅ | |
 | Signals, console control | `signals`, `signals_ctrlc*`, `signals_forward_real`, `signals_signal_hook`, `signals_win` | ✅ | ✅ | ✅ | `signal-hook` is unix only. |
+| Signals interrupting blocked calls | `signal_interrupts` | ✅ | ✅ | — | `pthread_kill(SIGINT)` to a thread blocked in each call, with and without `SA_RESTART`, against the host: `EINTR` or restart for socket receives and accepts (with and without `SO_RCVTIMEO`), `poll`, `select`, `epoll_wait`/`kevent`, `nanosleep` (and its remainder), `clock_nanosleep` (Linux), `sem_wait` (under `deterministic()` only), `flock`, `F_OFD_SETLKW`, `pause`, `sigsuspend`; a signal sent to the process interrupts the root thread's `accept`. |
+| Child process signals | `child_signals` | ✅ | ✅ | — | One `SIGCHLD` per child with the host's `si_pid`/`si_code`/`si_status` (exit, kill), a child's end ending `sigsuspend` on the root thread, `SIGCHLD` ignored reaping children, against the host. |
 | Recorded events | `recorded_events` | ✅ | ✅ | ✅ | |
 | Packet capture | `pcapng`, `pcapng_env*`, `simhost_pcapng`, `pcapng_npcap_win` | ✅ | ✅ | ✅ | npcap capture needs `wpcap.lib`. |
 | Raw L2 | `bpf_l2`, `demo_bpf_*`, `raw_l2`, `pcap_raw_win` | ✅ | ✅ | ◐ | npcap is structural; needs Npcap to link and run. |
@@ -159,12 +170,12 @@ What the Windows backend does not model, each with the tests that describe it:
 |---|---|---|
 | Other IOCP/AFD variants | Multi-socket, finite and exclusive AFD polls, alertable modeled-port waits, modeled port/helper aliases and mixed native/modeled port traffic are explicitly unsupported. Mio's single-socket infinite non-exclusive profile and non-alertable completion waits are modeled. | `windows_iocp` covers native packet/status/byte-count comparisons, virtual deadlines, native passthrough and dynamic interests; `mio_waker`, `timer_ties`, `backpressure`, `connect_faults` run by default. |
 | Overlapped and notified I/O on a sim socket | Overlapped `WSARecv`/`WSASend`/`WSARecvMsg`/`WSASendMsg`/`WSAIoctl`, `WSAEventSelect`, `WSAAsyncSelect`, `AcceptEx`, `TransmitFile`, `WSAJoinLeaf`, `WSAConnectByName`/`ByList`, and the `ConnectEx`/`AcceptEx`/`DisconnectEx`/`TransmitFile`/`TransmitPackets`/`GetAcceptExSockaddrs` extension pointers fail with `WSAEOPNOTSUPP`; `select`/`WSAPoll` over sim and real sockets together likewise. | none |
-| Control messages other than timestamps | `IP_PKTINFO`/`IPV6_PKTINFO`, `IP_RECVTTL`, `IP_RECVTOS`, ... are kept and listed as unmodelled, but `WSARecvMsg` returns no such message. `WSASendMsg` rejects non-timestamp control messages with `WSAEOPNOTSUPP` before sending. | `timestamps_win::unsupported_outbound_control_messages_fail_without_sending` |
+| Control-message edges | An `IP_PKTINFO` with an unspecified source from a wildcard-bound socket sends from the route's source; a `WSARecvMsg` that fails `WSAEMSGSIZE` leaves its byte count unwritten; `IP_RECVIF`, `IP_RECVDSTADDR`, `IP_ORIGINAL_ARRIVAL_IF`, `IP_PKTINFO_EX` and `IP_RECVERR` report nothing. | `cmsg_win_os_truth` leaves these cases out |
 | Holder of a std `Mutex` | Its `WaitOnAddress` word names no holder (as the Linux futex), so a waiter on one held outside the sim counts parked. | `outside_locks::a_std_mutex_held_outside_the_sim_holds_time_still` (also ignored on Linux) |
-| Foreign scheduling objects, actual realtime-class behavior | Foreign process/thread objects return `ERROR_NOT_SUPPORTED` (50). Tracked threads retain a native handle until `WinHost` drops. Actual realtime thread/background priority interactions remain unmeasured: the unelevated VM accepts the request but reports HIGH priority. | `win_host_os_truth` covers current-process aliases, access/error validation, background transitions and the explicit foreign-process boundary; elevated realtime-class parity tests needed. |
+| Foreign scheduling objects | Foreign process/thread objects return `ERROR_NOT_SUPPORTED` (50). Tracked threads retain a native handle until `WinHost` drops. Realtime thread/background priority interactions match the host only where it grants `REALTIME_PRIORITY_CLASS`: the unelevated VM user gets HIGH, so the realtime rows are compared only when the binary runs as SYSTEM (`prlctl exec` without `--current-user`). | `win_host_os_truth` covers current-process aliases, access/error validation, background transitions, the realtime matrix and the explicit foreign-process boundary. |
 | Waitable timer variants | `CreateWaitableTimerW/A` and `CreateWaitableTimerExW/A` share the timer model; native comparisons cover all four creation APIs in manual/auto-reset modes and extended-API access rights. Named/security attributes, APC/resume/reason contexts, cross-process aliases, alertable timer waits and blocking mixed-object waits are explicitly unsupported. Relative/absolute periodic timers, local aliases and timer-only any/all waits have native comparisons. Tolerable-delay requests use exact deadlines rather than host coalescing. | `win_waitable_timers` |
 | Files, environment | No Windows hooks; calls reach real process state. | No Windows API parity tests yet. |
-| Local time zone, CPU count | The UCRT's `_localtime64_s`/`_mktime64`/`_tzset` and `GetTimeZoneInformation` read the machine's zone; `GetSystemInfo` and `GetActiveProcessorCount` the machine's CPUs. | none |
+| CPU count | `GetSystemInfo` and `GetActiveProcessorCount` report the machine's CPUs. | none |
 
 ## Windows run triage
 
@@ -318,12 +329,31 @@ test interfaces.
 | `hw_win_iphlp_truth` | Windows adapter | `GetAdaptersAddresses` sizing and the fields the model fills, `GetIfEntry2`/`GetIfTable2` rows, the unknown-LUID code, `GetUdpStatistics(Ex/Ex2)` codes per family. |
 | `hw_win_npcap_truth` | npcap; `--features hw-npcap`; `-Mutate` to send | Opening `\Device\NPF_{GUID}` and a bogus device, `sendpacket` and send queues (`SendSync` off and on) and which frames loop back. The file is `#![cfg(all(windows, feature = "hw-npcap"))]`: the `pcap` crate links `wpcap.lib` from the npcap SDK, which a default Windows build does not have; the runner turns the feature on when `wpcap.dll` is present. |
 
-Windows 11 ARM64 VM runs have exercised `hw_win_udp_statistics_codes_match`,
-`hw_win_adapters_addresses_match`, `hw_win_if_rows_match` and
-`hw_win_adapter_reads_match_the_model`. The wired-adapter guards remain because those fixtures
-are not guaranteed on other machines. Adapter mutation and Npcap paths remain unverified on
-that VM. Linux device comparisons have also run in Docker against a veth interface and a peer;
-this does not establish physical NIC, driver or PHC parity.
+### Recorded runs
+
+Read-only runs, as an unprivileged user, on 2026-10-14. Nothing was mutated, no peer or traffic
+generator ran, and `SNARE_HW_MUTATE` was unset.
+
+| Test | Host | Result |
+|---|---|---|
+| `hw_ethtool_truth::hw_ethtool_reads_match_the_model` | Linux 6.8.0-139 x86_64: `enp4s0` (Aquantia AQC107, `atlantic`, link up, no PHC) and `enp5s0` (Intel I211, `igb`, link down, PHC `/dev/ptp0`) | pass on both |
+| `hw_ethtool_truth::hw_ethtool_setters_need_net_admin` | same, both NICs | pass on both (every setter `EPERM`) |
+| `hw_timestamping_truth::hw_hwtstamp_get_matches` | same, both NICs | pass on both |
+| `hw_timestamping_truth::hw_bind_phc_matches` | same, `enp5s0` (phc 0) | pass; skipped on `enp4s0` (no PHC) |
+| `hw_ptp_truth::*` | same | skipped: `/dev/ptp0` is `crw------- root` |
+| `connect_faults::real_os_on_link_absent_calibration` | same, `enp4s0`, a LAN address whose neighbour entry was already `FAILED` | `EHOSTUNREACH` after 3.10 s, as `connect_to_absent_on_link_station_host_unreachable` models (3 solicitations at 1 s) |
+| `nic_os_truth::linux_netns_ground_truth` | Docker (`rust:latest`, aarch64, `--cap-add SYS_ADMIN --cap-add NET_ADMIN`), private namespace | pass |
+| `hw_win_iphlp_truth::hw_win_adapters_addresses_match`, `hw_win_if_rows_match` | Windows 11 ARM64 Parallels VM, "Parallels VirtIO Ethernet Adapter" (`IfType` 6, 10 Gbps; picked by the automatic selection) | pass; noted as unmodelled: the description, DHCP flag and `Ipv4Metric` (15) |
+| `hw_win_adapter_truth::hw_win_adapter_reads_match_the_model` | same VM, not elevated | pass (`DriverVersion` 100.2.0.0; `*NumRssQueues`, `*RSS`, `*JumboPacket`, `*LsoV2IPv4`, `*PriorityVLANTag` present, the other keywords absent; write `ERROR_ACCESS_DENIED`) |
+
+The first `atlantic` and `igb` reads differed only in `ETHTOOL_GDRVINFO`'s `n_priv_flags`,
+`testinfo_len`, `eedump_len` and `regdump_len` (atlantic 5, 0, 0, 352; igb 1, 5, 4096, 2960), which
+the sim profile left at zero; `Nic::self_test_count` now models `testinfo_len` and the
+`ETH_SS_TEST` count, the profile copies all four, and the test compares the whole struct.
+
+Not yet run: the mutating tests (`--mutate`), the peer exchanges, `hw_ptp_truth` (needs a readable
+PHC), Npcap, and adapter writes. A VM's VirtIO adapter is not a physical NIC, and the Docker
+namespace runs on the Docker VM's kernel.
 
 ### Known gaps (failing on purpose until modelled)
 
@@ -335,8 +365,9 @@ by a sim-only test as well (`simhost_txtime`, `simhost_udp`, `simhost_hwtstamp`,
 
 Predicted from the model and not yet seen on hardware, so possibly divergent on a real NIC:
 
-- `Nic::register_dump_len`, `eeprom_len` and `private_flags_count` configure driver-info metadata
-  (zero by default); register/EEPROM contents and private-flag operations are not modelled.
+- `Nic::register_dump_len`, `eeprom_len`, `private_flags_count` and `self_test_count` configure
+  driver-info metadata (zero by default; the counts match `atlantic` and `igb` when copied from
+  them); register/EEPROM contents, self-tests and private-flag operations are not modelled.
   `Nic::carrier` represents an unknown-but-up interface, pinned across topology, sysfs,
   rtnetlink, `getifaddrs` and `GLINK` by `simhost_nic_topology`.
 - The transmit queues a driver allocated are taken from `ETHTOOL_GCHANNELS`' maxima; a driver that
@@ -389,7 +420,7 @@ against it are in `../benches/README.md`.
 
 | File | Pins |
 |---|---|
-| `edge_scale_sockets` | 10 000 UDP sockets: ids 1…10 000 in creation order, table order, closed-socket order, ids never reused, one datagram to each reaches only it (UDP counters exact); ephemeral UDP ports lowest-free from 49152, per address; 2 000 TCP connects queue unbounded and are accepted FIFO, client ports sequential, accepted ids after the clients. |
+| `edge_scale_sockets` | 10 000 UDP sockets: ids 1…10 000 in creation order, table order, closed-socket order, ids never reused, one datagram to each reaches only it (UDP counters exact); ephemeral UDP ports lowest-free from 49152, per address, a dual-stack wildcard's free in both families; 2 000 TCP connects queue unbounded and are accepted FIFO, client ports sequential, accepted ids after the clients. |
 | `edge_scale_fd_limit` | Own binary: with `RLIMIT_NOFILE` 300 past what the process holds, exactly 300 sockets open, the next `socket` is `EMFILE` (UDP and TCP), failures take no id or table row, a close frees a slot. |
 | `edge_scale_datagrams` | 10 000 × 100-byte datagrams at an unread socket: delivered/overflowed/drops exact per OS (Linux 221, macOS 4 099 admitted), the first sent kept in order, `UdpCounters` exact, the read time exact; with `enforce_rcvbuf` off all queue in order; a recording tester takes all 10 000 in order. |
 | `edge_scale_tcp` | 16 MiB across a 1 ms link: FNV-1a intact, exact virtual time per OS, with exact segment counts under `deterministic()`; plain byte/time checks; a 64 KiB receive window's exact longer time; a 4 MiB two-way echo's exact time. |

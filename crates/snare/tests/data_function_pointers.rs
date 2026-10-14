@@ -244,3 +244,46 @@ fn a_file_backed_sqlite_database_with_default_locking() {
         assert_eq!(mode, "wal");
     });
 }
+
+/// SQLite in WAL mode maps its wal-index (`-shm`) file `MAP_SHARED` through `aSyscall[]`'s `mmap`
+/// and coordinates readers and writers through that memory, so every connection must map the same
+/// pages, coherent with the file's `pwrite`/`ftruncate`.
+#[test]
+fn a_file_backed_sqlite_database_in_wal_mode() {
+    sim().run(|| {
+        let writer = rusqlite::Connection::open("/data/wal_mode.db").unwrap();
+        let mode: String = writer
+            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        writer
+            .execute_batch("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(1);")
+            .unwrap();
+        let reader = rusqlite::Connection::open("/data/wal_mode.db").unwrap();
+        let sum = |c: &rusqlite::Connection| -> i64 {
+            c.query_row("SELECT sum(x) FROM t", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(sum(&reader), 1);
+        reader.execute_batch("BEGIN").unwrap();
+        assert_eq!(sum(&reader), 1);
+        for x in 2..=100 {
+            writer.execute("INSERT INTO t VALUES(?1)", [x]).unwrap();
+        }
+        assert_eq!(sum(&reader), 1, "a read transaction keeps its snapshot");
+        reader.execute_batch("COMMIT").unwrap();
+        assert_eq!(sum(&reader), 5050);
+        let (busy, _, _): (i64, i64, i64) = writer
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(busy, 0);
+        assert_eq!(std::fs::metadata("/data/wal_mode.db-wal").unwrap().len(), 0);
+        drop(reader);
+        drop(writer);
+        let reopened = rusqlite::Connection::open("/data/wal_mode.db").unwrap();
+        assert_eq!(sum(&reopened), 5050);
+        assert!(std::fs::metadata("/data/wal_mode.db-shm").is_ok());
+    });
+}

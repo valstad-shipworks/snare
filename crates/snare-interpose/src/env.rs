@@ -2,8 +2,15 @@
 //! hooks serve the calling thread's process environment from it instead of the real one — so a
 //! test sees a deterministic, isolated environment (and Rust's `std::env::var`, which calls
 //! `libc::getenv`, reads it). A `None` backend leaves the calls to the real OS environment.
+//!
+//! On Windows the Win32 environment calls, which `std::env` uses there, and the C runtime's are
+//! served by a backend's [`WinEnv`](Env::windows).
 
 use core::ffi::{c_char, c_int};
+
+#[cfg(windows)]
+#[path = "env_windows.rs"]
+pub(crate) mod windows;
 
 /// A process environment the interposer serves a managed thread's `getenv`/`setenv`/`unsetenv`
 /// from. Only `getenv` is required; the setters default to succeeding without effect.
@@ -46,5 +53,13 @@ pub trait Env: Send + Sync + 'static {
     /// `name` is the caller's C string.
     unsafe fn unsetenv(&self, name: *const c_char) -> c_int {
         0
+    }
+
+    /// The Windows environment this backend serves `GetEnvironmentVariableW` and the other Win32
+    /// and C runtime environment calls from; `None` leaves them, all but `getenv`, to the real
+    /// process environment.
+    #[cfg(windows)]
+    fn windows(&self) -> Option<&windows::WinEnv> {
+        None
     }
 }

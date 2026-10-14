@@ -6,8 +6,11 @@
 //! when any descriptor of the inode is closed (POSIX.1-2017, `fcntl`, "all locks associated with a
 //! file for a given process shall be removed when a file descriptor for that file is closed by
 //! that process"). Description-owned locks conflict with every other owner and go when the last
-//! descriptor of their description closes. `flock` locks are whole-file, owned by the description,
-//! and independent of record locks, as on Linux (man 2 flock, NOTES).
+//! descriptor of their description closes. `flock` locks are whole-file and owned by the
+//! description. On Linux they are independent of record locks (man 2 flock, NOTES). macOS keeps
+//! them in the vnode's one lock list as whole-file locks of an owner of their own
+//! (bsd/kern/kern_lockf.c, `F_FLOCK`), so they conflict with every record lock, the same
+//! description's OFD locks and the process's included, and `F_GETLK` reports them with `l_pid` -1.
 //!
 //! A blocking request waits on [`readiness`], so the wait is seen by quiescence and the
 //! deterministic schedule like any other blocked call; a release wakes every waiter to retry.
@@ -15,11 +18,12 @@
 use std::ffi::c_int;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use snare_interpose::NetResult as FsResult;
 
 use crate::fs_sim::{err, ok};
-use crate::readiness::readiness;
+use crate::readiness::{Deadline, readiness};
 
 /// The end of a range that runs to the end of the file, however far it grows (`l_len` 0).
 const TO_END: u64 = u64::MAX;
@@ -29,10 +33,15 @@ const READ: c_int = libc::F_RDLCK as c_int;
 const WRITE: c_int = libc::F_WRLCK as c_int;
 const UNLOCK: c_int = libc::F_UNLCK as c_int;
 
+/// Whether `flock` locks live among the record locks, as on macOS, rather than apart.
+const FLOCKS_ARE_RECORDS: bool = cfg!(target_os = "macos");
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Owner {
     Process,
     Description(u64),
+    /// A description's `flock` lock, where [`FLOCKS_ARE_RECORDS`].
+    Flock(u64),
 }
 
 #[derive(Clone, Copy)]
@@ -67,11 +76,18 @@ impl Table {
 
     /// Replaces `owner`'s locks over `[start, end)` with one of type `write`, or with none,
     /// trimming the locks it overlaps and merging with adjacent ones of the same type.
+    ///
+    /// The list keeps each owner's locks together, in order of start, and the owners in the order
+    /// their first lock was taken, a lock of an owner holding none joining at the end: Linux
+    /// (fs/locks.c `posix_lock_inode`) and macOS (bsd/kern/kern_lockf.c `lf_setlock`) insert so,
+    /// and `F_GETLK` reports the first conflicting lock in that order.
     fn set(&mut self, owner: Owner, start: u64, end: u64, write: Option<bool>) -> bool {
+        let at = self.records.iter().position(|r| r.owner == owner);
         let mut released = false;
-        let mut kept = Vec::with_capacity(self.records.len() + 2);
-        for r in self.records.drain(..) {
-            if r.owner != owner || !r.overlaps(start, end) {
+        let mut kept = Vec::with_capacity(4);
+        let mine: Vec<Range> = self.records.extract_if(.., |r| r.owner == owner).collect();
+        for r in mine {
+            if !r.overlaps(start, end) {
                 kept.push(r);
                 continue;
             }
@@ -86,8 +102,7 @@ impl Table {
         if let Some(write) = write {
             let (mut low, mut high) = (start, end);
             kept.retain(|r| {
-                let joins =
-                    r.owner == owner && r.write == write && r.start <= end && start <= r.end;
+                let joins = r.write == write && r.start <= end && start <= r.end;
                 if joins {
                     low = low.min(r.start);
                     high = high.max(r.end);
@@ -102,7 +117,8 @@ impl Table {
             });
         }
         kept.sort_by_key(|r| r.start);
-        self.records = kept;
+        let at = at.unwrap_or(self.records.len());
+        self.records.splice(at..at, kept);
         released
     }
 
@@ -135,19 +151,50 @@ pub(crate) struct Target {
 enum Request {
     Get,
     Set,
-    Wait,
+    /// A blocking set; `timed` when the argument is a `struct flocktimeout`.
+    Wait {
+        timed: bool,
+    },
+}
+
+/// macOS `<sys/fcntl.h>`: `F_SETLKW` and `F_OFD_SETLKW` with a timeout, which `libc` lacks.
+#[cfg(target_os = "macos")]
+const F_SETLKWTIMEOUT: c_int = 10;
+#[cfg(target_os = "macos")]
+const F_OFD_SETLKWTIMEOUT: c_int = 93;
+
+/// macOS `struct flocktimeout`, the argument of the timed commands.
+#[repr(C)]
+struct FlockTimeout {
+    fl: libc::flock,
+    timeout: libc::timespec,
 }
 
 fn classify(cmd: c_int) -> Option<(Request, bool)> {
     Some(match cmd {
         libc::F_GETLK => (Request::Get, false),
         libc::F_SETLK => (Request::Set, false),
-        libc::F_SETLKW => (Request::Wait, false),
+        libc::F_SETLKW => (Request::Wait { timed: false }, false),
         libc::F_OFD_GETLK => (Request::Get, true),
         libc::F_OFD_SETLK => (Request::Set, true),
-        libc::F_OFD_SETLKW => (Request::Wait, true),
+        libc::F_OFD_SETLKW => (Request::Wait { timed: false }, true),
+        #[cfg(target_os = "macos")]
+        F_SETLKWTIMEOUT => (Request::Wait { timed: true }, false),
+        #[cfg(target_os = "macos")]
+        F_OFD_SETLKWTIMEOUT => (Request::Wait { timed: true }, true),
         _ => return None,
     })
+}
+
+/// When a timed wait gives up: its timeout's span from now on the sim's clock, or never for a zero
+/// or negative span, which XNU's `msleep` takes as no timeout (bsd/kern/kern_synch.c).
+///
+/// # Safety
+/// `arg` must point to a `struct flocktimeout`.
+unsafe fn timeout(arg: i64) -> Option<Deadline> {
+    let timeout = unsafe { (*(arg as *const FlockTimeout)).timeout };
+    let nanos = i128::from(timeout.tv_sec) * 1_000_000_000 + i128::from(timeout.tv_nsec);
+    (nanos > 0).then(|| Deadline::timeout(Duration::from_nanos(nanos.min(u64::MAX.into()) as u64)))
 }
 
 /// Whether `cmd` is a record-lock command [`Locks::fcntl`] serves.
@@ -179,10 +226,11 @@ fn span(lock: &libc::flock, target: &Target) -> Result<(u64, u64), c_int> {
 
 impl Locks {
     /// Serves a record-lock `fcntl` (`cmd` such that [`is_record_lock`]) with `arg` the caller's
-    /// `struct flock *`.
+    /// `struct flock *`, or for macOS `F_SETLKWTIMEOUT`/`F_OFD_SETLKWTIMEOUT` its
+    /// `struct flocktimeout *`, which waits until the timeout and then fails with `ETIMEDOUT`.
     ///
     /// # Safety
-    /// `arg` must be null or point to a `struct flock`.
+    /// `arg` must be null or point to the structure `cmd` takes.
     pub(crate) unsafe fn fcntl(&self, cmd: c_int, arg: i64, target: &Target) -> Option<FsResult> {
         let (request, ofd) = classify(cmd)?;
         let lock = arg as *mut libc::flock;
@@ -227,7 +275,7 @@ impl Locks {
                     };
                     fl.l_pid = match held.owner {
                         Owner::Process => std::process::id() as _,
-                        Owner::Description(_) => -1,
+                        Owner::Description(_) | Owner::Flock(_) => -1,
                     };
                 }
                 None => fl.l_type = UNLOCK as _,
@@ -252,12 +300,19 @@ impl Locks {
             Some(table.set(owner, start, end, kind))
         };
         let released = match request {
-            Request::Wait => wait("fcntl lock", attempt),
+            Request::Wait { timed } => {
+                let deadline = if timed { unsafe { timeout(arg) } } else { None };
+                match wait("fcntl lock", deadline, attempt) {
+                    Ok(released) => Some(released),
+                    Err(false) if deadline.is_some() => return err(libc::ETIMEDOUT),
+                    Err(_) => None,
+                }
+            }
             _ => attempt(),
         };
         let Some(released) = released else {
             return err(match request {
-                Request::Wait => libc::EINTR,
+                Request::Wait { .. } => libc::EINTR,
                 _ => libc::EAGAIN,
             });
         };
@@ -279,6 +334,9 @@ impl Locks {
         let Ok(exclusive) = exclusive else {
             return err(exclusive.unwrap_err());
         };
+        if FLOCKS_ARE_RECORDS {
+            return self.flock_record(description, exclusive, nonblocking);
+        }
         let converted = {
             let mut table = self.0.lock().unwrap();
             match table
@@ -309,13 +367,50 @@ impl Locks {
         let acquired = if nonblocking {
             attempt()
         } else {
-            wait("flock", attempt)
+            wait("flock", None, attempt).ok()
         };
         match acquired {
             Some(()) => ok(0),
             None if nonblocking => err(libc::EWOULDBLOCK),
             None => err(libc::EINTR),
         }
+    }
+
+    /// `flock` on macOS: a whole-file record lock of the description's `flock` owner, set as
+    /// `lf_setlock` sets it (bsd/kern/kern_lockf.c). A conversion replaces the held lock in place,
+    /// so a nonblocking upgrade that conflicts keeps the shared lock; only a blocking upgrade
+    /// drops it before it sleeps.
+    fn flock_record(
+        &self,
+        description: u64,
+        exclusive: bool,
+        nonblocking: bool,
+    ) -> Option<FsResult> {
+        let owner = Owner::Flock(description);
+        let attempt = || {
+            let mut table = self.0.lock().unwrap();
+            if table.conflict(owner, 0, TO_END, exclusive).is_some() {
+                return None;
+            }
+            Some(table.set(owner, 0, TO_END, Some(exclusive)))
+        };
+        let released = match attempt() {
+            Some(released) => released,
+            None if nonblocking => return err(libc::EWOULDBLOCK),
+            None => {
+                if exclusive && self.release_flock(description) {
+                    wake();
+                }
+                match wait("flock", None, attempt) {
+                    Ok(released) => released,
+                    Err(_) => return err(libc::EINTR),
+                }
+            }
+        };
+        if released {
+            wake();
+        }
+        ok(0)
     }
 
     /// Drops the process's record locks, as closing any descriptor of the inode does.
@@ -339,7 +434,8 @@ impl Locks {
             table
                 .records
                 .retain(|r| r.owner != Owner::Description(description));
-            table.records.len() != before || Self::drop_flock(&mut table, description)
+            let records = table.records.len() != before;
+            Self::drop_flock(&mut table, description) || records
         };
         if released {
             wake();
@@ -351,9 +447,12 @@ impl Locks {
     }
 
     fn drop_flock(table: &mut Table, description: u64) -> bool {
-        let before = table.flocks.len();
+        let before = table.flocks.len() + table.records.len();
         table.flocks.retain(|&(holder, _)| holder != description);
-        table.flocks.len() != before
+        table
+            .records
+            .retain(|r| r.owner != Owner::Flock(description));
+        table.flocks.len() + table.records.len() != before
     }
 }
 
@@ -383,14 +482,25 @@ fn operation_kind(operation: c_int) -> Option<Result<bool, c_int>> {
     }
 }
 
-/// Retries `attempt` until it succeeds; `None` if the wait ends first.
-fn wait<R>(label: &'static str, mut attempt: impl FnMut() -> Option<R>) -> Option<R> {
+/// Retries `attempt` until it succeeds. `Err(true)` when a signal handler interrupted the wait,
+/// `Err(false)` when it ended otherwise first: its deadline passed, or the sim is deadlocked. A
+/// handler installed with `SA_RESTART` lets it go on, as `flock`, `F_SETLKW` and `F_OFD_SETLKW`
+/// restart on both hosts (man 7 signal, "Interruption of system calls and library functions by
+/// signal handlers"; macOS pinned by tests/signal_interrupts.rs).
+fn wait<R>(
+    label: &'static str,
+    deadline: Option<Deadline>,
+    mut attempt: impl FnMut() -> Option<R>,
+) -> Result<R, bool> {
     let mut result = None;
-    readiness().wait_until(label, None, || {
-        result = attempt();
-        result.is_some()
-    });
-    result
+    let (_, interrupted) =
+        snare_interpose::interruptible(snare_interpose::Restart::WithSaRestart, || {
+            readiness().wait_until(label, deadline, || {
+                result = attempt();
+                result.is_some()
+            })
+        });
+    result.ok_or(interrupted)
 }
 
 /// Wakes every waiter to retry: a lock's waiters may be in any sim sharing the file system.

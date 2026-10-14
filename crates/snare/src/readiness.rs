@@ -12,18 +12,21 @@
 //! source identities use broad subscriptions. Domain keys keep independent sims' wakeups and
 //! settling state separate; key 0 reaches matching subscriptions in every domain.
 //!
-//! Lock order: a backend's socket table, then `Readiness::state` — a `ready` closure takes the
-//! table under `state`, so nothing may bump readiness while holding the table. The real waker's
-//! `due` lock is a leaf: no waker or bump runs under it.
+//! Lock order: a backend's socket table, then `Readiness::state` — a `ready` closure may take the
+//! table under `state`, so nothing may bump readiness while holding the table. A woken waiter
+//! re-checks with `state` let go but its stale mark held (see `Readiness::sleep_checked`). The real
+//! waker's `due` lock and a waiter's parker lock are leaves: no waker or bump runs under them.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
 use snare_interpose::RaceCell;
+
+use crate::{HashMap, HashSet};
 
 /// When a wait gives up: on the domain's virtual clock when it runs on one — the clock the code
 /// under test reads, which moves only as the sim moves it (discrete, scaled or paused) — and on
@@ -492,7 +495,7 @@ impl WakeKeys {
         } else {
             if self.len == 64 && self.indexed.as_ref().is_none_or(HashSet::is_empty) {
                 self.indexed
-                    .get_or_insert_with(HashSet::new)
+                    .get_or_insert_with(HashSet::default)
                     .extend(self.overflow.iter().copied());
             }
             !self.indexed.as_mut().unwrap().insert(key)
@@ -523,7 +526,7 @@ impl WakeKeys {
 use snare_interpose::ReadinessWake as WakeEvent;
 
 /// What a wait listens to besides its fixed keys and its deadline.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Wake<'a> {
     /// Keys the wait refreshes each time it re-checks.
     dynamic_keys: Option<&'a std::cell::RefCell<WakeKeys>>,
@@ -544,6 +547,10 @@ struct Timing {
     steady: bool,
 }
 
+/// Bumps of every domain so far, readable without the lock: a waiter that re-checked with the
+/// lock let go and found its interests changed checks again if any came meanwhile.
+static BUMPS: AtomicU64 = AtomicU64::new(0);
+
 /// Guarded by one lock so a quiescence check sees a consistent picture.
 struct State {
     /// Active subscriptions, including their domain and unread wake generations.
@@ -560,15 +567,15 @@ struct Waiters {
     domain: usize,
     /// Changes when a relevant event reaches this subscription.
     generation: u64,
-    /// Its threads currently asleep on `changed`.
+    /// Its threads currently asleep on `changed`, or woken by a bump and re-checking.
     sleeping: usize,
     /// Of those, the ones a bump woke that have not yet woken up and re-checked. A woken waiter
     /// still counts as parked until it runs, so while any is pending the domain only looks
     /// quiescent: a time skip then would race virtual time ahead of the work the woken thread is
     /// about to do.
     stale: usize,
-    /// Paired with [`Readiness::state`].
-    changed: Arc<Condvar>,
+    /// Where its threads sleep.
+    changed: Arc<Parker>,
     keys: Vec<WakeKey>,
     broad: bool,
     time_sensitive: bool,
@@ -580,13 +587,17 @@ struct Waiters {
     steady: bool,
     /// A park token that makes the wait ready: any bump that finds it set reaches the waiter.
     token: Option<Arc<AtomicBool>>,
+    /// Its domain's count of stale marks (see [`snare_interpose::settling_gauge`]), which
+    /// `stale` adds to.
+    gauge: Option<Arc<AtomicUsize>>,
 }
 
 impl State {
     /// Records a bump of `domain` (0 for every domain): each current sleeper of that domain, and
-    /// of the threads outside every domain, is stale until it runs. Hands `notify` the condvar of
+    /// of the threads outside every domain, is stale until it runs. Hands `notify` the parker of
     /// each entry reached.
-    fn bump(&mut self, domain: usize, event: WakeEvent<'_>, notify: impl FnMut(&Arc<Condvar>)) {
+    fn bump(&mut self, domain: usize, event: WakeEvent<'_>, notify: impl FnMut(&Arc<Parker>)) {
+        BUMPS.fetch_add(1, Ordering::SeqCst);
         self.reach(
             domain,
             |waiters| match event {
@@ -600,7 +611,8 @@ impl State {
 
     /// Records the clock of `domain` moving to `now` (monotonic nanos): reaches the waits it made
     /// due and those that every clock move concerns, and leaves the rest asleep.
-    fn bump_due(&mut self, domain: usize, now: u64, notify: impl FnMut(&Arc<Condvar>)) {
+    fn bump_due(&mut self, domain: usize, now: u64, notify: impl FnMut(&Arc<Parker>)) {
+        BUMPS.fetch_add(1, Ordering::SeqCst);
         self.reach(
             domain,
             |waiters| {
@@ -615,7 +627,7 @@ impl State {
         &mut self,
         domain: usize,
         relevant: impl Fn(&Waiters) -> bool,
-        mut notify: impl FnMut(&Arc<Condvar>),
+        mut notify: impl FnMut(&Arc<Parker>),
     ) {
         for waiters in &mut self.waiters {
             if domain != 0 && waiters.domain != domain && waiters.domain != 0 {
@@ -627,7 +639,11 @@ impl State {
                 .is_some_and(|token| token.load(Ordering::Acquire));
             if waiters.broad || unparked || relevant(waiters) {
                 waiters.generation += 1;
-                waiters.stale = waiters.sleeping;
+                waiters
+                    .changed
+                    .generation
+                    .store(waiters.generation, Ordering::Release);
+                waiters.set_stale(waiters.stale.max(waiters.sleeping));
                 if waiters.sleeping > 0 {
                     notify(&waiters.changed);
                 }
@@ -650,6 +666,7 @@ impl State {
             due: None,
             steady: false,
             token: None,
+            gauge: None,
         });
         waiters.id = self.next_waiter;
         waiters.domain = domain;
@@ -662,6 +679,7 @@ impl State {
         waiters.due = None;
         waiters.steady = false;
         waiters.token = None;
+        waiters.gauge = snare_interpose::settling_gauge();
         if let Some(keys) = keys {
             waiters.keys.extend_from_slice(keys);
         }
@@ -672,7 +690,9 @@ impl State {
     fn unregister(&mut self, id: u64) {
         if let Some(i) = self.waiters.iter().position(|w| w.id == id) {
             let mut waiters = self.waiters.swap_remove(i);
+            waiters.set_stale(0);
             waiters.token = None;
+            waiters.gauge = None;
             self.spare.push(waiters);
         }
     }
@@ -684,9 +704,14 @@ impl State {
             .any(|w| w.domain == domain && w.stale > 0)
     }
 
-    /// Counts a sleeper of `domain` asleep, returning the condvar it sleeps on and the domain's
-    /// generation for [`awake`](Self::awake).
-    fn asleep(&mut self, id: u64, timing: Timing, keys: Option<&[WakeKey]>) -> (Arc<Condvar>, u64) {
+    /// Counts a sleeper of `domain` asleep, returning the parker it sleeps on, its generation for
+    /// [`awake`](Self::awake) and the parker's signals so far.
+    fn asleep(
+        &mut self,
+        id: u64,
+        timing: Timing,
+        keys: Option<&[WakeKey]>,
+    ) -> (Arc<Parker>, u64, u64) {
         let waiters = self.waiters.iter_mut().find(|w| w.id == id).unwrap();
         waiters.time_sensitive = timing.sensitive;
         waiters.due = timing.due;
@@ -696,7 +721,8 @@ impl State {
             waiters.keys.extend_from_slice(keys);
         }
         waiters.sleeping += 1;
-        (waiters.changed.clone(), waiters.generation)
+        let seen = waiters.changed.signals();
+        (waiters.changed.clone(), waiters.generation, seen)
     }
 
     /// Counts a sleeper of `domain` awake again, before it takes any stale mark; `true` if a bump
@@ -711,15 +737,94 @@ impl State {
         }
     }
 
+    fn generation_of(&self, id: u64) -> u64 {
+        self.waiters
+            .iter()
+            .find(|w| w.id == id)
+            .map_or(0, |w| w.generation)
+    }
+
+    /// Registers `timing` and `keys` as what waiter `id` listens to, if they differ from what it
+    /// registered: `true` if they did. A bump during a check that changed them may have gone by
+    /// unmatched.
+    fn retune(&mut self, id: u64, timing: Timing, keys: Option<&[WakeKey]>) -> bool {
+        let Some(waiters) = self.waiters.iter_mut().find(|w| w.id == id) else {
+            return false;
+        };
+        let changed = waiters.time_sensitive != timing.sensitive
+            || waiters.due != timing.due
+            || waiters.steady != timing.steady
+            || keys.is_some_and(|keys| waiters.keys != keys);
+        if changed {
+            waiters.time_sensitive = timing.sensitive;
+            waiters.due = timing.due;
+            waiters.steady = timing.steady;
+            if let Some(keys) = keys {
+                waiters.keys.clear();
+                waiters.keys.extend_from_slice(keys);
+            }
+        }
+        changed
+    }
+
     /// Takes one stale mark of `domain` for a sleeper a bump woke, now back holding the lock;
     /// `true` if it was the domain's last.
     fn rechecked(&mut self, id: u64) -> bool {
         let Some(waiters) = self.waiters.iter_mut().find(|w| w.id == id && w.stale > 0) else {
             return false;
         };
-        waiters.stale -= 1;
+        waiters.set_stale(waiters.stale - 1);
         let domain = waiters.domain;
         !self.settling(domain)
+    }
+}
+
+/// Where one waiter sleeps: how many bumps signalled it, under a lock of its own, so a woken
+/// waiter runs without the readiness lock; and its generation as bumps last set it, to tell a bump
+/// that came while it re-checked.
+#[derive(Default)]
+struct Parker {
+    signals: Mutex<u64>,
+    signalled: Condvar,
+    generation: AtomicU64,
+}
+
+impl Parker {
+    fn signal(&self) {
+        *self.signals.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.signalled.notify_one();
+    }
+
+    fn signals(&self) -> u64 {
+        *self.signals.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Sleeps until signalled past `seen` or for at most `timeout`: whether it was signalled, and
+    /// whether the sleep timed out.
+    fn wait(&self, seen: u64, timeout: Duration) -> (bool, bool) {
+        let signals = self.signals.lock().unwrap_or_else(|e| e.into_inner());
+        if *signals != seen {
+            return (true, false);
+        }
+        let (signals, result) = self
+            .signalled
+            .wait_timeout(signals, timeout)
+            .unwrap_or_else(|e| e.into_inner());
+        (*signals != seen, result.timed_out())
+    }
+}
+
+impl Waiters {
+    /// Sets `stale`, keeping its domain's gauge in step.
+    fn set_stale(&mut self, stale: usize) {
+        if let Some(gauge) = &self.gauge {
+            if stale > self.stale {
+                gauge.fetch_add(stale - self.stale, Ordering::SeqCst);
+            } else if stale < self.stale {
+                gauge.fetch_sub(self.stale - stale, Ordering::SeqCst);
+            }
+        }
+        self.stale = stale;
     }
 }
 
@@ -757,7 +862,9 @@ impl Readiness {
     }
 
     fn bump_event(&self, domain: usize, event: WakeEvent<'_>, scheduled: bool) {
-        self.bump_unscheduled_event(domain, event);
+        let mut reached = WakeKeys::default();
+        let event = crate::notices::post(domain, event, &mut reached);
+        self.notify_bump(domain, event, |changed| changed.signal());
         // Under deterministic scheduling the waiters park in the schedule, not on the condvar. The
         // schedule reached from here is the calling thread's domain's, so another sim's is left
         // alone; a thread outside the domain has none to wake.
@@ -784,15 +891,27 @@ impl Readiness {
     pub(crate) fn bump_due_unscheduled(&self, domain: usize, now: u64) {
         self.notify_with(
             |state, notify| state.bump_due(domain, now, notify),
-            |changed| changed.notify_all(),
+            |changed| changed.signal(),
         );
     }
 
-    fn bump_unscheduled_event(&self, domain: usize, event: WakeEvent<'_>) {
-        self.notify_bump(domain, event, |changed| changed.notify_all());
+    /// As [`bump_due_unscheduled`](Self::bump_due_unscheduled), and wakes the time-sensitive
+    /// waits of the calling thread's deterministic schedule as [`bump_time`](Self::bump_time)
+    /// does.
+    pub(crate) fn bump_due(&self, domain: usize, now: u64) {
+        self.bump_due_unscheduled(domain, now);
+        if domain == 0 || domain == snare_interpose::domain_key() {
+            snare_interpose::det_wake_readiness(WakeEvent::Timer);
+        }
     }
 
-    fn notify_bump(&self, domain: usize, event: WakeEvent<'_>, notify: impl FnMut(&Arc<Condvar>)) {
+    fn bump_unscheduled_event(&self, domain: usize, event: WakeEvent<'_>) {
+        let mut reached = WakeKeys::default();
+        let event = crate::notices::post(domain, event, &mut reached);
+        self.notify_bump(domain, event, |changed| changed.signal());
+    }
+
+    fn notify_bump(&self, domain: usize, event: WakeEvent<'_>, notify: impl FnMut(&Arc<Parker>)) {
         self.notify_with(|state, reach| state.bump(domain, event, reach), notify);
     }
 
@@ -800,10 +919,10 @@ impl Readiness {
     /// the lock is let go.
     fn notify_with(
         &self,
-        bump: impl FnOnce(&mut State, &mut dyn FnMut(&Arc<Condvar>)),
-        mut notify: impl FnMut(&Arc<Condvar>),
+        bump: impl FnOnce(&mut State, &mut dyn FnMut(&Arc<Parker>)),
+        mut notify: impl FnMut(&Arc<Parker>),
     ) {
-        let mut woken: [Option<Arc<Condvar>>; 32] = std::array::from_fn(|_| None);
+        let mut woken: [Option<Arc<Parker>>; 32] = std::array::from_fn(|_| None);
         let mut spill = Vec::new();
         let mut reached = 0;
         let mut state = self.state.lock().unwrap();
@@ -826,7 +945,7 @@ impl Readiness {
     /// Bumps `domain`'s waiters from inside a wait, holding the lock, after the waiting thread
     /// moved its domain's time.
     fn bump_locked(state: &mut State, domain: usize) {
-        state.bump(domain, WakeEvent::Timer, |changed| changed.notify_all());
+        state.bump(domain, WakeEvent::Timer, |changed| changed.signal());
     }
 
     /// Whether a waiter of the domain with key `domain` has been woken but not yet run; see
@@ -939,7 +1058,48 @@ impl Readiness {
         )
     }
 
+    /// A wait in an interruptible call (see [`snare_interpose::interruptible`]) also ends when a
+    /// signal is left pending for its thread: it delivers the signal and, unless the call is
+    /// interrupted, waits on to the same deadline. An interrupted wait returns `false`.
     fn wait_interested(
+        &self,
+        label: &'static str,
+        deadline: Option<Deadline>,
+        keys: Option<&[WakeKey]>,
+        mut time_sensitive: impl FnMut() -> bool,
+        wake: Wake<'_>,
+        mut ready: impl FnMut() -> bool,
+    ) -> bool {
+        let signaled = std::cell::Cell::new(false);
+        loop {
+            let result = self.wait_once(
+                label,
+                deadline,
+                keys,
+                &mut time_sensitive,
+                wake.clone(),
+                || {
+                    if ready() {
+                        return true;
+                    }
+                    let pending = snare_interpose::interrupt_pending();
+                    signaled.set(signaled.get() || pending);
+                    pending
+                },
+            );
+            if !signaled.replace(false) {
+                return result;
+            }
+            if ready() {
+                return true;
+            }
+            if !snare_interpose::deliver_interrupting() {
+                return false;
+            }
+        }
+    }
+
+    fn wait_once(
         &self,
         label: &'static str,
         deadline: Option<Deadline>,
@@ -977,21 +1137,21 @@ impl Readiness {
         }
         let subscription = Subscription {
             readiness: self,
-            id: {
-                let mut state = self.state.lock().unwrap();
-                let id = state.register(snare_interpose::domain_key(), keys);
-                if let Some(waiters) = state.waiters.last_mut() {
-                    waiters.token = wake.token.clone();
-                }
-                id
-            },
+            id: std::cell::Cell::new(0),
+        };
+        let register = |state: &mut State| {
+            let id = state.register(snare_interpose::domain_key(), keys);
+            if let Some(waiters) = state.waiters.last_mut() {
+                waiters.token = wake.token.clone();
+            }
+            subscription.id.set(id);
+            id
         };
         let timed = deadline.is_some() || wake.due.is_some() || wake.token.is_some();
-        let initial_sensitive = time_sensitive();
-        let sensitive = std::cell::Cell::new(timed || initial_sensitive);
-        let steady = std::cell::Cell::new(initial_sensitive);
+        let sensitive = std::cell::Cell::new(timed);
+        let steady = std::cell::Cell::new(false);
         let mut parked = Parked {
-            waiter: subscription.id,
+            subscription: Some(&subscription.id),
             time_sensitive: Some(&sensitive),
             steady: Some(&steady),
             due: wake.due.or(timer),
@@ -1000,12 +1160,13 @@ impl Readiness {
             ..Parked::default()
         };
         let predicate = || {
+            let ready = ready();
             let needed = time_sensitive();
             sensitive.set(timed || needed);
             steady.set(needed);
-            ready()
+            ready
         };
-        let result = self.wait_inner(&mut deadline, &mut timer, &mut parked, predicate);
+        let result = self.wait_inner(&mut deadline, &mut timer, &mut parked, register, predicate);
         drop(parked);
         snare_interpose::note_wait_deadline(None);
         if let Some(key) = timer {
@@ -1075,6 +1236,7 @@ impl Readiness {
         deadline: &mut Option<Deadline>,
         timer: &mut Option<u64>,
         parked: &mut Parked,
+        register: impl FnOnce(&mut State) -> u64,
         mut ready: impl FnMut() -> bool,
     ) -> bool {
         // How long to wait after a time-skip done on another thread's behalf before checking again;
@@ -1082,7 +1244,11 @@ impl Readiness {
         // long enough for the woken thread to take the lock and run.
         const SETTLE: Duration = Duration::from_millis(5);
         let mut state = self.state.lock().unwrap();
-        if ready() {
+        parked.waiter = register(&mut state);
+        let (next, ready_now) = self.check(state, parked, &mut ready);
+        state = next;
+        if ready_now {
+            parked.unregister(&mut state);
             return true;
         }
         let class = snare_interpose::thread_class();
@@ -1207,9 +1373,10 @@ impl Readiness {
             if let Some(idle) = snare_interpose::idle_wait() {
                 wait = wait.min(idle);
             }
-            let (next, timed_out, bumped) = self.sleep(state, wait, parked);
+            let (next, timed_out, bumped, ready_now) =
+                self.sleep_checked(state, wait, parked, &mut ready);
             state = next;
-            if ready() {
+            if ready_now {
                 return self.leave(state, parked, true);
             }
             if deadline.is_some_and(|d| d.passed()) {
@@ -1244,12 +1411,21 @@ impl Readiness {
                         && !snare_interpose::executive_attached()
                     {
                         warned = true;
-                        eprintln!(
-                            "snare: every thread has been blocked on the clock for {}s while it \
-                             is held or running slowly toward its next timer; if it is paused, \
-                             advance or resume it from outside the simulation",
-                            HELD_WARNING.as_secs()
-                        );
+                        if snare_interpose::waits_outside() {
+                            eprintln!(
+                                "snare: every thread has been blocked for {}s waiting on a child \
+                                 process or on what one may write; the clock moves with real \
+                                 time until it is done",
+                                HELD_WARNING.as_secs()
+                            );
+                        } else {
+                            eprintln!(
+                                "snare: every thread has been blocked on the clock for {}s while \
+                                 it is held or running slowly toward its next timer; if it is \
+                                 paused, advance or resume it from outside the simulation",
+                                HELD_WARNING.as_secs()
+                            );
+                        }
                     }
                     continue;
                 }
@@ -1283,6 +1459,7 @@ impl Readiness {
             snare_interpose::pass_gate();
             state = self.state.lock().unwrap();
         }
+        parked.unregister(&mut state);
         drop(state);
         result
     }
@@ -1301,6 +1478,9 @@ impl Readiness {
         timeout: Duration,
         parked: &mut Parked,
     ) -> (MutexGuard<'a, State>, bool, bool) {
+        if std::mem::take(&mut parked.last_stale) {
+            parked.settled = Some(snare_interpose::bump_epoch());
+        }
         if let Some(settled) = parked.settled.take() {
             let (next, bumped) = self.unlocked(state, parked, || drop(settled));
             state = next;
@@ -1308,13 +1488,99 @@ impl Readiness {
                 return (state, false, true);
             }
         }
-        let (changed, generation) = parked.asleep(&mut state);
-        let (mut state, result) = changed.wait_timeout(state, timeout).unwrap();
+        let (parker, generation, seen) = parked.asleep(&mut state);
+        drop(state);
+        let (_, timed_out) = parker.wait(seen, timeout);
+        let mut state = self.state.lock().unwrap();
         let bumped = state.awake(parked.waiter, generation);
         if bumped {
             Self::woke(&mut state, parked);
         }
-        (state, result.timed_out(), bumped)
+        (state, timed_out, bumped)
+    }
+
+    /// [`sleep`](Self::sleep), then `ready`. A waiter a bump woke re-checks before it takes the
+    /// lock again: the bump left it marked stale and counted asleep, so the domain stays settling
+    /// until it has re-checked, as though it held the lock. A bump matching its interests during
+    /// the check, or any bump while a check changed those interests, makes it check again. Once a
+    /// check is final it counts itself awake and takes its mark (see [`woke`](Self::woke)) holding
+    /// the lock. A waiter woken any other way (its sleep timed out) re-checks holding the lock.
+    /// Returns whether the sleep timed out, whether a bump reached the waiter, and what `ready`
+    /// said.
+    fn sleep_checked<'a>(
+        &'a self,
+        mut state: MutexGuard<'a, State>,
+        timeout: Duration,
+        parked: &mut Parked,
+        ready: &mut impl FnMut() -> bool,
+    ) -> (MutexGuard<'a, State>, bool, bool, bool) {
+        if std::mem::take(&mut parked.last_stale) {
+            parked.settled = Some(snare_interpose::bump_epoch());
+        }
+        if let Some(settled) = parked.settled.take() {
+            let (next, bumped) = self.unlocked(state, parked, || drop(settled));
+            state = next;
+            if bumped {
+                let ready_now = ready();
+                return (state, false, true, ready_now);
+            }
+        }
+        let (parker, generation, seen) = parked.asleep(&mut state);
+        drop(state);
+        let (signalled, timed_out) = parker.wait(seen, timeout);
+        if !signalled {
+            let mut state = self.state.lock().unwrap();
+            let bumped = state.awake(parked.waiter, generation);
+            if bumped {
+                Self::woke(&mut state, parked);
+            }
+            let ready_now = ready();
+            return (state, timed_out, bumped, ready_now);
+        }
+        let mut checked = parker.generation.load(Ordering::Acquire);
+        loop {
+            let bumps = BUMPS.load(Ordering::SeqCst);
+            let ready_now = ready();
+            let mut state = self.state.lock().unwrap();
+            let now = parker.generation.load(Ordering::Acquire);
+            if !ready_now && now != checked {
+                checked = now;
+                continue;
+            }
+            if !ready_now && parked.retune(&mut state) && BUMPS.load(Ordering::SeqCst) != bumps {
+                continue;
+            }
+            state.awake(parked.waiter, generation);
+            Self::woke(&mut state, parked);
+            return (state, false, true, ready_now);
+        }
+    }
+
+    /// Runs `ready` with the lock let go, for a waiter not yet counted parked, and takes the lock
+    /// back; checks again as [`sleep_checked`](Self::sleep_checked) does.
+    fn check<'a>(
+        &'a self,
+        mut state: MutexGuard<'a, State>,
+        parked: &mut Parked,
+        ready: &mut impl FnMut() -> bool,
+    ) -> (MutexGuard<'a, State>, bool) {
+        loop {
+            let generation = state.generation_of(parked.waiter);
+            let bumps = BUMPS.load(Ordering::SeqCst);
+            drop(state);
+            let ready_now = ready();
+            state = self.state.lock().unwrap();
+            if ready_now {
+                return (state, true);
+            }
+            if state.generation_of(parked.waiter) != generation {
+                continue;
+            }
+            if parked.retune(&mut state) && BUMPS.load(Ordering::SeqCst) != bumps {
+                continue;
+            }
+            return (state, false);
+        }
     }
 
     /// Lets go of the lock to run `f` and takes it back, the waiter counted asleep meanwhile: it
@@ -1327,7 +1593,7 @@ impl Readiness {
         parked: &mut Parked,
         f: impl FnOnce(),
     ) -> (MutexGuard<'a, State>, bool) {
-        let (_, generation) = parked.asleep(&mut state);
+        let (_, generation, _) = parked.asleep(&mut state);
         drop(state);
         f();
         let mut state = self.state.lock().unwrap();
@@ -1338,12 +1604,11 @@ impl Readiness {
         (state, bumped)
     }
 
-    /// A waiter back holding the lock after a bump stops being stale; the last to do so moves the
-    /// epoch (see [`sleep`](Self::sleep)).
+    /// A waiter back holding the lock after a bump stops being stale. The last to do so moves the
+    /// epoch if it waits on (see [`sleep`](Self::sleep)), as the domain may be quiescent then; if it
+    /// leaves the wait instead, the domain was not quiescent before it ran and is not after.
     fn woke(state: &mut State, parked: &mut Parked) {
-        if state.rechecked(parked.waiter) && snare_interpose::executive_attached() {
-            parked.settled = Some(snare_interpose::bump_epoch());
-        }
+        parked.last_stale |= state.rechecked(parked.waiter);
     }
 
     /// Runs `f` under the readiness lock with whether a woken waiter of the domain with key
@@ -1394,18 +1659,23 @@ impl Readiness {
     }
 }
 
+/// A wait's registration, 0 before it registers and once it has unregistered itself on its way
+/// out holding the lock; one still registered when the wait unwinds is dropped here.
 struct Subscription<'a> {
     readiness: &'a Readiness,
-    id: u64,
+    id: std::cell::Cell<u64>,
 }
 
 impl Drop for Subscription<'_> {
     fn drop(&mut self) {
-        self.readiness
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .unregister(self.id);
+        let id = self.id.get();
+        if id != 0 {
+            self.readiness
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .unregister(id);
+        }
     }
 }
 
@@ -1414,6 +1684,8 @@ impl Drop for Subscription<'_> {
 #[derive(Default)]
 struct Parked<'a> {
     waiter: u64,
+    /// Where the wait's [`Subscription`] keeps its id, cleared once the waiter unregisters.
+    subscription: Option<&'a std::cell::Cell<u64>>,
     time_sensitive: Option<&'a std::cell::Cell<bool>>,
     steady: Option<&'a std::cell::Cell<bool>>,
     /// When the wait falls due on the virtual clock: the instant it waits for, or the one its
@@ -1429,16 +1701,32 @@ struct Parked<'a> {
     left: Option<snare_interpose::EpochBump>,
     /// The epoch callback released when this was the last woken waiter to run.
     settled: Option<snare_interpose::EpochBump>,
+    /// Its last re-check took its domain's last stale mark and it has not waited since.
+    last_stale: bool,
 }
 
 impl Parked<'_> {
-    fn asleep(&self, state: &mut State) -> (Arc<Condvar>, u64) {
-        let keys = self.dynamic_keys.map(std::cell::RefCell::borrow);
-        let timing = Timing {
+    fn timing(&self) -> Timing {
+        Timing {
             sensitive: self.timer_sensitive(),
             due: self.due,
             steady: self.unfiled_deadline || self.steady.is_none_or(std::cell::Cell::get),
-        };
+        }
+    }
+
+    /// Registers what the waiter's last check found it listens to (see [`State::retune`]).
+    fn retune(&self, state: &mut State) -> bool {
+        let keys = self.dynamic_keys.map(std::cell::RefCell::borrow);
+        state.retune(
+            self.waiter,
+            self.timing(),
+            keys.as_ref().map(|keys| keys.as_slice()),
+        )
+    }
+
+    fn asleep(&self, state: &mut State) -> (Arc<Parker>, u64, u64) {
+        let keys = self.dynamic_keys.map(std::cell::RefCell::borrow);
+        let timing = self.timing();
         state.asleep(
             self.waiter,
             timing,
@@ -1448,6 +1736,14 @@ impl Parked<'_> {
 
     fn timer_sensitive(&self) -> bool {
         self.time_sensitive.is_none_or(std::cell::Cell::get)
+    }
+
+    /// Ends the wait's registration, under the lock it leaves with.
+    fn unregister(&self, state: &mut State) {
+        state.unregister(self.waiter);
+        if let Some(subscription) = self.subscription {
+            subscription.set(0);
+        }
     }
     /// Counts the waiter as parked, returning the epoch callback that released, if any, for the
     /// caller to run once it has let go of the readiness lock.
@@ -1463,7 +1759,12 @@ impl Parked<'_> {
         if !self.entered || self.left.is_some() {
             return true;
         }
-        match snare_interpose::try_leave_sim_wait() {
+        let left = if self.last_stale {
+            snare_interpose::try_leave_sim_wait_settled()
+        } else {
+            snare_interpose::try_leave_sim_wait()
+        };
+        match left {
             Some(bump) => {
                 self.left = Some(bump);
                 true
@@ -1601,7 +1902,7 @@ mod tests {
             assert_eq!(state.waiters[0].generation, 1);
             assert_eq!(state.waiters[0].stale, 0);
 
-            let (_, generation) = state.asleep(
+            let (_, generation, _) = state.asleep(
                 id,
                 Timing {
                     sensitive: false,
@@ -1635,7 +1936,7 @@ mod tests {
             state.bump(7, WakeEvent::Keys(&key), |_| notified += 1);
             assert_eq!(notified, 1);
             assert_eq!(state.waiters[0].generation, 1);
-            let (_, generation) = state.asleep(
+            let (_, generation, _) = state.asleep(
                 reused,
                 Timing {
                     sensitive: false,
@@ -2129,7 +2430,7 @@ mod tests {
             let id = board.state.lock().unwrap().register(domain.key(), None);
             let _subscription = Subscription {
                 readiness: board,
-                id,
+                id: std::cell::Cell::new(id),
             };
             let generation = || {
                 board

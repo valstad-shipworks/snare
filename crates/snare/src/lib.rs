@@ -63,6 +63,7 @@ compile_error!(
      any(target_arch = \"x86_64\", target_arch = \"aarch64\")), target_os = \"macos\", windows))`"
 );
 
+mod ancillary;
 mod clock;
 mod dns;
 #[cfg(unix)]
@@ -75,6 +76,10 @@ mod faults;
 #[cfg(unix)]
 mod fs_locks;
 #[cfg(unix)]
+mod fs_mmap;
+#[cfg(unix)]
+mod fs_perm;
+#[cfg(unix)]
 mod fs_sim;
 #[cfg(unix)]
 mod ifaddrs;
@@ -84,6 +89,7 @@ mod limits;
 mod netif;
 mod netpolicy;
 mod netstats;
+mod notices;
 mod packet;
 mod pcapng;
 #[cfg(unix)]
@@ -94,6 +100,8 @@ mod procnet;
 mod qdisc;
 mod random;
 mod readiness;
+#[cfg(unix)]
+mod realfd;
 pub mod sched;
 mod scope;
 mod signals;
@@ -105,10 +113,14 @@ mod stream;
 mod tcp_transport;
 mod tester;
 #[cfg(unix)]
+mod tracefs;
+#[cfg(unix)]
 mod tstamp;
 
 #[cfg(windows)]
 mod win_adapter;
+#[cfg(windows)]
+mod win_cpu;
 #[cfg(windows)]
 mod win_host;
 #[cfg(windows)]
@@ -126,6 +138,14 @@ use crate::clock::Clock;
 #[cfg(unix)]
 use crate::clock::ClockLayer;
 use crate::scope::SimShared;
+
+/// std's `RandomState` draws its keys once per thread and keeps them, so a map snare made with it
+/// on the thread that builds a sim, or under passthrough, would fix that thread's keys from the
+/// OS's entropy rather than the sim's seed, and the code under test's hash order there would no
+/// longer replay.
+type FixedState = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
+pub(crate) type HashMap<K, V> = std::collections::HashMap<K, V, FixedState>;
+pub(crate) type HashSet<T> = std::collections::HashSet<T, FixedState>;
 
 pub use dns::{
     DnsFailure, DnsPolicy, add_host, remove_host, set_default_dns_policy, set_dns_policy,
@@ -173,6 +193,8 @@ pub use sockets::{
 pub use tester::{Recorder, Tester, TesterAction, connect_tester, udp_tester};
 #[doc(hidden)]
 pub use tester::{RunTester as __RunTester, run_testers as __run_testers};
+#[cfg(unix)]
+pub use tracefs::{Tracefs, TracefsFault, TracefsSim};
 
 #[cfg(windows)]
 pub use win_adapter::{Adapter, AdapterKey, AdvancedProperty, RegValue};
@@ -201,9 +223,18 @@ fn with_proc_net(
 /// first, then `fs` for every path the host declines.
 #[cfg(unix)]
 fn host_files(host: &Arc<SimHost>, fs: Option<&Arc<VirtualFs>>) -> Arc<dyn snare_interpose::Fs> {
-    match fs {
-        Some(fs) => Arc::new(fs_sim::FsChain(vec![host.clone(), fs.clone()])),
-        None => host.clone(),
+    let mut planes: Vec<Arc<dyn snare_interpose::Fs>> = Vec::new();
+    if let Some(tracefs) = host.tracefs_plane() {
+        planes.push(tracefs);
+    }
+    planes.push(host.clone());
+    if let Some(fs) = fs {
+        planes.push(fs.clone());
+    }
+    if planes.len() == 1 {
+        host.clone()
+    } else {
+        Arc::new(fs_sim::FsChain(planes))
     }
 }
 
@@ -1017,13 +1048,18 @@ impl SimBuilder {
     /// waits for good. Progress is a participant blocking or waking, a lease taken or given back,
     /// virtual time moving (a time skip, a clock write, a scaled or granted clock flowing, the
     /// latency each non-blocking call is charged) or, under [`deterministic`](Self::deterministic),
-    /// a participant beginning a wait in the schedule. It never fires while every participant is
-    /// blocked — on a paused clock, on an [`Executive`](crate::sched::Executive), on locks only a
+    /// a participant beginning a wait in the schedule. Running is measured in CPU time as well:
+    /// the participants running must also have used `after` of it, so one the OS has not let
+    /// run is not taken for a spin. One blocked in a call snare does not hook (a real pipe nobody
+    /// writes, `waitpid`) uses no CPU time either; it fails the run once it has gone ten times
+    /// `after`, and at least 5 s, of real time without progress. It never fires
+    /// while every participant is blocked — on a paused clock, on an
+    /// [`Executive`](crate::sched::Executive), on locks only a
     /// thread outside the sim can release — nor while a lease ([`Sim::busy`],
     /// [`sched::setup_scope`]) is held or an executive's timestamp is open, nor on a sim built
     /// [`wall_clock`](Self::wall_clock), whose time moves on its own. So a participant that
-    /// legitimately runs longer than `after` without a hooked call — a long computation, a
-    /// blocking call snare does not hook, work under [`real`] — must hold `busy` across it.
+    /// legitimately runs longer than `after` without a hooked call — a long computation, work
+    /// under [`real`] — must hold `busy` across it.
     ///
     /// On firing, a report naming each participant (running, or what it waits in and until when,
     /// what it last waited in, the leases it holds) is attempted on the process's stderr, past
@@ -1078,9 +1114,6 @@ impl SimBuilder {
             }
         }
         let shared = SimShared::new(self.seed, clock.clone());
-        if let Some(fs) = &self.fs {
-            fs.attach_clock(clock.clone());
-        }
         #[cfg(target_os = "linux")]
         shared
             .rx_timestamp_startup
@@ -1120,12 +1153,16 @@ impl SimBuilder {
         }
         if let Some(host) = &self.host {
             host.attach_fabric(fabric.registries());
+            shared.sys.model_identity();
         }
         if let Some(privileges) = self.privileges {
             shared.sys.set_privileges(|p| *p = privileges);
         }
         if let Some(limits) = self.sys_limits {
             shared.sys.set_limits(|l| *l = limits);
+        }
+        if let Some(fs) = &self.fs {
+            fs.attach(clock.clone(), &shared);
         }
         if let Some(host) = &self.host {
             // The host owns the NIC/scheduling/synthetic-fs planes: its `Net` handles the

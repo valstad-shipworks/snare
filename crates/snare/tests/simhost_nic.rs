@@ -96,11 +96,12 @@ fn ethtool_drvinfo_reports_the_driver() {
 #[test]
 fn driver_info_lengths_and_string_set_counts_follow_the_profile() {
     for deterministic in [false, true] {
-        for (registers, eeprom, private_flags) in [(0, 0, 0), (4096, 32768, 7)] {
+        for (registers, eeprom, private_flags, self_tests) in [(0, 0, 0, 0), (4096, 32768, 7, 5)] {
             let mut nic = Nic::new("eth0", 7)
                 .register_dump_len(registers)
                 .eeprom_len(eeprom)
-                .private_flags_count(private_flags);
+                .private_flags_count(private_flags)
+                .self_test_count(self_tests);
             let stats = if private_flags == 0 { 0 } else { 2 };
             if stats != 0 {
                 nic = nic.driver_stats([("rx_packets", 10), ("tx_packets", 20)]);
@@ -110,6 +111,7 @@ fn driver_info_lengths_and_string_set_counts_follow_the_profile() {
             assert_eq!(view.register_dump_len, registers);
             assert_eq!(view.eeprom_len, eeprom);
             assert_eq!(view.private_flags_count, private_flags);
+            assert_eq!(view.self_test_count, self_tests);
             let mut builder = Sim::builder().host(host);
             if deterministic {
                 builder = builder.deterministic();
@@ -126,30 +128,25 @@ fn driver_info_lengths_and_string_set_counts_follow_the_profile() {
                         |offset| u32::from_ne_bytes(info[offset..offset + 4].try_into().unwrap());
                     assert_eq!(word(176), private_flags);
                     assert_eq!(word(180), stats);
-                    assert_eq!(word(184), 0);
+                    assert_eq!(word(184), self_tests);
                     assert_eq!(word(188), eeprom);
                     assert_eq!(word(192), registers);
                     assert_eq!(&info[164..176], &[0; 12]);
                 }
-                let mut sets = [0u8; 24];
+                let mut sets = [0u8; 28];
                 sets[..4].copy_from_slice(&0x37u32.to_ne_bytes());
-                sets[8..16].copy_from_slice(&((1u64 << 1) | (1u64 << 2)).to_ne_bytes());
+                sets[8..16].copy_from_slice(&0b111u64.to_ne_bytes());
                 req.data = sets.as_mut_ptr() as usize;
                 assert_eq!(unsafe { libc::ioctl(fd, SIOCETHTOOL, &mut req) }, 0);
                 let mask = u64::from_ne_bytes(sets[8..16].try_into().unwrap());
-                assert_eq!(
-                    mask,
-                    if private_flags == 0 {
-                        0
-                    } else {
-                        (1 << 1) | (1 << 2)
-                    }
-                );
-                if private_flags != 0 {
-                    assert_eq!(u32::from_ne_bytes(sets[16..20].try_into().unwrap()), stats);
+                let count = |at: usize| u32::from_ne_bytes(sets[at..at + 4].try_into().unwrap());
+                if private_flags == 0 {
+                    assert_eq!(mask, 0);
+                } else {
+                    assert_eq!(mask, 0b111);
                     assert_eq!(
-                        u32::from_ne_bytes(sets[20..24].try_into().unwrap()),
-                        private_flags
+                        [count(16), count(20), count(24)],
+                        [self_tests, stats, private_flags]
                     );
                 }
                 unsafe { libc::close(fd) };

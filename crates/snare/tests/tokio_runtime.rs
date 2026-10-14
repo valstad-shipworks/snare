@@ -231,3 +231,49 @@ fn a_static_socketpair_is_each_sims_own() {
         }
     });
 }
+
+/// A wake that a thread of another sim carries reaches a deterministic sim before the sim skips
+/// time past it, as tokio's signal driver in one sim wakes the listeners of every sim once it
+/// takes the process-wide record of a signal another sim raised. The two sims share a socketpair
+/// kept in a static, as tokio's signal pipe, and the carrier is slow to make the wake while the
+/// deterministic sim has nothing else to run.
+#[test]
+fn a_wake_another_sim_carries_reaches_a_deterministic_sim_before_it_skips_time() {
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock, mpsc};
+
+    static PAIR: OnceLock<(UnixStream, UnixStream)> = OnceLock::new();
+    static WAITING: AtomicBool = AtomicBool::new(false);
+    static WAKE: Mutex<Option<mpsc::Sender<()>>> = Mutex::new(None);
+
+    let (made, pair_made) = mpsc::channel();
+    let carrier = std::thread::spawn(move || {
+        sim(false).run(|| {
+            PAIR.get_or_init(|| UnixStream::pair().unwrap());
+            made.send(()).unwrap();
+            snare::real(|| {
+                while !WAITING.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            });
+            let wake = WAKE.lock().unwrap().take().unwrap();
+            wake.send(()).unwrap();
+        })
+    });
+    pair_made.recv().unwrap();
+    let waited = sim(true).run(|| {
+        PAIR.get().unwrap().1.set_nonblocking(true).unwrap();
+        let (wake, woken) = mpsc::channel();
+        *WAKE.lock().unwrap() = Some(wake);
+        let start = Instant::now();
+        WAITING.store(true, Ordering::SeqCst);
+        woken
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the carried wake arrived");
+        start.elapsed()
+    });
+    carrier.join().unwrap();
+    assert!(waited < Duration::from_secs(5), "{waited:?}");
+}
