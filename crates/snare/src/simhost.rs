@@ -2818,7 +2818,7 @@ impl SimHost {
             let tid = state.resolve(0);
             let affinity = state.threads[&tid].affinity.clone();
             if affinity.is_empty() {
-                Some(state.online.iter().copied().collect())
+                Some(state.online.to_vec())
             } else {
                 Some(affinity)
             }

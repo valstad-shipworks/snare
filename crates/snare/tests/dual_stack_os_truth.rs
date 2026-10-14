@@ -1184,6 +1184,10 @@ fn compare(scenario: fn() -> Vec<String>) {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "IP_TOS on a dual-stack socket: the model refuses it as Windows 11 build 26200 does; Windows Server on the GitHub runner accepts it (OPEN_BUGS.md, Ignored validation)"
+)]
 fn v6only_option_os_truth() {
     compare(options);
 }

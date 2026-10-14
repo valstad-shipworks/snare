@@ -327,6 +327,10 @@ fn information_probe(relationship: Option<i32>, packages: bool) -> Vec<String> {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "the record a too-small buffer leaves first differs on the GitHub runners (OPEN_BUGS.md, Ignored validation)"
+)]
 fn logical_processor_information_matches_the_host() {
     let _host = host_state();
     let packages = one_package();
