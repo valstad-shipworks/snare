@@ -887,6 +887,17 @@ fn shared_unicast_os_truth() {
 
 #[test]
 fn shared_multicast_os_truth() {
+    let unroutable = snare::real(|| {
+        let tx = os::socket(false, false);
+        let to = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 42, 91)), 9);
+        let sent = os::send_to(tx, to, b"m");
+        os::close(tx);
+        matches!(&sent, Err(e) if e.ends_with(" 65") || e.ends_with(" 51"))
+    });
+    if unroutable {
+        eprintln!("skipped: this host has no route for multicast");
+        return;
+    }
     compare(multicast);
 }
 

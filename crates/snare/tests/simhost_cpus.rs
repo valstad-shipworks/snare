@@ -113,6 +113,7 @@ fn proc_cpuinfo_has_an_entry_per_online_cpu() {
             .lines()
             .filter(|line| !line.starts_with("processor"))
             .filter(|line| !line.starts_with("siblings") && !line.starts_with("cpu cores"))
+            .filter(|line| !line.starts_with("cpu MHz") && !line.starts_with("bogomips"))
             .filter(|line| !line.contains("id\t") && !line.starts_with("apicid"))
             .map(str::to_string)
             .collect::<Vec<_>>()

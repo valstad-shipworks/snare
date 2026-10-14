@@ -369,6 +369,12 @@ by version or capability, not a runner fault:
   (cache) where the model writes relationship 0 (processor core) first; the record order is the
   kernel's and the model's differ.
 
+- **Africa/Casablanca on macOS** (`local_time_os_truth::local_time_matches_the_c_library`, the
+  zone is skipped there): the macOS runner's C library prints `%Z` as `XXX` or `+200` and `%z`
+  as `+0200` for 2024 instants in that zone, where the model prints `+00`/`+0000` from the
+  zone file's negative-daylight-time rules; which tzdata the runner carries, and what its
+  `strftime` does with that zone's abbreviations, is undetermined.
+
 Four tests retain guards for information unavailable at the current interception boundary:
 
 - **Linux environment enumeration:** `edge_host_env::iterating_an_isolated_environment_lists_only_its_variables`

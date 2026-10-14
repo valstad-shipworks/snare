@@ -3162,14 +3162,12 @@ impl SimHost {
         let devnull =
             snare_interpose::real(|| unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) });
         let clock = Arc::new(Clock::new(p.tai_offset_secs));
-        let tracefs = p.tracefs.clone().map(|spec| {
-            Arc::new(crate::tracefs::TracefsPlane::new(
-                spec,
-                p.root,
-                p.cpu_count,
-                clock.clone(),
-            ))
-        });
+        let tracefs = Some(Arc::new(crate::tracefs::TracefsPlane::new(
+            p.tracefs.clone(),
+            p.root,
+            p.cpu_count,
+            clock.clone(),
+        )));
         SimHost {
             tracefs,
             state: Mutex::new(HostState {

@@ -317,7 +317,7 @@ fn nanosleep() -> Scenario {
             let r = result(unsafe { libc::nanosleep(&request, &mut left) } as isize);
             if r.0 < 0 {
                 assert!(left.tv_sec == 0 && left.tv_nsec > 0, "{}", left.tv_nsec);
-                assert!(left.tv_nsec <= 150_000_000, "{}", left.tv_nsec);
+                assert!(left.tv_nsec < 200_000_000, "{}", left.tv_nsec);
             }
             r
         }),

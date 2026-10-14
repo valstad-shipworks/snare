@@ -625,6 +625,9 @@ struct State {
 
 /// The plane: one tracefs per sim.
 pub struct TracefsPlane {
+    /// The profile has no tracefs: every path under the mount is `ENOENT`, so the real
+    /// machine's never leaks through.
+    absent: bool,
     state: Mutex<State>,
     devnull: c_int,
     clock: Arc<Clock>,
@@ -2381,7 +2384,14 @@ const MODE_RO: u32 = 0o100444;
 const MODE_DIR: u32 = 0o040755;
 
 impl TracefsPlane {
-    pub(crate) fn new(spec: Tracefs, root: bool, cpu_count: usize, clock: Arc<Clock>) -> Self {
+    pub(crate) fn new(
+        spec: Option<Tracefs>,
+        root: bool,
+        cpu_count: usize,
+        clock: Arc<Clock>,
+    ) -> Self {
+        let absent = spec.is_none();
+        let spec = spec.unwrap_or_default();
         let devnull = snare_interpose::real(|| unsafe {
             libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC)
         });
@@ -2389,6 +2399,7 @@ impl TracefsPlane {
         let mut instances = BTreeMap::new();
         instances.insert(String::new(), Instance::new(cpu_count, spec.snapshot));
         Self {
+            absent,
             state: Mutex::new(State {
                 spec,
                 root,
@@ -2446,12 +2457,22 @@ impl TracefsPlane {
         self.host.get()?.upgrade()?.current_affinity()
     }
 
-    fn located(path: &Path) -> Option<(String, String)> {
-        locate(path)
+    /// Where `path` points under the mount; `Err` is the errno to answer for a path there on a
+    /// host that has no tracefs.
+    fn located(&self, path: &Path) -> Option<Result<(String, String), c_int>> {
+        let at = locate(path)?;
+        Some(if self.absent {
+            Err(libc::ENOENT)
+        } else {
+            Ok(at)
+        })
     }
 
     fn stat_of(&self, path: &Path, buf: *mut u8, statx: bool) -> Option<FsResult> {
-        let (instance, rel) = Self::located(path)?;
+        let (instance, rel) = match self.located(path)? {
+            Ok(at) => at,
+            Err(e) => return err(e),
+        };
         let state = self.state();
         let (mode, links) = match state.node(&instance, &rel)? {
             Node::Dir(_) => (MODE_DIR, 2),
@@ -2510,7 +2531,10 @@ impl Fs for TracefsPlane {
 
     unsafe fn open(&self, path: *const c_char, flags: c_int, _mode: u32) -> Option<FsResult> {
         let path = unsafe { path_of(path) }?;
-        let (instance, rel) = Self::located(&path)?;
+        let (instance, rel) = match self.located(&path)? {
+            Ok(at) => at,
+            Err(e) => return err(e),
+        };
         let writing = flags & (libc::O_WRONLY | libc::O_RDWR) != 0;
         let shared = self.shared();
         let now = self.now();
@@ -2660,7 +2684,9 @@ impl Fs for TracefsPlane {
 
     unsafe fn stat(&self, path: *const c_char, buf: *mut u8) -> Option<FsResult> {
         let path = unsafe { path_of(path) }?;
-        Self::located(&path)?;
+        if let Err(e) = self.located(&path)? {
+            return err(e);
+        }
         self.stat_of(&path, buf, false)
             .or_else(|| err(libc::ENOENT))
     }
@@ -2695,13 +2721,18 @@ impl Fs for TracefsPlane {
             return self.stat_of(&p, buf, true).or_else(|| err(libc::ENOENT));
         }
         let path = unsafe { path_of(path) }?;
-        Self::located(&path)?;
+        if let Err(e) = self.located(&path)? {
+            return err(e);
+        }
         self.stat_of(&path, buf, true).or_else(|| err(libc::ENOENT))
     }
 
     unsafe fn access(&self, path: *const c_char, mode: c_int) -> Option<FsResult> {
         let path = unsafe { path_of(path) }?;
-        let (instance, rel) = Self::located(&path)?;
+        let (instance, rel) = match self.located(&path)? {
+            Ok(at) => at,
+            Err(e) => return err(e),
+        };
         let state = self.state();
         let Some(node) = state.node(&instance, &rel) else {
             return err(libc::ENOENT);
@@ -2848,7 +2879,10 @@ impl Fs for TracefsPlane {
         }
         let text = unsafe { std::slice::from_raw_parts(buf, len) };
         let text = String::from_utf8_lossy(text).into_owned();
-        let (instance, rel) = Self::located(&path)?;
+        let (instance, rel) = match self.located(&path)? {
+            Ok(at) => at,
+            Err(e) => return err(e),
+        };
         let shared = self.shared();
         let now = self.now();
         let mut state = self.state();
@@ -2947,7 +2981,10 @@ impl Fs for TracefsPlane {
 
     unsafe fn mkdir(&self, path: *const c_char, _mode: u32) -> Option<FsResult> {
         let path = unsafe { path_of(path) }?;
-        let (instance, rel) = Self::located(&path)?;
+        let (instance, rel) = match self.located(&path)? {
+            Ok(at) => at,
+            Err(e) => return err(e),
+        };
         let mut state = self.state();
         if !instance.is_empty() && rel.is_empty() {
             if !state.root {
@@ -2979,7 +3016,10 @@ impl Fs for TracefsPlane {
 
     unsafe fn rmdir(&self, path: *const c_char) -> Option<FsResult> {
         let path = unsafe { path_of(path) }?;
-        let (instance, rel) = Self::located(&path)?;
+        let (instance, rel) = match self.located(&path)? {
+            Ok(at) => at,
+            Err(e) => return err(e),
+        };
         if !instance.is_empty() && rel.is_empty() {
             if !self.state().root {
                 return err(libc::EACCES);
@@ -2996,7 +3036,10 @@ impl Fs for TracefsPlane {
 
     unsafe fn unlink(&self, path: *const c_char) -> Option<FsResult> {
         let path = unsafe { path_of(path) }?;
-        let (instance, rel) = Self::located(&path)?;
+        let (instance, rel) = match self.located(&path)? {
+            Ok(at) => at,
+            Err(e) => return err(e),
+        };
         match self.state().node(&instance, &rel) {
             Some(Node::Dir(_)) => err(libc::EISDIR),
             Some(_) => err(libc::EPERM),
@@ -3006,7 +3049,10 @@ impl Fs for TracefsPlane {
 
     unsafe fn opendir(&self, path: *const c_char) -> Option<FsResult> {
         let path = unsafe { path_of(path) }?;
-        let (instance, rel) = Self::located(&path)?;
+        let (instance, rel) = match self.located(&path)? {
+            Ok(at) => at,
+            Err(e) => return err(e),
+        };
         let mut state = self.state();
         let entries = match state.node(&instance, &rel) {
             Some(Node::Dir(e)) => e,
