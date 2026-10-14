@@ -23,7 +23,7 @@
 //! Tester-facing entry points run under [`snare_interpose::real`], so their own waits on these
 //! locks are not counted as blocked threads by quiescence detection.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::ffi::c_int;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -31,7 +31,9 @@ use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use snare_interpose::{Fs, Net, NetResult};
+use snare_interpose::{Fs, Net, NetResult, Restart};
+
+use crate::{HashMap, HashSet};
 
 #[cfg(target_os = "macos")]
 mod mac_shutdown;
@@ -92,6 +94,8 @@ pub(crate) struct Datagram {
     rx_fallback: Arc<std::sync::OnceLock<Duration>>,
     /// The smallest MTU on its path ([`crate::netif::Copy::mtu`]).
     mtu: Option<u32>,
+    /// Its IP header fields and receiving interface, for the receiver's control messages.
+    ip: crate::ancillary::Header,
     sequence: u64,
 }
 
@@ -165,6 +169,7 @@ impl DgramQueue {
         via: Option<(Arc<LinkState>, u64)>,
         sent: Stamp,
         mtu: Option<u32>,
+        ip: crate::ancillary::Header,
         domain: usize,
     ) {
         let arrives = (!delay.is_zero()).then(|| Deadline::after(delay));
@@ -180,6 +185,7 @@ impl DgramQueue {
             #[cfg(target_os = "linux")]
             rx_fallback: Arc::default(),
             mtu,
+            ip,
             sequence: readiness_sequence(),
         };
         self.packets.lock().unwrap().push(dg, self.rec.as_deref());
@@ -227,6 +233,14 @@ impl DgramQueue {
     /// How many datagrams have landed so far: the socket's read wakes (see [`Wakes`]).
     fn landed(&self) -> u64 {
         self.packets.lock().unwrap().landed(self.rec.as_deref())
+    }
+
+    /// [`has`](Self::has) any datagram, then [`landed`](Self::landed).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn readable_landed(&self) -> (bool, u64) {
+        let mut packets = self.packets.lock().unwrap();
+        let rec = self.rec.as_deref();
+        (packets.has(|_| true, rec), packets.landed(rec))
     }
 }
 
@@ -500,8 +514,10 @@ impl End {
 ///
 pub struct Listener {
     rec: Option<std::sync::Weak<SockRec>>,
-    /// The address it listens on, possibly a wildcard.
+    /// The address it listens on, possibly a wildcard; a v4-mapped one as IPv4.
     addr: SocketAddr,
+    /// A dual-stack socket at the IPv6 wildcard: it takes IPv4 connections too.
+    dual: bool,
     /// Established connections not yet accepted, oldest first.
     pending: Mutex<VecDeque<Arc<Conn>>>,
     capacity: AtomicUsize,
@@ -519,6 +535,15 @@ pub struct Listener {
 impl Listener {
     fn wake_key(&self) -> Option<crate::readiness::WakeKey> {
         self.rec.as_ref()?.upgrade().map(|rec| rec.wake_key())
+    }
+
+    /// How it shares its address with other listeners there.
+    fn share(&self) -> Share {
+        self.rec
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .map(|rec| Share::of(&rec))
+            .unwrap_or_default()
     }
 
     /// Takes the next connection, or `None` if none is waiting.
@@ -598,9 +623,9 @@ impl Drop for ListenerAdmission {
 /// The per-`Sim` listener and datagram registries, shared by the `Fabric` and the tester free
 /// functions (via the thread-local scope below) so tests never clobber each other's state.
 pub(crate) struct Registries {
-    /// Address → the listener there, the code under test's or a tester's. Keyed on the exact
+    /// Address → the listeners there, the code under test's or a tester's. Keyed on the exact
     /// address, so a wildcard listener is found only by [`Fabric::listener_for`]'s fallback.
-    listeners: Mutex<HashMap<SocketAddr, Arc<Listener>>>,
+    listeners: Mutex<Listeners>,
     /// Where datagrams to each address land.
     udp: Mutex<UdpRegistry>,
     /// Backends that model datagram sockets of their own (a `SimHost`), so a tester's datagram to
@@ -631,6 +656,12 @@ impl Registries {
     /// receiving socket; each surviving copy is queued after its own delay. Zero means nothing is
     /// bound there, for the caller's ICMP port-unreachable handling. Takes `udp` then releases it
     /// before queueing, which bumps readiness.
+    ///
+    /// `ip` is the header it carries. One with a GSO segment size (a Linux segmented send over
+    /// loopback) reaches a socket with `UDP_GRO` on whole and every other recipient as its
+    /// segments, as net/ipv4/udp.c `udp_queue_rcv_skb` hands a GSO packet to a socket that did not
+    /// ask for one through `udp_rcv_segment`.
+    #[allow(clippy::too_many_arguments)]
     fn deliver(
         &self,
         sender: &Sender,
@@ -638,6 +669,7 @@ impl Registries {
         dest: SocketAddr,
         data: &[u8],
         tx: bool,
+        ip: crate::ancillary::Header,
     ) -> usize {
         let sent = self.shared.tstamp_now();
         let joined = dest.ip().is_multicast() && self.shared.host_joined(dest.ip());
@@ -660,16 +692,37 @@ impl Registries {
                     rec.note_rx_nic(copy.nic.as_deref());
                 }
             }
+            let ip = crate::ancillary::Header {
+                ifindex: copy.ingress.unwrap_or(0),
+                ..ip
+            };
+            let whole = ip.gso == 0 || copy.q.rec.as_deref().is_some_and(crate::ancillary::gro);
             for delay in copy.delays {
-                copy.q.push_after(
-                    src,
-                    data,
-                    delay,
-                    copy.via.clone(),
-                    sent,
-                    copy.mtu,
-                    self.shared.domain_key(),
-                );
+                if whole {
+                    copy.q.push_after(
+                        src,
+                        data,
+                        delay,
+                        copy.via.clone(),
+                        sent,
+                        copy.mtu,
+                        ip,
+                        self.shared.domain_key(),
+                    );
+                    continue;
+                }
+                for segment in data.chunks(usize::from(ip.gso)) {
+                    copy.q.push_after(
+                        src,
+                        segment,
+                        delay,
+                        copy.via.clone(),
+                        sent,
+                        copy.mtu,
+                        crate::ancillary::Header { gso: 0, ..ip },
+                        self.shared.domain_key(),
+                    );
+                }
             }
         };
         match cands {
@@ -697,13 +750,94 @@ impl Registries {
     /// treating as one of the host's own addresses.
     pub(crate) fn station_at(&self, ip: IpAddr) -> bool {
         let endpoint = self.udp.lock().unwrap().endpoints.contains_key(&ip);
-        endpoint
-            || self
-                .listeners
-                .lock()
-                .unwrap()
-                .values()
-                .any(|l| l.tester && l.addr.ip() == ip)
+        endpoint || self.listeners.lock().unwrap().testers.contains_key(&ip)
+    }
+}
+
+/// [`Registries::listeners`]: the listeners by address, several sharing one in the order they
+/// listened, with how many of them are testers' at each IP and the addresses listened on at each
+/// port, so telling a station or a port conflict needs no scan.
+#[derive(Default)]
+struct Listeners {
+    by_addr: HashMap<SocketAddr, Vec<Arc<Listener>>>,
+    testers: HashMap<IpAddr, usize>,
+    ports: HashMap<u16, Vec<SocketAddr>>,
+}
+
+impl Listeners {
+    /// Adds `listener` at `addr`. A tester's replaces every listener there: it stands in for
+    /// another host, which holds the address alone.
+    fn insert(&mut self, addr: SocketAddr, listener: Arc<Listener>) {
+        if !self.by_addr.contains_key(&addr) {
+            self.ports.entry(addr.port()).or_default().push(addr);
+        }
+        if listener.tester {
+            let replaced = self.by_addr.get_mut(&addr).map(std::mem::take);
+            for replaced in replaced.unwrap_or_default() {
+                self.forget_tester(&replaced);
+            }
+            *self.testers.entry(listener.addr.ip()).or_default() += 1;
+        }
+        let held = self.by_addr.entry(addr).or_default();
+        if !held.iter().any(|l| Arc::ptr_eq(l, &listener)) {
+            held.push(listener);
+        }
+    }
+
+    /// Withdraws `listener`, if it is still registered.
+    fn remove(&mut self, listener: &Arc<Listener>) {
+        let addr = listener.addr;
+        let Some(held) = self.by_addr.get_mut(&addr) else {
+            return;
+        };
+        let Some(index) = held.iter().position(|l| Arc::ptr_eq(l, listener)) else {
+            return;
+        };
+        let removed = held.remove(index);
+        let emptied = held.is_empty();
+        self.forget_tester(&removed);
+        if !emptied {
+            return;
+        }
+        self.by_addr.remove(&addr);
+        if let Some(held) = self.ports.get_mut(&addr.port()) {
+            held.retain(|a| *a != addr);
+            if held.is_empty() {
+                self.ports.remove(&addr.port());
+            }
+        }
+    }
+
+    /// The listeners at exactly `addr`, in the order they listened.
+    fn at(&self, addr: &SocketAddr) -> &[Arc<Listener>] {
+        self.by_addr.get(addr).map_or(&[], Vec::as_slice)
+    }
+
+    /// The listeners on `port`, at any address.
+    fn on_port(&self, port: u16) -> impl Iterator<Item = &Arc<Listener>> + '_ {
+        self.ports
+            .get(&port)
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .flat_map(|addr| self.at(addr))
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.by_addr.is_empty()
+    }
+
+    fn forget_tester(&mut self, listener: &Listener) {
+        if !listener.tester {
+            return;
+        }
+        let ip = listener.addr.ip();
+        if let Some(count) = self.testers.get_mut(&ip) {
+            *count -= 1;
+            if *count == 0 {
+                self.testers.remove(&ip);
+            }
+        }
     }
 }
 
@@ -729,8 +863,9 @@ pub(crate) fn deliver_to_endpoints(
     src: SocketAddr,
     dest: SocketAddr,
     data: &[u8],
+    ip: crate::ancillary::Header,
 ) -> usize {
-    snare_interpose::real(|| regs.deliver(sender, src, dest, data, false))
+    snare_interpose::real(|| regs.deliver(sender, src, dest, data, false, ip))
 }
 
 /// The datagram delivery map for one `Sim`: which receive queue a datagram sent to a given address
@@ -738,16 +873,20 @@ pub(crate) fn deliver_to_endpoints(
 /// resolves the destination against it. Multicast memberships live in the sockets' records.
 #[derive(Default)]
 struct UdpRegistry {
-    /// Bound address → the queue to deliver unicast datagrams for that exact address into. Keyed on
-    /// the full `SocketAddr`, so several addresses on one port (snare 1.x's `add_ip_addr`) and a
-    /// wildcard `0.0.0.0`/`::` bind coexist.
-    bound: HashMap<SocketAddr, Arc<DgramQueue>>,
+    /// Bound address → the queues of the sockets bound there, which a unicast datagram for that
+    /// exact address picks among (`netif::pick_shared`). Keyed on the full `SocketAddr`, so
+    /// several addresses on one port (snare 1.x's `add_ip_addr`) and a wildcard `0.0.0.0`/`::`
+    /// bind coexist.
+    bound: HashMap<SocketAddr, Vec<Arc<DgramQueue>>>,
     by_port: HashMap<u16, UdpBindings>,
     endpoints: HashMap<IpAddr, usize>,
     ports: HashMap<IpAddr, UdpPorts>,
     families: [UdpPorts; 2],
+    /// The ports dual-stack sockets hold at the IPv6 wildcard, which IPv4 binds avoid too.
+    dual: UdpPorts,
     references: HashMap<(bool, u16), usize>,
     addresses: HashMap<(IpAddr, u16), usize>,
+    duals: HashMap<u16, usize>,
 }
 
 enum UdpCandidates {
@@ -790,11 +929,11 @@ impl UdpPorts {
         self.count -= 1;
     }
 
-    fn find(&self, start: usize, end: usize) -> Option<u16> {
-        if self.words.is_empty() {
-            return (start < end).then_some(Self::FIRST + start as u16);
-        }
-        let mut word = (start / 64).max(self.first);
+    /// The lowest port from `start` (an offset into the range) short of `end` that none of
+    /// `sets` holds.
+    fn find(sets: &[&UdpPorts], start: usize, end: usize) -> Option<u16> {
+        let full = sets.iter().map(|set| set.first).max().unwrap_or(0);
+        let mut word = (start / 64).max(full);
         while word < Self::WORDS && word * 64 < end {
             let low = start.saturating_sub(word * 64);
             let high = (end - word * 64).min(64);
@@ -804,7 +943,10 @@ impl UdpPorts {
                 } else {
                     (1 << high) - 1
                 };
-            let free = !self.words.get(word).copied().unwrap_or(0) & mask;
+            let taken = sets.iter().fold(0, |taken, set| {
+                taken | set.words.get(word).copied().unwrap_or(0)
+            });
+            let free = !taken & mask;
             if free != 0 {
                 return Some(Self::FIRST + (word * 64 + free.trailing_zeros() as usize) as u16);
             }
@@ -813,11 +955,18 @@ impl UdpPorts {
         None
     }
 
-    fn alloc_from(&self, first: u16) -> u16 {
+    /// The lowest port from `first` that none of `sets` holds, wrapping around the range once; 0
+    /// when every port is taken.
+    fn alloc(sets: &[&UdpPorts], first: u16) -> u16 {
         let start = usize::from(first.max(Self::FIRST) - Self::FIRST);
-        self.find(start, Self::WORDS * 64)
-            .or_else(|| self.find(0, start))
+        Self::find(sets, start, Self::WORDS * 64)
+            .or_else(|| Self::find(sets, 0, start))
             .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn alloc_from(&self, first: u16) -> u16 {
+        Self::alloc(&[self], first)
     }
 }
 
@@ -834,32 +983,49 @@ impl UdpRegistry {
         }
     }
 
-    fn insert(&mut self, addr: SocketAddr, queue: Arc<DgramQueue>) {
-        let endpoint = queue.rec.is_none();
-        let indexed = queue.clone();
-        if let Some(previous) = self.bound.insert(addr, queue) {
-            let bucket = self.by_port.get_mut(&addr.port()).unwrap();
-            let entry = if bucket.first.0 == addr {
-                &mut bucket.first
-            } else {
-                bucket
-                    .rest
-                    .iter_mut()
-                    .find(|entry| entry.0 == addr)
-                    .unwrap()
-            };
-            entry.1 = indexed;
-            if previous.rec.is_none() != endpoint {
-                if endpoint {
-                    self.add_endpoint(addr.ip());
-                } else {
-                    self.remove_endpoint(addr.ip());
-                }
-            }
+    /// Whether `queue` is a dual-stack socket's at `addr`.
+    fn dual_queue(addr: SocketAddr, queue: &DgramQueue) -> bool {
+        queue
+            .rec
+            .as_ref()
+            .is_some_and(|rec| rec.state().dual_at(addr))
+    }
+
+    /// Counts a dual-stack binding on `port` in or out of [`UdpRegistry::dual`].
+    fn count_dual(&mut self, port: u16, add: bool) {
+        if port < UdpPorts::FIRST {
             return;
         }
+        let count = self.duals.entry(port).or_default();
+        if add {
+            *count += 1;
+            if *count == 1 {
+                self.dual.insert(port);
+            }
+        } else {
+            *count -= 1;
+            if *count == 0 {
+                self.duals.remove(&port);
+                self.dual.remove(port);
+            }
+        }
+    }
+
+    /// Registers `queue` at `addr`, beside any other socket's there.
+    fn insert(&mut self, addr: SocketAddr, queue: Arc<DgramQueue>) {
+        let endpoint = queue.rec.is_none();
+        let dual = Self::dual_queue(addr, &queue);
+        let indexed = queue.clone();
+        let held = self.bound.entry(addr).or_default();
+        if held.iter().any(|q| Arc::ptr_eq(q, &queue)) {
+            return;
+        }
+        held.push(queue);
         if endpoint {
             self.add_endpoint(addr.ip());
+        }
+        if dual {
+            self.count_dual(addr.port(), true);
         }
         match self.by_port.entry(addr.port()) {
             std::collections::hash_map::Entry::Occupied(mut bucket) => {
@@ -890,24 +1056,36 @@ impl UdpRegistry {
         *references += 1;
     }
 
-    fn remove(&mut self, addr: &SocketAddr) -> Option<Arc<DgramQueue>> {
-        let queue = self.bound.remove(addr)?;
+    /// Withdraws `queue` from `addr`, if it is registered there.
+    fn remove(&mut self, addr: &SocketAddr, queue: &Arc<DgramQueue>) {
+        let Some(held) = self.bound.get_mut(addr) else {
+            return;
+        };
+        let Some(index) = held.iter().position(|q| Arc::ptr_eq(q, queue)) else {
+            return;
+        };
+        held.remove(index);
+        if held.is_empty() {
+            self.bound.remove(addr);
+        }
         if queue.rec.is_none() {
             self.remove_endpoint(addr.ip());
         }
+        if Self::dual_queue(*addr, queue) {
+            self.count_dual(addr.port(), false);
+        }
+        let mine = |bound: &(SocketAddr, Arc<DgramQueue>)| {
+            bound.0 == *addr && Arc::ptr_eq(&bound.1, queue)
+        };
         let bucket = self.by_port.get_mut(&addr.port()).unwrap();
-        if bucket.first.0 == *addr {
+        if mine(&bucket.first) {
             if let Some(last) = bucket.rest.pop() {
                 bucket.first = last;
             } else {
                 self.by_port.remove(&addr.port());
             }
         } else {
-            let index = bucket
-                .rest
-                .iter()
-                .position(|bound| bound.0 == *addr)
-                .unwrap();
+            let index = bucket.rest.iter().position(mine).unwrap();
             bucket.rest.swap_remove(index);
         }
         if addr.port() >= UdpPorts::FIRST {
@@ -930,30 +1108,43 @@ impl UdpRegistry {
                 self.families[usize::from(addr.is_ipv4())].remove(addr.port());
             }
         }
-        Some(queue)
     }
 
     /// Picks a free ephemeral port for `ip` from the IANA dynamic range (RFC 6335), skipping any
-    /// already bound on that IP — any IP for the wildcard. Called while the registry is locked,
-    /// so the result stays free until the caller inserts it. Returns 0 once the range is full.
+    /// already bound on that IP or the wildcard of its family — any IP of its family for the
+    /// wildcard — and the ports dual-stack sockets hold at the IPv6 wildcard if IPv4, and any IP
+    /// at all for a `dual`-stack socket: a port no socket overlaps, as Linux and macOS pick for
+    /// port 0 whatever `SO_REUSEADDR` and `SO_REUSEPORT` say. Called while the registry is
+    /// locked, so the result stays free until the caller inserts it. Returns 0 once the range is
+    /// full.
     ///
     /// 49152–65535 is the dynamic/private range of RFC 6335 §6 and macOS's default
     /// (`net.inet.ip.portrange.first`/`last`, XNU bsd/netinet/in.h `IPPORT_HIFIRSTAUTO`/
     /// `IPPORT_HILASTAUTO`). Linux defaults to 32768–60999 (Documentation/networking/
     /// ip-sysctl.rst, `ip_local_port_range`); using the IANA range everywhere is a snare choice,
     /// so addresses are the same on every host. The lowest free port is taken, not a random one.
-    fn alloc_port(&self, ip: IpAddr) -> u16 {
-        self.alloc_port_from(ip, 49152)
+    fn alloc_port(&self, ip: IpAddr, dual: bool) -> u16 {
+        self.alloc_port_from(ip, 49152, dual)
     }
 
-    fn alloc_port_from(&self, ip: IpAddr, first: u16) -> u16 {
-        if ip.is_unspecified() {
-            self.families[usize::from(ip.is_ipv4())].alloc_from(first)
+    fn alloc_port_from(&self, ip: IpAddr, first: u16, dual: bool) -> u16 {
+        let v4 = ip.is_ipv4();
+        let mut sets: Vec<&UdpPorts> = Vec::with_capacity(3);
+        if dual {
+            sets.extend(&self.families);
+        } else if ip.is_unspecified() {
+            sets.push(&self.families[usize::from(v4)]);
+            if v4 {
+                sets.push(&self.dual);
+            }
         } else {
-            self.ports
-                .get(&ip)
-                .map_or(first.max(UdpPorts::FIRST), |ports| ports.alloc_from(first))
+            sets.extend(self.ports.get(&ip));
+            sets.extend(self.ports.get(&unspecified_like(ip)));
+            if v4 {
+                sets.push(&self.dual);
+            }
         }
+        UdpPorts::alloc(&sets, first)
     }
 
     /// The queues a datagram to `dest` could reach: for a multicast group the sockets on the port
@@ -980,13 +1171,24 @@ impl UdpRegistry {
     }
 
     fn candidate(addr: SocketAddr, queue: &Arc<DgramQueue>) -> Cand<Arc<DgramQueue>> {
+        let (device, dual, share) =
+            queue
+                .rec
+                .as_ref()
+                .map_or((None, false, Share::default()), |rec| {
+                    let state = rec.state();
+                    (
+                        state.device.as_ref().map(|device| device.0),
+                        state.dual_at(addr),
+                        Share::of_state(&state),
+                    )
+                });
         Cand {
             addr,
             endpoint: queue.rec.is_none(),
-            device: queue
-                .rec
-                .as_ref()
-                .and_then(|rec| rec.state().device.as_ref().map(|device| device.0)),
+            device,
+            dual,
+            share,
             q: queue.clone(),
         }
     }
@@ -1010,30 +1212,69 @@ impl UdpRegistry {
 }
 
 /// The wildcard address (`0.0.0.0` or `::`) of `ip`'s family.
-fn unspecified_like(ip: IpAddr) -> IpAddr {
+pub(crate) fn unspecified_like(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     }
 }
 
-/// The addresses the bound datagram sockets in `socks` claim against a new bind: the address each
-/// one's `bind` named, at the port it got, wherever a connect has since rehashed it for delivery.
-/// A socket a send or connect bound implicitly claims where that put it.
-fn dgram_claims(socks: &Sockets) -> impl Iterator<Item = SocketAddr> + '_ {
-    socks.values().filter_map(|sock| match sock {
+/// The address a bound datagram socket claims against a new bind: the address its `bind` named,
+/// at the port it got, wherever a connect has since rehashed it for delivery. A socket a send or
+/// connect bound implicitly claims where that put it.
+fn dgram_claim(sock: &Sock) -> Option<SocketAddr> {
+    match sock {
         Sock::Dgram {
             local: Some(local),
             requested,
             ..
         } => Some(requested.map_or(*local, |r| SocketAddr::new(r.ip(), local.port()))),
         _ => None,
+    }
+}
+
+/// The address a TCP socket holds against a new bind, and whether it listens: a bound fresh or
+/// connecting socket's, a listener's, or a connected stream's local address. Socketpair streams
+/// hold none.
+fn tcp_bound(sock: &Sock) -> Option<(SocketAddr, bool)> {
+    match sock {
+        Sock::Fresh {
+            local: Some(local), ..
+        }
+        | Sock::Connecting {
+            local: Some(local), ..
+        } => Some((*local, false)),
+        Sock::Listener { listener, .. } => Some((listener.addr, true)),
+        Sock::Stream { conn, end, .. } if !conn.pair => Some((conn.local(*end), false)),
+        _ => None,
+    }
+}
+
+/// What a TCP socket holds against a new bind ([`tcp_bound`]).
+fn tcp_claim(sock: &Sock) -> Option<Claim> {
+    let (addr, listening) = tcp_bound(sock)?;
+    Some(Claim {
+        listening,
+        ..Claim::of(sock.rec()?, addr)
     })
+}
+
+/// What a datagram socket holds against a new bind ([`dgram_claim`]).
+fn udp_claim(sock: &Sock) -> Option<Claim> {
+    Some(Claim::of(sock.rec()?, dgram_claim(sock)?))
+}
+
+/// The port `sock` holds against a new bind, TCP or datagram.
+fn claimed_port(sock: &Sock) -> Option<u16> {
+    tcp_bound(sock)
+        .map(|(addr, _)| addr)
+        .or_else(|| dgram_claim(sock))
+        .map(|addr| addr.port())
 }
 
 /// What an unbound datagram socket still holds of the address its `bind` named: the address, at
 /// no port. Only a Linux disconnect leaves a socket so (see [`Fabric::disconnect_dgram`]).
-fn unhashed(requested: Option<SocketAddr>) -> Option<SocketAddr> {
+pub(crate) fn unhashed(requested: Option<SocketAddr>) -> Option<SocketAddr> {
     requested.map(|r| SocketAddr::new(r.ip(), 0))
 }
 
@@ -1086,20 +1327,27 @@ impl snare_interpose::Layer for ScopeLayer {
         // The scope lasts as long as the thread does.
         std::mem::forget(enter(self.0.clone()));
     }
+
+    fn settling(&self, domain: usize) -> bool {
+        crate::realfd::settling(domain)
+    }
+
+    fn real_ready(&self, domain: usize, ready: &mut dyn FnMut(snare_interpose::ReadinessKey)) {
+        crate::realfd::real_ready(domain, ready);
+    }
+
+    /// With no virtual clock to hold to real time, a sim whose thread waits on what a child
+    /// process may write waits for it, as it would on a held clock, rather than giving up.
+    fn idle_wait(&self) -> Option<Duration> {
+        (self.0.shared.clock.is_none() && crate::realfd::outside(self.0.shared.domain_key()))
+            .then_some(crate::realfd::OUTSIDE_POLL)
+    }
 }
 
 /// Withdraws `listener` from its address, so later connects there are refused (ECONNREFUSED) as
 /// they would be once a real server exits. Leaves a listener that has since replaced it alone.
 pub(crate) fn unlisten(regs: &Registries, listener: &Arc<Listener>) {
-    snare_interpose::real(|| {
-        let mut listeners = regs.listeners.lock().unwrap();
-        if listeners
-            .get(&listener.addr)
-            .is_some_and(|l| Arc::ptr_eq(l, listener))
-        {
-            listeners.remove(&listener.addr);
-        }
-    });
+    snare_interpose::real(|| regs.listeners.lock().unwrap().remove(listener));
 }
 
 /// A datagram endpoint a tester owns at a fixed address: datagrams the code under test sends there
@@ -1154,7 +1402,8 @@ impl UdpEndpoint {
             self.regs
                 .shared
                 .capture_udp(&sender, self.addr, dest, Dir::In, data, None);
-            let mut reached = self.regs.deliver(&sender, self.addr, dest, data, true);
+            let ip = crate::ancillary::Header::plain(dest.ip());
+            let mut reached = self.regs.deliver(&sender, self.addr, dest, data, true, ip);
             let foreign: Vec<_> = self.regs.foreign_udp.lock().unwrap().clone();
             for backend in foreign.iter().filter_map(std::sync::Weak::upgrade) {
                 reached += backend.deliver_from_peer(self.addr, dest, data);
@@ -1167,18 +1416,15 @@ impl UdpEndpoint {
     }
 }
 
-/// Unregisters the address, unless a later bind has since taken it over.
+/// Unregisters the address.
 impl Drop for UdpEndpoint {
     fn drop(&mut self) {
         snare_interpose::real(|| {
-            let mut udp = self.regs.udp.lock().unwrap();
-            if udp
-                .bound
-                .get(&self.addr)
-                .is_some_and(|q| Arc::ptr_eq(q, &self.queue))
-            {
-                udp.remove(&self.addr);
-            }
+            self.regs
+                .udp
+                .lock()
+                .unwrap()
+                .remove(&self.addr, &self.queue);
         });
     }
 }
@@ -1189,6 +1435,7 @@ pub(crate) fn listen_at(addr: SocketAddr) -> Arc<Listener> {
     let listener = Arc::new(Listener {
         rec: None,
         addr,
+        dual: false,
         pending: Mutex::default(),
         capacity: AtomicUsize::new(usize::MAX),
         occupied: AtomicUsize::new(0),
@@ -1202,7 +1449,7 @@ pub(crate) fn listen_at(addr: SocketAddr) -> Arc<Listener> {
             .listeners
             .lock()
             .unwrap()
-            .insert(addr, listener.clone())
+            .insert(addr, listener.clone());
     });
     listener
 }
@@ -1213,7 +1460,12 @@ use std::time::Duration;
 
 use crate::faults::{ConnectAttempt, Outcome, Syn};
 use crate::limits::{Arrival, RxQueue};
-use crate::netif::{Cand, Hop, LinkState, Op, Sender, Wire};
+use crate::netif::{
+    Cand, Hop, LinkState, Op, Sender, Share, Wire, pick_shared, reported, toward, unmapped,
+};
+#[cfg(target_os = "macos")]
+use crate::notices::Ticket;
+use crate::notices::{Keys, PollSet, Settled};
 use crate::pcapng::{Dir, TcpTap};
 use crate::readiness::Deadline;
 use crate::sockets::{Membership, RxProbe, SockRec, SocketKind, Taker, UnmodelledOption};
@@ -1322,7 +1574,10 @@ enum Sock {
     /// `EPOLLET` (see [`Edge`]); `EPOLLONESHOT` disables a registration once reported.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Epoll {
-        interests: HashMap<(c_int, EpollIdentity), EpollInterest>,
+        /// Its registrations, and which of them a scan looks at (see [`crate::notices`]).
+        interests: PollSet<(c_int, EpollIdentity), EpollInterest>,
+        /// The watch on the real descriptors registered, while there are any.
+        real: Option<Arc<crate::realfd::Watch>>,
     },
     /// A raw L2 endpoint on a virtual interface: whole Ethernet frames. On Linux this is an
     /// `AF_PACKET` socket (packet(7)); on macOS it is a `/dev/bpf*` device (bpf(4)); both share
@@ -1346,6 +1601,11 @@ enum Sock {
     /// mio's macOS `Waker` relies on (it clones the kqueue fd and triggers through the clone).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Kqueue { state: Arc<Mutex<KqueueState>> },
+    /// A signalfd (man 2 signalfd): readable while a signal of `mask`, the virtual signals as
+    /// `snare_interpose::virtual_bits` gives them, is pending for the thread that looks, a read
+    /// taking them.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Signal { mask: u64, nonblocking: bool },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1377,15 +1637,17 @@ struct EpollInterest {
 #[derive(Default)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct KqueueState {
-    /// `EVFILT_READ` registrations by fd.
-    reads: HashMap<c_int, Knote>,
-    /// `EVFILT_WRITE` registrations by fd.
-    writes: HashMap<c_int, Knote>,
+    /// `EVFILT_READ` and `EVFILT_WRITE` registrations by filter and fd, and which of them a scan
+    /// looks at (see [`crate::notices`]).
+    notes: PollSet<(i16, c_int), Knote>,
     /// `EVFILT_USER` registrations by ident.
     users: HashMap<usize, UserNote>,
+    /// The watch on the real descriptors registered, while there are any.
+    real: Option<Arc<crate::realfd::Watch>>,
 }
 
 /// An `EVFILT_READ` or `EVFILT_WRITE` registration.
+#[derive(Clone, Copy)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct Knote {
     udata: u64,
@@ -1486,19 +1748,18 @@ static NEXT_PAIR: AtomicU64 = AtomicU64::new(1);
 /// The descriptors registered in `sock` when it is an epoll set or a kqueue, real ones aside.
 fn registered_sockets(sock: &Sock) -> Vec<c_int> {
     match sock {
-        Sock::Epoll { interests } => interests
-            .keys()
-            .filter(|(_, identity)| matches!(identity, EpollIdentity::Local(_)))
-            .map(|&(fd, _)| fd)
+        Sock::Epoll { interests, .. } => interests
+            .iter()
+            .filter(|((_, identity), _)| matches!(identity, EpollIdentity::Local(_)))
+            .map(|(&(fd, _), _)| fd)
             .collect(),
         Sock::Kqueue { state } => {
             let state = state.lock().unwrap();
             state
-                .reads
+                .notes
                 .iter()
-                .chain(&state.writes)
                 .filter(|(_, note)| !note.untracked)
-                .map(|(&fd, _)| fd)
+                .map(|(&(_, fd), _)| fd)
                 .collect()
         }
         _ => Vec::new(),
@@ -1564,7 +1825,11 @@ struct SocketDescription {
     id: u64,
     sock: Sock,
     status_flags: c_int,
+    /// A socket's signal-driven I/O settings.
+    fcntl: SocketFcntl,
     descriptors: BTreeSet<c_int>,
+    /// The port [`Sockets::ports`] lists it under.
+    port: Option<u16>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1573,8 +1838,63 @@ struct DescriptionKey {
     id: u64,
 }
 
+/// How many descriptor numbers [`FdBits`] tells about.
+const FD_BITS: usize = 1 << 16;
+
+/// Which descriptor numbers a fabric's socket table holds, and which of them name another sim's
+/// socketpair end ([`Sockets::mirrors`]), readable without the table's lock: a bit per number
+/// below [`FD_BITS`], moved with the table under its lock. A number above that is looked up there.
+struct FdBits {
+    held: Box<[AtomicU64]>,
+    mirrored: Box<[AtomicU64]>,
+}
+
+impl Default for FdBits {
+    fn default() -> Self {
+        let words = || (0..FD_BITS / 64).map(|_| AtomicU64::new(0)).collect();
+        FdBits {
+            held: words(),
+            mirrored: words(),
+        }
+    }
+}
+
+impl FdBits {
+    fn word(fd: c_int) -> Option<(usize, u64)> {
+        let fd = usize::try_from(fd).ok().filter(|&fd| fd < FD_BITS)?;
+        Some((fd / 64, 1 << (fd % 64)))
+    }
+
+    fn set(bits: &[AtomicU64], fd: c_int, on: bool) {
+        if let Some((word, bit)) = Self::word(fd) {
+            if on {
+                bits[word].fetch_or(bit, Ordering::Release);
+            } else {
+                bits[word].fetch_and(!bit, Ordering::Release);
+            }
+        }
+    }
+
+    fn get(bits: &[AtomicU64], fd: c_int) -> Option<bool> {
+        let (word, bit) = Self::word(fd)?;
+        Some(bits[word].load(Ordering::Acquire) & bit != 0)
+    }
+
+    /// Whether the table holds `fd`, a number not mirrored: `None` when only the table can tell.
+    fn held(&self, fd: c_int) -> Option<bool> {
+        match Self::get(&self.held, fd)? {
+            false => Some(false),
+            true if Self::get(&self.mirrored, fd) == Some(false) => Some(true),
+            true => None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Sockets {
+    /// The numbers `descriptors` and `mirrors` hold, for [`Fabric::owns`] to read without the
+    /// lock.
+    bits: Arc<FdBits>,
     descriptions: Vec<Option<SocketDescription>>,
     free_slots: Vec<usize>,
     descriptors: HashMap<c_int, DescriptionKey>,
@@ -1583,6 +1903,8 @@ struct Sockets {
     next_id: u64,
     /// How many descriptions are timerfds, so settling them costs nothing without one.
     timers: usize,
+    /// How many descriptions are connecting sockets, so moving them on costs nothing without one.
+    connecting: usize,
     /// The sim whose descriptors these are, recorded with each (`snare_interpose::claim_fd`) so a
     /// thread of another sim reaching one is not sent to the OS's placeholder. Learnt from the
     /// first thread to mint one, which is always one of the sim's.
@@ -1593,6 +1915,10 @@ struct Sockets {
     /// This sim's instance of each socketpair it mirrored, by the pair's identity: the ends not
     /// yet reached under any descriptor.
     replicas: HashMap<u64, [Option<Sock>; 2]>,
+    /// The slots of the descriptions that hold each port against a new bind ([`claimed_port`]),
+    /// so a bind looks only at the sockets on its port. Kept by [`place`](Self::place),
+    /// [`reindex`](Self::reindex) and removal.
+    ports: HashMap<u16, HashSet<usize>>,
 }
 
 impl Sockets {
@@ -1653,14 +1979,17 @@ impl Sockets {
     /// socketpair `pair`.
     fn insert_mirror(&mut self, fd: c_int, sock: Sock, pair: u64) {
         self.mirrors.insert(fd, pair);
+        FdBits::set(&self.bits.mirrored, fd, true);
         self.place(fd, sock);
     }
 
     /// Serves `fd`, another sim's number, as one more descriptor of `held`'s description.
     fn alias_mirror(&mut self, held: c_int, fd: c_int, pair: u64) {
         self.mirrors.insert(fd, pair);
+        FdBits::set(&self.bits.mirrored, fd, true);
         let key = self.descriptors[&held];
         self.descriptors.insert(fd, key);
+        FdBits::set(&self.bits.held, fd, true);
         self.descriptions[key.slot]
             .as_mut()
             .unwrap()
@@ -1729,11 +2058,30 @@ impl Sockets {
         }
     }
 
+    /// Counts `sock` in, or out of, [`timers`](Self::timers) and
+    /// [`connecting`](Self::connecting).
+    fn tally(&mut self, sock: &Sock, add: bool) {
+        let timer = usize::from(matches!(sock, Sock::Timer { .. }));
+        let connecting = usize::from(matches!(sock, Sock::Connecting { .. }));
+        if add {
+            self.timers += timer;
+            self.connecting += connecting;
+        } else {
+            self.timers -= timer;
+            self.connecting -= connecting;
+        }
+    }
+
     fn place(&mut self, fd: c_int, sock: Sock) {
-        self.timers += usize::from(matches!(sock, Sock::Timer { .. }));
+        self.tally(&sock, true);
         if let Some(description) = self.description_mut(&fd) {
             let replaced = std::mem::replace(&mut description.sock, sock);
-            self.timers -= usize::from(matches!(replaced, Sock::Timer { .. }));
+            let keys = description_keys(description.id, &description.sock);
+            self.tally(&replaced, false);
+            self.reindex(fd);
+            for key in keys.iter() {
+                crate::notices::notice(0, key);
+            }
         } else {
             self.next_id += 1;
             let id = self.next_id;
@@ -1745,12 +2093,63 @@ impl Sockets {
                 id,
                 sock,
                 status_flags: libc::O_RDWR,
+                fcntl: SocketFcntl::default(),
                 descriptors: BTreeSet::from([fd]),
+                port: None,
             });
             self.descriptors.insert(fd, DescriptionKey { slot, id });
+            FdBits::set(&self.bits.held, fd, true);
             #[cfg(target_os = "linux")]
             self.identities.insert(id, slot);
+            self.index_port(slot);
         }
+    }
+
+    /// Lists `fd`'s description under the port it now holds; called after a change to its socket
+    /// in place that binds it or moves its address.
+    fn reindex(&mut self, fd: c_int) {
+        if let Some(key) = self.descriptors.get(&fd) {
+            self.index_port(key.slot);
+        }
+    }
+
+    fn index_port(&mut self, slot: usize) {
+        let Some(description) = self.descriptions[slot].as_mut() else {
+            return;
+        };
+        let port = claimed_port(&description.sock);
+        let previous = std::mem::replace(&mut description.port, port);
+        if previous == port {
+            return;
+        }
+        if let Some(previous) = previous {
+            self.unlist_port(previous, slot);
+        }
+        if let Some(port) = port {
+            self.ports.entry(port).or_default().insert(slot);
+        }
+    }
+
+    fn unlist_port(&mut self, port: u16, slot: usize) {
+        if let Some(slots) = self.ports.get_mut(&port) {
+            slots.remove(&slot);
+            if slots.is_empty() {
+                self.ports.remove(&port);
+            }
+        }
+    }
+
+    /// The sockets holding `port` against a new bind, in no particular order.
+    fn on_port(&self, port: u16) -> impl Iterator<Item = &Sock> {
+        self.ports
+            .get(&port)
+            .into_iter()
+            .flatten()
+            .map(move |&slot| {
+                let description = self.descriptions[slot].as_ref().unwrap();
+                debug_assert_eq!(claimed_port(&description.sock), Some(port));
+                &description.sock
+            })
     }
 
     fn alias(&mut self, fd: c_int, new_fd: c_int) {
@@ -1758,6 +2157,7 @@ impl Sockets {
         self.claim(new_fd, local);
         let key = self.descriptors[&fd];
         self.descriptors.insert(new_fd, key);
+        FdBits::set(&self.bits.held, new_fd, true);
         self.descriptions[key.slot]
             .as_mut()
             .unwrap()
@@ -1768,7 +2168,10 @@ impl Sockets {
 
     fn remove(&mut self, fd: &c_int) -> Option<Option<Sock>> {
         let key = self.descriptors.remove(fd)?;
-        if self.mirrors.remove(fd).is_none() {
+        FdBits::set(&self.bits.held, *fd, false);
+        if self.mirrors.remove(fd).is_some() {
+            FdBits::set(&self.bits.mirrored, *fd, false);
+        } else {
             if let Some(owner) = self.owner {
                 snare_interpose::release_fd(*fd, owner);
             }
@@ -1784,10 +2187,13 @@ impl Sockets {
         description.descriptors.remove(fd);
         Some(if description.descriptors.is_empty() {
             let retired = self.descriptions[key.slot].take().unwrap();
+            if let Some(port) = retired.port {
+                self.unlist_port(port, key.slot);
+            }
             self.free_slots.push(key.slot);
             #[cfg(target_os = "linux")]
             self.identities.remove(&key.id);
-            self.timers -= usize::from(matches!(retired.sock, Sock::Timer { .. }));
+            self.tally(&retired.sock, false);
             Some(retired.sock)
         } else {
             None
@@ -1846,14 +2252,18 @@ impl Sockets {
             {
                 continue;
             }
-            let description = self.descriptions[slot].take().unwrap();
+            let mut description = self.descriptions[slot].take().unwrap();
+            if let Some(port) = description.port.take() {
+                self.unlist_port(port, slot);
+            }
             self.free_slots.push(slot);
             for fd in &description.descriptors {
                 self.descriptors.remove(fd);
+                FdBits::set(&self.bits.held, *fd, false);
             }
             #[cfg(target_os = "linux")]
             self.identities.remove(&description.id);
-            self.timers -= usize::from(matches!(description.sock, Sock::Timer { .. }));
+            self.tally(&description.sock, false);
             taken.push(description);
         }
         taken
@@ -1886,19 +2296,14 @@ impl Sockets {
             for &fd in &description.descriptors {
                 self.claim(fd, true);
                 self.descriptors.insert(fd, DescriptionKey { slot, id });
+                FdBits::set(&self.bits.held, fd, true);
             }
             #[cfg(target_os = "linux")]
             self.identities.insert(id, slot);
-            self.timers += usize::from(matches!(description.sock, Sock::Timer { .. }));
+            self.tally(&description.sock, true);
             self.descriptions[slot] = Some(description);
+            self.index_port(slot);
         }
-    }
-
-    fn values(&self) -> impl Iterator<Item = &Sock> {
-        self.descriptions
-            .iter()
-            .flatten()
-            .map(|description| &description.sock)
     }
 
     fn iter(&self) -> impl Iterator<Item = (&c_int, &Sock)> {
@@ -1924,6 +2329,8 @@ pub struct Fabric {
     /// Every descriptor the fabric serves, by fd number. The first lock in the fabric's lock order;
     /// never held across a readiness bump or wait.
     socks: Mutex<Sockets>,
+    /// The numbers `socks` holds, without its lock.
+    fds: Arc<FdBits>,
     regs: Arc<Registries>,
 }
 
@@ -2001,6 +2408,12 @@ struct DgramRecvEndpoint {
     queue: Arc<DgramQueue>,
     nonblocking: bool,
     rec: Arc<SockRec>,
+    /// `AF_INET` or `AF_INET6`; `AF_UNIX` for a socketpair end.
+    domain: c_int,
+    /// Whether a sender's IPv4 address is reported v4-mapped: on an IPv6 socket, except on macOS
+    /// once bound or connected to an IPv4 address (XNU bsd/netinet/udp_usrreq.c `udp_input`
+    /// reports a `sockaddr_in` to a socket that takes IPv4 only, measured).
+    mapped: bool,
 }
 
 impl DgramRecvEndpoint {
@@ -2010,9 +2423,18 @@ impl DgramRecvEndpoint {
                 queue,
                 nonblocking,
                 rec,
+                domain,
+                local,
                 ..
-            }
-            | Sock::UnixDgram {
+            } => Some(Self {
+                queue: queue.clone(),
+                nonblocking: *nonblocking,
+                rec: rec.clone(),
+                domain: *domain,
+                mapped: *domain == libc::AF_INET6
+                    && !(cfg!(target_os = "macos") && local.is_some_and(|l| l.is_ipv4())),
+            }),
+            Sock::UnixDgram {
                 queue,
                 nonblocking,
                 rec,
@@ -2021,6 +2443,8 @@ impl DgramRecvEndpoint {
                 queue: queue.clone(),
                 nonblocking: *nonblocking,
                 rec: rec.clone(),
+                domain: libc::AF_UNIX,
+                mapped: false,
             }),
             _ => None,
         }
@@ -2031,8 +2455,10 @@ impl Fabric {
     /// A fabric with empty registries over the sim state `shared`.
     pub(crate) fn new(shared: Arc<SimShared>) -> Self {
         placeholder();
+        let socks = Sockets::default();
         Fabric {
-            socks: Mutex::new(Sockets::default()),
+            fds: socks.bits.clone(),
+            socks: Mutex::new(socks),
             regs: Arc::new(Registries::new(shared)),
         }
     }
@@ -2109,10 +2535,28 @@ impl Fabric {
                     .identity(fd)
                     .map(crate::readiness::WakeKey::Descriptor)
             });
+            self.notice_detach(&socks, fd);
             (socks.remove(&fd)?, rec, key)
         };
         self.retire_descriptor(fd, removed, rec, key);
         Some(())
+    }
+
+    /// Marks `fd`'s description on the sets watching it (see [`crate::notices`]): something no
+    /// readiness bump tells may have changed its readiness.
+    fn notice_fd(&self, fd: c_int) {
+        self.notice_detach(&self.socks.lock().unwrap(), fd);
+    }
+
+    /// Marks `fd`'s description on the sets watching it (see [`crate::notices`]), as `fd` is about
+    /// to stop naming it: a kqueue registration on `fd` then looks at what `fd` names next.
+    fn notice_detach(&self, socks: &Sockets, fd: c_int) {
+        if let (Some(id), Some(sock)) = (socks.identity(fd), socks.get(&fd)) {
+            let domain = self.shared().domain_key();
+            for key in description_keys(id, sock).iter() {
+                crate::notices::notice(domain, key);
+            }
+        }
     }
 
     fn retire_descriptor(
@@ -2147,13 +2591,19 @@ impl Fabric {
                     Some(linger) => {
                         conn.close(end);
                         let pipe = conn.write_pipe(end).clone();
-                        readiness().wait_until_on(
-                            "linger",
-                            Some(Deadline::timeout(linger)),
-                            &[rec.wake_key()],
-                            || rec.pending_time(),
-                            || pipe.delivered(),
-                        );
+                        let (_, interrupted) =
+                            snare_interpose::interruptible(Restart::Never, || {
+                                readiness().wait_until_on(
+                                    "linger",
+                                    Some(Deadline::timeout(linger)),
+                                    &[rec.wake_key()],
+                                    || rec.pending_time(),
+                                    || pipe.acknowledged(),
+                                )
+                            });
+                        if interrupted {
+                            snare_interpose::close_interrupted();
+                        }
                     }
                     None if conn.read_pipe(end).has_unread() && !conn.pair => conn.reset(end),
                     None => conn.close(end),
@@ -2164,9 +2614,11 @@ impl Fabric {
                 }
             }
             Some(Sock::Dgram {
-                local: Some(local), ..
+                local: Some(local),
+                queue,
+                ..
             }) => {
-                regs.udp.lock().unwrap().remove(&local);
+                regs.udp.lock().unwrap().remove(&local, &queue);
             }
             Some(Sock::Listener { listener, .. }) => {
                 unlisten(regs, &listener);
@@ -2199,19 +2651,60 @@ impl Fabric {
         keys: &mut crate::readiness::WakeKeys,
     ) -> bool {
         let mut time_sensitive = false;
-        for fd in fds {
-            let connecting = matches!(
-                self.socks.lock().unwrap().get(&fd),
-                Some(Sock::Connecting { .. })
-            );
-            if let Some(rec) = self.rec(fd).or_else(|| self.shared().sockets.lookup_fd(fd)) {
+        let mut others = Vec::new();
+        {
+            let socks = self.socks.lock().unwrap();
+            for fd in fds {
+                match socks.get(&fd) {
+                    Some(sock) => match sock.rec() {
+                        Some(rec) => {
+                            keys.push(rec.wake_key());
+                            time_sensitive |=
+                                matches!(sock, Sock::Connecting { .. }) || rec.pending_time();
+                        }
+                        None => others.push((fd, socks.identity(fd))),
+                    },
+                    None => others.push((fd, None)),
+                }
+            }
+        }
+        for (fd, identity) in others {
+            if let Some(rec) = self.shared().sockets.lookup_fd(fd) {
                 keys.push(rec.wake_key());
-                time_sensitive |= connecting || rec.pending_time();
-            } else if let Some(id) = self.socks.lock().unwrap().identity(fd) {
+                time_sensitive |= rec.pending_time();
+            } else if let Some(id) = identity {
                 keys.push(crate::readiness::WakeKey::Descriptor(id));
             }
         }
         time_sensitive
+    }
+
+    /// Keeps `waiting` blocked on `watch`, the watch on the real descriptors of the set a wait
+    /// blocks on, and returns the key it wakes the waiter on.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn wait_real(
+        &self,
+        waiting: &std::cell::RefCell<Option<crate::realfd::Waiting>>,
+        watch: Option<Arc<crate::realfd::Watch>>,
+    ) -> Option<crate::readiness::WakeKey> {
+        let mut waiting = waiting.borrow_mut();
+        let current = waiting.as_ref().map(crate::realfd::Waiting::watch);
+        if current.map(Arc::as_ptr) != watch.as_ref().map(Arc::as_ptr) {
+            *waiting = watch.map(|watch| watch.wait(&self.regs.shared));
+        }
+        waiting.as_ref().map(|waiting| waiting.watch().key())
+    }
+
+    /// Keeps `held`, a set's watch on its real descriptors, on `real`: made once there are any,
+    /// dropped once there are none.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn watch_set(held: &mut Option<Arc<crate::realfd::Watch>>, real: &[(c_int, i16)]) {
+        match held {
+            Some(watch) if !real.is_empty() => watch.set(real),
+            Some(_) => *held = None,
+            None if !real.is_empty() => *held = crate::realfd::Watch::new(real),
+            None => {}
+        }
     }
 
     fn bump_fds(&self, fds: impl IntoIterator<Item = c_int>) {
@@ -2220,58 +2713,80 @@ impl Fabric {
         self.shared().bump_keys(keys.as_slice());
     }
 
+    /// The keys a wait on epoll set `epfd` listens on: the set's own, which every notice to one
+    /// of its registrations reaches (see [`crate::notices`]); and whether its last scan found a
+    /// registration whose readiness moves with the clock.
     #[cfg(target_os = "linux")]
     fn epoll_interests(&self, epfd: c_int, keys: &mut crate::readiness::WakeKeys) -> bool {
-        self.fd_interests([epfd], keys);
-        let watched: Vec<_> = {
-            let socks = self.socks.lock().unwrap();
-            let Some(Sock::Epoll { interests }) = socks.get(&epfd) else {
-                return false;
-            };
-            interests.keys().copied().collect()
+        let socks = self.socks.lock().unwrap();
+        let Some(Sock::Epoll { interests, .. }) = socks.get(&epfd) else {
+            return false;
         };
-        let mut time_sensitive = false;
-        for (fd, identity) in watched {
-            let rec = match identity {
-                EpollIdentity::Local(id) => {
-                    let socks = self.socks.lock().unwrap();
-                    let sock = socks.get_identity(id);
-                    time_sensitive |= matches!(sock, Some(Sock::Connecting { .. }));
-                    if sock.is_some() {
-                        keys.push(crate::readiness::WakeKey::Descriptor(id));
-                    }
-                    sock.and_then(Sock::rec).cloned()
-                }
-                EpollIdentity::Foreign(id) => self.shared().sockets.lookup_raw_id(id),
-                EpollIdentity::Untracked => self.shared().sockets.lookup_fd(fd),
-            };
-            if let Some(rec) = rec {
-                keys.push(rec.wake_key());
-                time_sensitive |= rec.pending_time();
-            }
-        }
-        time_sensitive
+        keys.push(interests.list().key());
+        interests.timed()
     }
 
+    /// The watch on the real descriptors epoll set `epfd` holds, if it holds any.
+    #[cfg(target_os = "linux")]
+    fn epoll_watch(&self, epfd: c_int) -> Option<Arc<crate::realfd::Watch>> {
+        match self.socks.lock().unwrap().get(&epfd) {
+            Some(Sock::Epoll { real, .. }) => real.clone(),
+            _ => None,
+        }
+    }
+
+    /// Keeps epoll set `epfd`'s watch on the real descriptors it holds.
+    #[cfg(target_os = "linux")]
+    fn rewatch_epoll(&self, epfd: c_int) {
+        let real = self.epoll_real_fds(epfd);
+        if let Some(Sock::Epoll { real: held, .. }) = self.socks.lock().unwrap().get_mut(&epfd) {
+            Self::watch_set(held, &real);
+        }
+    }
+
+    /// The real descriptors epoll set `epfd` watches, with the `poll` events each is watched for.
+    #[cfg(target_os = "linux")]
+    fn epoll_real_fds(&self, epfd: c_int) -> Vec<(c_int, i16)> {
+        let untracked: Vec<(c_int, u32)> = {
+            let socks = self.socks.lock().unwrap();
+            let Some(Sock::Epoll { interests, .. }) = socks.get(&epfd) else {
+                return Vec::new();
+            };
+            interests
+                .iter()
+                .filter(|((_, identity), i)| *identity == EpollIdentity::Untracked && !i.spent)
+                .map(|(&(fd, _), i)| (fd, i.events))
+                .collect()
+        };
+        untracked
+            .into_iter()
+            .filter(|(fd, _)| self.shared().sockets.lookup_fd(*fd).is_none())
+            .map(|(fd, events)| {
+                let events = events & (EPOLLIN | EPOLLOUT | libc::EPOLLPRI as u32 | EPOLLRDHUP);
+                (fd, events as u16 as i16)
+            })
+            .collect()
+    }
+
+    /// The watch on the real descriptors kqueue `kq` holds, if it holds any.
+    #[cfg(target_os = "macos")]
+    fn kqueue_watch(&self, kq: c_int) -> Option<Arc<crate::realfd::Watch>> {
+        match self.socks.lock().unwrap().get(&kq) {
+            Some(Sock::Kqueue { state }) => state.lock().unwrap().real.clone(),
+            _ => None,
+        }
+    }
+
+    /// As [`epoll_interests`](Self::epoll_interests), for kqueue `kq`.
     #[cfg(target_os = "macos")]
     fn kqueue_interests(&self, kq: c_int, keys: &mut crate::readiness::WakeKeys) -> bool {
-        self.fd_interests([kq], keys);
         let state = match self.socks.lock().unwrap().get(&kq) {
             Some(Sock::Kqueue { state }) => state.clone(),
             _ => return false,
         };
-        let mut fds: Vec<_> = {
-            let state = state.lock().unwrap();
-            state
-                .reads
-                .keys()
-                .chain(state.writes.keys())
-                .copied()
-                .collect()
-        };
-        fds.sort_unstable();
-        fds.dedup();
-        self.fd_interests(fds, keys)
+        let state = state.lock().unwrap();
+        keys.push(state.notes.list().key());
+        state.notes.timed()
     }
 
     /// The sim state shared with the other backends.
@@ -2348,6 +2863,7 @@ impl Fabric {
             if !socks.contains_key(&fd) {
                 None
             } else if socks.stale_mirror(fd) {
+                self.notice_detach(&socks, fd);
                 socks.remove(&fd)
             } else {
                 return true;
@@ -2398,6 +2914,7 @@ impl Fabric {
             if !socks.mirrors.contains_key(&fd) {
                 return;
             }
+            self.notice_detach(&socks, fd);
             socks.remove(&fd)
         };
         if let Some(removed) = removed {
@@ -2431,7 +2948,15 @@ impl Fabric {
     /// Order of checks: the macOS send-buffer size limit, a pending error (an earlier ICMP error
     /// reported on this send), the route (its errno decided by `SimShared::route_send`, which is
     /// told whether `SO_BROADCAST` is on), a don't-fragment datagram too large for the egress
-    /// interface (`netif::frag`), the autobind, then a stalled link. A datagram nothing receives triggers the ICMP port-unreachable model.
+    /// interface (`netif::frag`), the autobind, then a stalled link. A datagram nothing receives
+    /// triggers the ICMP port-unreachable model.
+    ///
+    /// `ctl` holds what the send's control messages asked ([`crate::ancillary`]): an interface
+    /// and, on Linux, a source address for the route, the source address the datagram carries,
+    /// its header fields, and its transmit stamps. A Linux send with a segment size
+    /// (`UDP_SEGMENT`) longer than one segment is checked per segment rather than as one datagram
+    /// (`netif::frag::check_gso`) and leaves as its segments, except through loopback, where it
+    /// stays whole until a receiver without `UDP_GRO` takes it (`Registries::deliver`).
     fn udp_send(
         &self,
         fd: c_int,
@@ -2439,6 +2964,7 @@ impl Fabric {
         data: &[u8],
         dest: SocketAddr,
         flags: c_int,
+        ctl: &crate::ancillary::SendCtl,
     ) -> Option<NetResult> {
         if data.len() > if dest.is_ipv4() { 65507 } else { 65527 } {
             return if cfg!(target_os = "macos") && dest.is_ipv6() {
@@ -2468,25 +2994,50 @@ impl Fabric {
         if let Some(errno) = rec.take_error_as(self.shared(), Taker::Send) {
             return err(errno);
         }
+        if domain == libc::AF_INET6
+            && let Err(errno) =
+                dgram_crossing(&rec, local.or(unhashed(requested)), dest, false, false)
+        {
+            if cfg!(target_os = "linux") && local.is_none() && requested.is_none() {
+                let _ = self.autobind(fd, &queue, &rec, Ipv6Addr::UNSPECIFIED.into());
+            }
+            return err(errno);
+        }
         let station = self.regs.station_at(dest.ip());
-        let sender = match self.shared().route_send(
-            &rec.view(local.or(unhashed(requested))),
-            dest,
-            Op::Send,
-            station,
-            broadcast,
-        ) {
+        let mut view = rec.view(local.or(unhashed(requested)).map(|l| toward(l, dest)));
+        if ctl.oif.is_some() {
+            view.device = ctl.oif;
+        }
+        if cfg!(target_os = "linux")
+            && let Some(src) = ctl.src.filter(|src| src.is_ipv4() == dest.is_ipv4())
+        {
+            view.local = Some(SocketAddr::new(src, view.local.map_or(0, |l| l.port())));
+        }
+        let sender = match self
+            .shared()
+            .route_send(&view, dest, Op::Send, station, broadcast)
+        {
             Ok(sender) => sender,
             Err(errno) => return err(errno),
         };
-        if let Err(errno) = crate::netif::frag::check_send(
-            self.shared(),
-            &rec,
-            domain == libc::AF_INET6,
-            &sender,
-            dest,
-            data.len(),
-        ) {
+        #[cfg(target_os = "linux")]
+        let gso = crate::ancillary::gso_size(&rec, ctl);
+        #[cfg(not(target_os = "linux"))]
+        let gso = 0;
+        let checked = if gso != 0 {
+            crate::netif::frag::check_gso(self.shared(), &sender, dest, data.len(), gso)
+        } else {
+            crate::netif::frag::check_send(
+                self.shared(),
+                &rec,
+                domain == libc::AF_INET6,
+                &sender,
+                dest,
+                data.len(),
+                ctl.dontfrag,
+            )
+        };
+        if let Err(errno) = checked {
             return err(errno);
         }
         let local = match local {
@@ -2499,7 +3050,10 @@ impl Fabric {
                 }
             }
         };
-        let src = sender.source(local);
+        let src = match ctl.src {
+            Some(ip) => SocketAddr::new(ip, local.port()),
+            None => sender.source(toward(local, dest)),
+        };
         // A stalled link (`UdpPolicy::send_queue_depth == Some(0)`) holds the send back. A blocking
         // send that never unstalls (a quiescent deadlock) gives EAGAIN, as SO_SNDTIMEO expiry does.
         let stalled = || {
@@ -2516,17 +3070,40 @@ impl Fabric {
                 return err(libc::EAGAIN);
             }
         }
-        self.shared()
-            .capture_udp(&sender, src, dest, Dir::Out, data, None);
         #[cfg(target_os = "linux")]
         let now = self.shared().tstamp_now();
         #[cfg(target_os = "linux")]
-        crate::tstamp::udp_sent(&rec, now, None, || {
+        crate::tstamp::udp_sent(&rec, now, None, ctl.tx_flags, || {
             crate::tstamp::looped_frame(src, dest, false, data)
         });
-        if self.regs.deliver(&sender, src, dest, data, true) == 0 {
+        let ip = crate::ancillary::header(&rec, dest, ctl);
+        let whole = gso == 0
+            || data.len() <= usize::from(gso)
+            || matches!(&sender, Sender::Host(path) if path.local);
+        let (step, ip) = if whole {
+            let gso = if data.len() > usize::from(gso) {
+                gso
+            } else {
+                0
+            };
+            (data.len(), crate::ancillary::Header { gso, ..ip })
+        } else {
+            (usize::from(gso), ip)
+        };
+        let mut at = 0;
+        loop {
+            let end = (at + step).min(data.len());
+            let packet = &data[at..end];
             self.shared()
-                .unreachable_port(&rec, &sender, src, dest, data, station);
+                .capture_udp(&sender, src, dest, Dir::Out, packet, None);
+            if self.regs.deliver(&sender, src, dest, packet, true, ip) == 0 {
+                self.shared()
+                    .unreachable_port(&rec, &sender, src, dest, packet, station);
+            }
+            at = end;
+            if at >= data.len() {
+                break;
+            }
         }
         if rec.finish_udp_send(dest, &sender) {
             self.shared().bump_keys(&[rec.wake_key()]);
@@ -2545,26 +3122,30 @@ impl Fabric {
         rec: &Arc<SockRec>,
         ip: IpAddr,
     ) -> Result<SocketAddr, c_int> {
+        let dual = rec.state().dual_at(SocketAddr::new(ip, 0));
         let mut regs = self.regs.udp.lock().unwrap();
         let first = queue.next_port.load(Ordering::Relaxed) as u16;
-        let port = regs.alloc_port_from(ip, first);
+        let port = regs.alloc_port_from(ip, first, dual);
         if port == 0 {
             return Err(libc::EAGAIN);
         }
         let sa = SocketAddr::new(ip, port);
+        rec.state().bound_order = self.shared().bind_order();
         regs.insert(sa, queue.clone());
         drop(regs);
-        if let Some(Sock::Dgram { local, .. }) = self.socks.lock().unwrap().get_mut(&fd) {
+        let mut socks = self.socks.lock().unwrap();
+        if let Some(Sock::Dgram { local, .. }) = socks.get_mut(&fd) {
             *local = Some(sa);
         }
+        socks.reindex(fd);
+        drop(socks);
         rec.set_local(sa);
         Ok(sa)
     }
 
     /// Moves bound datagram socket `fd` from `from` to `to` in the delivery map, as the kernel
-    /// rehashes a socket whose local address a connect or disconnect changed. An address another
-    /// socket holds (shared through `SO_REUSEADDR`, which the map does not model) leaves it where
-    /// it is.
+    /// rehashes a socket whose local address a connect or disconnect changed (Linux
+    /// `udp_lib_rehash`, XNU `in_pcbrehash`), beside any other socket there.
     fn rehash(
         &self,
         fd: c_int,
@@ -2577,15 +3158,15 @@ impl Fabric {
             return;
         }
         let mut regs = self.regs.udp.lock().unwrap();
-        if regs.bound.contains_key(&to) {
-            return;
-        }
-        regs.remove(&from);
+        regs.remove(&from, queue);
         regs.insert(to, queue.clone());
         drop(regs);
-        if let Some(Sock::Dgram { local, .. }) = self.socks.lock().unwrap().get_mut(&fd) {
+        let mut socks = self.socks.lock().unwrap();
+        if let Some(Sock::Dgram { local, .. }) = socks.get_mut(&fd) {
             *local = Some(to);
         }
+        socks.reindex(fd);
+        drop(socks);
         rec.set_local(to);
     }
 
@@ -2596,7 +3177,7 @@ impl Fabric {
     /// (`SOCK_BINDPORT_LOCK`), so the next send or connect picks a new one. macOS
     /// `udp_disconnect` (bsd/netinet/udp_usrreq.c) always returns the address to the wildcard and
     /// keeps the port. Measured by tests/udp_connect_source.rs.
-    fn disconnect_dgram(&self, fd: c_int) -> Option<c_int> {
+    fn disconnect_dgram(&self, fd: c_int) -> Option<(c_int, bool)> {
         let mut socks = self.socks.lock().unwrap();
         let Some(Sock::Dgram {
             peer,
@@ -2614,32 +3195,279 @@ impl Fabric {
         *peer = None;
         rec.set_peer(None);
         let Some(bound) = *local else {
-            return Some(domain);
+            return Some((domain, false));
         };
+        let inet6 = domain == libc::AF_INET6;
+        let mapped = inet6 && bound.is_ipv4();
         let (requested, queue, rec) = (*requested, queue.clone(), rec.clone());
-        let wildcard = unspecified_like(bound.ip());
+        let wildcard = if inet6 && (cfg!(target_os = "linux") || bound.is_ipv6()) {
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        } else {
+            unspecified_like(bound.ip())
+        };
         if cfg!(target_os = "linux") && requested.is_none_or(|r| r.port() == 0) {
             *local = None;
+            socks.reindex(fd);
             drop(socks);
             queue.next_port.store(
                 bound.port().checked_add(1).unwrap_or(49152) as u64,
                 Ordering::Relaxed,
             );
-            self.regs.udp.lock().unwrap().remove(&bound);
+            self.regs.udp.lock().unwrap().remove(&bound, &queue);
             rec.state().local = unhashed(requested).filter(|a| !a.ip().is_unspecified());
-            return Some(domain);
+            return Some((domain, mapped));
         }
         drop(socks);
         let ip = requested
             .map(|r| r.ip())
-            .filter(|ip| cfg!(target_os = "linux") && !ip.is_unspecified())
+            .filter(|&ip| cfg!(target_os = "linux") && ip != unspecified_like(loopback_for(domain)))
             .unwrap_or(wildcard);
         self.rehash(fd, &queue, &rec, bound, SocketAddr::new(ip, bound.port()));
-        Some(domain)
+        Some((domain, mapped))
     }
 }
 
+/// What `fcntl` keeps of a socket's open file description besides `O_NONBLOCK` and the
+/// descriptor flags: the status flags `F_SETFL` keeps and the signal-driven I/O owner and signal.
+/// Shared by the fabric's sockets and a `SimHost`'s. Measured by tests/fcntl_os_truth.rs.
+///
+/// Signal-driven I/O is not modelled: no `SIGIO` or `SIGURG` is ever sent, but the owner and
+/// signal are kept and read back. Linux (fs/fcntl.c): `F_SETOWN` names a process, or a process
+/// group when negative (`INT_MIN` is `EINVAL`), and `F_GETOWN` reads it back so;
+/// `F_SETOWN_EX`/`F_GETOWN_EX` take an `f_owner_ex` (a type other than `F_OWNER_TID`,
+/// `F_OWNER_PID`, `F_OWNER_PGRP` is `EINVAL`); `F_SETSIG` takes a signal up to 64
+/// (`valid_signal`), else `EINVAL`. The owner is not looked up, so a process that does not exist
+/// is not refused with `ESRCH`. Record locks (`F_SETLK`, `F_SETLKW`, `F_GETLK` and the OFD forms)
+/// always succeed, as each socket is its own inode that no other process can reach here:
+/// `F_GETLK` reports `F_UNLCK`. `F_GETLEASE` reads `F_UNLCK`; `F_SETLEASE` and the seals are
+/// `EINVAL`, `F_NOTIFY` `ENOTDIR`, the pipe sizes `EBADF`.
+///
+/// macOS (bsd/kern/kern_descrip.c `fcntl_nocancel`): `F_SETOWN` stores `so_pgid` unchecked and
+/// `F_GETOWN` reads it; every command it does not handle for a socket, other than a negative one,
+/// is a vnode command and `EBADF`.
+#[derive(Clone, Copy)]
+pub(crate) struct SocketFcntl {
+    /// The status flags `F_SETFL` kept, from [`SocketFcntl::KEPT_STATUS`].
+    pub(crate) status: c_int,
+    /// Linux's `F_OWNER_*` type and id (a process, 0, by default), or the macOS `so_pgid`.
+    owner: (c_int, c_int),
+    /// Linux `F_SETSIG`: the signal sent instead of `SIGIO`, 0 for `SIGIO`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    signal: c_int,
+}
+
+impl Default for SocketFcntl {
+    fn default() -> Self {
+        SocketFcntl {
+            status: 0,
+            owner: (Self::F_OWNER_PID, 0),
+            signal: 0,
+        }
+    }
+}
+
+impl SocketFcntl {
+    /// Linux `F_SETSIG`, `F_GETSIG` (include/uapi/asm-generic/fcntl.h).
+    #[cfg(target_os = "linux")]
+    const F_SETSIG: c_int = 10;
+    #[cfg(target_os = "linux")]
+    const F_GETSIG: c_int = 11;
+    /// Linux `F_SETOWN_EX`, `F_GETOWN_EX` and the `f_owner_ex` types `F_OWNER_TID`,
+    /// `F_OWNER_PID`, `F_OWNER_PGRP`.
+    #[cfg(target_os = "linux")]
+    const F_SETOWN_EX: c_int = 15;
+    #[cfg(target_os = "linux")]
+    const F_GETOWN_EX: c_int = 16;
+    #[cfg(target_os = "linux")]
+    const F_OWNER_TID: c_int = 0;
+    const F_OWNER_PID: c_int = 1;
+    #[cfg(target_os = "linux")]
+    const F_OWNER_PGRP: c_int = 2;
+    /// Linux open file description locks, `F_OFD_GETLK`, `F_OFD_SETLK`, `F_OFD_SETLKW`.
+    #[cfg(target_os = "linux")]
+    const F_OFD_GETLK: c_int = 36;
+    #[cfg(target_os = "linux")]
+    const F_OFD_SETLK: c_int = 37;
+    #[cfg(target_os = "linux")]
+    const F_OFD_SETLKW: c_int = 38;
+    /// Linux `F_SETLEASE`, `F_SETPIPE_SZ`, `F_ADD_SEALS`.
+    #[cfg(target_os = "linux")]
+    const F_SETLEASE: c_int = 1024;
+    #[cfg(target_os = "linux")]
+    const F_SETPIPE_SZ: c_int = 1031;
+    #[cfg(target_os = "linux")]
+    const F_ADD_SEALS: c_int = 1033;
+    /// The status flags `F_SETFL` keeps on a socket besides `O_NONBLOCK`: Linux `O_APPEND` and
+    /// `O_ASYNC` (fs/fcntl.c `SETFL_MASK`, less `O_DIRECT` and `O_NOATIME`), macOS `O_APPEND`,
+    /// `O_ASYNC` and `O_SYNC` (`FCNTLFLAGS`, bsd/sys/fcntl.h).
+    #[cfg(target_os = "linux")]
+    const KEPT_STATUS: c_int = libc::O_APPEND | libc::O_ASYNC;
+    #[cfg(target_os = "macos")]
+    const KEPT_STATUS: c_int = libc::O_APPEND | libc::O_ASYNC | libc::O_SYNC;
+
+    /// The flags an `F_SETFL` of `arg` keeps; Linux refuses `O_DIRECT` on a socket (fs/fcntl.c
+    /// `setfl`: no `direct_IO`).
+    pub(crate) fn kept_status(arg: i64) -> Result<c_int, c_int> {
+        #[cfg(target_os = "linux")]
+        if arg as c_int & libc::O_DIRECT != 0 {
+            return Err(libc::EINVAL);
+        }
+        Ok(arg as c_int & Self::KEPT_STATUS)
+    }
+
+    /// Carries out `cmd` (see the type); `None` for a command it does not answer: duplication,
+    /// the descriptor and status flags, macOS `F_SETNOSIGPIPE`/`F_GETNOSIGPIPE`, and on Linux any
+    /// command it does not know.
+    ///
+    /// # Safety
+    /// For the commands taking a pointer, `arg` is the caller's `struct flock` or `f_owner_ex`.
+    #[cfg(target_os = "linux")]
+    pub(crate) unsafe fn command(&mut self, cmd: c_int, arg: i64) -> Option<NetResult> {
+        match cmd {
+            libc::F_GETOWN => {
+                let (ty, id) = self.owner;
+                ok(if ty == Self::F_OWNER_PGRP { -id } else { id } as i64)
+            }
+            libc::F_SETOWN => {
+                let who = arg as c_int;
+                if who == c_int::MIN {
+                    return err(libc::EINVAL);
+                }
+                self.owner = if who < 0 {
+                    (Self::F_OWNER_PGRP, -who)
+                } else {
+                    (Self::F_OWNER_PID, who)
+                };
+                ok(0)
+            }
+            Self::F_GETOWN_EX | Self::F_SETOWN_EX => {
+                let owner = arg as *mut [c_int; 2];
+                if owner.is_null() {
+                    return err(libc::EFAULT);
+                }
+                if cmd == Self::F_GETOWN_EX {
+                    let (ty, id) = self.owner;
+                    unsafe { owner.write_unaligned([ty, id]) };
+                } else {
+                    let [ty, id] = unsafe { owner.read_unaligned() };
+                    if ![Self::F_OWNER_TID, Self::F_OWNER_PID, Self::F_OWNER_PGRP].contains(&ty) {
+                        return err(libc::EINVAL);
+                    }
+                    self.owner = (ty, id);
+                }
+                ok(0)
+            }
+            Self::F_GETSIG => ok(self.signal as i64),
+            Self::F_SETSIG => {
+                if !(0..=64).contains(&arg) {
+                    return err(libc::EINVAL);
+                }
+                self.signal = arg as c_int;
+                ok(0)
+            }
+            libc::F_GETLK
+            | libc::F_SETLK
+            | libc::F_SETLKW
+            | Self::F_OFD_GETLK
+            | Self::F_OFD_SETLK
+            | Self::F_OFD_SETLKW => {
+                let lock = arg as *mut libc::flock;
+                if lock.is_null() {
+                    return err(libc::EFAULT);
+                }
+                let mut fl = unsafe { lock.read_unaligned() };
+                let getlk = cmd == libc::F_GETLK || cmd == Self::F_OFD_GETLK;
+                let types: &[c_int] = if getlk {
+                    &[libc::F_RDLCK, libc::F_WRLCK]
+                } else {
+                    &[libc::F_RDLCK, libc::F_WRLCK, libc::F_UNLCK]
+                };
+                if !types.contains(&c_int::from(fl.l_type))
+                    || !(0..=2).contains(&c_int::from(fl.l_whence))
+                    || (cmd >= Self::F_OFD_GETLK && fl.l_pid != 0)
+                {
+                    return err(libc::EINVAL);
+                }
+                if getlk {
+                    fl.l_type = libc::F_UNLCK as _;
+                    unsafe { lock.write_unaligned(fl) };
+                }
+                ok(0)
+            }
+            libc::F_GETLEASE => ok(libc::F_UNLCK as i64),
+            Self::F_SETLEASE | libc::F_GET_SEALS | Self::F_ADD_SEALS => err(libc::EINVAL),
+            libc::F_NOTIFY => err(libc::ENOTDIR),
+            libc::F_GETPIPE_SZ | Self::F_SETPIPE_SZ => err(libc::EBADF),
+            _ => None,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) unsafe fn command(&mut self, cmd: c_int, arg: i64) -> Option<NetResult> {
+        match cmd {
+            libc::F_GETOWN => ok(self.owner.1 as i64),
+            libc::F_SETOWN => {
+                self.owner = (Self::F_OWNER_PID, arg as c_int);
+                ok(0)
+            }
+            libc::F_DUPFD
+            | libc::F_DUPFD_CLOEXEC
+            | libc::F_GETFD
+            | libc::F_SETFD
+            | libc::F_GETFL
+            | libc::F_SETFL
+            | F_SETNOSIGPIPE
+            | F_GETNOSIGPIPE => None,
+            cmd if cmd < 0 => err(libc::EINVAL),
+            _ => err(libc::EBADF),
+        }
+    }
+}
+
+/// macOS `F_SETNOSIGPIPE`, `F_GETNOSIGPIPE` (XNU bsd/sys/fcntl.h).
+#[cfg(target_os = "macos")]
+const F_SETNOSIGPIPE: c_int = 73;
+#[cfg(target_os = "macos")]
+const F_GETNOSIGPIPE: c_int = 74;
+
 impl Fabric {
+    /// The commands [`SocketFcntl::command`] answers on a socket, and macOS
+    /// `F_SETNOSIGPIPE`/`F_GETNOSIGPIPE`, which XNU carries out as `SO_NOSIGPIPE` on a socket
+    /// (`fcntl_nocancel` calls `sock_setsockopt`/`sock_getsockopt`); `None` for any other command
+    /// or descriptor. A macOS `/dev/bpf` descriptor is a device, not a socket, and is left out.
+    ///
+    /// # Safety
+    /// As [`SocketFcntl::command`].
+    #[cfg_attr(target_os = "linux", allow(unused_variables))]
+    unsafe fn socket_fcntl(&self, fd: c_int, cmd: c_int, arg: i64) -> Option<NetResult> {
+        let mut socks = self.socks.lock().unwrap();
+        let rec = match socks.get(&fd)? {
+            sock @ (Sock::Fresh { .. }
+            | Sock::Connecting { .. }
+            | Sock::Stream { .. }
+            | Sock::Listener { .. }
+            | Sock::Dgram { .. }
+            | Sock::UnixDgram { .. }) => sock.rec().cloned(),
+            sock @ Sock::Raw { .. } if cfg!(target_os = "linux") => sock.rec().cloned(),
+            _ => return None,
+        };
+        #[cfg(target_os = "macos")]
+        if cmd == F_SETNOSIGPIPE || cmd == F_GETNOSIGPIPE {
+            drop(socks);
+            let rec = rec?;
+            if cmd == F_SETNOSIGPIPE {
+                let on = c_int::from(arg as c_int != 0);
+                rec.keep_ignored(libc::SOL_SOCKET, SO_NOSIGPIPE, &on.to_ne_bytes());
+                return ok(0);
+            }
+            let on = rec
+                .ignored_value(libc::SOL_SOCKET, SO_NOSIGPIPE)
+                .is_some_and(|v| v.iter().any(|&b| b != 0));
+            return ok(i64::from(on));
+        }
+        unsafe { socks.description_mut(&fd)?.fcntl.command(cmd, arg) }
+    }
+
     /// Whether `fd` is an IPv6 socket (`Some(false)` for IPv4); `None` for a descriptor that is
     /// not an IP socket, such as a socketpair end.
     fn ipv6(&self, fd: c_int) -> Option<bool> {
@@ -2648,10 +3476,68 @@ impl Fabric {
             | Sock::Connecting { domain, .. }
             | Sock::Dgram { domain, .. } => Some(*domain == libc::AF_INET6),
             Sock::Stream { conn, .. } if conn.pair => None,
-            Sock::Stream { conn, end, .. } => Some(conn.local(*end).is_ipv6()),
-            Sock::Listener { listener, .. } => Some(listener.addr.is_ipv6()),
+            Sock::Stream { rec, .. } | Sock::Listener { rec, .. } => Some(rec.state().inet6),
             _ => None,
         }
+    }
+
+    /// `fd`'s family and whether it is a stream socket, for an IP socket.
+    fn family(&self, fd: c_int) -> Option<(c_int, bool)> {
+        let socks = self.socks.lock().unwrap();
+        let inet = |rec: &SockRec| {
+            if rec.state().inet6 {
+                libc::AF_INET6
+            } else {
+                libc::AF_INET
+            }
+        };
+        match socks.get(&fd)? {
+            Sock::Dgram { domain, .. } => Some((*domain, false)),
+            Sock::Fresh { domain, .. } | Sock::Connecting { domain, .. } => Some((*domain, true)),
+            Sock::Stream { conn, rec, .. } if !conn.pair => Some((inet(rec), true)),
+            Sock::Listener { rec, .. } => Some((inet(rec), true)),
+            _ => None,
+        }
+    }
+
+    /// `fd`'s record, whether it is IPv6 and whether it is bound, for an IP socket: one bound,
+    /// connecting, connected or listening holds a port (Linux `inet_num`; macOS a local port or
+    /// address).
+    fn v6only_target(&self, fd: c_int) -> Option<(Arc<SockRec>, bool, bool)> {
+        let socks = self.socks.lock().unwrap();
+        let (rec, bound) = match socks.get(&fd)? {
+            Sock::Dgram { rec, local, .. } | Sock::Fresh { rec, local, .. } => {
+                (rec, local.is_some())
+            }
+            Sock::Connecting { rec, .. } | Sock::Listener { rec, .. } => (rec, true),
+            Sock::Stream { conn, rec, .. } if !conn.pair => (rec, true),
+            _ => return None,
+        };
+        let inet6 = rec.state().inet6;
+        Some((rec.clone(), inet6, bound))
+    }
+
+    /// [`v6only_set`] on `fd`; `None` for a descriptor that is not an IP socket.
+    ///
+    /// # Safety
+    /// `val` is null or holds `len` bytes.
+    unsafe fn set_v6only(&self, fd: c_int, val: *const u8, len: u32) -> Option<Option<NetResult>> {
+        let (rec, _, bound) = self.v6only_target(fd)?;
+        Some(unsafe { v6only_set(&rec, bound, val, len) })
+    }
+
+    /// [`v6only_get`] on `fd`; `None` for a descriptor that is not an IP socket.
+    ///
+    /// # Safety
+    /// `val` and `len` are each null or valid, `val` writable for `*len` bytes.
+    unsafe fn get_v6only(
+        &self,
+        fd: c_int,
+        val: *mut u8,
+        len: *mut u32,
+    ) -> Option<Option<NetResult>> {
+        let (rec, _, _) = self.v6only_target(fd)?;
+        Some(unsafe { v6only_get(&rec, val, len) })
     }
 
     /// How `fd` stands for the timestamp options: a datagram socket, a connected stream, or a
@@ -2796,9 +3682,9 @@ impl Fabric {
 /// - `IP_TOS`, `IP_TTL`, `IP_MULTICAST_TTL`, `IPV6_TCLASS`, `IPV6_UNICAST_HOPS`,
 ///   `IPV6_MULTICAST_HOPS`: the sim's links have no QoS and no hop count to run out.
 ///
-/// Everything else not modelled — `SO_REUSEPORT`, `IP_MULTICAST_LOOP`, `IP_DROP_MEMBERSHIP`,
-/// `IPV6_V6ONLY`, `SO_RCVLOWAT` and the rest — changes behaviour the sim does not reproduce, so
-/// it is recorded as unmodelled.
+/// Everything else not modelled — `IP_MULTICAST_LOOP`, `IP_DROP_MEMBERSHIP`,
+/// `SO_RCVLOWAT` and the rest — changes behaviour the sim does not reproduce, so it is recorded
+/// as unmodelled.
 #[cfg(unix)]
 pub(crate) fn harmless(level: c_int, name: c_int) -> bool {
     match level {
@@ -2819,6 +3705,18 @@ pub(crate) fn harmless(level: c_int, name: c_int) -> bool {
             libc::IPV6_TCLASS | libc::IPV6_UNICAST_HOPS | libc::IPV6_MULTICAST_HOPS
         ),
         _ => false,
+    }
+}
+
+/// What `getsockopt` reads for `SOL_SOCKET` boolean option `name`, `on` or off: 1 on Linux
+/// (net/core/sock.c `sk_getsockopt`), the option's own bit on macOS, as XNU `sogetoptlock`
+/// (bsd/kern/uipc_socket.c) answers `so_options & sopt_name`. Measured for `SO_REUSEADDR` and
+/// `SO_REUSEPORT` by tests/reuseport_os_truth.rs.
+pub(crate) fn socket_flag(on: bool, name: c_int) -> c_int {
+    match (on, cfg!(target_os = "macos")) {
+        (false, _) => 0,
+        (true, true) => name,
+        (true, false) => 1,
     }
 }
 
@@ -3009,17 +3907,23 @@ impl Fabric {
                         return Some(Ok((copied, stamp)));
                     }
                     if peek
-                        && !readiness().wait_until_on(
-                            "tcp peek",
-                            deadline,
-                            &[rec.wake_key()],
-                            || rec.pending_time(),
+                        && !snare_interpose::interruptible(
+                            crate::signals::socket_restart(deadline.is_some()),
                             || {
-                                rec.fionread() as usize >= out.len()
-                                    || pipe.read_eof()
-                                    || rec.peek_error().is_some()
+                                readiness().wait_until_on(
+                                    "tcp peek",
+                                    deadline,
+                                    &[rec.wake_key()],
+                                    || rec.pending_time(),
+                                    || {
+                                        rec.fionread() as usize >= out.len()
+                                            || pipe.read_eof()
+                                            || rec.peek_error().is_some()
+                                    },
+                                )
                             },
                         )
+                        .0
                     {
                         return Some(Ok((copied, stamp)));
                     }
@@ -3036,20 +3940,29 @@ impl Fabric {
                     return Some(Err(libc::EAGAIN));
                 }
                 Read::WouldBlock => {
-                    // `false` is a timeout (SO_RCVTIMEO) or a quiescent deadlock; both are EAGAIN.
-                    if !readiness().wait_until_on(
-                        "tcp recv",
-                        deadline,
-                        &[rec.wake_key()],
-                        || rec.pending_time(),
+                    // `false` is a timeout (SO_RCVTIMEO) or a quiescent deadlock, both EAGAIN, or
+                    // a signal handler's interruption, EINTR.
+                    let (woke, interrupted) = snare_interpose::interruptible(
+                        crate::signals::socket_restart(deadline.is_some()),
                         || {
-                            #[cfg(target_os = "macos")]
-                            conn.progress_tcp_shutdown();
-                            pipe.readable_or_closed() || rec.peek_error().is_some()
+                            readiness().wait_until_on(
+                                "tcp recv",
+                                deadline,
+                                &[rec.wake_key()],
+                                || rec.pending_time(),
+                                || {
+                                    #[cfg(target_os = "macos")]
+                                    conn.progress_tcp_shutdown();
+                                    pipe.readable_or_closed() || rec.peek_error().is_some()
+                                },
+                            )
                         },
-                    ) {
+                    );
+                    if !woke {
                         return Some(if copied > 0 {
                             Ok((copied, stamp))
+                        } else if interrupted {
+                            Err(libc::EINTR)
                         } else {
                             Err(libc::EAGAIN)
                         });
@@ -3073,6 +3986,7 @@ impl Fabric {
             queue,
             nonblocking,
             rec,
+            ..
         } = endpoint;
         let nonblocking = *nonblocking || flags & libc::MSG_DONTWAIT != 0;
         let taker = if flags & libc::MSG_PEEK != 0 {
@@ -3114,13 +4028,22 @@ impl Fabric {
                 snare_interpose::charge_latency();
                 return Err(libc::EAGAIN);
             }
-            if !readiness().wait_until_on(
-                "udp recv",
-                deadline,
-                &[rec.wake_key()],
-                || rec.pending_time(),
-                || queue.has(accept) || rec.peek_error().is_some(),
-            ) {
+            let (woke, interrupted) = snare_interpose::interruptible(
+                crate::signals::socket_restart(deadline.is_some()),
+                || {
+                    readiness().wait_until_on(
+                        "udp recv",
+                        deadline,
+                        &[rec.wake_key()],
+                        || rec.pending_time(),
+                        || queue.has(accept) || rec.peek_error().is_some(),
+                    )
+                },
+            );
+            if interrupted {
+                return Err(libc::EINTR);
+            }
+            if !woke {
                 return Err(libc::EAGAIN); // quiescent deadlock or SO_RCVTIMEO timeout
             }
         }
@@ -3147,7 +4070,7 @@ impl Fabric {
             if dg.src == UNNAMED {
                 unsafe { write_unnamed(addr, addr_len) };
             } else {
-                unsafe { write_addr(dg.src, addr, addr_len) };
+                unsafe { write_addr(reported(endpoint.mapped, dg.src), addr, addr_len) };
             }
         }
         ok(
@@ -3457,9 +4380,166 @@ impl Fabric {
 /// The socket calls of the code under test. Every method returns `None` for an fd, family or type
 /// the fabric does not serve, so the call reaches the next backend or the OS, and otherwise the
 /// result or errno the host OS would give.
+impl Fabric {
+    /// [`Net::setsockopt`] on `fd`, one of the fabric's own.
+    unsafe fn set_option(
+        &self,
+        fd: c_int,
+        level: c_int,
+        name: c_int,
+        val: *const u8,
+        len: u32,
+    ) -> Option<NetResult> {
+        if let Some(rec) = self.rec(fd)
+            && let Some(result) = unsafe {
+                crate::netif::sockopt::set(self.shared(), &rec, level, name, val, len).or_else(
+                    || crate::limits::sockopt::set(self.shared(), &rec, level, name, val, len),
+                )
+            }
+        {
+            return match result {
+                Ok(()) => ok(0),
+                Err(errno) => err(errno),
+            };
+        }
+        if let Some(rec) = self.rec(fd)
+            && let Some(v6) = self.ipv6(fd)
+            && let Some(result) =
+                unsafe { crate::netif::frag::set(&rec, v6, level, name, val, len) }
+        {
+            return match result {
+                Ok(()) => ok(0),
+                Err(errno) => err(errno),
+            };
+        }
+        if self.kind(fd) == Some(Kind::Dgram)
+            && let Some(rec) = self.rec(fd)
+            && let Some(v6) = self.ipv6(fd)
+            && let Some(result) = unsafe { crate::ancillary::set(&rec, v6, level, name, val, len) }
+        {
+            return match result {
+                Ok(()) => ok(0),
+                Err(errno) => err(errno),
+            };
+        }
+        if level == libc::IPPROTO_TCP
+            && let Some(rec) = self.rec(fd)
+            && let Some(result) = unsafe { crate::faults::sockopt::set(&rec, name, val, len) }
+        {
+            return match result {
+                Ok(()) => ok(0),
+                Err(errno) => err(errno),
+            };
+        }
+        if let Some(rec) = self.rec(fd)
+            && let Some(result) = unsafe {
+                crate::tstamp::set(
+                    Some(self.shared()),
+                    &rec,
+                    self.ts_kind(fd),
+                    level,
+                    name,
+                    val,
+                    len,
+                )
+            }
+        {
+            return match result {
+                Ok(()) => ok(0),
+                Err(errno) => err(errno),
+            };
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(rec) = self.rec(fd) {
+            let net_admin = self.shared().sys.has_cap(crate::limits::CAP_NET_ADMIN);
+            if let Some(result) =
+                unsafe { crate::tstamp::set_txtime(&rec, net_admin, level, name, val, len) }
+            {
+                return match result {
+                    Ok(()) => ok(0),
+                    Err(errno) => err(errno),
+                };
+            }
+        }
+        // man 7 socket: SO_BROADCAST permits sending to a broadcast address.
+        if level == libc::SOL_SOCKET && name == libc::SO_BROADCAST {
+            let on = unsafe { read_int(val, len) } != 0;
+            if let Some(Sock::Dgram { broadcast, .. }) = self.socks.lock().unwrap().get_mut(&fd) {
+                *broadcast = on;
+            }
+            return ok(0);
+        }
+        if level == libc::SOL_SOCKET
+            && let Some(rec) = self.rec(fd)
+        {
+            // man 7 socket: SO_RCVTIMEO/SO_SNDTIMEO bound how long a blocking receive/send waits;
+            // a zero timeval clears them (block indefinitely again).
+            let timeout = || unsafe { parse_timeval(val, len) }.filter(|d| !d.is_zero());
+            let mut state = rec.state();
+            match name {
+                libc::SO_RCVTIMEO => state.opts.rcvtimeo = timeout(),
+                libc::SO_SNDTIMEO => state.opts.sndtimeo = timeout(),
+                libc::SO_REUSEADDR => state.opts.reuseaddr = unsafe { read_int(val, len) } != 0,
+                libc::SO_REUSEPORT => state.opts.reuseport = unsafe { read_int(val, len) } != 0,
+                libc::SO_LINGER => {
+                    state.opts.linger = unsafe { parse_linger(val, len, LINGER_UNIT) }
+                }
+                #[cfg(target_os = "macos")]
+                SO_LINGER_SEC => {
+                    state.opts.linger = unsafe { parse_linger(val, len, Duration::from_secs(1)) }
+                }
+                _ => {
+                    drop(state);
+                    return unsafe { self.unmodelled_set(Some(&rec), level, name, val, len) };
+                }
+            }
+            return ok(0);
+        }
+        // IP_RECVERR(2const): queues errors on a datagram socket. Without it Linux reports an
+        // ICMP error only on a connected socket (net/ipv4/udp.c udp_err), so it is what makes
+        // errors fail calls on an unconnected one too.
+        #[cfg(target_os = "linux")]
+        if (level, name) == (libc::IPPROTO_IP, libc::IP_RECVERR)
+            || (level, name) == (libc::IPPROTO_IPV6, libc::IPV6_RECVERR)
+        {
+            if let Some(rec) = self.rec(fd) {
+                rec.state().dgram.recverr = unsafe { read_int(val, len) } != 0;
+            }
+            return ok(0);
+        }
+        // IP_ADD_MEMBERSHIP(2const) / IPV6_ADD_MEMBERSHIP(2const): joining a multicast group so
+        // datagrams to it are delivered here.
+        let drop_group = (level == libc::IPPROTO_IP && name == libc::IP_DROP_MEMBERSHIP)
+            || (level == libc::IPPROTO_IPV6 && name == IPV6_LEAVE);
+        let membership_name = if drop_group {
+            if level == libc::IPPROTO_IP {
+                libc::IP_ADD_MEMBERSHIP
+            } else {
+                IPV6_JOIN
+            }
+        } else {
+            name
+        };
+        if let Some(membership) = unsafe { parse_add_membership(level, membership_name, val, len) }
+        {
+            if let Some(rec) = self.rec(fd) {
+                return match rec.change_membership(membership, !drop_group) {
+                    Ok(()) => ok(0),
+                    Err(errno) => err(errno),
+                };
+            }
+            return err(libc::ENOTSOCK);
+        }
+        unsafe { self.unmodelled_set(self.rec(fd).as_ref(), level, name, val, len) }
+    }
+}
+
 impl Net for Fabric {
     /// Whether `fd` is one of the fabric's virtual descriptors.
     fn owns(&self, fd: c_int) -> bool {
+        if let Some(held) = self.fds.held(fd) {
+            return held;
+        }
         let socks = self.socks.lock().unwrap();
         socks.contains_key(&fd) && !socks.stale_mirror(fd)
     }
@@ -3476,9 +4556,11 @@ impl Net for Fabric {
         let Some(end) = process_pairs().get(fd) else {
             return self.mirror_dead(fd);
         };
+        snare_interpose::share_statics(fd);
         let fresh = {
             let mut socks = self.socks.lock().unwrap();
             if socks.stale_mirror(fd) {
+                self.notice_detach(&socks, fd);
                 let removed = socks.remove(&fd);
                 drop(socks);
                 if let Some(removed) = removed {
@@ -3588,29 +4670,34 @@ impl Net for Fabric {
         socks.adopt(descriptions, |sock, renamed| match sock {
             Sock::Timer { expires, .. } => *expires = expires.map(|left| now + left),
             Sock::Event { ready_at, .. } => *ready_at = now,
-            Sock::Epoll { interests } => {
-                *interests = std::mem::take(interests)
+            Sock::Epoll { interests, .. } => {
+                let held: Vec<_> = interests.iter().map(|(key, _)| *key).collect();
+                let held: Vec<_> = held
                     .into_iter()
-                    .filter_map(|((fd, identity), mut interest)| {
-                        let identity = match identity {
-                            EpollIdentity::Local(id) => EpollIdentity::Local(
-                                *renamed.get(&id).or_else(|| mirrored.get(&fd))?,
-                            ),
-                            EpollIdentity::Foreign(_) => return None,
-                            EpollIdentity::Untracked => EpollIdentity::Untracked,
-                        };
-                        interest.pending_order = None;
-                        Some(((fd, identity), interest))
-                    })
+                    .filter_map(|key| Some((key, interests.remove(&key)?)))
                     .collect();
+                for ((fd, identity), mut interest) in held {
+                    let identity = match identity {
+                        EpollIdentity::Local(id) => {
+                            match renamed.get(&id).or_else(|| mirrored.get(&fd)) {
+                                Some(&id) => EpollIdentity::Local(id),
+                                None => continue,
+                            }
+                        }
+                        EpollIdentity::Foreign(_) => continue,
+                        EpollIdentity::Untracked => EpollIdentity::Untracked,
+                    };
+                    interest.pending_order = None;
+                    interests.insert((fd, identity), interest, Keys::default());
+                }
             }
             Sock::Kqueue { state } => {
                 let mut state = state.lock().unwrap();
                 let keep = |fd: &c_int, note: &mut Knote| {
                     note.untracked || moved.contains(fd) || mirrored.contains_key(fd)
                 };
-                state.reads.retain(keep);
-                state.writes.retain(keep);
+                state.notes.retain(|(_, fd), note| keep(fd, note));
+                state.notes.everything();
             }
             _ => {}
         });
@@ -3662,10 +4749,18 @@ impl Net for Fabric {
         };
         #[cfg(not(target_os = "linux"))]
         let _ = protocol;
+        let inet6 = domain == libc::AF_INET6;
+        let v6only = inet6 && self.shared().sys.limits().bindv6only;
+        let family = |rec: &SockRec| {
+            let mut state = rec.state();
+            state.inet6 = inet6;
+            state.v6only = v6only;
+        };
         if base == libc::SOCK_DGRAM {
             return self.open_socket(SocketKind::Udp, ty, |rec| {
                 #[cfg(target_os = "linux")]
                 rec.set_family(domain, resolved);
+                family(&rec);
                 Sock::Dgram {
                     queue: DgramQueue::for_socket(&rec),
                     domain,
@@ -3684,6 +4779,7 @@ impl Net for Fabric {
         self.open_socket(SocketKind::TcpStream, ty, |rec| {
             #[cfg(target_os = "linux")]
             rec.set_family(domain, resolved);
+            family(&rec);
             Sock::Fresh {
                 domain,
                 local: None,
@@ -3691,6 +4787,60 @@ impl Net for Fabric {
                 rec,
             }
         })
+    }
+
+    /// Makes a real pipe (man 2 pipe, and `pipe2` with `flags` on Linux) and records it as the
+    /// sim's ([`Pipes`](crate::realfd::Pipes)), so that a wait on it beside the sim's own
+    /// descriptors blocks on it as well.
+    unsafe fn pipe(&self, fds: *mut c_int, flags: c_int) -> Option<NetResult> {
+        if fds.is_null() {
+            return err(libc::EFAULT);
+        }
+        #[cfg(not(target_os = "linux"))]
+        if flags != 0 {
+            return err(libc::EINVAL);
+        }
+        let mut ends = [-1; 2];
+        let made = snare_interpose::real(|| {
+            #[cfg(target_os = "linux")]
+            let made = unsafe { libc::pipe2(ends.as_mut_ptr(), flags) };
+            #[cfg(not(target_os = "linux"))]
+            let made = unsafe { libc::pipe(ends.as_mut_ptr()) };
+            (made == 0).then_some(()).ok_or_else(|| {
+                io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EMFILE)
+            })
+        });
+        if let Err(errno) = made {
+            return err(errno);
+        }
+        self.shared().pipes.add(ends);
+        unsafe {
+            fds.write(ends[0]);
+            fds.add(1).write(ends[1]);
+        }
+        ok(0)
+    }
+
+    /// Marks the pipe `fd` is an end of (every pipe of the sim's, for a `fork`) as one a child
+    /// process may hold, and has the sim's waits on real descriptors look again.
+    fn spawning(&self, fd: Option<c_int>) {
+        self.shared().pipes.lend(fd);
+        crate::realfd::recheck(self.shared().domain_key());
+    }
+
+    /// Holds the sim's clock to real time while child process `pid` runs (see
+    /// [`Clock::hold_child`](crate::clock::Clock::hold_child)), and has its end be the sim's
+    /// `SIGCHLD` ([`watch_child`](crate::realfd::watch_child)). The sim's waits on real
+    /// descriptors look again: one waiting for any child ([`await_children`](Net::await_children))
+    /// waits for this one too.
+    fn spawned(&self, pid: c_int) {
+        if let Some(clock) = &self.shared().clock {
+            clock.hold_child(pid);
+        }
+        crate::realfd::watch_child(&self.regs.shared, pid);
+        crate::realfd::recheck(self.shared().domain_key());
     }
 
     /// Opens a connected pair of `AF_UNIX` stream or datagram sockets (man 2 socketpair): a
@@ -3737,14 +4887,15 @@ impl Net for Fabric {
 
     /// Binds a fresh TCP socket, a UDP socket, or (Linux) a packet socket to its interface.
     ///
-    /// For TCP and UDP the address must be one the host holds or the wildcard
-    /// (`SimShared::claim_address`, EADDRNOTAVAIL otherwise, man 7 ip) and a port the process may
-    /// take (`bind_denied`: EACCES for a privileged port without the capability, man 7 ip). TCP
-    /// then applies `tcp_bind_conflict` against every socket of the sim; UDP refuses only an
-    /// exact duplicate of an address a socket was bound to (EADDRINUSE) — the address `bind`
-    /// named, not where a connect since rehashed it — as `SO_REUSEADDR` is not modelled for
-    /// datagram sockets. Port 0
-    /// takes an ephemeral port. A second bind of a bound socket is EINVAL (man 2 bind).
+    /// For TCP and UDP the address must be of the socket's family ([`sock_addr`]), one the host
+    /// holds or the wildcard (`SimShared::claim_address`, EADDRNOTAVAIL otherwise, man 7 ip) and a
+    /// port the process may take (`bind_denied`: EACCES for a privileged port without the
+    /// capability, man 7 ip); an IPv6 socket's v4-mapped address binds it to that IPv4 address,
+    /// unless `IPV6_V6ONLY` is on ([`bind_addr`]). It then must not collide ([`bind_conflict`])
+    /// with a socket of its protocol: every TCP socket of the sim, or every datagram socket, each
+    /// holding the address `bind` named, not where a connect since rehashed it, and a tester's
+    /// endpoint at the address. Port 0 takes an ephemeral port. A second bind of a bound socket is
+    /// EINVAL (man 2 bind).
     unsafe fn bind(&self, fd: c_int, addr: *const u8, len: u32) -> Option<NetResult> {
         #[cfg(target_os = "linux")]
         {
@@ -3763,11 +4914,15 @@ impl Net for Fabric {
         let mut socks = self.socks.lock().unwrap();
         match socks.get(&fd) {
             Some(Sock::Fresh {
-                local: None, rec, ..
+                local: None,
+                rec,
+                domain,
+                ..
             }) => {
                 let rec = rec.clone();
-                let Some(want) = (unsafe { parse_addr(addr, len) }) else {
-                    return err(libc::EINVAL);
+                let want = match unsafe { bind_addr(&rec, *domain, addr, len, true) } {
+                    Ok(want) => want,
+                    Err(errno) => return err(errno),
                 };
                 if let Err(errno) = self.shared().claim_address(want.ip()) {
                     return err(errno);
@@ -3775,13 +4930,16 @@ impl Net for Fabric {
                 if let Some(errno) = self.shared().sys.bind_denied(want) {
                     return err(errno);
                 }
-                let Some(want) = self.tcp_bind_addr(&socks, want, rec.opts().reuseaddr) else {
+                let Some(want) = self.tcp_bind_addr(&socks, self.want(&rec, want)) else {
                     return err(libc::EADDRINUSE);
                 };
                 if let Some(Sock::Fresh { local, .. }) = socks.get_mut(&fd) {
                     *local = Some(want);
                 }
+                socks.reindex(fd);
+                rec.state().bound_order = self.shared().bind_order();
                 rec.set_local(want);
+                bound_at(&rec, want);
                 return ok(0);
             }
             Some(Sock::Fresh { .. } | Sock::Stream { .. } | Sock::Listener { .. }) => {
@@ -3790,7 +4948,11 @@ impl Net for Fabric {
             _ => {}
         }
         let Some(Sock::Dgram {
-            queue, local, rec, ..
+            queue,
+            local,
+            rec,
+            domain,
+            ..
         }) = socks.get_mut(&fd)
         else {
             return None;
@@ -3798,8 +4960,9 @@ impl Net for Fabric {
         if local.is_some() {
             return err(libc::EINVAL); // man 2 bind: already bound
         }
-        let Some(mut want) = (unsafe { parse_addr(addr, len) }) else {
-            return err(libc::EINVAL);
+        let mut want = match unsafe { bind_addr(rec, *domain, addr, len, false) } {
+            Ok(want) => want,
+            Err(errno) => return err(errno),
         };
         if let Err(errno) = self.shared().claim_address(want.ip()) {
             return err(errno);
@@ -3809,9 +4972,10 @@ impl Net for Fabric {
         }
         let asked = want;
         let (queue, rec) = (queue.clone(), rec.clone());
+        let claim = self.want(&rec, want);
         let mut regs = self.regs.udp.lock().unwrap();
         if want.port() == 0 {
-            let port = regs.alloc_port(want.ip());
+            let port = regs.alloc_port(want.ip(), claim.dual);
             if port == 0 {
                 return err(if cfg!(target_os = "linux") {
                     libc::EADDRINUSE
@@ -3820,9 +4984,18 @@ impl Net for Fabric {
                 });
             }
             want.set_port(port);
-        } else if regs.bound.contains_key(&want) || dgram_claims(&socks).any(|c| c == want) {
+        } else if regs
+            .bound
+            .get(&want)
+            .is_some_and(|held| held.iter().any(|q| q.rec.is_none()))
+            || socks
+                .on_port(want.port())
+                .filter_map(udp_claim)
+                .any(|held| bind_conflict(held, claim))
+        {
             return err(libc::EADDRINUSE);
         }
+        rec.state().bound_order = self.shared().bind_order();
         regs.insert(want, queue);
         drop(regs);
         if let Some(Sock::Dgram {
@@ -3832,14 +5005,20 @@ impl Net for Fabric {
             *local = Some(want);
             *requested = Some(asked);
         }
+        socks.reindex(fd);
         rec.set_local(want);
+        bound_at(&rec, want);
         ok(0)
     }
 
     /// Turns a fresh TCP socket into a listener registered at its address. Listening on a connected socket is EINVAL
     /// (net/ipv4/af_inet.c inet_listen; XNU bsd/kern/uipc_socket.c solisten; macOS listen(2))
     /// and on a datagram socket EOPNOTSUPP (man 2 listen). A connecting socket also gets
-    /// EOPNOTSUPP here, where both kernels give EINVAL.
+    /// EOPNOTSUPP here, where both kernels give EINVAL. Linux checks the address again as the
+    /// socket starts listening (net/ipv4/inet_connection_sock.c `inet_csk_listen_start` calls
+    /// `get_port` with the socket already listening), so of two sockets that shared an address
+    /// through `SO_REUSEADDR`, the second to listen gets EADDRINUSE unless both set `SO_REUSEPORT`
+    /// ([`bind_conflict`]); macOS does not (measured by tests/reuseport_os_truth.rs).
     unsafe fn listen(&self, fd: c_int, backlog: c_int) -> Option<NetResult> {
         let maximum = self.shared().sys.limits().listen_backlog_max;
         let capacity = if cfg!(target_os = "linux") {
@@ -3872,18 +5051,30 @@ impl Net for Fabric {
         };
         // An unbound socket listens on the wildcard address at an ephemeral port (man 7 ip).
         let addr = match local {
-            Some(addr) => addr,
+            Some(addr) => {
+                if cfg!(target_os = "linux")
+                    && !self.tcp_free(&socks, Claim::of(&rec, addr), Some(&rec))
+                {
+                    return err(libc::EADDRINUSE);
+                }
+                addr
+            }
             None => {
                 let wildcard = SocketAddr::new(unspecified_like(loopback_for(domain)), 0);
-                match self.tcp_bind_addr(&socks, wildcard, rec.opts().reuseaddr) {
-                    Some(addr) => addr,
+                match self.tcp_bind_addr(&socks, self.want(&rec, wildcard)) {
+                    Some(addr) => {
+                        rec.state().bound_order = self.shared().bind_order();
+                        addr
+                    }
                     None => return err(libc::EADDRINUSE),
                 }
             }
         };
+        let dual = rec.state().dual_at(addr);
         let listener = Arc::new(Listener {
             rec: Some(Arc::downgrade(&rec)),
             addr,
+            dual,
             pending: Mutex::default(),
             capacity: AtomicUsize::new(capacity),
             occupied: AtomicUsize::new(0),
@@ -3948,13 +5139,22 @@ impl Net for Fabric {
             } else {
                 None
             };
-            if !readiness().wait_until_on(
-                "accept",
-                deadline,
-                &[lrec.wake_key()],
-                || lrec.pending_time(),
-                || listener.has_pending(),
-            ) {
+            let (woke, interrupted) = snare_interpose::interruptible(
+                crate::signals::socket_restart(deadline.is_some()),
+                || {
+                    readiness().wait_until_on(
+                        "accept",
+                        deadline,
+                        &[lrec.wake_key()],
+                        || lrec.pending_time(),
+                        || listener.has_pending(),
+                    )
+                },
+            );
+            if interrupted {
+                return err(libc::EINTR);
+            }
+            if !woke {
                 return err(libc::EAGAIN);
             }
             match pop() {
@@ -3975,6 +5175,15 @@ impl Net for Fabric {
             rec.set_ends(conn.server, conn.client);
             rec.set_listener(lrec.id);
             rec.inherit_buffers(&lrec);
+            // An accepted socket takes the listener's `IPV6_V6ONLY` on Linux and reads it off on
+            // macOS (measured by tests/dual_stack_os_truth.rs).
+            let inet6 = {
+                let listener = lrec.state();
+                let mut state = rec.state();
+                state.inet6 = listener.inet6;
+                state.v6only = cfg!(target_os = "linux") && listener.v6only;
+                listener.inet6
+            };
             // sk_clone_lock (net/core/sock.c) copies the listener whole: its family, protocol
             // and busy-poll settings carry over.
             #[cfg(target_os = "linux")]
@@ -4003,7 +5212,7 @@ impl Net for Fabric {
                 },
             );
             if !addr.is_null() && !addr_len.is_null() {
-                unsafe { write_addr(peer, addr, addr_len) };
+                unsafe { write_addr(reported(inet6, peer), addr, addr_len) };
             }
             ok(new_fd as i64)
         })
@@ -4026,10 +5235,13 @@ impl Net for Fabric {
         if !addr.is_null() && len as usize >= size_of::<libc::sa_family_t>() {
             let family = unsafe { (*addr.cast::<libc::sockaddr>()).sa_family } as c_int;
             if family == libc::AF_UNSPEC
-                && let Some(domain) = self.disconnect_dgram(fd)
+                && let Some((domain, mapped)) = self.disconnect_dgram(fd)
             {
                 if cfg!(not(target_os = "macos")) {
                     return ok(0);
+                }
+                if mapped {
+                    return err(libc::EADDRNOTAVAIL);
                 }
                 // XNU in_pcbladdr and in6_pcbladdr (bsd/netinet/in_pcb.c, in6_pcb.c) check
                 // the address length before its family.
@@ -4046,8 +5258,22 @@ impl Net for Fabric {
                 });
             }
         }
-        let Some(server) = (unsafe { parse_addr(addr, len) }) else {
-            return err(libc::EINVAL);
+        let (server, native) = match self.family(fd) {
+            Some((domain, stream)) => {
+                let usage = if stream {
+                    AddrUse::Stream
+                } else {
+                    AddrUse::Datagram
+                };
+                match unsafe { sock_addr(domain, addr, len, usage) } {
+                    Ok(server) => server,
+                    Err(errno) => return err(errno),
+                }
+            }
+            None => match unsafe { parse_addr(addr, len) } {
+                Some(server) => (server, false),
+                None => return err(libc::EINVAL),
+            },
         };
         // man 2 connect on a datagram socket: it sends nothing, it just fixes the default peer so a
         // later plain `send`/`recv` works and receives from other addresses are filtered out. An
@@ -4057,10 +5283,19 @@ impl Net for Fabric {
             let socks = self.socks.lock().unwrap();
             match socks.get(&fd)? {
                 // XNU soconnectlock (bsd/kern/uipc_socket.c) dissolves a datagram socket's
-                // association before connecting it again, so the source is picked anew.
-                Sock::Dgram { peer: Some(_), .. } if cfg!(target_os = "macos") => {
+                // association before connecting it again, so the source is picked anew. An IPv6
+                // socket connected to one family then refuses the other (`EINVAL`, measured).
+                Sock::Dgram {
+                    peer: Some(peer),
+                    domain,
+                    ..
+                } if cfg!(target_os = "macos") => {
+                    let crossed = *domain == libc::AF_INET6 && peer.is_ipv4() != server.is_ipv4();
                     drop(socks);
                     self.disconnect_dgram(fd);
+                    if crossed {
+                        return err(libc::EINVAL);
+                    }
                     return unsafe { self.connect(fd, addr, len) };
                 }
                 Sock::Dgram {
@@ -4069,10 +5304,22 @@ impl Net for Fabric {
                     queue,
                     rec,
                     broadcast,
+                    domain,
                     ..
                 } => {
                     let (local, requested, queue, rec, broadcast) =
                         (*local, *requested, queue.clone(), rec.clone(), *broadcast);
+                    if *domain == libc::AF_INET6
+                        && let Err(errno) = dgram_crossing(
+                            &rec,
+                            local.or(unhashed(requested)),
+                            server,
+                            native,
+                            true,
+                        )
+                    {
+                        return err(errno);
+                    }
                     drop(socks);
                     return self.connect_dgram(
                         fd, server, station, local, requested, &queue, &rec, broadcast,
@@ -4091,9 +5338,15 @@ impl Net for Fabric {
                     drop(socks);
                     return self.await_connect(fd);
                 }
-                Sock::Connecting { .. } => {
+                Sock::Connecting { nonblocking, .. } => {
+                    let nonblocking = *nonblocking;
                     drop(socks);
                     return match self.advance_connect(fd) {
+                        // XNU's `connectit` (bsd/kern/uipc_syscalls.c) reports EALREADY only for
+                        // a nonblocking socket; a blocking one reaches `soconnectlock`, which
+                        // refuses a socket still connecting with EISCONN (measured after a
+                        // connect a signal interrupted).
+                        Progress::Pending(_) if !nonblocking => err(libc::EISCONN),
                         Progress::Pending(_) => {
                             snare_interpose::charge_latency();
                             err(libc::EALREADY)
@@ -4116,21 +5369,31 @@ impl Net for Fabric {
                 _ => return err(libc::EOPNOTSUPP),
             }
         };
+        if domain == libc::AF_INET6
+            && let Err(errno) = stream_crossing(&rec, bound, server)
+        {
+            return err(errno);
+        }
         rec.state().tcp_failed = false;
+        let from = bound.map(|bound| toward(bound, server));
         let sender =
             match self
                 .shared()
-                .route_send(&rec.view(bound), server, Op::Connect, station, true)
+                .route_send(&rec.view(from), server, Op::Connect, station, true)
             {
                 Ok(sender) => sender,
                 Err(errno) => return err(errno),
             };
-        if bound == Some(server) {
+        if from == Some(server) {
             return self.connect_to_self(fd, server, nonblocking, rec);
         }
         crate::netstats::bump(&self.shared().stats.tcp(server.ip()).active_opens);
         let host_local = matches!(&sender, Sender::Host(path) if path.local);
-        let listener = self.listener_for(server, host_local);
+        let client = self.client_addr(server, from, &sender);
+        if client.port() == 0 {
+            return err(libc::EADDRNOTAVAIL);
+        }
+        let listener = self.listener_for(server, host_local, client);
         let mut syn = self.shared().syn_probe(server, listener.is_some(), station);
         let admission = if matches!(syn, Syn::Accept) {
             listener.as_ref().and_then(Listener::reserve)
@@ -4139,10 +5402,6 @@ impl Net for Fabric {
         };
         if matches!(syn, Syn::Accept) && admission.is_none() {
             syn = Syn::Silent;
-        }
-        let client = self.client_addr(server, bound, &sender);
-        if client.port() == 0 {
-            return err(libc::EADDRNOTAVAIL);
         }
         let connect = StreamConnect {
             domain,
@@ -4232,6 +5491,7 @@ impl Net for Fabric {
                         .unwrap_or(libc::EPIPE)),
                     Sent::Closed => err(libc::EPIPE),
                     Sent::WouldBlock | Sent::TimedOut | Sent::Stuck => err(libc::EAGAIN),
+                    Sent::Interrupted => err(libc::EINTR),
                     Sent::Error => err(rec
                         .take_error_as(self.shared(), Taker::Send)
                         .unwrap_or(libc::EAGAIN)),
@@ -4251,6 +5511,7 @@ impl Net for Fabric {
                     None,
                     self.shared().tstamp_now(),
                     None,
+                    crate::ancillary::Header::plain(UNNAMED.ip()),
                     self.shared().domain_key(),
                 );
                 rec.count_sent();
@@ -4264,7 +5525,7 @@ impl Net for Fabric {
                 let endpoint = UdpSendEndpoint::from_sock(sock).unwrap();
                 drop(socks);
                 let data = unsafe { std::slice::from_raw_parts(buf, len) };
-                self.udp_send(fd, endpoint, data, dest, flags)
+                self.udp_send(fd, endpoint, data, dest, flags, &Default::default())
             }
             Some(_) => err(libc::ENOTCONN),
             None => None,
@@ -4290,16 +5551,19 @@ impl Net for Fabric {
             let socks = self.socks.lock().unwrap();
             UdpSendEndpoint::from_sock(socks.get(&fd)?)?
         };
-        let Some(dest) = (unsafe { parse_addr(addr, addr_len) }) else {
-            return err(libc::EINVAL);
+        let dest = match unsafe { sock_addr(endpoint.domain, addr, addr_len, AddrUse::Datagram) } {
+            Ok((dest, _)) => dest,
+            Err(errno) => return err(errno),
         };
         let data = unsafe { std::slice::from_raw_parts(buf, len) };
-        self.udp_send(fd, endpoint, data, dest, flags)
+        self.udp_send(fd, endpoint, data, dest, flags, &Default::default())
     }
 
     /// Sends the payload `msg`'s iovecs gather (man 2 sendmsg) as [`sendto`](Self::sendto) to
     /// `msg_name`, or as [`send`](Self::send) to the connected peer when it is null. Control
-    /// messages are not modelled here: a message carrying any fails with `EOPNOTSUPP`.
+    /// messages are checked and applied as the host does ([`crate::ancillary`]) on an IP datagram
+    /// socket and a TCP stream; on a `socketpair` end, which would carry `SCM_RIGHTS` or
+    /// credentials, they are not modelled and fail with `EOPNOTSUPP`.
     unsafe fn sendmsg(&self, fd: c_int, msg: *const u8, flags: c_int) -> Option<NetResult> {
         if !Net::owns(self, fd) {
             return None;
@@ -4309,18 +5573,18 @@ impl Net for Fabric {
         }
         let hdr = msg as *const libc::msghdr;
         // SAFETY: `hdr` is the caller's msghdr.
-        let (name, name_len, iov, iov_len, control_len) = unsafe {
+        let (name, name_len, iov, iov_len) = unsafe {
             (
                 (*hdr).msg_name,
                 (*hdr).msg_namelen,
                 (*hdr).msg_iov,
                 (*hdr).msg_iovlen,
-                (*hdr).msg_controllen,
             )
         };
-        if control_len != 0 {
-            return err(libc::EOPNOTSUPP);
-        }
+        let control = match unsafe { crate::ancillary::control(hdr) } {
+            Ok(control) => control,
+            Err(errno) => return err(errno),
+        };
         let mut data = Vec::new();
         if !iov.is_null() {
             for i in 0..iov_len as _ {
@@ -4331,6 +5595,47 @@ impl Net for Fabric {
                         std::slice::from_raw_parts(v.iov_base as *const u8, v.iov_len)
                     });
                 }
+            }
+        }
+        if let Some(control) = control {
+            let (endpoint, peer, stream) = {
+                let socks = self.socks.lock().unwrap();
+                match socks.get(&fd)? {
+                    sock @ Sock::Dgram { peer, .. } => {
+                        (UdpSendEndpoint::from_sock(sock), *peer, None)
+                    }
+                    Sock::Stream { conn, rec, .. } if !conn.pair => (None, None, Some(rec.clone())),
+                    _ => return err(libc::EOPNOTSUPP),
+                }
+            };
+            if let Some(rec) = stream {
+                if let Err(errno) = crate::ancillary::stream_send(self.shared(), &rec, &control) {
+                    return err(errno);
+                }
+            } else if let Some(endpoint) = endpoint {
+                let dest = if name.is_null() {
+                    match peer {
+                        Some(peer) => peer,
+                        None => return err(libc::EDESTADDRREQ),
+                    }
+                } else {
+                    let name = name as *const u8;
+                    match unsafe { sock_addr(endpoint.domain, name, name_len, AddrUse::Datagram) } {
+                        Ok((dest, _)) => dest,
+                        Err(errno) => return err(errno),
+                    }
+                };
+                let ctl = match crate::ancillary::datagram_send(
+                    self.shared(),
+                    &endpoint.rec,
+                    &control,
+                    endpoint.domain == libc::AF_INET6,
+                    dest,
+                ) {
+                    Ok(ctl) => ctl,
+                    Err(errno) => return err(errno),
+                };
+                return self.udp_send(fd, endpoint, &data, dest, flags, &ctl);
             }
         }
         unsafe {
@@ -4371,12 +5676,14 @@ impl Net for Fabric {
     }
 
     /// Receives one datagram into `msg`'s iovecs (man 2 recvmsg), setting `MSG_TRUNC` in
-    /// `msg_flags` when it did not fit and `MSG_CTRUNC` when its control messages did not. The
-    /// receive timestamps the socket asked for come first (see [`crate::tstamp`]); then, with
+    /// `msg_flags` when it did not fit and `MSG_CTRUNC` when its control messages did not. On
+    /// Linux a datagram read whole from a segmented send leads with its `UDP_GRO` message; the
+    /// receive timestamps the socket asked for come next (see [`crate::tstamp`]); then, with
     /// Linux's `SO_RXQ_OVFL` on, a `SOL_SOCKET`/`SO_RXQ_OVFL` message carries the `u32` count of
     /// datagrams the socket has dropped since its creation, as recorded on this datagram (man 7
     /// socket); none is attached while the count is 0 (net/socket.c `__sock_recv_cmsgs` writes
-    /// the timestamps, then the drops). On Linux `MSG_ERRQUEUE` reads the error queue instead
+    /// the timestamps, then the drops); last the IP-level messages the socket asked for
+    /// ([`crate::ancillary::rx_cmsgs`]). On Linux `MSG_ERRQUEUE` reads the error queue instead
     /// (`Fabric::recv_errqueue`). A stream socket reads what has arrived
     /// ([`Fabric::recvmsg_stream`]).
     unsafe fn recvmsg(&self, fd: c_int, msg: *mut u8, flags: c_int) -> Option<NetResult> {
@@ -4418,7 +5725,7 @@ impl Net for Fabric {
                 if dg.src == UNNAMED {
                     write_unnamed(name, &mut name_len);
                 } else {
-                    write_addr(dg.src, name, &mut name_len);
+                    write_addr(reported(endpoint.mapped, dg.src), name, &mut name_len);
                 }
                 (*hdr).msg_namelen = name_len;
             }
@@ -4427,17 +5734,20 @@ impl Net for Fabric {
         let fallback = Some(dg.rx_fallback.as_ref());
         #[cfg(not(target_os = "linux"))]
         let fallback = None;
-        #[allow(unused_mut)]
-        let mut cmsgs = crate::tstamp::rx_cmsgs(
+        let mut cmsgs = Vec::new();
+        #[cfg(target_os = "linux")]
+        cmsgs.extend(crate::ancillary::gro_cmsg(&endpoint.rec, &dg.ip));
+        let stamps = crate::tstamp::rx_cmsgs(
             Some(self.shared()),
             &endpoint.rec,
             dg.stamp,
             Rx::Datagram,
             fallback,
         );
-        if !cmsgs.is_empty() {
+        if !stamps.is_empty() {
             self.shared().reach_stamp(dg.stamp);
         }
+        cmsgs.extend(stamps);
         #[cfg(target_os = "linux")]
         if rxq_ovfl && drops > 0 {
             cmsgs.push((
@@ -4448,6 +5758,15 @@ impl Net for Fabric {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = drops;
+        if endpoint.domain != libc::AF_UNIX {
+            cmsgs.extend(crate::ancillary::rx_cmsgs(
+                self.shared(),
+                &endpoint.rec,
+                endpoint.domain == libc::AF_INET6,
+                dg.src.ip(),
+                &dg.ip,
+            ));
+        }
         if unsafe { write_cmsg_list(hdr, &cmsgs) } {
             msg_flags |= libc::MSG_CTRUNC;
         }
@@ -4573,6 +5892,7 @@ impl Net for Fabric {
                 .identity(newfd)
                 .map(crate::readiness::WakeKey::Descriptor)
         });
+        self.notice_detach(&socks, newfd);
         let removed = socks.remove(&newfd).flatten();
         socks.alias(fd, newfd);
         if let Some(rec) = rec {
@@ -4600,10 +5920,14 @@ impl Net for Fabric {
         let peer = match socks.get(&fd)? {
             Sock::Stream { conn, .. } if conn.pair => None,
             Sock::UnixDgram { .. } => None,
-            Sock::Stream { conn, end, .. } => Some(conn.peer(*end)),
+            Sock::Stream { conn, end, rec, .. } => {
+                Some(reported(rec.state().inet6, conn.peer(*end)))
+            }
             Sock::Dgram {
-                peer: Some(peer), ..
-            } => Some(*peer),
+                peer: Some(peer),
+                domain,
+                ..
+            } => Some(reported(*domain == libc::AF_INET6, *peer)),
             _ => return err(libc::ENOTCONN),
         };
         drop(socks);
@@ -4626,19 +5950,28 @@ impl Net for Fabric {
         let local = match socks.get(&fd)? {
             Sock::Stream { conn, .. } if conn.pair => None,
             Sock::UnixDgram { .. } => None,
-            Sock::Stream { conn, end, .. } => Some(conn.local(*end)),
-            Sock::Listener { listener, .. } => Some(listener.addr),
+            Sock::Stream { conn, end, rec, .. } => {
+                Some(reported(rec.state().inet6, conn.local(*end)))
+            }
+            Sock::Listener { listener, rec, .. } => {
+                Some(reported(rec.state().inet6, listener.addr))
+            }
             Sock::Dgram {
                 local: None,
                 requested: Some(requested),
+                domain,
                 ..
-            } => Some(SocketAddr::new(requested.ip(), 0)),
+            } => Some(reported(
+                *domain == libc::AF_INET6,
+                SocketAddr::new(requested.ip(), 0),
+            )),
             Sock::Dgram { local, domain, .. }
             | Sock::Fresh { local, domain, .. }
-            | Sock::Connecting { local, domain, .. } => Some(
+            | Sock::Connecting { local, domain, .. } => Some(reported(
+                *domain == libc::AF_INET6,
                 local
                     .unwrap_or_else(|| SocketAddr::new(unspecified_like(loopback_for(*domain)), 0)),
-            ),
+            )),
             _ => return None,
         };
         drop(socks);
@@ -4669,136 +6002,17 @@ impl Net for Fabric {
         if !Net::owns(self, fd) {
             return None;
         }
-        if let Some(rec) = self.rec(fd)
-            && let Some(result) = unsafe {
-                crate::netif::sockopt::set(self.shared(), &rec, level, name, val, len).or_else(
-                    || crate::limits::sockopt::set(self.shared(), &rec, level, name, val, len),
-                )
-            }
+        if (level, name) == (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY)
+            && let Some(result) = unsafe { self.set_v6only(fd, val, len) }
         {
-            return match result {
-                Ok(()) => ok(0),
-                Err(errno) => err(errno),
-            };
+            return result;
         }
-        if let Some(rec) = self.rec(fd)
-            && let Some(v6) = self.ipv6(fd)
-            && let Some(result) =
-                unsafe { crate::netif::frag::set(&rec, v6, level, name, val, len) }
-        {
-            return match result {
-                Ok(()) => ok(0),
-                Err(errno) => err(errno),
-            };
+        if cfg!(target_os = "macos") && level == libc::IPPROTO_IP && self.ipv6(fd) == Some(true) {
+            return err(libc::EINVAL);
         }
-        if level == libc::IPPROTO_TCP
-            && let Some(rec) = self.rec(fd)
-            && let Some(result) = unsafe { crate::faults::sockopt::set(&rec, name, val, len) }
-        {
-            return match result {
-                Ok(()) => ok(0),
-                Err(errno) => err(errno),
-            };
-        }
-        if let Some(rec) = self.rec(fd)
-            && let Some(result) = unsafe {
-                crate::tstamp::set(
-                    Some(self.shared()),
-                    &rec,
-                    self.ts_kind(fd),
-                    level,
-                    name,
-                    val,
-                    len,
-                )
-            }
-        {
-            return match result {
-                Ok(()) => ok(0),
-                Err(errno) => err(errno),
-            };
-        }
-        #[cfg(target_os = "linux")]
-        if let Some(rec) = self.rec(fd) {
-            let net_admin = self.shared().sys.has_cap(crate::limits::CAP_NET_ADMIN);
-            if let Some(result) =
-                unsafe { crate::tstamp::set_txtime(&rec, net_admin, level, name, val, len) }
-            {
-                return match result {
-                    Ok(()) => ok(0),
-                    Err(errno) => err(errno),
-                };
-            }
-        }
-        // man 7 socket: SO_BROADCAST permits sending to a broadcast address.
-        if level == libc::SOL_SOCKET && name == libc::SO_BROADCAST {
-            let on = unsafe { read_int(val, len) } != 0;
-            if let Some(Sock::Dgram { broadcast, .. }) = self.socks.lock().unwrap().get_mut(&fd) {
-                *broadcast = on;
-            }
-            return ok(0);
-        }
-        if level == libc::SOL_SOCKET
-            && let Some(rec) = self.rec(fd)
-        {
-            // man 7 socket: SO_RCVTIMEO/SO_SNDTIMEO bound how long a blocking receive/send waits;
-            // a zero timeval clears them (block indefinitely again).
-            let timeout = || unsafe { parse_timeval(val, len) }.filter(|d| !d.is_zero());
-            let mut state = rec.state();
-            match name {
-                libc::SO_RCVTIMEO => state.opts.rcvtimeo = timeout(),
-                libc::SO_SNDTIMEO => state.opts.sndtimeo = timeout(),
-                libc::SO_REUSEADDR => state.opts.reuseaddr = unsafe { read_int(val, len) } != 0,
-                libc::SO_LINGER => {
-                    state.opts.linger = unsafe { parse_linger(val, len, LINGER_UNIT) }
-                }
-                #[cfg(target_os = "macos")]
-                SO_LINGER_SEC => {
-                    state.opts.linger = unsafe { parse_linger(val, len, Duration::from_secs(1)) }
-                }
-                _ => {
-                    drop(state);
-                    return unsafe { self.unmodelled_set(Some(&rec), level, name, val, len) };
-                }
-            }
-            return ok(0);
-        }
-        // IP_RECVERR(2const): queues errors on a datagram socket. Without it Linux reports an
-        // ICMP error only on a connected socket (net/ipv4/udp.c udp_err), so it is what makes
-        // errors fail calls on an unconnected one too.
-        #[cfg(target_os = "linux")]
-        if (level, name) == (libc::IPPROTO_IP, libc::IP_RECVERR)
-            || (level, name) == (libc::IPPROTO_IPV6, libc::IPV6_RECVERR)
-        {
-            if let Some(rec) = self.rec(fd) {
-                rec.state().dgram.recverr = unsafe { read_int(val, len) } != 0;
-            }
-            return ok(0);
-        }
-        // IP_ADD_MEMBERSHIP(2const) / IPV6_ADD_MEMBERSHIP(2const): joining a multicast group so
-        // datagrams to it are delivered here.
-        let drop_group = (level == libc::IPPROTO_IP && name == libc::IP_DROP_MEMBERSHIP)
-            || (level == libc::IPPROTO_IPV6 && name == IPV6_LEAVE);
-        let membership_name = if drop_group {
-            if level == libc::IPPROTO_IP {
-                libc::IP_ADD_MEMBERSHIP
-            } else {
-                IPV6_JOIN
-            }
-        } else {
-            name
-        };
-        if let Some(membership) = unsafe { parse_add_membership(level, membership_name, val, len) }
-        {
-            if let Some(rec) = self.rec(fd) {
-                return match rec.change_membership(membership, !drop_group) {
-                    Ok(()) => ok(0),
-                    Err(errno) => err(errno),
-                };
-            }
-            return err(libc::ENOTSOCK);
-        }
-        unsafe { self.unmodelled_set(self.rec(fd).as_ref(), level, name, val, len) }
+        let result = unsafe { self.set_option(fd, level, name, val, len) };
+        self.notice_fd(fd);
+        result
     }
 
     /// Reads a socket option, consulting the same owners as [`setsockopt`](Net::setsockopt).
@@ -4814,6 +6028,14 @@ impl Net for Fabric {
     ) -> Option<NetResult> {
         if !Net::owns(self, fd) {
             return None;
+        }
+        if (level, name) == (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY)
+            && let Some(result) = unsafe { self.get_v6only(fd, val, len) }
+        {
+            return result;
+        }
+        if cfg!(target_os = "macos") && level == libc::IPPROTO_IP && self.ipv6(fd) == Some(true) {
+            return err(libc::EINVAL);
         }
         if level == libc::SOL_SOCKET && name == libc::SO_ERROR {
             self.advance_connect(fd);
@@ -4843,6 +6065,16 @@ impl Net for Fabric {
         if let Some(rec) = &rec
             && let Some(v6) = self.ipv6(fd)
             && let Some(result) = unsafe { crate::netif::frag::get(rec, v6, level, name, val, len) }
+        {
+            return match result {
+                Ok(()) => ok(0),
+                Err(errno) => err(errno),
+            };
+        }
+        if let Some(rec) = &rec
+            && self.kind(fd) == Some(Kind::Dgram)
+            && let Some(v6) = self.ipv6(fd)
+            && let Some(result) = unsafe { crate::ancillary::get(rec, v6, level, name, val, len) }
         {
             return match result {
                 Ok(()) => ok(0),
@@ -4896,7 +6128,12 @@ impl Net for Fabric {
                 libc::SO_ERROR => rec
                     .and_then(|rec| rec.take_error_as(self.shared(), Taker::SoError))
                     .unwrap_or(0),
-                libc::SO_REUSEADDR => rec.is_some_and(|rec| rec.opts().reuseaddr) as i32,
+                libc::SO_REUSEADDR => {
+                    socket_flag(rec.is_some_and(|rec| rec.opts().reuseaddr), name)
+                }
+                libc::SO_REUSEPORT => {
+                    socket_flag(rec.is_some_and(|rec| rec.opts().reuseport), name)
+                }
                 libc::SO_ACCEPTCONN => (self.kind(fd) == Some(Kind::Listener)) as i32,
                 _ => return unsafe { self.unmodelled_get(rec.as_ref(), level, name, val, len) },
             }
@@ -4922,6 +6159,7 @@ impl Net for Fabric {
                     .unwrap_or(libc::EMFILE));
             }
             let stale = if socks.mirrors.contains_key(&new_fd) {
+                self.notice_detach(&socks, new_fd);
                 socks.remove(&new_fd)
             } else {
                 None
@@ -4949,6 +6187,9 @@ impl Net for Fabric {
                 ok(result as i64)
             };
         }
+        if let Some(result) = unsafe { self.socket_fcntl(fd, cmd, arg) } {
+            return Some(result);
+        }
         let mut socks = self.socks.lock().unwrap();
         if matches!(socks.get(&fd)?, Sock::Epoll { .. } | Sock::Kqueue { .. }) {
             let status = &mut socks.description_mut(&fd).unwrap().status_flags;
@@ -4970,19 +6211,30 @@ impl Net for Fabric {
             | Some(Sock::UnixDgram { nonblocking, .. })
             | Some(Sock::Event { nonblocking, .. })
             | Some(Sock::Timer { nonblocking, .. })
+            | Some(Sock::Signal { nonblocking, .. })
             | Some(Sock::Raw { nonblocking, .. }) => nonblocking,
             _ => return None,
         };
-        // man 2 fcntl: F_GETFL/F_SETFL read/set the fd's status flags (only O_NONBLOCK is settable
-        // once open), F_GETFD/F_SETFD the FD_CLOEXEC flag. A socket's file is opened O_RDWR
-        // (net/socket.c sock_alloc_file), so F_GETFL reports that access mode.
+        // man 2 fcntl: F_GETFL/F_SETFL read/set the fd's status flags, F_GETFD/F_SETFD the
+        // FD_CLOEXEC flag. A socket's file is opened O_RDWR (net/socket.c sock_alloc_file), so
+        // F_GETFL reports that access mode. Besides O_NONBLOCK, F_SETFL keeps the flags
+        // [`fcntl_cmd::KEPT_STATUS`] lists; Linux refuses O_DIRECT on a socket (fs/fcntl.c
+        // setfl: no `direct_IO`).
         match cmd {
             libc::F_GETFL => {
-                let flags = libc::O_RDWR | if *nb { libc::O_NONBLOCK } else { 0 };
-                ok(flags as i64)
+                let nonblock = if *nb { libc::O_NONBLOCK } else { 0 };
+                let kept = socks.description_mut(&fd).map_or(0, |d| d.fcntl.status);
+                ok((libc::O_RDWR | nonblock | kept) as i64)
             }
             libc::F_SETFL => {
+                let kept = match SocketFcntl::kept_status(arg) {
+                    Ok(kept) => kept,
+                    Err(errno) => return err(errno),
+                };
                 *nb = arg as c_int & libc::O_NONBLOCK != 0;
+                if let Some(description) = socks.description_mut(&fd) {
+                    description.fcntl.status = kept;
+                }
                 socks.publish_pair(fd);
                 ok(0)
             }
@@ -5141,11 +6393,13 @@ impl Net for Fabric {
         crate::ifaddrs::release(ifa).then_some(NetResult::Ok(0))
     }
 
-    /// `poll(2)` over a set made entirely of the fabric's fds and the sim's other datagram
-    /// sockets (a `SimHost`'s, [`foreign_ready`]); a set mixing in other fds is declined whole.
-    /// Connecting sockets are moved on before each check, so a nonblocking connect's POLLOUT
-    /// appears when its attempt settles. An fd closed during the wait reports `POLLNVAL` (man 2
-    /// poll).
+    /// `poll(2)` over a set holding the fabric's fds, the sim's other datagram sockets (a
+    /// `SimHost`'s, [`foreign_ready`]) or a pipe the sim made; a set of real descriptors only,
+    /// none of them the sim's pipes, is declined whole. The real descriptors in a set the fabric
+    /// takes report what a zero-timeout `poll` of them reads, and a wait keeps a
+    /// [`Watch`](crate::realfd::Watch) on them while it blocks. Connecting sockets are moved on
+    /// before each check, so a nonblocking connect's POLLOUT appears when its attempt settles. An
+    /// fd closed during the wait reports `POLLNVAL` (man 2 poll).
     unsafe fn poll(&self, fds: *mut u8, nfds: u64, timeout: c_int) -> Option<NetResult> {
         // man 2 poll: each pollfd has requested `events` and returned `revents`; a connected
         // stream is always writable (POLLOUT) and readable (POLLIN) once data or EOF is pending,
@@ -5155,16 +6409,27 @@ impl Net for Fabric {
         let pfds =
             unsafe { std::slice::from_raw_parts_mut(fds.cast::<libc::pollfd>(), nfds as usize) };
         let watched: Vec<(c_int, i16)> = pfds.iter().map(|p| (p.fd, p.events)).collect();
-        if !self
-            .foreign_masks(watched.iter().map(|w| w.0))
+        let foreign = self.foreign_masks(watched.iter().map(|w| w.0));
+        let real: Vec<(c_int, i16)> = watched
             .iter()
-            .all(|(fd, ready)| {
-                ready.is_some() || *fd < 0 || unsafe { libc::fcntl(*fd, libc::F_GETFD) } < 0
+            .filter(|(fd, _)| {
+                *fd >= 0
+                    && foreign.iter().any(|(f, ready)| f == fd && ready.is_none())
+                    && unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0
             })
+            .copied()
+            .collect();
+        let sim_fds = foreign.len() < watched.len() || foreign.iter().any(|(_, r)| r.is_some());
+        if !real.is_empty()
+            && !sim_fds
+            && !real
+                .iter()
+                .any(|(fd, _)| self.shared().pipes.lent(*fd).is_some())
         {
             return None;
         }
         let fds: Vec<c_int> = watched.iter().map(|(fd, _)| *fd).collect();
+        let mut waiting: Option<crate::realfd::Waiting> = None;
         let deadline = (timeout >= 0)
             .then(|| Deadline::timeout(std::time::Duration::from_millis(timeout as u64)));
         // A return that never blocked — fds already ready, or a zero timeout — is a busy-poll step
@@ -5173,7 +6438,7 @@ impl Net for Fabric {
         let mut last = timeout == 0;
         loop {
             self.advance_connecting(Some(&fds));
-            let revents = self.poll_revents(&watched);
+            let revents = self.poll_revents(&watched, &foreign);
             let ready = revents.iter().filter(|r| **r != 0).count();
             if ready > 0 || last {
                 for (p, r) in pfds.iter_mut().zip(revents) {
@@ -5184,18 +6449,37 @@ impl Net for Fabric {
                 }
                 return ok(ready as i64);
             }
+            if waiting.is_none() && !real.is_empty() {
+                waiting =
+                    crate::realfd::Watch::new(&real).map(|watch| watch.wait(&self.regs.shared));
+            }
             let expiry = self.fds_timer_expiry(&fds);
             let timer = expiry.map(|at| self.timer_deadline(at));
-            let woke = readiness().wait_until_dynamic(
-                "poll",
-                earlier(deadline, timer),
-                |keys| self.fd_interests(fds.iter().copied(), keys),
-                || {
-                    self.poll_revents(&watched).iter().any(|r| *r != 0)
-                        || self.connecting_due(Some(&fds))
-                        || self.fds_timer_expiry(&fds) != expiry
-                },
-            );
+            let (woke, interrupted) = snare_interpose::interruptible(Restart::Never, || {
+                readiness().wait_until_dynamic(
+                    "poll",
+                    earlier(deadline, timer),
+                    |keys| {
+                        if let Some(waiting) = &waiting {
+                            keys.push(waiting.watch().key());
+                        }
+                        self.fd_interests(fds.iter().copied(), keys)
+                    },
+                    || {
+                        if let Some(waiting) = &waiting {
+                            waiting.look();
+                        }
+                        self.poll_revents(&watched, &foreign)
+                            .iter()
+                            .any(|r| *r != 0)
+                            || self.connecting_due(Some(&fds))
+                            || self.fds_timer_expiry(&fds) != expiry
+                    },
+                )
+            });
+            if interrupted {
+                return err(libc::EINTR);
+            }
             last = !woke;
             if let (false, Some(at), Some(timer)) = (woke, expiry, timer)
                 && timer.passed()
@@ -5287,6 +6571,8 @@ impl Net for Fabric {
             Kind::Event => self.eventfd_read(fd, buf, len),
             #[cfg(target_os = "linux")]
             Kind::Timer => self.timerfd_read(fd, buf, len),
+            #[cfg(target_os = "linux")]
+            Kind::Signal => self.signalfd_read(fd, buf, len),
             Kind::Stream | Kind::Dgram | Kind::Fresh | Kind::Listener => unsafe {
                 self.recv(fd, buf, len, 0)
             },
@@ -5338,6 +6624,151 @@ impl Net for Fabric {
         }
     }
 
+    /// Waits for a blocking `read` of a pipe the sim made, read alone, as a `poll` of it would (see
+    /// [`await_real`](Self::await_real)); any other descriptor, or one in nonblocking mode, is
+    /// left to the OS.
+    fn await_readable(&self, fd: c_int) -> Option<NetResult> {
+        self.await_pipe(fd, libc::O_RDONLY, libc::POLLIN, "pipe read")
+    }
+
+    /// Waits for child process `pid` to end through a descriptor that turns readable then
+    /// ([`child_probe`](crate::realfd::child_probe)), as [`await_real`](Self::await_real).
+    fn await_child(&self, pid: c_int) -> Option<NetResult> {
+        let probe = snare_interpose::real(|| crate::realfd::child_probe(pid));
+        if probe < 0 {
+            return None;
+        }
+        let r = self.await_real(probe, libc::POLLIN, "waitpid");
+        // SAFETY: the probe made above.
+        snare_interpose::real(|| unsafe { libc::close(probe) });
+        r
+    }
+
+    /// Waits for a blocking `write` or `writev` of a pipe the sim made to find room, as a `poll`
+    /// of it would (see [`await_real`](Self::await_real)); any other descriptor, or one in
+    /// nonblocking mode, is left to the OS.
+    fn await_writable(&self, fd: c_int) -> Option<NetResult> {
+        self.await_pipe(fd, libc::O_WRONLY, libc::POLLOUT, "pipe write")
+    }
+
+    /// Waits for one of the children `children` lists to end, through a probe of each
+    /// ([`child_probe`](crate::realfd::child_probe)) held in one
+    /// [`Watch`](crate::realfd::Watch), as [`await_real`](Self::await_real) waits. The list is
+    /// asked again each time the wait looks, which a child the sim spawns meanwhile makes it do
+    /// ([`spawned`](Net::spawned)).
+    fn await_children(
+        &self,
+        children: &mut dyn FnMut() -> Vec<c_int>,
+        ready: &mut dyn FnMut() -> bool,
+    ) -> Option<NetResult> {
+        if ready() {
+            return ok(0);
+        }
+        let watch = crate::realfd::Watch::new(&[])?;
+        let mut probes: Vec<(c_int, c_int)> = Vec::new();
+        let mut refresh = |probes: &mut Vec<(c_int, c_int)>| {
+            let pids = children();
+            let mut gone = Vec::new();
+            probes.retain(|&(pid, probe)| {
+                let keep = pids.contains(&pid);
+                if !keep {
+                    gone.push(probe);
+                }
+                keep
+            });
+            for pid in pids {
+                if !probes.iter().any(|&(held, _)| held == pid) {
+                    let probe = snare_interpose::real(|| crate::realfd::child_probe(pid));
+                    if probe >= 0 {
+                        probes.push((pid, probe));
+                    }
+                }
+            }
+            let watched: Vec<(c_int, i16)> = probes
+                .iter()
+                .map(|&(_, probe)| (probe, libc::POLLIN))
+                .collect();
+            watch.set(&watched);
+            for probe in gone {
+                // SAFETY: a probe made here, no longer watched.
+                snare_interpose::real(|| unsafe { libc::close(probe) });
+            }
+        };
+        refresh(&mut probes);
+        let waiting = watch.wait(&self.regs.shared);
+        let (woke, interrupted) = snare_interpose::interruptible(Restart::WithSaRestart, || {
+            readiness().wait_until_dynamic(
+                "wait",
+                None,
+                |keys| {
+                    keys.push(waiting.watch().key());
+                    false
+                },
+                || {
+                    waiting.look();
+                    if ready() {
+                        return true;
+                    }
+                    refresh(&mut probes);
+                    ready()
+                },
+            )
+        });
+        drop(waiting);
+        drop(watch);
+        for (_, probe) in probes {
+            // SAFETY: a probe made here.
+            snare_interpose::real(|| unsafe { libc::close(probe) });
+        }
+        if interrupted {
+            return err(libc::EINTR);
+        }
+        woke.then(|| ok(0)).flatten()
+    }
+
+    /// man 2 signalfd: with `fd` -1 a new descriptor reading the signals of `mask` (the caller's
+    /// set's virtual signals), with `SFD_NONBLOCK`/`SFD_CLOEXEC`; with a signalfd of the sim's, its
+    /// set replaced by `mask`. EINVAL for other flags (checked first, fs/signalfd.c
+    /// `do_signalfd4`) and for an `fd` of the sim's that is no signalfd. A new set of none of the
+    /// sim's signals, or an `fd` not the sim's, is the OS's.
+    #[cfg(target_os = "linux")]
+    unsafe fn signalfd(&self, fd: c_int, mask: u64, flags: c_int) -> Option<NetResult> {
+        let invalid = flags & !(libc::SFD_NONBLOCK | libc::SFD_CLOEXEC) != 0;
+        if fd != -1 {
+            let mut socks = self.socks.lock().unwrap();
+            let sock = socks.get_mut(&fd)?;
+            if invalid {
+                return err(libc::EINVAL);
+            }
+            let Sock::Signal { mask: set, .. } = sock else {
+                return err(libc::EINVAL);
+            };
+            *set = mask;
+            drop(socks);
+            self.bump_fds([fd]);
+            return ok(fd as i64);
+        }
+        if mask == 0 {
+            return None;
+        }
+        if invalid {
+            return err(libc::EINVAL);
+        }
+        match self.reserve_fd_flags(flags) {
+            Ok(fd) => {
+                self.socks.lock().unwrap().insert(
+                    fd,
+                    Sock::Signal {
+                        mask,
+                        nonblocking: flags & libc::SFD_NONBLOCK != 0,
+                    },
+                );
+                ok(fd as i64)
+            }
+            Err(e) => err(e.raw_os_error().unwrap_or(libc::EMFILE)),
+        }
+    }
+
     /// man 2 epoll_create1: creates an epoll instance and returns an fd referring to it.
     #[cfg(target_os = "linux")]
     unsafe fn epoll_create1(&self, flags: c_int) -> Option<NetResult> {
@@ -5346,12 +6777,19 @@ impl Net for Fabric {
         }
         match self.reserve_fd_flags(flags) {
             Ok(fd) => {
-                self.socks.lock().unwrap().insert(
+                let interests = PollSet::new();
+                let list = interests.list().clone();
+                let mut socks = self.socks.lock().unwrap();
+                socks.insert(
                     fd,
                     Sock::Epoll {
-                        interests: Default::default(),
+                        interests,
+                        real: None,
                     },
                 );
+                if let Some(id) = socks.identity(fd) {
+                    list.place(id, self.shared().domain_key());
+                }
                 ok(fd as i64)
             }
             Err(e) => err(e.raw_os_error().unwrap_or(libc::EMFILE)),
@@ -5400,7 +6838,16 @@ impl Net for Fabric {
         if matches!(identity, EpollIdentity::Local(id) if Some(id) == socks.identity(epfd)) {
             return err(libc::EINVAL);
         }
-        let Some(Sock::Epoll { interests }) = socks.get_mut(&epfd) else {
+        let keys = match identity {
+            EpollIdentity::Local(id) => socks
+                .get(&fd)
+                .map_or_else(Keys::default, |sock| description_keys(id, sock)),
+            EpollIdentity::Foreign(id) => {
+                Keys::of(Some(crate::readiness::WakeKey::Socket(id)), None)
+            }
+            EpollIdentity::Untracked => Keys::default(),
+        };
+        let Some(Sock::Epoll { interests, .. }) = socks.get_mut(&epfd) else {
             return err(libc::EINVAL);
         };
         let key = (fd, identity);
@@ -5426,6 +6873,7 @@ impl Net for Fabric {
                         order: readiness_sequence(),
                         pending_order: None,
                     },
+                    keys,
                 );
             }
             libc::EPOLL_CTL_DEL => {
@@ -5436,6 +6884,9 @@ impl Net for Fabric {
             _ => return err(libc::EINVAL),
         }
         drop(socks);
+        if identity == EpollIdentity::Untracked {
+            self.rewatch_epoll(epfd);
+        }
         self.bump_fds([epfd]);
         ok(0)
     }
@@ -5600,12 +7051,18 @@ impl Net for Fabric {
     unsafe fn kqueue(&self) -> Option<NetResult> {
         match self.reserve_fd() {
             Ok(fd) => {
-                self.socks.lock().unwrap().insert(
+                let state = KqueueState::default();
+                let list = state.notes.list().clone();
+                let mut socks = self.socks.lock().unwrap();
+                socks.insert(
                     fd,
                     Sock::Kqueue {
-                        state: Arc::new(Mutex::new(KqueueState::default())),
+                        state: Arc::new(Mutex::new(state)),
                     },
                 );
+                if let Some(id) = socks.identity(fd) {
+                    list.place(id, self.shared().domain_key());
+                }
                 ok(fd as i64)
             }
             Err(e) => err(e.raw_os_error().unwrap_or(libc::EMFILE)),
@@ -5655,13 +7112,17 @@ impl Net for Fabric {
             }
         }
         // Apply the changelist, collecting any EV_RECEIPT acknowledgements to return at once.
-        let targets: Vec<Result<bool, c_int>> = {
+        let targets: Vec<(Result<bool, c_int>, Keys)> = {
             let socks = self.socks.lock().unwrap();
             (0..nchanges.max(0) as usize)
                 .map(|i| {
                     let ch = unsafe { changelist.cast::<libc::kevent>().add(i).read_unaligned() };
                     let fd = ch.ident as c_int;
-                    if !matches!(ch.filter, libc::EVFILT_READ | libc::EVFILT_WRITE)
+                    let keys = match (socks.identity(fd), socks.get(&fd)) {
+                        (Some(id), Some(sock)) => description_keys(id, sock),
+                        _ => Keys::default(),
+                    };
+                    let target = if !matches!(ch.filter, libc::EVFILT_READ | libc::EVFILT_WRITE)
                         || socks.contains_key(&fd)
                     {
                         Ok(false)
@@ -5673,7 +7134,8 @@ impl Net for Fabric {
                         Err(libc::ENOENT)
                     } else {
                         Ok(true)
-                    }
+                    };
+                    (target, keys)
                 })
                 .collect()
         };
@@ -5682,12 +7144,8 @@ impl Net for Fabric {
         let mut changed = false;
         {
             let mut guard = state.lock().unwrap();
-            let KqueueState {
-                reads,
-                writes,
-                users,
-            } = &mut *guard;
-            for (i, &target) in targets.iter().enumerate() {
+            let KqueueState { notes, users, .. } = &mut *guard;
+            for (i, &(target, keys)) in targets.iter().enumerate() {
                 // `kevent` is a packed struct (`#pragma pack(4)` in <sys/event.h>,
                 // `repr(packed(4))` in libc); read each entry by value to avoid unaligned refs.
                 let ch = unsafe { changelist.cast::<libc::kevent>().add(i).read_unaligned() };
@@ -5709,8 +7167,9 @@ impl Net for Fabric {
                     }
                 };
                 let exists = match filter {
-                    libc::EVFILT_READ => reads.contains_key(&(ident as c_int)),
-                    libc::EVFILT_WRITE => writes.contains_key(&(ident as c_int)),
+                    libc::EVFILT_READ | libc::EVFILT_WRITE => {
+                        notes.contains_key(&(filter, ident as c_int))
+                    }
                     libc::EVFILT_USER => users.contains_key(&ident),
                     _ => false,
                 };
@@ -5738,18 +7197,14 @@ impl Net for Fabric {
                     );
                     match filter {
                         libc::EVFILT_READ | libc::EVFILT_WRITE => {
-                            let notes = if filter == libc::EVFILT_READ {
-                                &mut *reads
-                            } else {
-                                &mut *writes
-                            };
-                            let fd = ident as c_int;
+                            let at = (filter, ident as c_int);
                             if deleting {
-                                notes.remove(&fd);
+                                notes.remove(&at);
                             } else {
+                                let mut note = notes.get(&at).copied();
                                 if adding {
                                     let untracked = target == Ok(true);
-                                    let note = notes.entry(fd).or_insert(Knote {
+                                    let note = note.get_or_insert(Knote {
                                         udata,
                                         flags: kept,
                                         disabled: false,
@@ -5766,8 +7221,9 @@ impl Net for Fabric {
                                     note.edge = Edge::default();
                                     note.generation = next_knote_generation();
                                 }
-                                if let Some(note) = notes.get_mut(&fd) {
+                                if let Some(mut note) = note {
                                     toggle(&mut note.disabled);
+                                    notes.insert(at, note, keys);
                                 }
                             }
                         }
@@ -5805,6 +7261,22 @@ impl Net for Fabric {
             }
         }
         if changed {
+            let mut guard = state.lock().unwrap();
+            let real: Vec<(c_int, i16)> = guard
+                .notes
+                .iter()
+                .filter(|(_, n)| n.untracked)
+                .map(|(&(filter, fd), _)| {
+                    let events = if filter == libc::EVFILT_READ {
+                        libc::POLLIN
+                    } else {
+                        libc::POLLOUT
+                    };
+                    (fd, events)
+                })
+                .collect();
+            Self::watch_set(&mut guard.real, &real);
+            drop(guard);
             self.bump_fds([kq]);
         }
         if let Some(errno) = plain_error {
@@ -5831,6 +7303,7 @@ impl Net for Fabric {
         // As for epoll_wait: a return that never blocked is charged the call latency.
         let immediate = deadline.is_some_and(|d| d.passed());
         let mut waited = false;
+        let waiting = std::cell::RefCell::new(None);
         let _waiting = snare_interpose::fd_wait(kq);
         loop {
             if !Net::owns(self, kq) {
@@ -5851,27 +7324,38 @@ impl Net for Fabric {
             }
             if zero_timeout {
                 snare_interpose::end_spin();
-                let ready = self.collect_kevents(kq, cap, true);
-                snare_interpose::charge_latency();
-                for (i, ev) in ready.iter().enumerate() {
-                    unsafe {
-                        std::ptr::write_unaligned(eventlist.cast::<libc::kevent>().add(i), *ev)
-                    };
+                if self.connecting_due(None) {
+                    waited = true;
+                    continue;
                 }
-                return ok(ready.len() as i64);
+                snare_interpose::charge_latency();
+                return ok(0);
             }
-            let woke = readiness().wait_until_dynamic(
-                "kevent",
-                deadline,
-                |keys| self.kqueue_interests(kq, keys),
-                || {
-                    !Net::owns(self, kq)
-                        || !self.collect_kevents(kq, 1, false).is_empty()
-                        || self.connecting_due(None)
-                },
-            );
+            let (woke, interrupted) = snare_interpose::interruptible(Restart::Never, || {
+                readiness().wait_until_dynamic(
+                    "kevent",
+                    deadline,
+                    |keys| {
+                        if let Some(key) = self.wait_real(&waiting, self.kqueue_watch(kq)) {
+                            keys.push(key);
+                        }
+                        self.kqueue_interests(kq, keys)
+                    },
+                    || {
+                        if let Some(waiting) = &*waiting.borrow() {
+                            waiting.look();
+                        }
+                        !Net::owns(self, kq)
+                            || !self.collect_kevents(kq, 1, false).is_empty()
+                            || self.connecting_due(None)
+                    },
+                )
+            });
             if !Net::owns(self, kq) {
                 return None;
+            }
+            if interrupted {
+                return err(libc::EINTR);
             }
             if !woke {
                 if immediate {
@@ -5985,7 +7469,7 @@ unsafe fn kevent_deadline(timeout: *const u8) -> Option<Deadline> {
 }
 
 /// Reads a C `int` option value (SO_BROADCAST et al.), zero if the buffer is null or too short.
-unsafe fn read_int(val: *const u8, len: u32) -> c_int {
+pub(crate) unsafe fn read_int(val: *const u8, len: u32) -> c_int {
     if val.is_null() || (len as usize) < size_of::<c_int>() {
         return 0;
     }
@@ -6188,6 +7672,228 @@ unsafe fn parse_addr(ptr: *const u8, len: u32) -> Option<SocketAddr> {
     }
 }
 
+/// What a call does with the address it names, for [`sock_addr`]'s family checks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddrUse {
+    /// A `bind`, of a stream socket if `stream`.
+    Bind { stream: bool },
+    /// A datagram socket's `connect` or send.
+    Datagram,
+    /// A stream socket's `connect`.
+    Stream,
+}
+
+/// Reads the address a call on a socket of family `domain` names, a v4-mapped one as the IPv4
+/// address it carries ([`unmapped`]), with whether it came as a `sockaddr_in`. The other family's
+/// address is refused as each host refuses it (measured by tests/dual_stack_os_truth.rs):
+/// Linux refuses an IPv6 one on an IPv4 socket with `EAFNOSUPPORT` and lets an IPv6 datagram
+/// socket send to and connect to an IPv4 one (net/ipv6/udp.c `udpv6_sendmsg`, net/ipv6/
+/// datagram.c `__ip6_datagram_connect`), while binding one or connecting a stream to one is
+/// `EINVAL`, the address being shorter than an IPv6 one; macOS refuses either way, `EINVAL` on a
+/// datagram socket and `EAFNOSUPPORT` on a stream.
+///
+/// # Safety
+/// `ptr` is null or holds `len` readable bytes.
+pub(crate) unsafe fn sock_addr(
+    domain: c_int,
+    ptr: *const u8,
+    len: u32,
+    usage: AddrUse,
+) -> Result<(SocketAddr, bool), c_int> {
+    let addr = unsafe { parse_addr(ptr, len) }.ok_or(libc::EINVAL)?;
+    let inet6 = domain == libc::AF_INET6;
+    if addr.is_ipv6() == inet6 {
+        return Ok((unmapped(addr), false));
+    }
+    let refused = if cfg!(target_os = "linux") {
+        if !inet6 {
+            libc::EAFNOSUPPORT
+        } else if usage == AddrUse::Datagram {
+            return Ok((addr, true));
+        } else {
+            libc::EINVAL
+        }
+    } else if matches!(usage, AddrUse::Stream | AddrUse::Bind { stream: true }) {
+        libc::EAFNOSUPPORT
+    } else {
+        libc::EINVAL
+    };
+    Err(refused)
+}
+
+/// `setsockopt(IPV6_V6ONLY)` (RFC 3493 §5.3, man 7 ipv6) on IP socket `rec`, `bound` or not: an
+/// `int`, any nonzero value on, taken only before the socket is bound (`EINVAL` after). Linux
+/// refuses a value shorter than an `int` with `EINVAL` and the option on an IPv4 socket with
+/// `ENOPROTOOPT` (net/ipv6/ipv6_sockglue.c `do_ipv6_setsockopt`); macOS refuses a value of any
+/// other size and an IPv4 socket with `EINVAL` (XNU bsd/netinet6/ip6_output.c `ip6_ctloutput`).
+/// Measured by tests/dual_stack_os_truth.rs.
+///
+/// # Safety
+/// `val` is null or holds `len` bytes.
+pub(crate) unsafe fn v6only_set(
+    rec: &SockRec,
+    bound: bool,
+    val: *const u8,
+    len: u32,
+) -> Option<NetResult> {
+    if !rec.state().inet6 {
+        return err(if cfg!(target_os = "linux") {
+            libc::ENOPROTOOPT
+        } else {
+            libc::EINVAL
+        });
+    }
+    let sized = if cfg!(target_os = "linux") {
+        len as usize >= size_of::<c_int>()
+    } else {
+        len as usize == size_of::<c_int>()
+    };
+    if !sized || bound {
+        return err(libc::EINVAL);
+    }
+    if val.is_null() {
+        return err(libc::EFAULT);
+    }
+    rec.state().v6only = unsafe { val.cast::<c_int>().read_unaligned() } != 0;
+    ok(0)
+}
+
+/// `getsockopt(IPV6_V6ONLY)` on IP socket `rec`: the flag as an `int`, truncated to a shorter
+/// buffer. On an IPv4 socket Linux fails with `EOPNOTSUPP` and macOS with `EINVAL` (measured).
+///
+/// # Safety
+/// `val` and `len` are each null or valid, `val` writable for `*len` bytes.
+pub(crate) unsafe fn v6only_get(rec: &SockRec, val: *mut u8, len: *mut u32) -> Option<NetResult> {
+    let state = rec.state();
+    if !state.inet6 {
+        return err(if cfg!(target_os = "linux") {
+            libc::EOPNOTSUPP
+        } else {
+            libc::EINVAL
+        });
+    }
+    let value = c_int::from(state.v6only);
+    drop(state);
+    if !val.is_null() && !len.is_null() {
+        let n = (unsafe { *len } as usize).min(size_of::<c_int>());
+        unsafe {
+            std::ptr::copy_nonoverlapping(value.to_ne_bytes().as_ptr(), val, n);
+            *len = n as u32;
+        }
+    }
+    ok(0)
+}
+
+/// The address a `bind` of `rec`'s socket (of family `domain`, a stream if `stream`) names
+/// ([`sock_addr`]). A v4-mapped one on an IPv6 socket with `IPV6_V6ONLY` on is refused: Linux
+/// `EINVAL` (net/ipv6/af_inet6.c `__inet6_bind`), macOS `EADDRNOTAVAIL`, as measured.
+///
+/// # Safety
+/// `ptr` is null or holds `len` readable bytes.
+pub(crate) unsafe fn bind_addr(
+    rec: &SockRec,
+    domain: c_int,
+    ptr: *const u8,
+    len: u32,
+    stream: bool,
+) -> Result<SocketAddr, c_int> {
+    let (want, _) = unsafe { sock_addr(domain, ptr, len, AddrUse::Bind { stream }) }?;
+    if domain == libc::AF_INET6 && want.is_ipv4() && rec.state().v6only {
+        return Err(if cfg!(target_os = "linux") {
+            libc::EINVAL
+        } else {
+            libc::EADDRNOTAVAIL
+        });
+    }
+    Ok(want)
+}
+
+/// Records that `rec`'s socket was bound to `addr`: Linux turns `IPV6_V6ONLY` on for an IPv6
+/// address other than the wildcard (net/ipv6/af_inet6.c `__inet6_bind`), which `getsockopt` and
+/// an accepted socket then read.
+pub(crate) fn bound_at(rec: &SockRec, addr: SocketAddr) {
+    if cfg!(target_os = "linux") && addr.is_ipv6() && !addr.ip().is_unspecified() {
+        rec.state().v6only = true;
+    }
+}
+
+/// Whether IPv6 datagram socket `rec`, bound at `local`, may send to (or, for `connect`, connect
+/// to) `dest`, which a `sockaddr_in` named when `native`; `Err` with the errno the host gives.
+/// IPv4 traffic needs a dual-stack socket not bound to an IPv6 address, and IPv6 traffic one not
+/// bound to a v4-mapped address. Linux (net/ipv6/udp.c `udpv6_sendmsg`, net/ipv6/datagram.c
+/// `__ip6_datagram_connect`): `ENETUNREACH` for IPv4 from an `IPV6_V6ONLY` socket or one bound to
+/// an IPv6 address (a `connect` to a `sockaddr_in` from an `IPV6_V6ONLY` socket `EAFNOSUPPORT`),
+/// `EAFNOSUPPORT` for IPv6 from a v4-mapped one. macOS lets an `IPV6_V6ONLY` socket send to and
+/// connect to IPv4; from an IPv6 address it refuses IPv4 (`EADDRNOTAVAIL` to send, `EINVAL` to
+/// connect), and from a v4-mapped address IPv6 (`EHOSTUNREACH` to send from a specific one,
+/// `EINVAL` to connect). Measured by tests/dual_stack_os_truth.rs.
+pub(crate) fn dgram_crossing(
+    rec: &SockRec,
+    local: Option<SocketAddr>,
+    dest: SocketAddr,
+    native: bool,
+    connect: bool,
+) -> Result<(), c_int> {
+    let linux = cfg!(target_os = "linux");
+    if dest.is_ipv4() {
+        if linux && rec.state().v6only {
+            return Err(if native && connect {
+                libc::EAFNOSUPPORT
+            } else {
+                libc::ENETUNREACH
+            });
+        }
+        if local.is_some_and(|l| l.is_ipv6() && !l.ip().is_unspecified()) {
+            return Err(if linux {
+                libc::ENETUNREACH
+            } else if connect {
+                libc::EINVAL
+            } else {
+                libc::EADDRNOTAVAIL
+            });
+        }
+    } else if let Some(local) = local.filter(SocketAddr::is_ipv4) {
+        if linux {
+            return Err(libc::EAFNOSUPPORT);
+        }
+        if connect {
+            return Err(libc::EINVAL);
+        }
+        if !local.ip().is_unspecified() {
+            return Err(libc::EHOSTUNREACH);
+        }
+    }
+    Ok(())
+}
+
+/// Whether IPv6 stream socket `rec`, bound at `bound`, may connect to `server`; `Err` with the
+/// errno the host gives (measured by tests/dual_stack_os_truth.rs): an IPv4 server from an
+/// `IPV6_V6ONLY` socket or one bound to an IPv6 address is `ENETUNREACH` on Linux
+/// (net/ipv6/tcp_ipv6.c `tcp_v6_connect`) and `EAFNOSUPPORT` on macOS, and an IPv6 one from a
+/// socket bound to a v4-mapped address `EAFNOSUPPORT` on both.
+fn stream_crossing(
+    rec: &SockRec,
+    bound: Option<SocketAddr>,
+    server: SocketAddr,
+) -> Result<(), c_int> {
+    let refused = if server.is_ipv4() {
+        rec.state().v6only || bound.is_some_and(|b| b.is_ipv6() && !b.ip().is_unspecified())
+    } else {
+        return match bound {
+            Some(b) if b.is_ipv4() => Err(libc::EAFNOSUPPORT),
+            _ => Ok(()),
+        };
+    };
+    if !refused {
+        return Ok(());
+    }
+    Err(if cfg!(target_os = "linux") {
+        libc::ENETUNREACH
+    } else {
+        libc::EAFNOSUPPORT
+    })
+}
+
 /// The placeholder address of a socketpair end, which has none. Never a real peer: no socket can
 /// connect from `0.0.0.0:0`, so comparing against it is safe.
 const UNNAMED: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
@@ -6315,26 +8021,27 @@ impl Fabric {
         rec: &Arc<SockRec>,
         broadcast: bool,
     ) -> Option<NetResult> {
-        let sender = match self.shared().route_send(
-            &rec.view(local.or(unhashed(requested))),
-            server,
-            Op::Connect,
-            station,
-            broadcast,
-        ) {
-            Ok(sender) => sender,
-            Err(errno) => return err(errno),
-        };
+        let from = local.or(unhashed(requested)).map(|l| toward(l, server));
+        let sender =
+            match self
+                .shared()
+                .route_send(&rec.view(from), server, Op::Connect, station, broadcast)
+            {
+                Ok(sender) => sender,
+                Err(errno) => return err(errno),
+            };
         match local {
             None => {
-                let unbound = unhashed(requested)
-                    .unwrap_or(SocketAddr::new(unspecified_like(server.ip()), 0));
+                let unbound = from.unwrap_or(SocketAddr::new(unspecified_like(server.ip()), 0));
                 let ip = sender.connected_local(unbound).ip();
                 if let Err(errno) = self.autobind(fd, queue, rec, ip) {
                     return err(errno);
                 }
             }
-            Some(bound) => self.rehash(fd, queue, rec, bound, sender.connected_local(bound)),
+            Some(bound) => {
+                let to = sender.connected_local(toward(bound, server));
+                self.rehash(fd, queue, rec, bound, to);
+            }
         }
         if let Some(Sock::Dgram { peer, .. }) = self.socks.lock().unwrap().get_mut(&fd) {
             *peer = Some(server);
@@ -6502,22 +8209,43 @@ impl Fabric {
     }
 
     /// The listener a connect to `server` reaches: one on the exact address, else — for one of
-    /// the host's own addresses — one on the wildcard address of that port.
-    fn listener_for(&self, server: SocketAddr, host_local: bool) -> Option<Arc<Listener>> {
+    /// the host's own addresses — one on the wildcard address of that port, an IPv4 socket's
+    /// before a dual-stack one's (as for datagrams, [`Cand::dual`]). Of several listening on one
+    /// address, the one [`pick_shared`] picks for a connection from `client`.
+    fn listener_for(
+        &self,
+        server: SocketAddr,
+        host_local: bool,
+        client: SocketAddr,
+    ) -> Option<Arc<Listener>> {
         let listeners = self.regs.listeners.lock().unwrap();
-        listeners
-            .get(&server)
-            .or_else(|| {
-                host_local
-                    .then(|| {
-                        listeners.get(&SocketAddr::new(
-                            unspecified_like(server.ip()),
-                            server.port(),
-                        ))
-                    })
-                    .flatten()
-            })
-            .cloned()
+        let seed = self.shared().seed;
+        let pick = |held: Vec<&Arc<Listener>>| {
+            let i = match held.len() {
+                0 => return None,
+                1 => 0,
+                _ => {
+                    let shares: Vec<Share> = held.iter().map(|l| l.share()).collect();
+                    let wildcard = held[0].addr.ip().is_unspecified();
+                    pick_shared(&shares, wildcard, client, server, seed)
+                }
+            };
+            Some(held[i].clone())
+        };
+        let at = |ip| listeners.at(&SocketAddr::new(ip, server.port())).iter();
+        if let Some(listener) = pick(at(server.ip()).collect()) {
+            return Some(listener);
+        }
+        if !host_local {
+            return None;
+        }
+        pick(at(unspecified_like(server.ip())).collect()).or_else(|| {
+            pick(
+                at(Ipv6Addr::UNSPECIFIED.into())
+                    .filter(|listener| server.is_ipv4() && listener.dual)
+                    .collect(),
+            )
+        })
     }
 
     /// The address a connect to `server` along `sender` leaves from, from a socket bound at
@@ -6538,7 +8266,16 @@ impl Fabric {
             Some(local) => SocketAddr::new(src, local.port()),
             None => {
                 let socks = self.socks.lock().unwrap();
-                let local = self.tcp_bind_addr(&socks, SocketAddr::new(src, 0), false);
+                let want = Claim {
+                    addr: SocketAddr::new(src, 0),
+                    dual: false,
+                    inet: src.is_ipv4(),
+                    reuse: false,
+                    reuseport: false,
+                    listening: false,
+                    station: self.shared().topo().is_station_ip(src),
+                };
+                let local = self.tcp_bind_addr(&socks, want);
                 local.unwrap_or(SocketAddr::new(src, 0))
             }
         }
@@ -6621,16 +8358,29 @@ impl Fabric {
     /// Called with no fabric lock held. This is a blocking connect, so the error is consumed as it
     /// is returned. `Idle` means another descriptor of the socket settled it meanwhile: the
     /// socket's state then says how; ECONNABORTED stands in if its error was already taken.
+    ///
+    /// A signal handler interrupts the wait as the host's does
+    /// ([`connect_restart`](crate::signals::connect_restart)); the attempt goes on, for a later
+    /// `connect` or a poll to settle.
     fn await_connect(&self, fd: c_int) -> Option<NetResult> {
+        let timeout = self
+            .rec(fd)
+            .is_some_and(|rec| rec.opts().sndtimeo.is_some());
+        let restart = crate::signals::connect_restart(timeout);
         loop {
             match self.advance_connect(fd) {
                 Progress::Pending(next) => {
-                    readiness().wait_until_dynamic(
-                        "connect",
-                        Some(next),
-                        |keys| self.fd_interests([fd], keys),
-                        || self.connect_due(fd),
-                    );
+                    let (_, interrupted) = snare_interpose::interruptible(restart, || {
+                        readiness().wait_until_dynamic(
+                            "connect",
+                            Some(next),
+                            |keys| self.fd_interests([fd], keys),
+                            || self.connect_due(fd),
+                        )
+                    });
+                    if interrupted {
+                        return err(libc::EINTR);
+                    }
                 }
                 Progress::Settled(Outcome::Connected, _) => return ok(0),
                 Progress::Settled(Outcome::Failed(errno), rec) => {
@@ -6676,7 +8426,8 @@ impl Fabric {
         let mut admission = None;
         let step = attempt.lock().unwrap().poll(|| {
             let station = self.regs.station_at(dest.ip());
-            listener = self.listener_for(dest, self.shared().dest_is_host(dest.ip(), station));
+            let host_local = self.shared().dest_is_host(dest.ip(), station);
+            listener = self.listener_for(dest, host_local, client);
             let syn = self.shared().syn_probe(dest, listener.is_some(), station);
             if matches!(syn, Syn::Accept) {
                 admission = listener.as_ref().and_then(Listener::reserve);
@@ -6759,16 +8510,18 @@ impl Fabric {
 
     /// Moves on every connecting socket among `fds` (all of them for `None`).
     fn advance_connecting(&self, fds: Option<&[c_int]>) {
-        let connecting: Vec<c_int> = self
-            .socks
-            .lock()
-            .unwrap()
+        let socks = self.socks.lock().unwrap();
+        if socks.connecting == 0 {
+            return;
+        }
+        let connecting: Vec<c_int> = socks
             .iter()
             .filter(|(fd, sock)| {
                 matches!(sock, Sock::Connecting { .. }) && fds.is_none_or(|fds| fds.contains(fd))
             })
             .map(|(fd, _)| *fd)
             .collect();
+        drop(socks);
         for fd in connecting {
             self.advance_connect(fd);
         }
@@ -6784,11 +8537,9 @@ impl Fabric {
 
     /// Whether any connecting socket among `fds` (all of them for `None`) has a point to play.
     fn connecting_due(&self, fds: Option<&[c_int]>) -> bool {
-        self.socks
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(fd, sock)| match sock {
+        let socks = self.socks.lock().unwrap();
+        socks.connecting > 0
+            && socks.iter().any(|(fd, sock)| match sock {
                 Sock::Connecting { attempt, .. } => {
                     fds.is_none_or(|fds| fds.contains(fd)) && attempt.lock().unwrap().due()
                 }
@@ -6812,6 +8563,8 @@ enum Kind {
     Raw,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Kqueue,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Signal,
 }
 
 /// The expirations of a timer armed for `expires` (reloading every `interval`, or once for
@@ -6903,6 +8656,28 @@ fn readiness_order(sock: &Sock, fallback: u64) -> (Duration, u64) {
             ..
         } => (*ready_at, *ready_order),
         _ => (Duration::ZERO, fallback),
+    }
+}
+
+/// The keys a registration on description `id`, holding `sock`, is subscribed under: the
+/// description's own and its socket record's.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+fn description_keys(id: u64, sock: &Sock) -> Keys {
+    Keys::of(
+        Some(crate::readiness::WakeKey::Descriptor(id)),
+        sock.rec().map(|rec| rec.wake_key()),
+    )
+}
+
+/// Whether `sock`'s readiness can change with the clock alone: a connect under way, an armed
+/// timerfd, or a delayed arrival, error or report its record is waiting on. A blocking wait on it
+/// wakes on clock moves for the same reasons.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+fn moves_with_time(sock: &Sock) -> bool {
+    match sock {
+        Sock::Connecting { .. } => true,
+        Sock::Timer { expires, .. } => expires.is_some(),
+        _ => sock.rec().is_some_and(|rec| rec.pending_time()),
     }
 }
 
@@ -7133,6 +8908,8 @@ fn base_mask(sock: &Sock) -> u32 {
             m
         }
         Sock::Timer { ticks, .. } if *ticks > 0 => epollin,
+        #[cfg(target_os = "linux")]
+        Sock::Signal { mask, .. } if snare_interpose::signals_pending(*mask) => epollin,
         Sock::Listener { listener, .. } if listener.has_pending() => epollin,
         // A connect that failed: writable, with its error and the hang-up of a closed socket
         // (net/ipv4/tcp.c tcp_poll: TCP_CLOSE gives EPOLLHUP, SEND_SHUTDOWN gives EPOLLOUT, sk_err
@@ -7180,7 +8957,7 @@ fn poll_bits(mask: u32, events: i16) -> i16 {
 /// and XNU bsd/kern/kern_event.c `knote` runs the filter on every wake and activates the knote
 /// when it fires. So data arriving at a socket already readable, or a write to an eventfd whose
 /// counter is already nonzero, is a new edge.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
 struct Wakes {
     read: u64,
     write: u64,
@@ -7192,7 +8969,50 @@ struct Wakes {
 /// readiness bit rising.
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 fn wakes(sock: &Sock) -> Wakes {
-    let mut wakes = match sock {
+    let mut wakes = data_wakes(sock);
+    wakes.error = sock.rec().map_or(0, |rec| rec.error_wakes());
+    wakes
+}
+
+/// [`ready_mask`] and then [`wakes`], reading a stream's or datagram socket's record once.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn mask_and_wakes(sock: &Sock) -> (u32, Wakes) {
+    let (Sock::Stream { rec, .. } | Sock::Dgram { rec, .. }) = sock else {
+        let mask = ready_mask(sock);
+        return (mask, wakes(sock));
+    };
+    #[cfg(target_os = "macos")]
+    if let Sock::Stream { conn, .. } = sock {
+        conn.progress_tcp_shutdown();
+    }
+    let (mut mask, mut wakes) = match sock {
+        Sock::Dgram { queue, .. } => {
+            let (readable, landed) = queue.readable_landed();
+            let wakes = Wakes {
+                read: landed,
+                ..Wakes::default()
+            };
+            (EPOLLOUT | if readable { EPOLLIN } else { 0 }, wakes)
+        }
+        _ => (base_mask(sock), data_wakes(sock)),
+    };
+    let (error, report, error_wakes) = rec.error_readiness();
+    if error.is_some() {
+        mask |= if cfg!(target_os = "linux") {
+            EPOLLERR
+        } else {
+            EPOLLIN
+        };
+    } else if report {
+        mask |= EPOLLERR;
+    }
+    wakes.error = error_wakes;
+    (mask, wakes)
+}
+
+/// `sock`'s [`Wakes`] for reading and writing, without its error wakes.
+fn data_wakes(sock: &Sock) -> Wakes {
+    match sock {
         Sock::Stream { conn, end, .. } => Wakes {
             read: conn.read_pipe(*end).read_wakes(),
             write: conn.write_pipe(*end).write_wakes(),
@@ -7213,6 +9033,12 @@ fn wakes(sock: &Sock) -> Wakes {
             write: 0,
             ..Wakes::default()
         },
+        #[cfg(target_os = "linux")]
+        Sock::Signal { .. } => Wakes {
+            read: snare_interpose::signal_generation(),
+            write: 0,
+            ..Wakes::default()
+        },
         Sock::Raw { arrived, .. } => Wakes {
             read: *arrived,
             write: 0,
@@ -7224,9 +9050,7 @@ fn wakes(sock: &Sock) -> Wakes {
             ..Wakes::default()
         },
         _ => Wakes::default(),
-    };
-    wakes.error = sock.rec().map_or(0, |rec| rec.error_wakes());
-    wakes
+    }
 }
 
 /// The edge-trigger state of one registration: `EPOLLET` (man 7 epoll: delivered "only when
@@ -7236,7 +9060,7 @@ fn wakes(sock: &Sock) -> Wakes {
 /// direction that is ready having been woken ([`Wakes`]) since. The report carries the full
 /// current readiness, as Linux `ep_send_events` re-polls the item (`ep_item_poll`) before
 /// copying it out.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 struct Edge {
     /// The bits last reported, less any since seen clear.
@@ -7304,7 +9128,11 @@ impl Sock {
     fn process_local(&self) -> bool {
         matches!(
             self,
-            Sock::Epoll { .. } | Sock::Kqueue { .. } | Sock::Event { .. } | Sock::Timer { .. }
+            Sock::Epoll { .. }
+                | Sock::Kqueue { .. }
+                | Sock::Event { .. }
+                | Sock::Timer { .. }
+                | Sock::Signal { .. }
         )
     }
 
@@ -7322,85 +9150,191 @@ impl Sock {
     }
 }
 
-/// Whether binding TCP address `want` (with SO_REUSEADDR as `reuse`) collides with a socket that
-/// holds `held`. Two addresses overlap on the same port and family when they are equal or one is
-/// the wildcard. Measured against the host OS (see the bind_os_truth test): Linux refuses any
-/// overlap unless both sockets set SO_REUSEADDR and the held one is not listening; macOS refuses
-/// an equal address always and a wildcard overlap unless the new socket sets SO_REUSEADDR.
-/// `held` is (address, its SO_REUSEADDR, whether it listens). The test is
-/// bind_os_truth.rs `overlapping_binds_match_the_host`, which runs every combination against the
-/// real stack (Linux: net/ipv4/inet_connection_sock.c inet_bind_conflict; XNU:
-/// bsd/netinet/in_pcb.c in_pcbbind).
-fn tcp_bind_conflict(held: (SocketAddr, bool, bool), want: SocketAddr, reuse: bool) -> bool {
-    let (held, held_reuse, held_listening) = held;
-    if held.port() != want.port() || held.is_ipv4() != want.is_ipv4() {
-        return false;
+/// One socket's hold on an address, or a bind's want of one.
+#[derive(Clone, Copy)]
+pub(crate) struct Claim {
+    /// The address, a v4-mapped one as IPv4.
+    addr: SocketAddr,
+    /// An IPv6 socket at the wildcard without `IPV6_V6ONLY`, which holds the IPv4 wildcard too.
+    dual: bool,
+    /// Created `AF_INET`.
+    inet: bool,
+    /// `SO_REUSEADDR`.
+    reuse: bool,
+    /// `SO_REUSEPORT`.
+    reuseport: bool,
+    listening: bool,
+    /// At a station address: a socket standing in for another host, whose addresses the host's
+    /// wildcard does not cover.
+    station: bool,
+}
+
+impl Claim {
+    /// A bind of `rec`'s socket to `addr`.
+    pub(crate) fn of(rec: &SockRec, addr: SocketAddr) -> Self {
+        let state = rec.state();
+        Claim {
+            addr,
+            dual: state.dual_at(addr),
+            inet: !state.inet6,
+            reuse: state.opts.reuseaddr,
+            reuseport: state.opts.reuseport,
+            listening: false,
+            station: state.station,
+        }
     }
-    let exact = held.ip() == want.ip();
-    if !exact && !held.ip().is_unspecified() && !want.ip().is_unspecified() {
-        return false;
+
+    /// A bind of `rec`'s socket to `addr`, a station address if `station`.
+    pub(crate) fn want(rec: &SockRec, addr: SocketAddr, station: bool) -> Self {
+        Claim {
+            station,
+            ..Claim::of(rec, addr)
+        }
     }
-    if cfg!(target_os = "linux") {
-        !(reuse && held_reuse && !held_listening)
-    } else {
-        exact || !reuse
+
+    /// What a tester's listener at `addr` holds: the address alone, listening.
+    fn tester(addr: SocketAddr, dual: bool) -> Self {
+        Claim {
+            addr,
+            dual,
+            inet: addr.is_ipv4(),
+            reuse: false,
+            reuseport: false,
+            listening: true,
+            station: false,
+        }
+    }
+
+    /// What `listener` holds against a new bind.
+    fn of_listener(listener: &Listener) -> Self {
+        match listener.rec.as_ref().and_then(std::sync::Weak::upgrade) {
+            Some(rec) => Claim {
+                listening: true,
+                ..Claim::of(&rec, listener.addr)
+            },
+            None => Claim::tester(listener.addr, listener.dual),
+        }
+    }
+
+    /// The addresses it holds: its own, and the IPv4 wildcard for a dual-stack one.
+    fn held(self) -> impl Iterator<Item = SocketAddr> {
+        let v4 = self
+            .dual
+            .then(|| SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), self.addr.port()));
+        std::iter::once(self.addr).chain(v4)
     }
 }
 
+/// Whether the bind `want` collides with the socket of its protocol that holds `held`, TCP and UDP
+/// alike. Two addresses overlap on the same port and family when they are equal or one is the
+/// wildcard; a dual-stack socket holds the IPv4 wildcard as well as the IPv6 one. Measured against
+/// the host OS for IPv4, IPv6, v4-mapped and dual-stack binds under every combination of
+/// `SO_REUSEADDR` and `SO_REUSEPORT` (bind_os_truth.rs, dual_stack_os_truth.rs,
+/// reuseport_os_truth.rs):
+///
+/// - Linux refuses any overlap unless both sockets set `SO_REUSEADDR` and the held one is not
+///   listening, or both set `SO_REUSEPORT` (net/ipv4/inet_connection_sock.c
+///   `inet_bind_conflict`, net/ipv4/udp.c `udp_lib_lport_inuse`). Both sockets have one owner
+///   in a sim, so the effective-UID match `SO_REUSEPORT` also asks for always holds.
+/// - macOS refuses an equal address and, unless the new socket sets `SO_REUSEADDR` or
+///   `SO_REUSEPORT`, a wildcard overlap, unless both set `SO_REUSEPORT` (XNU bsd/netinet/in_pcb.c
+///   `in_pcbbind`: the lookup is exact-only once either option is set, and a socket found passes
+///   only when its options share the new socket's `SO_REUSEPORT`); and a dual-stack bind passes
+///   over an `AF_INET` socket at the IPv4 wildcard (bsd/netinet6/in6_pcb.c `in6_pcbbind`). A bind
+///   of a multicast group with `SO_REUSEADDR` counts it as both options, so it passes a socket
+///   that set either.
+///
+/// A socket at a station address stands in for another host, so it and a socket of the host
+/// never collide.
+pub(crate) fn bind_conflict(held: Claim, want: Claim) -> bool {
+    let group_reuse = cfg!(target_os = "macos")
+        && want.addr.ip().is_multicast()
+        && want.reuse
+        && (held.reuse || held.reuseport);
+    if (want.reuseport && held.reuseport) || group_reuse || held.station != want.station {
+        return false;
+    }
+    held.held().any(|h| {
+        want.held().any(|w| {
+            if h.port() != w.port() || h.is_ipv4() != w.is_ipv4() {
+                return false;
+            }
+            let exact = h.ip() == w.ip();
+            if !exact && !h.ip().is_unspecified() && !w.ip().is_unspecified() {
+                return false;
+            }
+            if cfg!(target_os = "linux") {
+                return !(want.reuse && held.reuse && !held.listening);
+            }
+            if want.dual && w.is_ipv4() && held.inet && h.ip().is_unspecified() {
+                return false;
+            }
+            exact || !(want.reuse || want.reuseport)
+        })
+    })
+}
+
 impl Fabric {
+    /// A bind of `rec`'s socket to `addr`, as a station's when `addr` is a station address.
+    fn want(&self, rec: &SockRec, addr: SocketAddr) -> Claim {
+        Claim::want(rec, addr, self.shared().topo().is_station_ip(addr.ip()))
+    }
+
     /// `want` with its port resolved (an ephemeral one for port 0), or `None` when it collides
-    /// with a TCP socket already bound or listening there.
+    /// ([`bind_conflict`]) with a TCP socket already bound or listening there.
     ///
-    /// The held addresses are every bound fresh or connecting socket and listener in `socks`
-    /// (the caller holds it), plus every registered listener, testers' included, counted as
-    /// listening without SO_REUSEADDR. Established streams do not hold their port here. For port
-    /// 0 it draws from the sim's ephemeral counter at most once per port in the range, so a full
-    /// range gives `None` (EADDRINUSE) rather than looping.
-    fn tcp_bind_addr(
-        &self,
-        socks: &Sockets,
-        mut want: SocketAddr,
-        reuse: bool,
-    ) -> Option<SocketAddr> {
-        let mut held: Vec<(SocketAddr, bool, bool)> = socks
-            .values()
-            .filter_map(|sock| match sock {
-                Sock::Fresh {
-                    local: Some(local),
-                    rec,
-                    ..
-                }
-                | Sock::Connecting {
-                    local: Some(local),
-                    rec,
-                    ..
-                } => Some((*local, rec.opts().reuseaddr, false)),
-                Sock::Listener { listener, rec, .. } => {
-                    Some((listener.addr, rec.opts().reuseaddr, true))
-                }
-                Sock::Stream { conn, end, rec, .. } if !conn.pair => {
-                    Some((conn.local(*end), rec.opts().reuseaddr, false))
-                }
-                _ => None,
-            })
-            .collect();
-        held.extend(
-            self.regs
-                .listeners
-                .lock()
-                .unwrap()
-                .keys()
-                .map(|a| (*a, false, true)),
-        );
-        let free = |addr: SocketAddr| !held.iter().any(|&h| tcp_bind_conflict(h, addr, reuse));
-        if want.port() != 0 {
-            return free(want).then_some(want);
+    /// The held addresses are every bound fresh or connecting socket, listener and connected
+    /// stream in `socks` (the caller holds it), plus every registered listener, a tester's
+    /// counted as listening without SO_REUSEADDR or SO_REUSEPORT. Socketpair ends hold none. Only
+    /// the sockets and listeners on the port asked about are looked at. Port 0 takes a port no
+    /// socket overlaps, whatever the options say (Linux `inet_csk_find_open_port` checks without
+    /// relaxing for them; XNU `in_pcbbind` looks for an unused port): it draws from the sim's
+    /// ephemeral counter at most once per port in the range, so a full range gives `None`
+    /// (EADDRINUSE) rather than looping.
+    fn tcp_bind_addr(&self, socks: &Sockets, mut want: Claim) -> Option<SocketAddr> {
+        if want.addr.port() != 0 {
+            return self.tcp_free(socks, want, None).then_some(want.addr);
         }
         let port = (0..=u16::MAX - crate::scope::EPHEMERAL_FIRST)
             .map(|_| self.shared().ephemeral_port())
-            .find(|&port| free(SocketAddr::new(want.ip(), port)))?;
-        want.set_port(port);
-        Some(want)
+            .find(|&port| {
+                let want = Claim {
+                    addr: SocketAddr::new(want.addr.ip(), port),
+                    reuse: false,
+                    reuseport: false,
+                    ..want
+                };
+                self.tcp_free(socks, want, None)
+            })?;
+        want.addr.set_port(port);
+        Some(want.addr)
+    }
+
+    /// Whether `want` collides ([`bind_conflict`]) with none of the TCP sockets and listeners
+    /// [`tcp_bind_addr`](Self::tcp_bind_addr) looks at, but for `except`'s.
+    fn tcp_free(&self, socks: &Sockets, want: Claim, except: Option<&Arc<SockRec>>) -> bool {
+        let port = want.addr.port();
+        let other = |rec: Option<&Arc<SockRec>>| match (rec, except) {
+            (Some(rec), Some(except)) => !Arc::ptr_eq(rec, except),
+            _ => true,
+        };
+        let listened = self
+            .regs
+            .listeners
+            .lock()
+            .unwrap()
+            .on_port(port)
+            .filter(|listener| {
+                let rec = listener.rec.as_ref().and_then(std::sync::Weak::upgrade);
+                other(rec.as_ref())
+            })
+            .any(|listener| bind_conflict(Claim::of_listener(listener), want));
+        !listened
+            && !socks
+                .on_port(port)
+                .filter(|sock| other(sock.rec()))
+                .filter_map(tcp_claim)
+                .any(|held| bind_conflict(held, want))
     }
 
     /// `fd`'s [`Kind`], or `None` if the fabric does not serve it.
@@ -7416,6 +9350,7 @@ impl Fabric {
             Sock::Epoll { .. } => Kind::Epoll,
             Sock::Raw { .. } => Kind::Raw,
             Sock::Kqueue { .. } => Kind::Kqueue,
+            Sock::Signal { .. } => Kind::Signal,
         })
     }
 
@@ -7429,6 +9364,9 @@ impl Fabric {
                 nonblocking: true,
                 ..
             }) | Some(Sock::Timer {
+                nonblocking: true,
+                ..
+            }) | Some(Sock::Signal {
                 nonblocking: true,
                 ..
             }) | Some(Sock::Stream {
@@ -7447,24 +9385,53 @@ impl Fabric {
         )
     }
 
-    /// The revents of each `(fd, events)`; `POLLNVAL` for an fd closed meanwhile.
-    fn poll_revents(&self, watched: &[(c_int, i16)]) -> Vec<i16> {
+    /// The revents of each `(fd, events)`; for a real descriptor what a zero-timeout `poll` of it
+    /// reads. `began` is [`foreign_masks`](Self::foreign_masks) of the set when the wait began: an
+    /// fd the sim served then and no longer does was closed meanwhile and reports `POLLNVAL`,
+    /// without a look at the real descriptor its number may still name (the reserved one its
+    /// close has yet to release, or a reuse after that).
+    fn poll_revents(
+        &self,
+        watched: &[(c_int, i16)],
+        began: &[(c_int, Option<(u32, Wakes)>)],
+    ) -> Vec<i16> {
         let foreign: HashMap<c_int, Option<(u32, Wakes)>> = self
             .foreign_masks(watched.iter().map(|w| w.0))
             .into_iter()
+            .filter(|(fd, ready)| {
+                ready.is_some() || began.iter().any(|(f, then)| f == fd && then.is_none())
+            })
             .collect();
+        let mut real: Vec<libc::pollfd> = watched
+            .iter()
+            .map(|&(fd, events)| libc::pollfd {
+                fd: if matches!(foreign.get(&fd), Some(None)) {
+                    fd
+                } else {
+                    -1
+                },
+                events,
+                revents: 0,
+            })
+            .collect();
+        if real.iter().any(|p| p.fd >= 0) {
+            snare_interpose::real(|| unsafe {
+                libc::poll(real.as_mut_ptr(), real.len() as libc::nfds_t, 0)
+            });
+        }
         let mut socks = self.socks.lock().unwrap();
         socks.settle_timers(self.shared().monotonic_now());
         watched
             .iter()
-            .map(|(fd, events)| match socks.get(fd) {
+            .zip(&real)
+            .map(|((fd, events), real)| match socks.get(fd) {
                 Some(s) => poll_bits(ready_mask(s), *events),
                 None if *fd < 0 => 0,
-                None => foreign
-                    .get(fd)
-                    .copied()
-                    .flatten()
-                    .map_or(libc::POLLNVAL, |(mask, _)| poll_bits(mask, *events)),
+                None => match foreign.get(fd).copied() {
+                    Some(Some((mask, _))) => poll_bits(mask, *events),
+                    Some(None) => real.revents,
+                    None => libc::POLLNVAL,
+                },
             })
             .collect()
     }
@@ -7520,6 +9487,7 @@ impl Fabric {
         // A wait that returns without blocking — events already pending, or a zero timeout — is a
         // busy-poll step when repeated, so it is charged the call latency.
         let mut waited = false;
+        let waiting = std::cell::RefCell::new(None);
         let _waiting = snare_interpose::fd_wait(epfd);
         loop {
             if !Net::owns(self, epfd) {
@@ -7545,21 +9513,46 @@ impl Fabric {
                 }
                 return ok(ready.len() as i64);
             }
+            // A zero timeout never blocks, so it needs no subscription or interests. The wait
+            // would only look again, and of what it looks at only a due connect is not already
+            // covered by the scan just made.
+            if timeout.is_some_and(|t| t.is_zero()) {
+                snare_interpose::end_spin();
+                if self.connecting_due(None) {
+                    waited = true;
+                    continue;
+                }
+                snare_interpose::charge_latency();
+                return ok(0);
+            }
             let expiry = self.epoll_timer_expiry(epfd);
             let timer = expiry.map(|at| self.timer_deadline(at));
-            let woke = readiness().wait_until_dynamic(
-                "epoll_wait",
-                earlier(deadline, timer),
-                |keys| self.epoll_interests(epfd, keys),
-                || {
-                    !Net::owns(self, epfd)
-                        || !self.collect_ready(epfd, 1, false).is_empty()
-                        || self.connecting_due(None)
-                        || self.epoll_timer_expiry(epfd) != expiry
-                },
-            );
+            let (woke, interrupted) = snare_interpose::interruptible(Restart::Never, || {
+                readiness().wait_until_dynamic(
+                    "epoll_wait",
+                    earlier(deadline, timer),
+                    |keys| {
+                        if let Some(key) = self.wait_real(&waiting, self.epoll_watch(epfd)) {
+                            keys.push(key);
+                        }
+                        self.epoll_interests(epfd, keys)
+                    },
+                    || {
+                        if let Some(waiting) = &*waiting.borrow() {
+                            waiting.look();
+                        }
+                        !Net::owns(self, epfd)
+                            || !self.collect_ready(epfd, 1, false).is_empty()
+                            || self.connecting_due(None)
+                            || self.epoll_timer_expiry(epfd) != expiry
+                    },
+                )
+            });
             if !Net::owns(self, epfd) {
                 return None;
+            }
+            if interrupted {
+                return err(libc::EINTR);
             }
             if !woke {
                 if let (Some(at), Some(timer)) = (expiry, timer)
@@ -7583,10 +9576,13 @@ impl Fabric {
     #[cfg(target_os = "linux")]
     fn epoll_timer_expiry(&self, epfd: c_int) -> Option<Duration> {
         let socks = self.socks.lock().unwrap();
-        let Some(Sock::Epoll { interests }) = socks.get(&epfd) else {
+        if socks.timers == 0 {
+            return None;
+        }
+        let Some(Sock::Epoll { interests, .. }) = socks.get(&epfd) else {
             return None;
         };
-        let watched: std::collections::HashSet<u64> = interests
+        let watched: crate::HashSet<u64> = interests
             .iter()
             .filter(|(_, interest)| !interest.spent)
             .filter_map(|((_, identity), _)| match identity {
@@ -7604,6 +9600,69 @@ impl Fabric {
     fn fds_timer_expiry(&self, fds: &[c_int]) -> Option<Duration> {
         let socks = self.socks.lock().unwrap();
         socks.next_expiry(|description| description.descriptors.iter().any(|fd| fds.contains(fd)))
+    }
+
+    /// Blocks until real descriptor `fd` is ready for `events`, as a `poll` of it alone blocks (a
+    /// [`Watch`](crate::realfd::Watch) on it), in a wait a signal handler interrupts, restarted
+    /// under `SA_RESTART`: a pipe `read`, `readv`, `write` and `writev`, and `wait`, `waitpid` and
+    /// `waitid`, restart on both hosts, and fail with EINTR without it (man 7 signal,
+    /// "Interruption of system calls and library functions by signal handlers"; pinned by
+    /// tests/signal_interrupts.rs). `Some(Ok(0))` once it is ready, for the call to go to the OS;
+    /// `None` when the sim gives up the wait as deadlocked, or has no probe set to watch it with,
+    /// leaving it to the OS as before.
+    fn await_real(&self, fd: c_int, events: i16, label: &'static str) -> Option<NetResult> {
+        let ready = || {
+            let mut pfd = libc::pollfd {
+                fd,
+                events,
+                revents: 0,
+            };
+            // SAFETY: one pollfd; a zero timeout.
+            snare_interpose::real(|| unsafe { libc::poll(&mut pfd, 1, 0) }) > 0
+        };
+        if ready() {
+            return ok(0);
+        }
+        let watch = crate::realfd::Watch::new(&[(fd, events)])?;
+        let waiting = watch.wait(&self.regs.shared);
+        let (woke, interrupted) = snare_interpose::interruptible(Restart::WithSaRestart, || {
+            readiness().wait_until_dynamic(
+                label,
+                None,
+                |keys| {
+                    keys.push(waiting.watch().key());
+                    false
+                },
+                || {
+                    waiting.look();
+                    ready()
+                },
+            )
+        });
+        if interrupted {
+            return err(libc::EINTR);
+        }
+        woke.then(|| ok(0)).flatten()
+    }
+
+    /// Waits for `fd`, an end of a pipe the sim made that is open for `access` (`O_RDONLY`,
+    /// `O_WRONLY`) in blocking mode, to be ready for `events`, as
+    /// [`await_real`](Self::await_real) waits. Any other descriptor is left to the OS, which fails
+    /// a call on the wrong end at once (EBADF).
+    fn await_pipe(
+        &self,
+        fd: c_int,
+        access: c_int,
+        events: i16,
+        label: &'static str,
+    ) -> Option<NetResult> {
+        self.shared().pipes.lent(fd)?;
+        // SAFETY: no pointers.
+        let flags = snare_interpose::real(|| unsafe { libc::fcntl(fd, libc::F_GETFL) });
+        if flags < 0 || flags & libc::O_NONBLOCK != 0 || flags & libc::O_ACCMODE != access {
+            return None;
+        }
+        self.await_real(fd, events, label)
     }
 
     /// A wait's deadline for a timer expiring at `at` on the sim's monotonic timeline.
@@ -7640,19 +9699,25 @@ impl Fabric {
             }
             let expiry = self.fds_timer_expiry(&[fd]);
             let timer = expiry.map(|at| self.timer_deadline(at));
-            let woke = readiness().wait_until_dynamic(
-                "timerfd",
-                timer,
-                |keys| self.fd_interests([fd], keys),
-                || {
-                    !Net::owns(self, fd)
-                        || self.fds_timer_expiry(&[fd]) != expiry
-                        || matches!(
-                            self.socks.lock().unwrap().get(&fd),
-                            Some(Sock::Timer { ticks, .. }) if *ticks > 0
-                        )
-                },
-            );
+            let (woke, interrupted) =
+                snare_interpose::interruptible(Restart::WithSaRestart, || {
+                    readiness().wait_until_dynamic(
+                        "timerfd",
+                        timer,
+                        |keys| self.fd_interests([fd], keys),
+                        || {
+                            !Net::owns(self, fd)
+                                || self.fds_timer_expiry(&[fd]) != expiry
+                                || matches!(
+                                    self.socks.lock().unwrap().get(&fd),
+                                    Some(Sock::Timer { ticks, .. }) if *ticks > 0
+                                )
+                        },
+                    )
+                });
+            if interrupted && Net::owns(self, fd) {
+                return err(libc::EINTR);
+            }
             if !woke && Net::owns(self, fd) {
                 match (expiry, timer) {
                     (Some(at), Some(timer)) if timer.passed() => {
@@ -7666,22 +9731,86 @@ impl Fabric {
         ok(8)
     }
 
+    /// man 2 signalfd, "read(2)": each `signalfd_siginfo` (128 bytes) the buffer has room for takes
+    /// one pending signal of the descriptor's set, blocking (or EAGAIN when nonblocking) until there
+    /// is one; a buffer too small for one is EINVAL (fs/signalfd.c `signalfd_read`). A handler
+    /// that interrupts the wait restarts it under `SA_RESTART` and fails it with EINTR otherwise,
+    /// as the kernel's `-ERESTARTSYS` does (`signalfd_dequeue`).
+    #[cfg(target_os = "linux")]
+    fn signalfd_read(&self, fd: c_int, buf: *mut u8, len: usize) -> Option<NetResult> {
+        const SIZE: usize = size_of::<libc::signalfd_siginfo>();
+        if len < SIZE {
+            return err(libc::EINVAL);
+        }
+        let mask = || match self.socks.lock().unwrap().get(&fd) {
+            Some(Sock::Signal { mask, .. }) => Some(*mask),
+            _ => None,
+        };
+        let _waiting = snare_interpose::fd_wait(fd);
+        let taken = loop {
+            let set = mask()?;
+            let taken = snare_interpose::take_signals(set, len / SIZE);
+            if !taken.is_empty() {
+                break taken;
+            }
+            if self.is_nonblocking(fd) {
+                return would_block();
+            }
+            let (_, interrupted) = snare_interpose::interruptible(Restart::WithSaRestart, || {
+                readiness().wait_until_dynamic(
+                    "signalfd",
+                    None,
+                    |keys| self.fd_interests([fd], keys),
+                    || mask().is_none_or(snare_interpose::signals_pending),
+                )
+            });
+            if interrupted && Net::owns(self, fd) {
+                return err(libc::EINTR);
+            }
+        };
+        for (at, info) in taken.iter().enumerate() {
+            // SAFETY: all-zero is a valid signalfd_siginfo.
+            let mut out: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
+            out.ssi_signo = info.signo as u32;
+            out.ssi_code = info.code;
+            out.ssi_pid = info.pid as u32;
+            out.ssi_uid = info.uid;
+            out.ssi_status = info.status;
+            unsafe { std::ptr::write_unaligned(buf.add(at * SIZE).cast(), out) };
+        }
+        ok((taken.len() * SIZE) as i64)
+    }
+
     /// Ready registrations in activation order; reported level-triggered registrations move
     /// behind the remaining ready registrations. `take` consumes edges and one-shot events.
     #[cfg(target_os = "linux")]
     fn collect_ready(&self, epfd: c_int, max: usize, take: bool) -> Vec<(u32, u64)> {
-        let interested: Vec<(c_int, EpollIdentity)> = {
-            let socks = self.socks.lock().unwrap();
-            let Some(Sock::Epoll { interests }) = socks.get(&epfd) else {
+        let domain = self.shared().domain_key();
+        let (due, others, watch) = {
+            let mut socks = self.socks.lock().unwrap();
+            let id = socks.identity(epfd);
+            let Some(Sock::Epoll { interests, real }) = socks.get_mut(&epfd) else {
                 return Vec::new();
             };
-            interests
-                .keys()
+            if let Some(id) = id {
+                interests.list().place(id, domain);
+            }
+            let due = interests.due();
+            let others: Vec<_> = due
+                .iter()
+                .filter_map(|&ticket| interests.at(ticket))
+                .map(|(key, _)| key)
                 .filter(|key| !matches!(key.1, EpollIdentity::Local(_)))
-                .copied()
-                .collect()
+                .collect();
+            (due, others, real.clone())
         };
-        let foreign: HashMap<_, (u32, Wakes)> = interested
+        if let Some(watch) = &watch {
+            watch.drain();
+        }
+        if due.is_empty() {
+            return Vec::new();
+        }
+        let foreign: HashMap<_, (u32, Wakes, bool)> = others
             .into_iter()
             .filter_map(|key| {
                 let rec = match key.1 {
@@ -7690,9 +9819,19 @@ impl Fabric {
                     EpollIdentity::Local(_) => None,
                 };
                 match rec {
-                    Some(rec) => Some((key, foreign_ready(&rec)?)),
+                    Some(rec) => {
+                        let (mask, wakes) = foreign_ready(&rec)?;
+                        Some((key, (mask, wakes, rec.pending_time())))
+                    }
                     None if key.1 == EpollIdentity::Untracked => {
-                        Some((key, (real_ready(key.0)?, Wakes::default())))
+                        let (read, write) =
+                            watch.as_ref().map_or((0, 0), |watch| watch.edges(key.0));
+                        let wakes = Wakes {
+                            read,
+                            write,
+                            error: 0,
+                        };
+                        Some((key, (real_ready(key.0)?, wakes, false)))
                     }
                     None => None,
                 }
@@ -7700,30 +9839,41 @@ impl Fabric {
             .collect();
         let mut socks = self.socks.lock().unwrap();
         socks.settle_timers(self.shared().monotonic_now());
-        let Some(Sock::Epoll { interests }) = socks.get(&epfd) else {
+        let Some(Sock::Epoll { interests, .. }) = socks.get(&epfd) else {
             return Vec::new();
         };
-        let watched: Vec<_> = interests
-            .iter()
-            .filter(|(_, i)| !i.spent)
-            .map(|(key, i)| (*key, i.events, i.data, i.edge, i.order, i.pending_order))
-            .collect();
         let mut pending = Vec::new();
         let mut seen = Vec::new();
+        let mut settled = Vec::with_capacity(due.len());
         let mut gone = Vec::new();
-        for (key, events, data, mut edge, order, pending_order) in watched {
+        for ticket in due {
+            let ticket = interests.current(ticket);
+            let Some((key, interest)) = interests.at(ticket) else {
+                continue;
+            };
+            if interest.spent {
+                settled.push((ticket, Settled::Idle, None));
+                continue;
+            }
+            let (events, data, was, order, pending_order) = (
+                interest.events,
+                interest.data,
+                interest.edge,
+                interest.order,
+                interest.pending_order,
+            );
             let sock = match key.1 {
                 EpollIdentity::Local(id) => socks.get_identity(id),
                 EpollIdentity::Untracked => socks.get(&key.0),
                 EpollIdentity::Foreign(_) => None,
             };
-            let (mask, now, arrival) = match sock {
+            let (mask, now, timed) = match sock {
                 Some(sock) => {
-                    let mask = ready_mask(sock);
-                    (mask, wakes(sock), readiness_order(sock, order))
+                    let (mask, now) = mask_and_wakes(sock);
+                    (mask, now, None)
                 }
                 None => match foreign.get(&key) {
-                    Some(&(mask, now)) => (mask, now, (Duration::ZERO, order)),
+                    Some(&(mask, now, timed)) => (mask, now, Some(timed)),
                     None => {
                         gone.push(key);
                         continue;
@@ -7731,28 +9881,51 @@ impl Fabric {
                 },
             };
             let got = mask & (events | EPOLLERR | EPOLLHUP);
+            let mut edge = was;
             let edged = edge.pending(got, now);
             let fire = got != 0 && (events & libc::EPOLLET as u32 == 0 || edged);
-            if fire {
-                pending.push((pending_order.unwrap_or(arrival), key, got, data, now));
+            let fired_order = fire.then(|| {
+                pending_order.unwrap_or_else(|| {
+                    sock.map_or((Duration::ZERO, order), |sock| readiness_order(sock, order))
+                })
+            });
+            if let Some(at) = fired_order {
+                pending.push((at, key, got, data, now, ticket));
             }
-            seen.push((key, edge, fire.then_some(pending_order.unwrap_or(arrival))));
+            if edge != was || fired_order != pending_order {
+                seen.push((ticket, edge, fired_order));
+            }
+            let keys = match (key.1, sock) {
+                (EpollIdentity::Local(id), Some(sock)) => Some(description_keys(id, sock)),
+                _ => None,
+            };
+            let state = if fire || key.1 == EpollIdentity::Untracked {
+                Settled::Due
+            } else if timed.unwrap_or_else(|| sock.is_some_and(moves_with_time)) {
+                Settled::Timed
+            } else {
+                Settled::Idle
+            };
+            settled.push((ticket, state, keys));
         }
         pending.sort_by_key(|p| (p.0, p.1.0));
         let mut out = Vec::new();
-        if let Some(Sock::Epoll { interests }) = socks.get_mut(&epfd) {
+        if let Some(Sock::Epoll { interests, .. }) = socks.get_mut(&epfd) {
+            for (ticket, state, keys) in settled {
+                interests.settle(ticket, state, keys);
+            }
             for key in gone {
                 interests.remove(&key);
             }
-            for (key, edge, pending_order) in seen {
-                if let Some(i) = interests.get_mut(&key) {
+            for (ticket, edge, pending_order) in seen {
+                if let Some((_, i)) = interests.at_mut(ticket) {
                     i.edge = edge;
                     i.pending_order = pending_order;
                 }
             }
-            for (_, key, got, data, now) in pending.into_iter().take(max) {
+            for (_, _, got, data, now, ticket) in pending.into_iter().take(max) {
                 out.push((got, data));
-                if take && let Some(i) = interests.get_mut(&key) {
+                if take && let Some((_, i)) = interests.at_mut(ticket) {
                     i.edge.report(got, now);
                     i.spent |= i.events & libc::EPOLLONESHOT as u32 != 0;
                     i.pending_order = if i.events & libc::EPOLLET as u32 == 0 {
@@ -7760,6 +9933,9 @@ impl Fabric {
                     } else {
                         None
                     };
+                    if i.spent {
+                        interests.settle(ticket, Settled::Idle, None);
+                    }
                 }
             }
         }
@@ -7773,46 +9949,58 @@ impl Fabric {
     /// released before `socks` is taken, so the two are never nested.
     #[cfg(target_os = "macos")]
     fn collect_kevents(&self, kq: c_int, max: usize, take: bool) -> Vec<libc::kevent> {
-        let state = {
+        let (state, id) = {
             let socks = self.socks.lock().unwrap();
             match socks.get(&kq) {
-                Some(Sock::Kqueue { state }) => state.clone(),
+                Some(Sock::Kqueue { state }) => (state.clone(), socks.identity(kq)),
                 _ => return Vec::new(),
             }
         };
-        type Watch = (c_int, u64, u16, Edge, bool, u64);
-        let live = |notes: &HashMap<c_int, Knote>| -> Vec<Watch> {
-            notes
-                .iter()
-                .filter(|(_, n)| !n.disabled)
-                .map(|(fd, n)| (*fd, n.udata, n.flags, n.edge, n.untracked, n.generation))
-                .collect()
-        };
-        let g = state.lock().unwrap();
-        let reads = live(&g.reads);
-        let writes = live(&g.writes);
+        type Watch = (Ticket, c_int, Knote);
+        let mut g = state.lock().unwrap();
+        if let Some(id) = id {
+            g.notes.list().place(id, self.shared().domain_key());
+        }
+        let (mut reads, mut writes): (Vec<Watch>, Vec<Watch>) = (Vec::new(), Vec::new());
+        for ticket in g.notes.due() {
+            let Some(((filter, fd), &note)) = g.notes.at(ticket) else {
+                continue;
+            };
+            if note.disabled {
+                g.notes.settle(ticket, Settled::Idle, None);
+            } else if filter == libc::EVFILT_READ {
+                reads.push((ticket, fd, note));
+            } else {
+                writes.push((ticket, fd, note));
+            }
+        }
         let users_ready: Vec<(usize, u64)> = g
             .users
             .iter()
             .filter(|(_, n)| n.triggered && !n.disabled)
             .map(|(id, n)| (*id, n.udata))
             .collect();
+        let watch = g.real.clone();
         drop(g);
+        if let Some(watch) = &watch {
+            watch.drain();
+        }
         let real: HashMap<(i16, c_int), Option<libc::kevent>> =
             [(libc::EVFILT_READ, &reads), (libc::EVFILT_WRITE, &writes)]
                 .into_iter()
                 .flat_map(|(filter, watched)| {
                     watched
                         .iter()
-                        .filter(|watch| watch.4)
+                        .filter(|watch| watch.2.untracked)
                         .filter_map(move |watch| {
-                            Some(((filter, watch.0), real_kevent(watch.0, filter).ok()?))
+                            Some(((filter, watch.1), real_kevent(watch.1, filter).ok()?))
                         })
                 })
                 .collect();
         let socks = self.socks.lock().unwrap();
         let mut out = Vec::new();
-        let mut seen: Vec<(i16, c_int, u64, Edge, bool)> = Vec::new();
+        let mut seen: Vec<(Ticket, i16, c_int, u64, Edge, bool)> = Vec::new();
+        let mut settled: Vec<(Ticket, Settled, Option<Keys>)> = Vec::new();
         let mut gone = Vec::new();
         for (filter, watched) in [(libc::EVFILT_READ, reads), (libc::EVFILT_WRITE, writes)] {
             if out.len() >= max {
@@ -7824,18 +10012,32 @@ impl Fabric {
                 EPOLLOUT
             };
             let mut pending = Vec::new();
-            for (fd, udata, flags, mut edge, untracked, generation) in watched {
+            for (ticket, fd, note) in watched {
+                let Knote {
+                    udata,
+                    flags,
+                    mut edge,
+                    untracked,
+                    generation,
+                    ..
+                } = note;
                 if untracked {
                     let Some(&polled) = real.get(&(filter, fd)) else {
                         gone.push((filter, fd, generation));
                         continue;
                     };
                     let got = if polled.is_some() { bit } else { 0 };
-                    let now = Wakes::default();
+                    let (read, write) = watch.as_ref().map_or((0, 0), |watch| watch.edges(fd));
+                    let now = Wakes {
+                        read,
+                        write,
+                        error: 0,
+                    };
                     let edged = edge.pending(got, now);
                     let fire = got != 0 && (flags & libc::EV_CLEAR == 0 || edged);
                     let seen_index = seen.len();
-                    seen.push((filter, fd, generation, edge, false));
+                    seen.push((ticket, filter, fd, generation, edge, false));
+                    settled.push((ticket, Settled::Due, None));
                     if fire {
                         pending.push((
                             (Duration::ZERO, fd as u64),
@@ -7851,9 +10053,11 @@ impl Fabric {
                     continue;
                 }
                 let Some(sock) = socks.get(&fd) else {
+                    settled.push((ticket, Settled::Due, Some(Keys::default())));
                     continue;
                 };
-                let mask = ready_mask(sock);
+                let keys = socks.identity(fd).map(|id| description_keys(id, sock));
+                let (mask, now) = mask_and_wakes(sock);
                 let got = if matches!(sock, Sock::Fresh { rec, .. } if rec.state().tcp_failed)
                     || (filter == libc::EVFILT_WRITE
                         && matches!(sock, Sock::Stream { conn, end, .. }
@@ -7864,11 +10068,22 @@ impl Fabric {
                 } else {
                     mask & bit
                 };
-                let now = wakes(sock);
+                let was = edge;
                 let edged = edge.pending(got, now);
                 let fire = got != 0 && (flags & libc::EV_CLEAR == 0 || edged);
+                let state = if fire {
+                    Settled::Due
+                } else if moves_with_time(sock) {
+                    Settled::Timed
+                } else {
+                    Settled::Idle
+                };
+                settled.push((ticket, state, keys));
+                if !fire && edge == was {
+                    continue;
+                }
                 let seen_index = seen.len();
-                seen.push((filter, fd, generation, edge, false));
+                seen.push((ticket, filter, fd, generation, edge, false));
                 if fire {
                     pending.push((
                         readiness_order(sock, fd as u64),
@@ -7893,8 +10108,8 @@ impl Fabric {
                     ev.data = polled.data;
                     out.push(ev);
                     if take {
-                        seen[seen_index].3.report(got, now);
-                        seen[seen_index].4 = true;
+                        seen[seen_index].4.report(got, now);
+                        seen[seen_index].5 = true;
                     }
                 } else if let Some(sock) = socks.get(&fd) {
                     let mut ev = make_kevent(fd as usize, filter, udata);
@@ -7951,8 +10166,8 @@ impl Fabric {
                     }
                     out.push(ev);
                     if take {
-                        seen[seen_index].3.report(got, now);
-                        seen[seen_index].4 = true;
+                        seen[seen_index].4.report(got, now);
+                        seen[seen_index].5 = true;
                     }
                 }
             }
@@ -7969,37 +10184,40 @@ impl Fabric {
             users_taken.push(id);
         }
         let mut g = state.lock().unwrap();
+        let notes = &mut g.notes;
+        for (ticket, state, keys) in settled {
+            notes.settle(ticket, state, keys);
+        }
         for (filter, fd, generation) in gone {
-            let notes = if filter == libc::EVFILT_READ {
-                &mut g.reads
-            } else {
-                &mut g.writes
-            };
             if notes
-                .get(&fd)
+                .get(&(filter, fd))
                 .is_some_and(|note| note.generation == generation)
             {
-                notes.remove(&fd);
+                notes.remove(&(filter, fd));
             }
         }
-        for (filter, fd, generation, edge, reported) in seen {
-            let notes = if filter == libc::EVFILT_READ {
-                &mut g.reads
+        for (ticket, filter, fd, generation, edge, reported) in seen {
+            let at = (filter, fd);
+            let unmoved = notes
+                .at(ticket)
+                .is_some_and(|(_, note)| note.generation == generation);
+            let note = if unmoved {
+                notes.at_mut(ticket).map(|(_, note)| note)
             } else {
-                &mut g.writes
+                notes
+                    .get_mut(&at)
+                    .filter(|note| note.generation == generation)
             };
-            let Some(note) = notes
-                .get_mut(&fd)
-                .filter(|note| note.generation == generation)
-            else {
+            let Some(note) = note else {
                 continue;
             };
             note.edge = edge;
             if reported {
                 if note.flags & libc::EV_ONESHOT != 0 {
-                    notes.remove(&fd);
+                    notes.remove(&at);
                 } else if note.flags & libc::EV_DISPATCH != 0 {
                     note.disabled = true;
+                    notes.unlist(&at);
                 }
             }
         }
@@ -8082,15 +10300,26 @@ impl Fabric {
             f
         } else if self.is_nonblocking(fd) {
             return would_block();
-        } else if readiness().wait_until_dynamic(
-            "raw recv",
-            self.recv_deadline(fd),
-            |keys| self.fd_interests([fd], keys),
-            || self.raw_has(fd),
-        ) {
-            self.raw_pop(fd)?
         } else {
-            return err(libc::EAGAIN); // quiescent deadlock or SO_RCVTIMEO timeout
+            let deadline = self.recv_deadline(fd);
+            let (woke, interrupted) = snare_interpose::interruptible(
+                crate::signals::socket_restart(deadline.is_some()),
+                || {
+                    readiness().wait_until_dynamic(
+                        "raw recv",
+                        deadline,
+                        |keys| self.fd_interests([fd], keys),
+                        || self.raw_has(fd),
+                    )
+                },
+            );
+            if interrupted {
+                return err(libc::EINTR);
+            }
+            if !woke {
+                return err(libc::EAGAIN); // quiescent deadlock or SO_RCVTIMEO timeout
+            }
+            self.raw_pop(fd)?
         };
         let n = len.min(frame.len());
         unsafe { std::ptr::copy_nonoverlapping(frame.as_ptr(), buf, n) };
@@ -8169,14 +10398,20 @@ impl Fabric {
             return would_block();
         } else {
             let _waiting = snare_interpose::fd_wait(fd);
-            let woke = readiness().wait_until_dynamic(
-                "eventfd",
-                None,
-                |keys| self.fd_interests([fd], keys),
-                || !Net::owns(self, fd) || self.eventfd_peek(fd) > 0,
-            );
+            let (woke, interrupted) =
+                snare_interpose::interruptible(Restart::WithSaRestart, || {
+                    readiness().wait_until_dynamic(
+                        "eventfd",
+                        None,
+                        |keys| self.fd_interests([fd], keys),
+                        || !Net::owns(self, fd) || self.eventfd_peek(fd) > 0,
+                    )
+                });
             if !Net::owns(self, fd) {
                 return None;
+            }
+            if interrupted {
+                return err(libc::EINTR);
             }
             if !woke {
                 return err(libc::EAGAIN); // quiescent: nothing will post to this eventfd
@@ -8224,12 +10459,19 @@ impl Fabric {
                 return err(libc::EAGAIN);
             }
             drop(socks);
-            if !readiness().wait_until_dynamic(
-                "eventfd write",
-                None,
-                |keys| self.fd_interests([fd], keys),
-                || add <= (u64::MAX - 1).saturating_sub(self.eventfd_peek(fd)),
-            ) {
+            let (woke, interrupted) =
+                snare_interpose::interruptible(Restart::WithSaRestart, || {
+                    readiness().wait_until_dynamic(
+                        "eventfd write",
+                        None,
+                        |keys| self.fd_interests([fd], keys),
+                        || add <= (u64::MAX - 1).saturating_sub(self.eventfd_peek(fd)),
+                    )
+                });
+            if interrupted {
+                return err(libc::EINTR);
+            }
+            if !woke {
                 return err(libc::EAGAIN);
             }
         }
@@ -8272,6 +10514,9 @@ impl Fs for Fabric {
     /// Whether `fd` is a raw endpoint (on macOS, always a BPF device).
     #[cfg(target_os = "macos")]
     fn owns(&self, fd: c_int) -> bool {
+        if self.fds.held(fd) == Some(false) {
+            return false;
+        }
         matches!(self.socks.lock().unwrap().get(&fd), Some(Sock::Raw { .. }))
     }
 
@@ -8543,7 +10788,7 @@ mod socket_arena_tests {
             representatives = sockets.iter_mut().map(|(fd, _)| *fd).collect();
             representatives.sort();
             assert_eq!(representatives, [20, 40]);
-            assert_eq!(sockets.values().count(), 2);
+            assert_eq!(sockets.descriptions.iter().flatten().count(), 2);
         });
     }
 }
@@ -8586,8 +10831,51 @@ mod payload_tests {
 mod udp_port_tests {
     use super::*;
 
+    fn listener(addr: &str, tester: bool) -> Arc<Listener> {
+        Arc::new(Listener {
+            rec: None,
+            addr: addr.parse().unwrap(),
+            dual: false,
+            pending: Mutex::default(),
+            capacity: AtomicUsize::new(usize::MAX),
+            occupied: AtomicUsize::new(0),
+            tester,
+            arrivals: AtomicU64::new(0),
+            ready_order: AtomicU64::new(0),
+            ready_at: AtomicU64::new(0),
+        })
+    }
+
     #[test]
-    fn endpoint_replacement_and_removal_preserve_station_membership() {
+    fn listeners_share_an_address_and_a_tester_replaces_them() {
+        let ip: IpAddr = "127.0.0.5".parse().unwrap();
+        let first = listener("127.0.0.5:9400", true);
+        let second = listener("127.0.0.5:9401", true);
+        let socket = listener("127.0.0.5:9400", false);
+        let mut listeners = Listeners::default();
+        listeners.insert(first.addr, first.clone());
+        listeners.insert(second.addr, second.clone());
+        listeners.insert(first.addr, socket.clone());
+        assert_eq!(listeners.at(&first.addr).len(), 2);
+        assert_eq!(listeners.testers.get(&ip), Some(&2));
+        listeners.remove(&second);
+        assert_eq!(listeners.testers.get(&ip), Some(&1));
+        listeners.remove(&first);
+        assert!(listeners.testers.is_empty());
+        assert!(Arc::ptr_eq(&listeners.at(&first.addr)[0], &socket));
+        listeners.insert(first.addr, first.clone());
+        listeners.insert(first.addr, first.clone());
+        assert_eq!(listeners.at(&first.addr).len(), 1);
+        assert_eq!(listeners.testers.get(&ip), Some(&1));
+        assert_eq!(listeners.on_port(9400).count(), 1);
+        listeners.remove(&first);
+        assert!(listeners.testers.is_empty());
+        assert!(listeners.is_empty());
+        assert_eq!(listeners.on_port(9400).count(), 0);
+    }
+
+    #[test]
+    fn endpoints_and_sockets_share_an_address_until_each_leaves() {
         use std::os::fd::AsRawFd;
 
         crate::Sim::new().run(|| {
@@ -8607,16 +10895,20 @@ mod udp_port_tests {
             let second: SocketAddr = "127.0.0.5:9401".parse().unwrap();
             registry.insert(first, endpoint.clone());
             registry.insert(second, endpoint.clone());
-            registry.insert(first, ordinary);
-            assert!(registry.endpoints.contains_key(&first.ip()));
-            registry.remove(&second).unwrap();
-            assert!(!registry.endpoints.contains_key(&first.ip()));
+            registry.insert(first, ordinary.clone());
+            assert_eq!(registry.endpoints.get(&first.ip()), Some(&2));
+            registry.remove(&second, &endpoint);
+            assert_eq!(registry.endpoints.get(&first.ip()), Some(&1));
             registry.insert(first, endpoint.clone());
-            registry.insert(first, endpoint);
-            assert!(registry.endpoints.contains_key(&first.ip()));
-            registry.remove(&first).unwrap();
+            assert_eq!(registry.endpoints.get(&first.ip()), Some(&1));
+            registry.remove(&first, &endpoint);
             assert!(!registry.endpoints.contains_key(&first.ip()));
+            let left = registry.candidates(first, false);
+            assert_eq!(left.len(), 1);
+            assert!(Arc::ptr_eq(&left[0].q, &ordinary));
+            registry.remove(&first, &ordinary);
             assert!(registry.candidates(first, false).is_empty());
+            assert!(registry.bound.is_empty());
         });
     }
 
@@ -8633,43 +10925,43 @@ mod udp_port_tests {
             ]
             .map(|addr| addr.parse().unwrap())
             .to_vec();
-            for &address in &addresses {
-                registry.insert(address, Arc::new(DgramQueue::default()));
+            let mut bound = Vec::new();
+            for _ in 0..2 {
+                for &address in &addresses {
+                    let queue = Arc::new(DgramQueue::default());
+                    registry.insert(address, queue.clone());
+                    bound.push((address, queue));
+                }
             }
-            for &address in &addresses {
-                let replacement = Arc::new(DgramQueue::default());
-                registry.insert(address, replacement.clone());
-                assert!(
-                    registry
-                        .candidates(address, false)
-                        .iter()
-                        .find(|candidate| candidate.addr == address)
-                        .is_some_and(|candidate| Arc::ptr_eq(&candidate.q, &replacement))
-                );
-            }
-            for &removed in &addresses {
+            let key = |q: &Arc<DgramQueue>| Arc::as_ptr(q) as usize;
+            while let Some((removed, queue)) = bound.pop() {
                 for &destination in &addresses {
                     let mut actual: Vec<_> = registry
                         .candidates(destination, false)
                         .into_iter()
                         .map(|candidate| {
-                            assert!(Arc::ptr_eq(&candidate.q, &registry.bound[&candidate.addr]));
-                            candidate.addr
+                            assert!(
+                                registry.bound[&candidate.addr]
+                                    .iter()
+                                    .any(|q| Arc::ptr_eq(q, &candidate.q))
+                            );
+                            (candidate.addr, key(&candidate.q))
                         })
                         .collect();
-                    let mut expected: Vec<_> = registry
-                        .bound
-                        .keys()
-                        .filter(|addr| addr.port() == destination.port())
-                        .copied()
+                    let mut expected: Vec<_> = bound
+                        .iter()
+                        .chain(std::iter::once(&(removed, queue.clone())))
+                        .filter(|(addr, _)| addr.port() == destination.port())
+                        .map(|(addr, q)| (*addr, key(q)))
                         .collect();
                     actual.sort();
                     expected.sort();
                     assert_eq!(actual, expected);
                 }
-                registry.remove(&removed).unwrap();
+                registry.remove(&removed, &queue);
             }
             assert!(registry.by_port.is_empty());
+            assert!(registry.bound.is_empty());
         });
     }
 
@@ -8706,19 +10998,22 @@ mod udp_port_tests {
             let first = SocketAddr::V6(std::net::SocketAddrV6::new(ip, 49152, 0, 1));
             let second = SocketAddr::V6(std::net::SocketAddrV6::new(ip, 49152, 0, 2));
             let queue = Arc::new(DgramQueue::default());
+            let sharing = Arc::new(DgramQueue::default());
             registry.insert(first, queue.clone());
-            registry.insert(first, Arc::new(DgramQueue::default()));
-            registry.insert(second, queue);
-            registry.remove(&first).unwrap();
-            assert_eq!(registry.alloc_port(IpAddr::V6(ip)), 49153);
+            registry.insert(first, sharing.clone());
+            registry.insert(second, queue.clone());
+            registry.remove(&first, &queue);
+            assert_eq!(registry.alloc_port(IpAddr::V6(ip), false), 49153);
+            registry.remove(&first, &sharing);
+            assert_eq!(registry.alloc_port(IpAddr::V6(ip), false), 49153);
             assert_eq!(
-                registry.alloc_port(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+                registry.alloc_port(IpAddr::V6(Ipv6Addr::UNSPECIFIED), false),
                 49153
             );
-            registry.remove(&second).unwrap();
-            assert_eq!(registry.alloc_port(IpAddr::V6(ip)), 49152);
+            registry.remove(&second, &queue);
+            assert_eq!(registry.alloc_port(IpAddr::V6(ip), false), 49152);
             assert_eq!(
-                registry.alloc_port(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+                registry.alloc_port(IpAddr::V6(Ipv6Addr::UNSPECIFIED), false),
                 49152
             );
         });

@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::ffi::c_int;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -8,7 +8,9 @@ use snare_interpose::{CompletionCall, CompletionPost, NetResult};
 use windows_sys::Win32::Foundation::GetLastError;
 
 use super::{Sock, WinNet};
-use crate::readiness::{Deadline, WakeKey, WakeKeys, readiness};
+use crate::HashMap;
+use crate::notices::{Keys, PollSet, Settled};
+use crate::readiness::{Deadline, WakeKey, readiness};
 use crate::sockets::SockRec;
 
 #[derive(Default)]
@@ -16,7 +18,28 @@ pub(super) struct State {
     ports: HashMap<usize, Arc<Port>>,
     files: HashMap<usize, (Arc<Port>, usize)>,
     next_id: u64,
-    requests: Vec<Request>,
+    /// The pending AFD polls of each port, by port id, under their status blocks, each subscribed
+    /// to its socket's record (see [`crate::notices`]).
+    requests: HashMap<u64, PollSet<usize, Request>>,
+    /// Requests submitted so far: each request's place in submission order.
+    submitted: u64,
+}
+
+impl State {
+    /// Takes every pending request `take` accepts, in submission order.
+    fn take(&mut self, mut take: impl FnMut(&Request) -> bool) -> Vec<Request> {
+        let mut taken = Vec::new();
+        for set in self.requests.values_mut() {
+            let statuses: Vec<usize> = set
+                .iter()
+                .filter(|(_, request)| take(request))
+                .map(|(&status, _)| status)
+                .collect();
+            taken.extend(statuses.iter().filter_map(|status| set.remove(status)));
+        }
+        taken.sort_by_key(|request| request.order);
+        taken
+    }
 }
 
 struct Port {
@@ -38,7 +61,9 @@ struct Request {
     output: usize,
     context: usize,
     mask: u32,
+    socket: c_int,
     rec: Arc<SockRec>,
+    order: u64,
 }
 
 #[repr(C)]
@@ -88,76 +113,134 @@ impl Request {
     }
 }
 
-impl WinNet {
-    fn afd_events(&self, rec: &SockRec) -> u32 {
-        let socks = self.socks.lock().unwrap();
-        let Some(sock) = socks.values().find(|sock| sock.rec().id == rec.id) else {
-            return 32;
-        };
-        match sock {
-            Sock::Fresh { rec, .. } if rec.peek_socket_error().is_some() => 256,
-            Sock::Fresh { .. } | Sock::Connecting { .. } => 0,
-            Sock::Stream { conn, end, rec, .. } => {
-                let read = conn.read_pipe(*end);
-                let write = conn.write_pipe(*end);
-                if read.is_reset() || write.is_reset() || rec.peek_socket_error().is_some() {
-                    return 16;
-                }
-                u32::from(read.readable_or_closed())
-                    | (u32::from(write.writable()) * 4)
-                    | (u32::from(read.read_eof()) * 8)
+/// The socket a request polls, by the handle it named while that handle still holds it, and
+/// with its handle.
+fn polled<'a>(socks: &'a HashMap<c_int, Sock>, request: &Request) -> Option<(c_int, &'a Sock)> {
+    let id = request.rec.id;
+    socks
+        .get_key_value(&request.socket)
+        .filter(|(_, sock)| sock.rec().id == id)
+        .or_else(|| socks.iter().find(|(_, sock)| sock.rec().id == id))
+        .map(|(&fd, sock)| (fd, sock))
+}
+
+/// The AFD events `request`'s socket in `socks` shows now, and how a scan leaves the request
+/// when none of them is asked for: a connect under way or a delayed arrival moves with the clock,
+/// and a fresh socket may start connecting or listening with nothing bumped.
+fn afd_state(socks: &HashMap<c_int, Sock>, request: &Request) -> (u32, Settled) {
+    let Some((_, sock)) = polled(socks, request) else {
+        return (32, Settled::Due);
+    };
+    let settled = if matches!(sock, Sock::Fresh { .. } | Sock::Connecting { .. })
+        || request.rec.pending_time()
+    {
+        Settled::Timed
+    } else {
+        Settled::Idle
+    };
+    (afd_events(sock), settled)
+}
+
+fn afd_events(sock: &Sock) -> u32 {
+    match sock {
+        Sock::Fresh { rec, .. } if rec.peek_socket_error().is_some() => 256,
+        Sock::Fresh { .. } | Sock::Connecting { .. } => 0,
+        Sock::Stream { conn, end, rec, .. } => {
+            let read = conn.read_pipe(*end);
+            let write = conn.write_pipe(*end);
+            if read.is_reset() || write.is_reset() || rec.peek_socket_error().is_some() {
+                return 16;
             }
-            Sock::Dgram { queue, rec, .. } => {
-                u32::from(queue.has(|_| true) || rec.peek_error().is_some()) | 4
-            }
-            Sock::Listener { state, .. } => {
-                u32::from(!state.pending.lock().unwrap().is_empty()) * 128
-            }
+            u32::from(read.readable_or_closed())
+                | (u32::from(write.writable()) * 4)
+                | (u32::from(read.read_eof()) * 8)
         }
+        Sock::Dgram { queue, rec, .. } => {
+            u32::from(queue.has(|_| true) || rec.peek_error().is_some()) | 4
+        }
+        Sock::Listener { state, .. } => u32::from(!state.pending.lock().unwrap().is_empty()) * 128,
+    }
+}
+
+impl WinNet {
+    fn afd_events(&self, request: &Request) -> u32 {
+        afd_state(&self.socks.lock().unwrap(), request).0
     }
 
+    /// Completes the requests on `port` whose sockets now show an event they ask for, in
+    /// submission order, looking only at those notices or the clock may have changed.
     fn completion_refresh(&self, port: &Port) {
         self.advance_connecting(None);
         let mut state = self.completions.lock().unwrap();
-        let mut index = 0;
-        while index < state.requests.len() {
-            let request = &state.requests[index];
-            let events = if request.port.id == port.id {
-                self.afd_events(&request.rec) & request.mask
-            } else {
-                0
-            };
-            if events != 0 {
-                let request = state.requests.remove(index);
-                unsafe {
-                    request.complete(events, 0);
+        let Some(set) = state.requests.get_mut(&port.id) else {
+            return;
+        };
+        let due = set.due();
+        if due.is_empty() {
+            return;
+        }
+        let mut fired = Vec::new();
+        {
+            let socks = self.socks.lock().unwrap();
+            for ticket in due {
+                let Some((status, request)) = set.at(ticket) else {
+                    continue;
+                };
+                let (events, settled) = afd_state(&socks, request);
+                let events = events & request.mask;
+                if events != 0 {
+                    fired.push((request.order, status, events));
+                } else {
+                    set.settle(ticket, settled, None);
                 }
-            } else {
-                index += 1;
+            }
+        }
+        fired.sort_unstable_by_key(|&(order, ..)| order);
+        for (_, status, events) in fired {
+            if let Some(request) = set.remove(&status) {
+                unsafe { request.complete(events, 0) };
             }
         }
     }
 
-    fn completion_interests(&self, port: &Port) -> (WakeKeys, bool) {
-        let mut keys = WakeKeys::default();
-        keys.push(WakeKey::CompletionPort(port.id));
-        let state = self.completions.lock().unwrap();
-        let mut timed = false;
-        for request in &state.requests {
-            if request.port.id == port.id {
-                keys.push(request.rec.wake_key());
-                timed |= request.rec.pending_time();
-                timed |= self.socks.lock().unwrap().values().any(|sock| {
-                    sock.rec().id == request.rec.id && matches!(sock, Sock::Connecting { .. })
-                });
-            }
-        }
-        (keys, timed)
+    /// Whether a wait on `port` must look again as the clock moves: one of its requests'
+    /// readiness moved with time when last looked at, by a refresh or by
+    /// [`completion_due`](Self::completion_due), which a wait asks first.
+    fn completion_timed(&self, port: &Port) -> bool {
+        self.completions
+            .lock()
+            .unwrap()
+            .requests
+            .get(&port.id)
+            .is_some_and(PollSet::timed)
     }
 
+    /// Whether a request on `port` shows an event it asks for or has a connect to move on. The
+    /// requests notices listed that do neither are settled, as a refresh would leave them.
     fn completion_due(&self, port: &Port) -> bool {
-        let state = self.completions.lock().unwrap();
-        state.requests.iter().any(|request| request.port.id == port.id && (self.afd_events(&request.rec) & request.mask != 0 || self.socks.lock().unwrap().iter().any(|(fd, sock)| sock.rec().id == request.rec.id && matches!(sock, Sock::Connecting { attempt, .. } if attempt.lock().unwrap().due()) && *fd >= 0)))
+        let mut state = self.completions.lock().unwrap();
+        let Some(set) = state.requests.get_mut(&port.id) else {
+            return false;
+        };
+        let due = set.due();
+        let socks = self.socks.lock().unwrap();
+        let mut any = false;
+        for ticket in due {
+            let Some((_, request)) = set.at(ticket) else {
+                continue;
+            };
+            let (events, settled) = afd_state(&socks, request);
+            let connect = polled(&socks, request).is_some_and(|(fd, sock)| {
+                fd >= 0
+                    && matches!(sock, Sock::Connecting { attempt, .. } if attempt.lock().unwrap().due())
+            });
+            if events & request.mask != 0 || connect {
+                any = true;
+            } else {
+                set.settle(ticket, settled, None);
+            }
+        }
+        any
     }
 }
 
@@ -257,8 +340,8 @@ pub(super) unsafe fn call(net: &WinNet, call: CompletionCall) -> Option<NetResul
             }
             if state
                 .requests
-                .iter()
-                .any(|request| request.status == status as usize)
+                .values()
+                .any(|set| set.contains_key(&(status as usize)))
             {
                 return Some(NetResult::Ok(0xc000000d_u32 as i64));
             }
@@ -269,6 +352,7 @@ pub(super) unsafe fn call(net: &WinNet, call: CompletionCall) -> Option<NetResul
                 };
             }
             port.modeled.store(true, Ordering::Release);
+            state.submitted += 1;
             let request = Request {
                 file,
                 port: port.clone(),
@@ -277,14 +361,25 @@ pub(super) unsafe fn call(net: &WinNet, call: CompletionCall) -> Option<NetResul
                 output: output as usize,
                 context,
                 mask: info.handle.events,
+                socket: info.handle.handle as c_int,
                 rec,
+                order: state.submitted,
             };
-            let events = net.afd_events(&request.rec) & request.mask;
+            let events = net.afd_events(&request) & request.mask;
             let completed = events != 0;
             if completed {
                 unsafe { request.complete(events, 0) };
             } else {
-                state.requests.push(request);
+                let keys = Keys::of(Some(request.rec.wake_key()), None);
+                state
+                    .requests
+                    .entry(port.id)
+                    .or_insert_with(|| {
+                        let set = PollSet::new();
+                        set.list().place(port.id, net.regs.shared.domain_key());
+                        set
+                    })
+                    .insert(status as usize, request, keys);
             }
             port.generation.fetch_add(1, Ordering::Release);
             drop(state);
@@ -303,19 +398,13 @@ pub(super) unsafe fn call(net: &WinNet, call: CompletionCall) -> Option<NetResul
                 return None;
             }
             let port = state.files[&file].0.clone();
-            let mut found = false;
-            let mut index = 0;
-            while index < state.requests.len() {
-                if state.requests[index].file == file
-                    && (status.is_null() || state.requests[index].status == status as usize)
-                {
-                    let request = state.requests.remove(index);
-                    unsafe {
-                        request.complete(0, 0xc0000120_u32 as i32);
-                    }
-                    found = true;
-                } else {
-                    index += 1;
+            let cancelled = state.take(|request| {
+                request.file == file && (status.is_null() || request.status == status as usize)
+            });
+            let found = !cancelled.is_empty();
+            for request in cancelled {
+                unsafe {
+                    request.complete(0, 0xc0000120_u32 as i32);
                 }
             }
             if !found {
@@ -351,21 +440,18 @@ pub(super) unsafe fn call(net: &WinNet, call: CompletionCall) -> Option<NetResul
                 port.closed.store(true, Ordering::Release);
             }
             let file = state.files.remove(&handle);
-            let mut index = 0;
-            while index < state.requests.len() {
-                if state.requests[index].file == handle
-                    || port
-                        .as_ref()
-                        .is_some_and(|port| port.id == state.requests[index].port.id)
-                {
-                    let request = state.requests.remove(index);
-                    if !request.port.closed.load(Ordering::Acquire) {
-                        unsafe {
-                            request.complete(0, 0xc0000120_u32 as i32);
-                        }
+            let closed = state.take(|request| {
+                request.file == handle
+                    || port.as_ref().is_some_and(|port| port.id == request.port.id)
+            });
+            if let Some(port) = &port {
+                state.requests.remove(&port.id);
+            }
+            for request in closed {
+                if !request.port.closed.load(Ordering::Acquire) {
+                    unsafe {
+                        request.complete(0, 0xc0000120_u32 as i32);
                     }
-                } else {
-                    index += 1;
                 }
             }
             let key = port
@@ -433,16 +519,18 @@ pub(super) unsafe fn call(net: &WinNet, call: CompletionCall) -> Option<NetResul
                     return Some(NetResult::Err(258));
                 }
                 let generation = port.generation.load(Ordering::Acquire);
-                let (keys, _) = net.completion_interests(&port);
+                // The port itself is asked last: a waiter a notice woke finds its request due,
+                // whose completion reaches the port only from the refresh that follows, so asking
+                // the port first is a system call on every such wake that cannot find it.
                 if !readiness().wait_until_on(
                     "IOCP",
                     deadline,
-                    keys.as_slice(),
-                    || net.completion_interests(&port).1,
+                    &[WakeKey::CompletionPort(port.id)],
+                    || net.completion_timed(&port),
                     || {
-                        probe()
-                            || port.generation.load(Ordering::Acquire) != generation
+                        port.generation.load(Ordering::Acquire) != generation
                             || net.completion_due(&port)
+                            || probe()
                     },
                 ) {
                     return Some(NetResult::Err(258));

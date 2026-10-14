@@ -18,6 +18,9 @@ use std::time::Duration;
 
 use snare::{Sim, SysLimits};
 
+#[path = "support/shared_port.rs"]
+mod shared_port;
+
 type Res = Result<usize, i32>;
 
 fn errno() -> i32 {
@@ -927,8 +930,8 @@ fn timestamp_control_bytes_exact() {
 fn broadcast_permission_and_recipients() {
     Sim::new().run(|| {
         let p = port(&bound());
-        let wild = UdpSocket::bind(("0.0.0.0", p)).unwrap();
-        let lo2 = UdpSocket::bind(("127.0.0.2", p)).unwrap();
+        let wild = shared_port::udp_reuse(("0.0.0.0", p)).unwrap();
+        let lo2 = shared_port::udp_reuse(("127.0.0.2", p)).unwrap();
         let other_port = UdpSocket::bind(("0.0.0.0", p + 1)).unwrap();
         let tx = UdpSocket::bind("0.0.0.0:0").unwrap();
         let refused = tx.send_to(b"x", (Ipv4Addr::BROADCAST, p)).unwrap_err();
@@ -1005,12 +1008,12 @@ fn multicast_all_toggles_delivery() {
     Sim::new().run(|| {
         let group = Ipv4Addr::new(239, 255, 42, 78);
         let p = port(&bound());
-        let member = UdpSocket::bind(("0.0.0.0", p)).unwrap();
+        let member = shared_port::udp_reuse(("0.0.0.0", p)).unwrap();
         member
             .join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)
             .unwrap();
         let bystander = UdpSocket::bind(("0.0.0.0", p + 1)).unwrap();
-        let on_group = UdpSocket::bind((group, p)).unwrap();
+        let on_group = shared_port::udp_reuse((group, p)).unwrap();
         for s in [&bystander, &on_group] {
             assert_eq!(
                 get_int(s.as_raw_fd(), libc::IPPROTO_IP, libc::IP_MULTICAST_ALL),

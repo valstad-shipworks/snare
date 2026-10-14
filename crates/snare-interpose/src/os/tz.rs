@@ -19,12 +19,18 @@
 //!
 //! A TZif file's leap-second records are not applied, so the `right/` zones read as their
 //! `posix/` twins. The `tzname`, `timezone` and `daylight` globals stay the process's: they are
-//! shared by every thread, so no sim can own them.
+//! data shared by every thread, so no sim can own them, and writing a sim's values into them
+//! would show them to every other sim and to code outside. What the C library reads from them
+//! inside itself — strftime(3)'s `%Z` of a `struct tm` without a zone name, and on macOS its
+//! `%z` — the sim answers from a copy of its own ([`strftime_inputs`], [`note_conversion`]).
 
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "tz_mktime.rs"]
+mod mktime;
 
 /// What decides a domain's local zone: the domain's serial, and its `TZ` and `TZDIR` variables.
 #[derive(Clone, PartialEq, Eq)]
@@ -73,6 +79,22 @@ pub(crate) struct Zone {
     indices: Vec<u8>,
     types: Vec<LocalType>,
     rule: Option<Rule>,
+    /// Whether it comes from a TZ string alone, without a file.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    posix: bool,
+    quirk: Quirk,
+}
+
+/// How a zone from an unusual `TZ` differs from the zone of its type alone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Quirk {
+    None,
+    /// tzcode's zone for an empty `TZ`, UTC with no local time types at all ("user wants it
+    /// fast rather than right"): tzset leaves no names, and mktime fails for daylight time.
+    Untyped,
+    /// glibc's zone for a `TZ` whose offset does not parse: tzset leaves the daylight name
+    /// empty (`__tzset_parse_tz` sets both names to "" before parsing).
+    Unparsed,
 }
 
 /// A zone with where it came from: its IANA name when one is known, and its TZif bytes when it
@@ -82,6 +104,8 @@ pub(crate) struct Resolved {
     pub(crate) zone: Zone,
     pub(crate) name: Option<String>,
     pub(crate) data: Option<Vec<u8>>,
+    /// The `TZ` and `TZDIR` it was resolved from, which name the zone a sim's `tzname` follows.
+    key: (Option<Vec<u8>>, Option<Vec<u8>>),
 }
 
 /// Bumped by `tzset`, which makes every thread resolve its zone again.
@@ -107,7 +131,9 @@ pub(crate) fn current(fresh: bool) -> Option<Rc<Resolved>> {
     {
         return Some(hit);
     }
-    let resolved = Rc::new(resolve(&setting));
+    let mut resolved = resolve(&setting);
+    resolved.key = (setting.tz.clone(), setting.tzdir.clone());
+    let resolved = Rc::new(resolved);
     let _ = CACHE.try_with(|c| {
         let mut c = c.borrow_mut();
         c.retain(|(s, g, _)| *g == generation && s.serial != setting.serial);
@@ -137,7 +163,11 @@ fn resolve(setting: &Setting) -> Resolved {
     // the name of a zone file and otherwise a zone of that abbreviation.
     let tz: &[u8] = match tz {
         [] if cfg!(target_os = "linux") => b"Universal",
-        [] => return utc(),
+        [] => {
+            let mut fast = utc();
+            fast.zone.quirk = Quirk::Untyped;
+            return fast;
+        }
         tz => tz,
     };
     let path = if tz.starts_with(b"/") {
@@ -157,6 +187,7 @@ fn resolve(setting: &Setting) -> Resolved {
             zone,
             name,
             data: Some(data),
+            key: Default::default(),
         };
     }
     match parse_posix(tz) {
@@ -164,6 +195,7 @@ fn resolve(setting: &Setting) -> Resolved {
             zone: Zone::from_rule(rule),
             name: None,
             data: None,
+            key: Default::default(),
         },
         None if cfg!(target_os = "linux") => unparsed(tz),
         None => utc(),
@@ -176,17 +208,20 @@ fn resolve(setting: &Setting) -> Resolved {
 fn unparsed(tz: &[u8]) -> Resolved {
     let mut p = Parser { s: tz, at: 0 };
     let abbr = p.name().unwrap_or_default();
+    let mut zone = Zone::from_rule(Rule {
+        std: LocalType {
+            utoff: 0,
+            isdst: false,
+            abbr: intern(abbr),
+        },
+        dst: None,
+    });
+    zone.quirk = Quirk::Unparsed;
     Resolved {
-        zone: Zone::from_rule(Rule {
-            std: LocalType {
-                utoff: 0,
-                isdst: false,
-                abbr: intern(abbr),
-            },
-            dst: None,
-        }),
+        zone,
         name: None,
         data: None,
+        key: Default::default(),
     }
 }
 
@@ -211,6 +246,7 @@ fn local_file() -> Option<Resolved> {
         zone,
         name,
         data: Some(data),
+        key: Default::default(),
     })
 }
 
@@ -243,6 +279,7 @@ fn utc() -> Resolved {
         }),
         name: Some("UTC".into()),
         data: None,
+        key: Default::default(),
     }
 }
 
@@ -267,6 +304,8 @@ fn intern(bytes: &[u8]) -> &'static CStr {
 impl Zone {
     fn from_rule(rule: Rule) -> Self {
         Self {
+            posix: true,
+            quirk: Quirk::None,
             transitions: Vec::new(),
             indices: Vec::new(),
             types: vec![rule.std],
@@ -500,6 +539,8 @@ pub(crate) fn parse_tzif(data: &[u8]) -> Option<Zone> {
         None
     };
     Some(Zone {
+        posix: false,
+        quirk: Quirk::None,
         transitions,
         indices: indices.to_vec(),
         types,
@@ -668,6 +709,367 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// The standard and daylight types tzset(3) leaves in `tzname` (and, on macOS, `timezone` and
+/// `altzone`) for `zone`: those of the latest transitions of each kind, as glibc's
+/// `__tzfile_read` and tzcode's `settzname` scan them from the end, or a TZ string's own. A
+/// zone without daylight time gets its standard type twice from glibc, and from tzcode a type
+/// of three spaces (`WILDABBR`) at the offset of the first transition's type.
+pub(crate) fn tzset_types(zone: &Zone) -> (LocalType, LocalType) {
+    let (mut std, mut dst) = (None, None);
+    for &i in zone.indices.iter().rev() {
+        let ty = zone.types[usize::from(i)];
+        let slot = if ty.isdst { &mut dst } else { &mut std };
+        slot.get_or_insert(ty);
+        if std.is_some() && dst.is_some() {
+            break;
+        }
+    }
+    if zone.transitions.is_empty()
+        && let Some(rule) = &zone.rule
+    {
+        std = Some(rule.std);
+        dst = rule.dst.map(|d| d.0);
+    }
+    let first = zone
+        .indices
+        .first()
+        .map_or(zone.types[0], |&i| zone.types[usize::from(i)]);
+    if cfg!(target_os = "macos") {
+        let wild = LocalType {
+            abbr: intern(b"   "),
+            ..first
+        };
+        if zone.quirk == Quirk::Untyped {
+            return (wild, wild);
+        }
+        (std.unwrap_or(wild), dst.unwrap_or(wild))
+    } else {
+        let std = std.unwrap_or(zone.types[0]);
+        if zone.quirk == Quirk::Unparsed {
+            return (std, LocalType { abbr: c"", ..std });
+        }
+        (std, dst.unwrap_or(std))
+    }
+}
+
+/// What the C library's `tzname` holds in a sim: the names tzset(3) left for the zone named by
+/// `key`, as the sim's conversions have moved them since.
+struct TzNames {
+    key: (Option<Vec<u8>>, Option<Vec<u8>>),
+    names: [&'static CStr; 2],
+}
+
+/// The calling thread's sim's `tzname` state, `None` off a sim.
+fn sim_names() -> Option<std::sync::Arc<std::sync::Mutex<Option<TzNames>>>> {
+    crate::domain::sim_local(|| std::sync::Mutex::new(None))
+}
+
+/// Runs `op` on the calling sim's `tzname` for `resolved`'s zone, starting from the names tzset(3)
+/// leaves ([`tzset_types`]) when the sim has none yet or had them for another zone. `None` off a
+/// sim.
+fn with_names<R>(resolved: &Resolved, op: impl FnOnce(&mut [&'static CStr; 2]) -> R) -> Option<R> {
+    let state = sim_names()?;
+    let _passthrough = crate::state::Passthrough::enter();
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    let current = match &mut *state {
+        Some(n) if n.key == resolved.key => n,
+        slot => {
+            let (std, dst) = tzset_types(&resolved.zone);
+            slot.insert(TzNames {
+                key: resolved.key.clone(),
+                names: [std.abbr, dst.abbr],
+            })
+        }
+    };
+    Some(op(&mut current.names))
+}
+
+/// The calling sim's `tzname` for `resolved`'s zone.
+fn tzname(resolved: &Resolved) -> [&'static CStr; 2] {
+    with_names(resolved, |names| *names).unwrap_or_else(|| {
+        let (std, dst) = tzset_types(&resolved.zone);
+        [std.abbr, dst.abbr]
+    })
+}
+
+/// Moves the calling sim's `tzname` as the C library does when it converts `t` to local time:
+/// tzcode names the type of `t` (`localsub`), glibc the types around it (`__tzfile_compute`),
+/// leaving a TZ string's names alone.
+pub(crate) fn note_conversion(resolved: &Resolved, t: i64) {
+    let zone = &resolved.zone;
+    let ty = zone.at(t);
+    with_names(resolved, |names| {
+        if cfg!(target_os = "macos") {
+            names[usize::from(ty.isdst)] = ty.abbr;
+        } else if !zone.transitions.is_empty() {
+            let (std, dst) = glibc_names_at(zone, t);
+            *names = [std.abbr, dst.abbr];
+        }
+    });
+}
+
+/// glibc's `__tzfile_compute` names for `t` in a zone with transitions: before the first, the
+/// first standard type and the first daylight type of the file; after the last, the TZ string's
+/// (`__tzset_parse_tz`, its standard name twice without daylight time); otherwise the type of
+/// the transition before `t` and, for the other kind, the first after it, a missing standard
+/// name taking the daylight one and a missing daylight name the standard one.
+fn glibc_names_at(zone: &Zone, t: i64) -> (LocalType, LocalType) {
+    let count = zone.transitions.len();
+    let ty = |i: usize| zone.types[usize::from(zone.indices[i])];
+    let mut names: [Option<LocalType>; 2] = [None, None];
+    if t < zone.transitions[0] {
+        let mut i = 0;
+        while i < zone.types.len() && zone.types[i].isdst {
+            names[1].get_or_insert(zone.types[i]);
+            i += 1;
+        }
+        if i == zone.types.len() {
+            i = 0;
+        }
+        names[0] = Some(zone.types[i]);
+        if names[1].is_none() {
+            names[1] = zone.types[i..].iter().copied().find(|t| t.isdst);
+        }
+    } else {
+        if t >= zone.transitions[count - 1]
+            && let Some(rule) = &zone.rule
+        {
+            return (rule.std, rule.dst.map_or(rule.std, |d| d.0));
+        }
+        let i = zone.transitions.partition_point(|&x| x <= t);
+        let before = ty(i - 1);
+        names[usize::from(before.isdst)] = Some(before);
+        for j in i..count {
+            let next = ty(j);
+            let slot = &mut names[usize::from(next.isdst)];
+            if slot.is_none() {
+                *slot = Some(next);
+                if names[0].is_some() && names[1].is_some() {
+                    break;
+                }
+            }
+        }
+        if names[0].is_none() {
+            names[0] = names[1];
+        }
+    }
+    let std = names[0].unwrap_or(zone.types[0]);
+    (std, names[1].unwrap_or(std))
+}
+
+/// A character of a strftime(3) format, narrow or wide.
+pub(crate) trait FormatUnit: Copy + Eq {
+    fn of(byte: u8) -> Self;
+    fn digit(self) -> Option<u32>;
+}
+
+impl FormatUnit for std::ffi::c_char {
+    fn of(byte: u8) -> Self {
+        byte as Self
+    }
+
+    #[allow(clippy::unnecessary_cast)]
+    fn digit(self) -> Option<u32> {
+        (self as u8 as char).to_digit(10)
+    }
+}
+
+impl FormatUnit for libc::wchar_t {
+    fn of(byte: u8) -> Self {
+        Self::from(byte)
+    }
+
+    #[allow(clippy::unnecessary_cast)]
+    fn digit(self) -> Option<u32> {
+        char::from_u32(self as u32)?.to_digit(10)
+    }
+}
+
+/// What strftime(3) should be handed for `format` and `tm` in `zone`, when it differs from what
+/// the caller passed. The C library reads its own zone for three conversions, which the sim
+/// answers from `zone` instead:
+///
+/// - `%Z` of a `struct tm` without a zone name prints `tzname[tm_isdst]` (glibc: an empty name
+///   too, and `"?"` past 1; tzcode: `tm_isdst != 0`), which the sim keeps per sim
+///   ([`note_conversion`]); the copy of `tm` handed on carries that name, so the formats `%c`
+///   and `%+` expand to are covered too. The library's `tzname` moves with the conversion a
+///   `%s` makes, so a `%Z` after a `%s` in the same format can print a name the sim's does not.
+/// - `%s` is mktime(3) of a copy of `tm`; it is replaced by the sim's, padded to the GNU field
+///   width with zeros for the `0` flag and spaces otherwise.
+/// - On macOS `%z` is `timezone` for `tm_isdst` 0 and `altzone` above, not `tm_gmtoff`
+///   (UNIX03), and nothing below; padded by the `-`, `_` and `0` flags as tzcode pads years.
+pub(crate) fn strftime_inputs<C: FormatUnit>(
+    resolved: &Resolved,
+    format: *const C,
+    tm: &libc::tm,
+) -> Option<(Option<Vec<C>>, libc::tm)> {
+    let (std, dst) = tzset_types(&resolved.zone);
+    let [std_name, dst_name] = tzname(resolved);
+    let mut named = *tm;
+    // SAFETY: a non-null `tm_zone` is the caller's C string.
+    let unnamed = tm.tm_zone.is_null()
+        || (cfg!(target_os = "linux") && unsafe { *tm.tm_zone } == 0);
+    if unnamed && tm.tm_isdst >= 0 {
+        let name = match tm.tm_isdst {
+            0 => std_name,
+            1 => dst_name,
+            _ if cfg!(target_os = "linux") => c"?",
+            _ => dst_name,
+        };
+        named.tm_zone = name.as_ptr() as _;
+    }
+    let mut units = Vec::new();
+    // SAFETY: the caller's NUL-terminated format.
+    unsafe {
+        let mut at = format;
+        while *at != C::of(0) {
+            units.push(*at);
+            at = at.add(1);
+        }
+    }
+    let rewritten = rewrite_format(resolved, &units, tm, (std, dst));
+    let changed = unnamed && tm.tm_isdst >= 0;
+    (changed || rewritten.is_some()).then(|| {
+        (
+            rewritten.map(|mut f| {
+                f.push(C::of(0));
+                f
+            }),
+            named,
+        )
+    })
+}
+
+/// `units` with each `%s`, and on macOS each `%z`, replaced by its text; `None` when it has none.
+fn rewrite_format<C: FormatUnit>(
+    resolved: &Resolved,
+    units: &[C],
+    tm: &libc::tm,
+    (std, dst): (LocalType, LocalType),
+) -> Option<Vec<C>> {
+    let percent = C::of(b'%');
+    let mut out = Vec::with_capacity(units.len());
+    let mut changed = false;
+    let mut at = 0;
+    while at < units.len() {
+        if units[at] != percent {
+            out.push(units[at]);
+            at += 1;
+            continue;
+        }
+        let Some(spec) = directive(units, at) else {
+            out.extend_from_slice(&units[at..]);
+            break;
+        };
+        let end = spec.end;
+        let text = if units[end] == C::of(b's') {
+            let mut copy = *tm;
+            let t = match make_time(&resolved.zone, &mut copy) {
+                Ok(t) => {
+                    note_conversion(resolved, t);
+                    t
+                }
+                Err(_) => -1,
+            };
+            let digits = t.to_string();
+            let width = spec.width.max(digits.len());
+            let fill = if spec.pad == Some(b'0') { '0' } else { ' ' };
+            Some(format!("{}{digits}", fill.to_string().repeat(width - digits.len())))
+        } else if cfg!(target_os = "macos") && units[end] == C::of(b'z') {
+            Some(match tm.tm_isdst {
+                ..0 => String::new(),
+                isdst => {
+                    let east = if isdst == 0 { std.utoff } else { dst.utoff };
+                    let minutes = east.abs() / 60;
+                    let value = minutes / 60 * 100 + minutes % 60;
+                    let sign = if east < 0 { '-' } else { '+' };
+                    match spec.pad {
+                        Some(b'-') => format!("{sign}{value}"),
+                        Some(b'_') => format!("{sign}{value:4}"),
+                        _ => format!("{sign}{value:04}"),
+                    }
+                }
+            })
+        } else {
+            None
+        };
+        match text {
+            Some(text) => {
+                changed = true;
+                for b in text.bytes() {
+                    if b == b'%' {
+                        out.push(percent);
+                    }
+                    out.push(C::of(b));
+                }
+            }
+            None => out.extend_from_slice(&units[at..=end]),
+        }
+        at = end + 1;
+    }
+    changed.then_some(out)
+}
+
+/// A strftime(3) conversion: where its conversion character is, its padding flag and its field
+/// width.
+struct Directive {
+    end: usize,
+    pad: Option<u8>,
+    width: usize,
+}
+
+/// The conversion starting with the `%` at `at`, as the C library reads it: glibc takes flags
+/// (`_`, `-`, `0`, `^`, `#`), a field width, then an `E` or `O` modifier; tzcode takes at most
+/// one `E` or `O` and one of `-`, `_`, `0`, in any order, and no width. `None` when the format
+/// ends first.
+fn directive<C: FormatUnit>(units: &[C], at: usize) -> Option<Directive> {
+    let mut i = at + 1;
+    let mut pad = None;
+    let mut width = 0usize;
+    let is = |i: usize, b: u8| units.get(i) == Some(&C::of(b));
+    if cfg!(target_os = "linux") {
+        while let Some(&c) = units.get(i) {
+            match b"_-0^#".iter().copied().find(|&b| c == C::of(b)) {
+                Some(b) => {
+                    if b != b'^' && b != b'#' {
+                        pad = Some(b);
+                    }
+                    i += 1;
+                }
+                None => break,
+            }
+        }
+        while let Some(d) = units.get(i).and_then(|c| c.digit()) {
+            width = width.saturating_mul(10).saturating_add(d as usize);
+            i += 1;
+        }
+        if is(i, b'E') || is(i, b'O') {
+            i += 1;
+        }
+    } else {
+        let mut modifier = false;
+        loop {
+            if !modifier && (is(i, b'E') || is(i, b'O')) {
+                modifier = true;
+            } else if let Some(b) = b"-_0"
+                .iter()
+                .copied()
+                .find(|&b| pad.is_none() && is(i, b))
+            {
+                pad = Some(b);
+            } else {
+                break;
+            }
+            i += 1;
+        }
+    }
+    (i < units.len()).then_some(Directive {
+        end: i,
+        pad,
+        width,
+    })
+}
+
 /// Fills `tm` with `t` in `zone`, as localtime_r(3) does; `false` when the year does not fit
 /// `tm_year` (`EOVERFLOW`).
 pub(crate) fn break_down(zone: &Zone, t: i64, tm: &mut libc::tm) -> bool {
@@ -700,124 +1102,42 @@ pub(crate) fn break_down(zone: &Zone, t: i64, tm: &mut libc::tm) -> bool {
 }
 
 /// mktime(3): the time `tm` names as local time in `zone`, with `tm` normalized and completed.
-/// Out-of-range fields carry into the next larger ones. `Err` leaves `tm` alone and carries the
-/// errno to set, if any.
+/// Out-of-range fields carry into the next larger ones. `Err` carries the errno to set, if any.
 ///
-/// A local time can name one instant, two (a fall-back overlap) or none (a spring-forward gap):
+/// On Linux, glibc's search, step for step (`mktime::glibc`), from the offset the sim's previous
+/// call found, as glibc keeps it for the process; it fails with `EOVERFLOW`, leaving `tm` alone.
 ///
-/// - In an overlap a non-negative `tm_isdst` picks the instant of that kind; with `tm_isdst`
-///   negative POSIX leaves the choice open, glibc's choice depends on the offset its previous
-///   `mktime` call in the process found, and tzcode's on its binary search, so the sim takes the
-///   earlier.
-/// - In a gap both libraries move the time by the gap's size, preferring the result whose kind
-///   differs from a non-negative `tm_isdst`; for a negative one glibc prefers daylight time and
-///   tzcode the later side.
-/// - A `tm_isdst` that no instant of the local time has is [`mismatched`].
+/// On macOS, tzcode's, step for step (`mktime::tzcode`). It keeps `errno`; it makes a
+/// `tm_isdst` above 1 into 1 first, and a negative one into 0 where it finds no instant, even
+/// when it fails.
 pub(crate) fn make_time(zone: &Zone, tm: &mut libc::tm) -> Result<i64, Option<libc::c_int>> {
-    let month = i64::from(tm.tm_mon);
-    let year = i64::from(tm.tm_year) + 1900 + month.div_euclid(12);
-    let days = days_from_civil(year, month.rem_euclid(12) + 1, 1) + i64::from(tm.tm_mday) - 1;
-    let local = days * 86_400
-        + i64::from(tm.tm_hour) * 3600
-        + i64::from(tm.tm_min) * 60
-        + i64::from(tm.tm_sec);
-    let found = instants(zone, local);
-    let wanted = (tm.tm_isdst >= 0).then_some(tm.tm_isdst > 0);
-    let t = match (found.first(), wanted) {
-        (None, _) => {
-            let probe = local - i64::from(zone.at(local).utoff);
-            let before = zone.at(probe - 86_400);
-            let after = zone.at(probe + 86_400);
-            // `local` in `before`'s offset lands after the gap, in `after`; in `after`'s, before
-            // it. With a negative `tm_isdst` glibc prefers the side in daylight time, tzcode the
-            // later one.
-            let prefer_before = match wanted {
-                Some(dst) => before.isdst != dst && after.isdst == dst,
-                None => cfg!(target_os = "linux") && before.isdst && !after.isdst,
-            };
-            let ty = if prefer_before { after } else { before };
-            local - i64::from(ty.utoff)
-        }
-        (Some(&(t, _)), None) => t,
-        (Some(&first), Some(dst)) => match found.iter().find(|f| f.1.isdst == dst) {
-            Some(f) => f.0,
-            None => mismatched(zone, local, first, dst)?,
-        },
-    };
-    let mut out = *tm;
-    if !break_down(zone, t, &mut out) {
-        return Err(Some(libc::EOVERFLOW));
+    #[cfg(target_os = "linux")]
+    {
+        with_mktime_offset(|offset| mktime::glibc::mktime(zone, tm, offset))
+            .ok_or(Some(libc::EOVERFLOW))
     }
-    *tm = out;
-    Ok(t)
+    #[cfg(target_os = "macos")]
+    {
+        mktime::tzcode::mktime(zone, tm).ok_or(None)
+    }
 }
 
-/// Every instant whose local time in `zone` is `local`, earliest first, with its type.
-fn instants(zone: &Zone, local: i64) -> Vec<(i64, LocalType)> {
-    let mut found: Vec<(i64, LocalType)> = Vec::new();
-    for d in -2..=2 {
-        let t = local - i64::from(zone.at(local + d * 86_400).utoff);
-        let ty = zone.at(t);
-        if t + i64::from(ty.utoff) == local && !found.iter().any(|f| f.0 == t) {
-            found.push((t, ty));
-        }
-    }
-    found.sort_by_key(|f| f.0);
-    found
-}
-
-/// The time for a local time whose only instants, `found` among them, are not of the kind
-/// `dst` asks for. glibc's `__mktime_internal` (time/mktime.c) looks a week at a time up to
-/// about seven years either side of `found` for a type of that kind and takes the local time in
-/// its offset, and failing that moves the time an hour.
+/// glibc's `localtime_offset`, the offset its previous mktime(3) found: one per sim, as glibc
+/// has one per process.
 #[cfg(target_os = "linux")]
-fn mismatched(
-    zone: &Zone,
-    local: i64,
-    (t, ty): (i64, LocalType),
-    dst: bool,
-) -> Result<i64, Option<libc::c_int>> {
-    const STRIDE: i64 = 601_200;
-    const BOUND: i64 = 457_243_200 / 2 + STRIDE;
-    let mut delta = STRIDE;
-    while delta < BOUND {
-        for other in [t - delta, t + delta] {
-            let o = zone.at(other);
-            if o.isdst == dst {
-                return Ok(local - i64::from(o.utoff));
-            }
-        }
-        delta += STRIDE;
-    }
-    Ok(t + 3600 * (i64::from(!dst) - i64::from(!ty.isdst)))
-}
+struct MktimeOffset(std::sync::Mutex<i64>);
 
-/// The time for a local time whose only instants, `found` among them, are not of the kind
-/// `dst` asks for. tzcode's `time1` (Apple Libc stdtime/FreeBSD/localtime.c) assumes the time
-/// was computed in the most recent type of that kind, converts it into the most recent type of
-/// the other kind and looks that up; a zone with no type of that kind fails without setting
-/// errno. A TZ string without daylight time has no kinds to tell apart, and its one type
-/// serves either.
-#[cfg(target_os = "macos")]
-fn mismatched(
-    zone: &Zone,
-    local: i64,
-    (t, _): (i64, LocalType),
-    dst: bool,
-) -> Result<i64, Option<libc::c_int>> {
-    if zone.transitions.is_empty() && zone.rule.as_ref().is_some_and(|r| r.dst.is_none()) {
-        return Ok(t);
-    }
-    let recent = zone.recent_types();
-    for same in recent.iter().filter(|ty| ty.isdst == dst) {
-        for other in recent.iter().filter(|ty| ty.isdst != dst) {
-            let moved = local + i64::from(other.utoff) - i64::from(same.utoff);
-            if let Some(f) = instants(zone, moved).iter().find(|f| f.1.isdst != dst) {
-                return Ok(f.0);
-            }
+/// Runs `op` on the calling sim's [`MktimeOffset`], or on a fresh one off a sim.
+#[cfg(target_os = "linux")]
+fn with_mktime_offset<R>(op: impl FnOnce(&mut i64) -> R) -> R {
+    match crate::domain::sim_local(|| MktimeOffset(std::sync::Mutex::new(0))) {
+        Some(state) => {
+            let _passthrough = crate::state::Passthrough::enter();
+            let mut offset = state.0.lock().unwrap_or_else(|e| e.into_inner());
+            op(&mut offset)
         }
+        None => op(&mut 0),
     }
-    Err(None)
 }
 
 #[cfg(test)]

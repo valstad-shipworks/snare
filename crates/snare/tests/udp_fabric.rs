@@ -11,6 +11,9 @@ use std::time::Duration;
 
 use snare::Sim;
 
+#[path = "support/shared_port.rs"]
+mod shared_port;
+
 #[test]
 fn sendto_and_recvfrom() {
     Sim::new().run(|| {
@@ -170,8 +173,8 @@ fn broadcast_reaches_every_bound_socket() {
             let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
             probe.local_addr().unwrap().port()
         };
-        let one = UdpSocket::bind(("0.0.0.0", port)).unwrap();
-        let two = UdpSocket::bind(("127.0.0.2", port)).unwrap();
+        let one = shared_port::udp_reuse(("0.0.0.0", port)).unwrap();
+        let two = shared_port::udp_reuse(("127.0.0.2", port)).unwrap();
 
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
         // Broadcasting without SO_BROADCAST is refused (man 7 socket).

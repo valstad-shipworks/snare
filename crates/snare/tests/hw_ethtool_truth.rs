@@ -4,7 +4,7 @@
 //! every read-only `SIOCETHTOOL` command answered by the real driver, then by a sim whose `Nic`
 //! was built from those answers ([`hw::linux::nic_profile`]), must come back identical, so the
 //! model's struct layouts, its derived fields (EEE `eee_active`, `ETHTOOL_GLINK`, the
-//! `ETHTOOL_GDRVINFO` statistics count) and its error codes hold for that driver. With
+//! `ETHTOOL_GDRVINFO` string-set counts) and its error codes hold for that driver. With
 //! `SNARE_HW_MUTATE=1` it also changes settings on both and compares what is read back and which
 //! changes are refused, restoring the real NIC afterwards.
 //!
@@ -37,39 +37,7 @@ fn hw_ethtool_reads_match_the_model() {
         hw::hw().summary()
     );
 
-    match (&real.drvinfo, &sim.drvinfo) {
-        (Ok(r), Ok(s)) => {
-            assert_eq!(
-                (
-                    &s.driver,
-                    &s.version,
-                    &s.fw_version,
-                    &s.bus_info,
-                    &s.erom_version,
-                    s.n_stats
-                ),
-                (
-                    &r.driver,
-                    &r.version,
-                    &r.fw_version,
-                    &r.bus_info,
-                    &r.erom_version,
-                    r.n_stats
-                ),
-                "ETHTOOL_GDRVINFO strings and n_stats"
-            );
-            let unmodelled =
-                |s: &DrvInfo| (s.n_priv_flags, s.testinfo_len, s.eedump_len, s.regdump_len);
-            if unmodelled(s) != unmodelled(r) {
-                hw::note(&format!(
-                    "ETHTOOL_GDRVINFO (n_priv_flags, testinfo_len, eedump_len, regdump_len): real {:?}, sim {:?} (not modelled)",
-                    unmodelled(r),
-                    unmodelled(s)
-                ));
-            }
-        }
-        (r, s) => assert_eq!(s.as_ref().err(), r.as_ref().err(), "ETHTOOL_GDRVINFO"),
-    }
+    assert_eq!(sim.drvinfo, real.drvinfo, "ETHTOOL_GDRVINFO");
     assert_eq!(
         sim.link, real.link,
         "ETHTOOL_GLINK (sim: admin up and operstate \"up\")"

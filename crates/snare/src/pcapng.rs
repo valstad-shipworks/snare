@@ -24,7 +24,7 @@
 //! [`SimShared::wire_ends`] runs before the lock is taken.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::HashMap;
 use crate::clock::Clock;
 use crate::netif::Sender;
 use crate::netpolicy::SplitMix64;
@@ -487,15 +488,15 @@ impl Capture {
         let mut writer = Writer {
             out: Some(BufWriter::new(file)),
             pending: BinaryHeap::new(),
-            frames: HashMap::new(),
+            frames: HashMap::default(),
             next_frame: 0,
-            flows: HashMap::new(),
-            plans: HashMap::new(),
+            flows: HashMap::default(),
+            plans: HashMap::default(),
             #[cfg(target_os = "macos")]
-            resets: HashMap::new(),
+            resets: HashMap::default(),
             last: 0,
-            ip_id: HashMap::new(),
-            links: HashMap::new(),
+            ip_id: HashMap::default(),
+            links: HashMap::default(),
             finished: false,
             wall_comment,
             now: 0,
@@ -548,7 +549,7 @@ impl Capture {
             static USED: Mutex<Option<HashMap<PathBuf, u32>>> = Mutex::new(None);
             let mut used = snare_interpose::real(|| USED.lock().unwrap_or_else(|e| e.into_inner()));
             let n = used
-                .get_or_insert_with(HashMap::new)
+                .get_or_insert_with(HashMap::default)
                 .entry(dir.join(&base))
                 .or_insert(0);
             *n += 1;
@@ -1841,15 +1842,15 @@ mod tests {
         Writer {
             out: None,
             pending: BinaryHeap::new(),
-            frames: HashMap::new(),
+            frames: HashMap::default(),
             next_frame: 0,
-            flows: HashMap::new(),
-            plans: HashMap::new(),
+            flows: HashMap::default(),
+            plans: HashMap::default(),
             #[cfg(target_os = "macos")]
-            resets: HashMap::new(),
+            resets: HashMap::default(),
             last: 0,
-            ip_id: HashMap::new(),
-            links: HashMap::new(),
+            ip_id: HashMap::default(),
+            links: HashMap::default(),
             finished: false,
             wall_comment: false,
             now: 0,

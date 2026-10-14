@@ -101,7 +101,9 @@ fn simhost_pause_parks_sleeper() {
         let controller = after_real(Duration::from_millis(200), move || {
             time.advance(Duration::from_secs(1));
         });
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(
+            (start + Duration::from_secs(1)).saturating_duration_since(Instant::now()),
+        );
         assert!(
             snare::real(|| real.elapsed()) >= Duration::from_millis(150),
             "the sleep parked"

@@ -1001,7 +1001,7 @@ struct Peers<'a> {
     /// Every address a datagram has come from, in order of first arrival.
     udp: Vec<SocketAddr>,
     /// UDP peers the tester is silent toward, and until when.
-    udp_silent: std::collections::HashMap<SocketAddr, Instant>,
+    udp_silent: crate::HashMap<SocketAddr, Instant>,
 }
 
 impl Peers<'_> {
@@ -1201,7 +1201,7 @@ impl<P: Packet, S, C> Inner<P, S, C> {
             },
             tcp: Vec::new(),
             udp: Vec::new(),
-            udp_silent: std::collections::HashMap::new(),
+            udp_silent: crate::HashMap::default(),
         };
         let mut deliver =
             |peers: &mut Peers, state: &mut S, conn: &mut C, message: P, from, origin| {

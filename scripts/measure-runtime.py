@@ -19,7 +19,8 @@ parser.add_argument(
 parser.add_argument('--output', type=Path, default=Path('target/performance'))
 parser.add_argument('--repeats', type=int, default=5)
 parser.add_argument(
-    '--suite', choices=['runtime', 'send-recv', 'recvmsg', 'udp32'], default='runtime'
+    '--suite', choices=['runtime', 'send-recv', 'recvmsg', 'udp32', 'handoff', 'scale'],
+    default='runtime',
 )
 parser.add_argument(
     '--payloads', type=int, nargs='+',
@@ -102,6 +103,27 @@ elif args.suite == 'udp32':
                 else 10000 if case.startswith('udp_burst_') else 300000
             )
             matrix.append((mode, case, 32, iterations))
+elif args.suite == 'handoff':
+    matrix = []
+    for mode in ['native', 'plain', 'det']:
+        for case in ['handoff_condvar', 'handoff_channel']:
+            for workers in [2, 3, 8]:
+                matrix.append((mode, case, workers, 20000))
+        matrix.append((mode, 'channel_burst', 64, 64000))
+    for mode in ['plain', 'det']:
+        for size in [1000, 4000]:
+            matrix.append((mode, 'timer_cancel_tied', size, 1))
+        for size in [1, 1024]:
+            matrix.append((mode, 'udp_beside_listeners', size, 20000))
+elif args.suite == 'scale':
+    matrix = []
+    for mode in ['plain', 'det']:
+        for size, iterations in [(1, 20000), (64, 5000), (1024, 300)]:
+            matrix.append((mode, 'poll', size, iterations))
+        matrix.append((mode, 'poll_ready_1024', 128, 100))
+        for case in ['listen_beside_listeners', 'connect_beside_listeners']:
+            for size in [1, 1024, 16384]:
+                matrix.append((mode, case, size, 2000))
 metadata = dict(
     uname=list(platform.uname()),
     cpu_count=os.cpu_count(),

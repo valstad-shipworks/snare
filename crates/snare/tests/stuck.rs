@@ -297,6 +297,109 @@ fn waiting_and_polling_never_trip_under_deterministic() {
     }
 }
 
+/// A participant the OS is not running uses no CPU time, however long it goes without progress,
+/// so it is not a busy stall: one blocked reading a real pipe, which snare leaves to the OS,
+/// stands in for one a loaded machine has not scheduled.
+#[cfg(unix)]
+fn off_the_cpu(sim: &Sim) {
+    sim.run(|| {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let [rx, tx] = fds;
+        let writer = snare::real(|| {
+            thread::spawn(move || {
+                thread::sleep(300 * MS);
+                assert_eq!(unsafe { libc::write(tx, b"x".as_ptr().cast(), 1) }, 1);
+            })
+        });
+        let mut byte = 0u8;
+        assert_eq!(unsafe { libc::read(rx, (&raw mut byte).cast(), 1) }, 1);
+        snare::real(|| writer.join().unwrap());
+        unsafe {
+            libc::close(rx);
+            libc::close(tx);
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_participant_off_the_cpu_never_trips_on_discrete_clock() {
+    if !child() {
+        off_the_cpu(&Sim::builder().stuck_after(50 * MS).build());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_participant_off_the_cpu_never_trips_under_deterministic() {
+    if !child() {
+        off_the_cpu(&Sim::builder().deterministic().stuck_after(50 * MS).build());
+    }
+}
+
+/// The root participant waits in the OS for a read lock on a `pthread_rwlock_t`, which snare does
+/// not hook, that a thread of the sim took for writing and never let go.
+#[cfg(unix)]
+fn blocked_for_good(builder: SimBuilder) {
+    builder.stuck_after(50 * MS).build().run(|| {
+        let lock = Box::leak(Box::new(libc::PTHREAD_RWLOCK_INITIALIZER));
+        let at = std::ptr::from_mut(lock) as usize;
+        // SAFETY: the lock lives for the rest of the process.
+        thread::spawn(move || unsafe { libc::pthread_rwlock_wrlock(at as *mut _) })
+            .join()
+            .unwrap();
+        // SAFETY: as above.
+        unsafe { libc::pthread_rwlock_rdlock(at as *mut _) };
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn child_blocked_for_good_discrete() {
+    if child() {
+        blocked_for_good(Sim::builder());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn child_blocked_for_good_deterministic() {
+    if child() {
+        blocked_for_good(Sim::builder().deterministic());
+    }
+}
+
+#[cfg(unix)]
+fn assert_tripped_off_the_cpu(name: &str) {
+    let start = Instant::now();
+    let (ok, stderr) = run_child(name);
+    assert!(!ok, "{name} should have aborted:\n{stderr}");
+    assert!(stderr.contains("snare: stuck:"), "{stderr}");
+    assert!(stderr.contains("used no CPU time"), "{stderr}");
+    assert!(
+        start.elapsed() >= Duration::from_secs(5),
+        "tripped after {:?}, before the 5 s off-CPU floor:\n{stderr}",
+        start.elapsed()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_participant_blocked_for_good_off_the_cpu_trips_on_discrete_clock() {
+    if !child() {
+        assert_tripped_off_the_cpu("child_blocked_for_good_discrete");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_participant_blocked_for_good_off_the_cpu_trips_under_deterministic() {
+    if !child() {
+        assert_tripped_off_the_cpu("child_blocked_for_good_deterministic");
+    }
+}
+
 #[test]
 fn paused_clock_waits_never_trip() {
     if child() {

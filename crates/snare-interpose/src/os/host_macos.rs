@@ -3,13 +3,15 @@
 //! `thread_policy_set`. These consult the calling thread's [`Host`](crate::Host) before the OS; a
 //! `None` host declines.
 //! `sysctl`, `sysctlnametomib` and `sysctlbyname` are here too, since they are how a macOS program
-//! reads CPU topology, protocol counters and other host facts, and so are `getrlimit`,
+//! reads CPU topology, protocol counters and other host facts, as is the Mach
+//! `host_processor_info`, which lists the processors, and so are `getrlimit`,
 //! `setrlimit`, `mlock` and `munlock`, which `RLIMIT_MEMLOCK` ties together. macOS has no
 //! working `mlockall` (it fails with `ENOSYS`), so that is left to the real call.
 //!
 //! Return conventions differ per function and are converted here, not in the host: `sysctl*`
 //! return `-1` with errno (man 3 sysctl); `pthread_*` return the errno itself (IEEE Std 1003.1,
-//! pthread_setschedparam, RETURN VALUE); `thread_policy_set` returns a `kern_return_t`.
+//! pthread_setschedparam, RETURN VALUE); `thread_policy_set` and `host_processor_info` return a
+//! `kern_return_t`.
 
 use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::sync::atomic::AtomicUsize;
@@ -36,6 +38,7 @@ slot!(GETRLIMIT);
 slot!(SETRLIMIT);
 slot!(MLOCK);
 slot!(MUNLOCK);
+slot!(HOST_PROCESSOR_INFO);
 
 /// The hooks this module contributes to the macOS hook table; all are modelled.
 pub(crate) fn hooks() -> Vec<Hook> {
@@ -63,6 +66,11 @@ pub(crate) fn hooks() -> Vec<Hook> {
         hook!("setrlimit", setrlimit, SETRLIMIT),
         hook!("mlock", mlock, MLOCK),
         hook!("munlock", munlock, MUNLOCK),
+        hook!(
+            "host_processor_info",
+            host_processor_info,
+            HOST_PROCESSOR_INFO
+        ),
     ]
 }
 
@@ -159,6 +167,41 @@ unsafe extern "C" fn thread_policy_set(
         original::<unsafe extern "C" fn(u32, c_int, *mut u32, u32) -> c_int>(&THREAD_POLICY_SET)(
             thread, flavor, info, count,
         )
+    }
+}
+
+/// The task's host port, as `mach_host_self` names it. Each call of `mach_host_self` adds a
+/// user reference to the send right, so it is asked once.
+fn host_self() -> libc::mach_port_t {
+    static PORT: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+    // SAFETY: mach_host_self takes no arguments.
+    #[allow(deprecated)]
+    *PORT.get_or_init(|| unsafe { libc::mach_host_self() })
+}
+
+/// Mach `host_processor_info` on the task's own host port: the host's `Ok` value is returned as
+/// the `kern_return_t` unchanged, as for `thread_policy_set`.
+unsafe extern "C" fn host_processor_info(
+    host: libc::mach_port_t,
+    flavor: c_int,
+    count: *mut u32,
+    info: *mut *mut c_int,
+    info_count: *mut u32,
+) -> c_int {
+    // SAFETY: `count`, `info` and `info_count` are the caller's out-parameters.
+    if let Some(r) = dispatch_host(|h| {
+        if host != host_self() {
+            return None;
+        }
+        unsafe { h.host_processor_info(flavor, count, info, info_count) }
+    }) {
+        return r as c_int;
+    }
+    type HostProcessorInfoFn =
+        unsafe extern "C" fn(libc::mach_port_t, c_int, *mut u32, *mut *mut c_int, *mut u32) -> c_int;
+    // SAFETY: HOST_PROCESSOR_INFO holds the Mach host_processor_info.
+    unsafe {
+        original::<HostProcessorInfoFn>(&HOST_PROCESSOR_INFO)(host, flavor, count, info, info_count)
     }
 }
 

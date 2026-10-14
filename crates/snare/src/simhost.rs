@@ -23,7 +23,6 @@
 //! lock. `snare_interpose::charge_latency` can wake waiters that re-enter the host, so it is
 //! called with `state` released.
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -33,12 +32,15 @@ use snare_interpose::NetResult as HostResult;
 use snare_interpose::NetResult;
 use snare_interpose::{Env, Fs, Host, Layer, Net, NetResult as FsResult};
 
+use crate::HashMap;
+use crate::fs_locks::{Locks, Target};
+use crate::fs_perm::{self, Credentials, Kind, Owner};
+use crate::fs_sim::{
+    Attributes, OpenFiles, Stamp, Times, descriptor_fcntl, err, fill_stat, ino_of, ok, path_of,
+    set_cloexec, status_flags, with_times,
+};
 #[cfg(target_os = "linux")]
 use crate::fs_sim::{DirEntry, DirStream, fill_statx};
-use crate::fs_sim::{
-    OpenFiles, Stamp, Times, descriptor_fcntl, err, fill_stat, ino_of, ok, path_of, set_cloexec,
-    status_flags, with_times,
-};
 
 use crate::clock::{Clock, ClockLayer};
 use crate::netif::{IpNet, NicCounters, NicPolicy, NicSnapshot, NicSpec, Route};
@@ -375,6 +377,13 @@ impl Nic {
         self
     }
 
+    /// The self-test count reported by `ETHTOOL_GDRVINFO` (`testinfo_len`) and
+    /// `ETHTOOL_GSSET_INFO` (`ETH_SS_TEST`); the tests themselves are not modelled.
+    pub fn self_test_count(mut self, count: u32) -> Self {
+        self.ethtool.self_test_count = count;
+        self
+    }
+
     /// Gives the driver resizable descriptor rings (`ETHTOOL_[GS]RINGPARAM`): the maxima and the
     /// starting sizes. Without it both commands are `EOPNOTSUPP`.
     pub fn rings(mut self, rings: crate::ethtool::Rings) -> Self {
@@ -622,6 +631,8 @@ pub struct HostProfile {
     /// Granted capabilities, bit `n` for capability number `n`.
     caps: u64,
     root: bool,
+    /// The tracefs under `/sys/kernel/tracing`, if the kernel has one.
+    tracefs: Option<crate::tracefs::Tracefs>,
     nics: Vec<Nic>,
     /// The root qdisc kind reported by sysctl and `RTM_GETQDISC`.
     default_qdisc: String,
@@ -669,11 +680,11 @@ const DEFAULT_MACHINE: &str = "arm64";
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 const DEFAULT_MACHINE: &str = std::env::consts::ARCH;
 
-/// The kernel identity a [`SimHost`] reports through `uname`.
+/// The kernel identity a [`SimHost`] reports through `uname`, all but the host name, which
+/// `sethostname` can change.
 #[derive(Clone, Debug)]
 struct Uname {
     sysname: String,
-    nodename: String,
     release: String,
     version: String,
     machine: String,
@@ -709,6 +720,7 @@ impl HostProfile {
             preempt_rt: false,
             caps: 0,
             root: false,
+            tracefs: None,
             nics: Vec::new(),
             default_qdisc: "fq_codel".to_string(),
             tai_offset_secs: 37,
@@ -732,7 +744,11 @@ impl HostProfile {
         self
     }
 
-    /// The host name `uname` reports. `gethostname` is not modelled and still reads the real one.
+    /// The host name `uname` and `gethostname` report, as do Linux's
+    /// `/proc/sys/kernel/hostname` and macOS's `kern.hostname` sysctl. A `sethostname` (or, on
+    /// macOS, a write of `kern.hostname`) by [`root`](Self::root) renames the sim's host and
+    /// never the machine; Linux's needs `CAP_SYS_ADMIN`, which [`Privileges`](crate::Privileges)
+    /// does not model, so there it fails with `EPERM`.
     pub fn nodename(mut self, name: impl Into<String>) -> Self {
         self.nodename = name.into();
         self
@@ -787,7 +803,6 @@ impl HostProfile {
         });
         Uname {
             sysname: self.sysname.clone(),
-            nodename: self.nodename.clone(),
             release: self.kernel_release.clone(),
             version,
             machine: self.machine.clone(),
@@ -896,6 +911,13 @@ impl HostProfile {
     }
 
     /// Whether the kernel reports `PREEMPT_RT` (`/sys/kernel/realtime` is `1`).
+    /// Serves a tracefs at `/sys/kernel/tracing` (see [`Tracefs`](crate::Tracefs)); `None`
+    /// is a kernel without `CONFIG_TRACING`, where the path does not exist.
+    pub fn tracefs(mut self, tracefs: Option<crate::tracefs::Tracefs>) -> Self {
+        self.tracefs = tracefs;
+        self
+    }
+
     pub fn preempt_rt(mut self, on: bool) -> Self {
         self.preempt_rt = on;
         self
@@ -1025,6 +1047,7 @@ impl EasyBuilder {
             .governor("performance")
             .preempt_rt(true)
             .default_qdisc("fq")
+            .tracefs(Some(crate::tracefs::Tracefs::full()))
             .cap(CAP_SYS_NICE)
             .cap(CAP_IPC_LOCK)
             .cap(CAP_NET_ADMIN)
@@ -1052,6 +1075,7 @@ impl EasyBuilder {
             .cap(CAP_NET_ADMIN)
             .cap(CAP_NET_RAW)
             .cap(CAP_NET_BIND_SERVICE)
+            .tracefs(Some(crate::tracefs::Tracefs::full()))
             .nic(rich_nic("eth0", 2, std::net::Ipv4Addr::new(10, 0, 0, 20).into()).mtu(9000));
         EasyBuilder { profile }
     }
@@ -1172,6 +1196,8 @@ struct OpenFile {
     writable: bool,
     flags: c_int,
     path: std::path::PathBuf,
+    /// Owns the description's OFD and `flock` locks.
+    description: u64,
 }
 
 /// Per-(virtual)-thread scheduling state. `policy`/`rt_priority` are the `sched_setscheduler`
@@ -1192,10 +1218,7 @@ struct ThreadState {
 /// a test might pass deliberately.
 const TID_BASE: i32 = 4000;
 
-/// The uid of the first user a stock install creates: 1000 on Linux (`UID_MIN` in man 5
-/// login.defs), 501 on macOS (the uid the first account gets, as observed with `id -u` on
-/// macOS 26; Apple documents no source for it).
-const UNPRIVILEGED_UID: u32 = if cfg!(target_os = "macos") { 501 } else { 1000 };
+use crate::limits::{UNPRIVILEGED_GID, UNPRIVILEGED_UID};
 
 /// A datagram queued for delivery, with the virtual-clock timestamp stamped when it was sent.
 /// Also used for the error-queue entries that carry a TX software timestamp, with empty `data`.
@@ -1217,6 +1240,8 @@ struct Datagram {
     /// The smallest MTU on its path, which decides whether it crossed as fragments
     /// ([`crate::netif::Copy::mtu`]).
     mtu: Option<u32>,
+    /// Its IP header fields and receiving interface, for the receiver's control messages.
+    ip: crate::ancillary::Header,
 }
 
 #[cfg(target_os = "linux")]
@@ -1264,6 +1289,7 @@ fn in_flight(
     sent: std::time::Duration,
     delay: std::time::Duration,
     via: Option<(Arc<crate::netif::LinkState>, u64)>,
+    ip: crate::ancillary::Header,
 ) -> Datagram {
     let arrives = (!delay.is_zero()).then(|| crate::readiness::Deadline::after(delay));
     if let Some(arrives) = arrives {
@@ -1278,6 +1304,7 @@ fn in_flight(
         via,
         hw: None,
         mtu: None,
+        ip,
     }
 }
 
@@ -1300,6 +1327,8 @@ struct UdpSocket {
     rx: crate::limits::RxQueue<Datagram>,
     /// `O_NONBLOCK`, from `SOCK_NONBLOCK`, `FIONBIO` or `F_SETFL`.
     nonblocking: bool,
+    /// The other kept status flags and the signal-driven I/O settings.
+    fcntl: crate::fabric::SocketFcntl,
     /// SO_BROADCAST (man 7 socket): broadcasting to `255.255.255.255` is refused without it.
     broadcast: bool,
     /// Raw values of every option set that no modelled handler consumed, keyed by
@@ -1388,6 +1417,8 @@ struct NetlinkSocket {
     rec: Arc<SockRec>,
     _probe: Arc<NetlinkRx>,
     nonblocking: bool,
+    /// The kept status flags and signal-driven I/O settings.
+    fcntl: crate::fabric::SocketFcntl,
     descriptors: std::collections::BTreeSet<c_int>,
     sockopts: HashMap<(c_int, c_int), Vec<u8>>,
 }
@@ -1585,6 +1616,9 @@ pub(crate) struct HostState {
     /// Directory streams opened through [`Fs::opendir`], by fd.
     #[cfg(target_os = "linux")]
     dirs: OpenFiles<DirStream>,
+    /// The advisory locks of each synthesized file and directory, one inode per path. Taken with
+    /// the state unlocked.
+    locks: HashMap<std::path::PathBuf, Arc<Locks>>,
     /// Scheduling state per simulated tid, created on first reference.
     threads: std::collections::BTreeMap<i32, ThreadState>,
     /// The simulated tid minted for each OS thread that has asked.
@@ -1617,10 +1651,12 @@ pub(crate) struct HostState {
     /// Netlink sockets the host serves, by fd.
     #[cfg(target_os = "linux")]
     netlinks: NetlinkSockets,
-    /// Bound datagram sockets keyed by full address, so several IPs can share a port (snare 1.x's
-    /// `add_ip_addr`) and a wildcard `0.0.0.0`/`::` bind coexists with specific ones.
+    /// Bound datagram sockets (by their records' ids) keyed by full address, so several IPs can
+    /// share a port (snare 1.x's `add_ip_addr`), a wildcard `0.0.0.0`/`::` bind coexists with
+    /// specific ones, and sockets sharing an address through `SO_REUSEADDR` or `SO_REUSEPORT` are
+    /// all held.
     #[cfg(target_os = "linux")]
-    bound: HashMap<std::net::SocketAddr, c_int>,
+    bound: HashMap<std::net::SocketAddr, Vec<u64>>,
     /// Where the round-robin search for a free ephemeral port resumes.
     #[cfg(target_os = "linux")]
     next_ephemeral: u16,
@@ -1630,9 +1666,67 @@ pub(crate) struct HostState {
     inherited_threads: HashMap<u64, ThreadState>,
     /// The sim this host serves; empty until [`SimHost::attach_fabric`].
     shared: std::sync::Weak<crate::scope::SimShared>,
+    /// The kernel identity `uname` reports, but for its host name.
+    uname: Uname,
+    /// The host name: the bytes the profile or the last `sethostname` gave, read up to the first
+    /// NUL, as the kernel keeps the `len` bytes `sethostname` copies (kernel/sys.c).
+    nodename: Vec<u8>,
+    /// The host's virtual clock, which the CPU time counters of `/proc/stat` and
+    /// `host_processor_info` follow.
+    clock: Arc<Clock>,
 }
 
+/// The longest host name the kernel keeps: `__NEW_UTS_LEN` on Linux
+/// (include/uapi/linux/utsname.h), `MAXHOSTNAMELEN` less its NUL on macOS (`<sys/param.h>`).
+#[cfg(target_os = "linux")]
+const NODENAME_MAX: usize = 64;
+#[cfg(target_os = "macos")]
+const NODENAME_MAX: usize = 255;
+
 impl HostState {
+    /// Whether `fd` is one of the host's directory streams.
+    fn is_dir(&self, fd: c_int) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.dirs.contains_key(&fd);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = fd;
+            false
+        }
+    }
+
+    /// Drops descriptor `fd` from the open tables; `None` when it is not the host's. The last
+    /// descriptor of `/dev/cpu_dma_latency` withdraws the latency request, as releasing the
+    /// kernel's PM QoS request does.
+    fn forget(&mut self, fd: c_int) -> Option<Dropped> {
+        #[cfg(target_os = "linux")]
+        if let Some(stream) = self.dirs.get(&fd) {
+            let path = stream.path.clone();
+            let last = self
+                .dirs
+                .remove(&fd)
+                .flatten()
+                .map(|stream| stream.description);
+            return Some(Dropped { path, last });
+        }
+        let path = self.open.get(&fd)?.path.clone();
+        let last = self.open.remove(&fd).flatten();
+        if last.is_some() && path == Path::new("/dev/cpu_dma_latency") {
+            self.cpu_dma_latency = None;
+        }
+        Some(Dropped {
+            path: Some(path),
+            last: last.map(|file| file.description),
+        })
+    }
+
+    /// The host name as `uname` reports it: up to its first NUL and at most [`NODENAME_MAX`]
+    /// bytes.
+    fn hostname(&self) -> &[u8] {
+        let name = &self.nodename[..self.nodename.len().min(NODENAME_MAX)];
+        name.split(|&b| b == 0).next().unwrap_or_default()
+    }
+
     /// How many CPUs are online: the online set's members below the CPU count, at least one.
     fn online_count(&self) -> usize {
         self.online
@@ -1656,24 +1750,75 @@ impl HostState {
             && let Some(socket) = self.udp.close(fd).flatten()
             && let Some(local) = socket.local
         {
-            self.bound.remove(&local);
+            self.unbind_udp(local, socket.rec.id.get());
+        }
+    }
+
+    /// Records datagram socket `id` (its record's id) at `addr`, beside any other there.
+    #[cfg(target_os = "linux")]
+    fn bind_udp(&mut self, addr: std::net::SocketAddr, id: u64) {
+        self.bound.entry(addr).or_default().push(id);
+    }
+
+    /// Withdraws datagram socket `id` from `addr`.
+    #[cfg(target_os = "linux")]
+    fn unbind_udp(&mut self, addr: std::net::SocketAddr, id: u64) {
+        if let Some(held) = self.bound.get_mut(&addr) {
+            held.retain(|&held| held != id);
+            if held.is_empty() {
+                self.bound.remove(&addr);
+            }
         }
     }
 
     /// Moves bound datagram socket `fd` from `from` to `to` in `bound`, as the kernel rehashes a
-    /// socket whose local address a connect or disconnect changed; an address another socket
-    /// holds leaves it where it is.
+    /// socket whose local address a connect or disconnect changed (net/ipv4/udp.c
+    /// `udp_lib_rehash`), beside any other socket there.
     #[cfg(target_os = "linux")]
     fn rehash(&mut self, fd: c_int, from: std::net::SocketAddr, to: std::net::SocketAddr) {
-        if from == to || self.bound.contains_key(&to) {
+        let Some(id) = self.udp.get(&fd).map(|sock| sock.rec.id.get()) else {
+            return;
+        };
+        if from == to {
             return;
         }
-        self.bound.remove(&from);
-        self.bound.insert(to, fd);
+        self.unbind_udp(from, id);
+        self.bind_udp(to, id);
         if let Some(sock) = self.udp.get_mut(&fd) {
             sock.local = Some(to);
             sock.rec.set_local(to);
         }
+    }
+
+    /// Binds unbound datagram socket `fd` to `ip` at an ephemeral port, as the kernel does on the
+    /// first send or connect of an unbound socket (man 7 udp); `None` when no port is free.
+    #[cfg(target_os = "linux")]
+    fn autobind(
+        &mut self,
+        fd: c_int,
+        ip: std::net::IpAddr,
+        shared: &crate::scope::SimShared,
+    ) -> Option<std::net::SocketAddr> {
+        let sock = self.udp.get(&fd)?;
+        let (id, rec) = (sock.rec.id.get(), sock.rec.clone());
+        let dual = rec.state().dual_at(std::net::SocketAddr::new(ip, 0));
+        let sa = std::net::SocketAddr::new(ip, self.alloc_ephemeral(ip, dual)?);
+        rec.state().bound_order = shared.bind_order();
+        self.bind_udp(sa, id);
+        self.udp.get_mut(&fd)?.local = Some(sa);
+        rec.set_local(sa);
+        Some(sa)
+    }
+
+    /// What datagram socket `sock` holds against a new bind: the address its `bind` named, at the
+    /// port it got, wherever a connect has since rehashed it ([`crate::fabric::Claim`]).
+    #[cfg(target_os = "linux")]
+    fn udp_claim(sock: &UdpSocket) -> Option<crate::fabric::Claim> {
+        let local = sock.local?;
+        let addr = sock
+            .requested
+            .map_or(local, |r| std::net::SocketAddr::new(r.ip(), local.port()));
+        Some(crate::fabric::Claim::of(&sock.rec, addr))
     }
 
     /// Dissolves datagram socket `fd`'s association; see [`Net::connect`].
@@ -1691,18 +1836,20 @@ impl HostState {
         let ip = requested
             .map(|r| r.ip())
             .filter(|ip| !ip.is_unspecified())
-            .unwrap_or(match bound {
-                std::net::SocketAddr::V4(_) => std::net::Ipv4Addr::UNSPECIFIED.into(),
-                std::net::SocketAddr::V6(_) => std::net::Ipv6Addr::UNSPECIFIED.into(),
+            .unwrap_or(if sock.domain == libc::AF_INET6 {
+                std::net::Ipv6Addr::UNSPECIFIED.into()
+            } else {
+                std::net::Ipv4Addr::UNSPECIFIED.into()
             });
         if requested.is_some_and(|r| r.port() != 0) {
             self.rehash(fd, bound, std::net::SocketAddr::new(ip, bound.port()));
             return;
         }
+        let id = sock.rec.id.get();
         sock.local = None;
         sock.rec.state().local =
             Some(std::net::SocketAddr::new(ip, 0)).filter(|a| !a.ip().is_unspecified());
-        self.bound.remove(&bound);
+        self.unbind_udp(bound, id);
     }
 
     #[cfg(target_os = "linux")]
@@ -1819,6 +1966,29 @@ impl HostState {
         {
             return Some(self.status().into_bytes());
         }
+        if cfg!(target_os = "linux") && p == "/proc/stat" {
+            return Some(self.proc_stat().into_bytes());
+        }
+        #[cfg(target_os = "linux")]
+        if p == "/proc/cpuinfo" {
+            return self.cpuinfo().map(String::into_bytes);
+        }
+        // The kernel identity, as `uname` reports it (Documentation/admin-guide/sysctl/kernel.rst,
+        // "domainname & hostname", "osrelease, ostype & version").
+        if cfg!(target_os = "linux")
+            && let Some(name) = p.strip_prefix("/proc/sys/kernel/")
+        {
+            let u = &self.uname;
+            let text = match name {
+                "hostname" => self.hostname(),
+                "domainname" => b"(none)".as_slice(),
+                "ostype" => u.sysname.as_bytes(),
+                "osrelease" => u.release.as_bytes(),
+                "version" => u.version.as_bytes(),
+                _ => return None,
+            };
+            return Some([text, b"\n"].concat());
+        }
         if let Some(rest) = p.strip_prefix("/sys/class/net/")
             && let Some((name, attr)) = rest.split_once('/')
         {
@@ -1919,18 +2089,107 @@ impl HostState {
         Ok(())
     }
 
+    /// The online CPUs, ascending: the online set's members below the CPU count, or CPU 0 if
+    /// there are none.
+    fn online_cpus(&self) -> Vec<usize> {
+        let mut cpus: Vec<usize> = self
+            .online
+            .iter()
+            .copied()
+            .filter(|&c| c < self.cpu_count)
+            .collect();
+        cpus.sort_unstable();
+        cpus.dedup();
+        if cpus.is_empty() {
+            cpus.push(0);
+        }
+        cpus
+    }
+
+    /// The idle time each online CPU has run up since boot, in `USER_HZ` (100 per second, what
+    /// `sysconf(_SC_CLK_TCK)` reports) ticks: the host runs no load of its own, so every CPU has
+    /// been idle for the whole of the clock's monotonic time.
+    fn idle_ticks(&self) -> u64 {
+        self.clock.monotonic() / 10_000_000
+    }
+
+    /// `/proc/stat` as fs/proc/stat.c `show_stat` lays it out: the `cpu` totals, a `cpuN` line
+    /// for each online CPU, then the interrupt, context-switch, boot-time, process and softirq
+    /// lines (man 5 proc_stat). Every CPU is idle (see [`idle_ticks`](Self::idle_ticks)), with
+    /// every other time at 0; no interrupt, context switch or softirq has happened, so `intr`
+    /// carries its total alone, without the per-interrupt counts that follow it on a real kernel;
+    /// `btime` is the sim's boot; the process that reads the file is the one that has run.
+    fn proc_stat(&self) -> String {
+        use std::fmt::Write;
+        let cpus = self.online_cpus();
+        let idle = self.idle_ticks();
+        let total = idle * cpus.len() as u64;
+        let mut text = format!("cpu  0 0 0 {total} 0 0 0 0 0 0\n");
+        for cpu in cpus {
+            let _ = writeln!(text, "cpu{cpu} 0 0 0 {idle} 0 0 0 0 0 0");
+        }
+        let btime = self.clock.base_realtime().as_secs();
+        let _ = write!(
+            text,
+            "intr 0\nctxt 0\nbtime {btime}\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n\
+             softirq 0 0 0 0 0 0 0 0 0 0 0\n"
+        );
+        text
+    }
+
+    /// `/proc/cpuinfo`: the machine's first processor entry, repeated for each online CPU (the
+    /// kernel lists the online ones; arch/x86/kernel/cpu/proc.c, arch/arm64/kernel/cpuinfo.c),
+    /// numbered for that CPU. The host has one thread per core in one package, so x86's
+    /// `physical id` is 0, `core id`, `apicid` and `initial apicid` are the CPU's number, and
+    /// `siblings` and `cpu cores` count the online CPUs. Other fields, such as the model name and
+    /// the feature flags, describe the processor the code really runs on. `None` if the
+    /// machine's file cannot be read.
+    #[cfg(target_os = "linux")]
+    fn cpuinfo(&self) -> Option<String> {
+        use std::fmt::Write;
+        let entry = machine_cpuinfo_entry()?;
+        let cpus = self.online_cpus();
+        let count = cpus.len();
+        let mut text = String::new();
+        for cpu in cpus {
+            for line in entry.lines() {
+                let renumbered = line.split_once(':').and_then(|(key, _)| {
+                    let value = match key.trim() {
+                        "processor" | "core id" | "apicid" | "initial apicid" => cpu,
+                        "physical id" => 0,
+                        "siblings" | "cpu cores" => count,
+                        _ => return None,
+                    };
+                    Some(format!("{key}: {value}"))
+                });
+                let _ = writeln!(text, "{}", renumbered.as_deref().unwrap_or(line));
+            }
+            text.push('\n');
+        }
+        Some(text)
+    }
+
     /// The credential and capability lines of proc(5)'s `/proc/<pid>/status` (man 5
     /// proc_pid_status): real/effective/saved/filesystem uid and gid all equal, and the
-    /// permitted, effective and bounding sets equal to the granted capabilities, as 16 hex digits.
-    /// The gid mirrors the uid, a snare simplification.
+    /// permitted, effective and bounding sets equal to the granted capabilities, as 16 hex digits,
+    /// and the sim's umask as the four octal digits Linux 4.7 and later print.
     fn status(&self) -> String {
         let privileges = self.privileges();
-        let uid = if privileges.root { 0 } else { UNPRIVILEGED_UID };
+        let (uid, gid) = if privileges.root {
+            (0, 0)
+        } else {
+            (UNPRIVILEGED_UID, UNPRIVILEGED_GID)
+        };
+        let umask = self
+            .shared
+            .upgrade()
+            .map_or(0o022, |shared| shared.sys.umask(None));
         let caps = privileges.cap_mask();
         format!(
-            "Name:\tsnare\nState:\tR (running)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n\
-             Gid:\t{uid}\t{uid}\t{uid}\t{uid}\nCapInh:\t{:016x}\nCapPrm:\t{caps:016x}\n\
-             CapEff:\t{caps:016x}\nCapBnd:\t{caps:016x}\nCapAmb:\t{:016x}\n",
+            "Name:\tsnare\nUmask:\t{umask:04o}\nState:\tR (running)\n\
+             Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\n\
+             CapInh:\t{:016x}\nCapPrm:\t{caps:016x}\nCapEff:\t{caps:016x}\nCapBnd:\t{caps:016x}\n\
+             CapAmb:\t{:016x}\n",
             0, 0
         )
     }
@@ -2297,17 +2556,29 @@ impl HostState {
     /// The range is IANA's dynamic/private range (RFC 6335 §6), a snare choice; Linux's default
     /// `ip_local_port_range` is 32768–60999 (Documentation/networking/ip-sysctl.rst). Ports are
     /// handed out round-robin from `next_ephemeral` rather than hashed as the kernel does, which
-    /// keeps them deterministic. A port counts as taken when bound on the same family at the same
-    /// address, or at any address when `ip` is the wildcard.
+    /// keeps them deterministic. A port counts as taken when any socket on it overlaps a bind of
+    /// `ip` (a `dual`-stack one if `dual`): the same address, the wildcard of its family on either
+    /// side, or a dual-stack socket and any IPv4 address, whatever `SO_REUSEADDR` and
+    /// `SO_REUSEPORT` say, as for the fabric's sockets.
     #[cfg(target_os = "linux")]
-    fn alloc_ephemeral(&mut self, ip: std::net::IpAddr) -> Option<u16> {
+    fn alloc_ephemeral(&mut self, ip: std::net::IpAddr, dual: bool) -> Option<u16> {
         for _ in 49152..=65535u32 {
             let p = self.next_ephemeral;
             self.next_ephemeral = if p == u16::MAX { 49152 } else { p + 1 };
-            let taken = self.bound.keys().any(|a| {
+            let taken = self.bound.iter().any(|(a, held)| {
+                let held_dual = || {
+                    held.iter().any(|id| {
+                        self.udp
+                            .sockets
+                            .get(id)
+                            .is_some_and(|sock| sock.rec.state().dual_at(*a))
+                    })
+                };
                 a.port() == p
-                    && a.is_ipv4() == ip.is_ipv4()
-                    && (a.ip() == ip || ip.is_unspecified())
+                    && (dual
+                        || (a.is_ipv4() == ip.is_ipv4()
+                            && (a.ip() == ip || ip.is_unspecified() || a.ip().is_unspecified()))
+                        || (ip.is_ipv4() && held_dual()))
             });
             if !taken {
                 return Some(p);
@@ -2334,10 +2605,13 @@ impl HostState {
                 if dest.ip().is_multicast() && !s.rec.takes_group(local, dest.ip(), joined) {
                     return None;
                 }
+                let state = s.rec.state();
                 Some(crate::netif::Cand {
                     addr: local,
                     endpoint: false,
-                    device: s.rec.state().device.as_ref().map(|d| d.0),
+                    device: state.device.as_ref().map(|d| d.0),
+                    dual: state.dual_at(local),
+                    share: crate::netif::Share::of_state(&state),
                     q: fd,
                 })
             })
@@ -2356,6 +2630,7 @@ impl HostState {
         data: &[u8],
         src: std::net::SocketAddr,
         now: std::time::Duration,
+        ip: crate::ancillary::Header,
     ) {
         for copy in copies {
             if let Some(s) = self.udp.get_mut(&copy.q) {
@@ -2365,19 +2640,35 @@ impl HostState {
                     s.rec.note_rx_nic(copy.nic.as_deref());
                 }
                 let port = s.local.map_or(0, |l| l.port());
+                let ip = crate::ancillary::Header {
+                    ifindex: copy.ingress.unwrap_or(0),
+                    ..ip
+                };
+                let (packets, ip): (Vec<&[u8]>, _) = if ip.gso == 0 || crate::ancillary::gro(&s.rec)
+                {
+                    (vec![data], ip)
+                } else {
+                    (
+                        data.chunks(usize::from(ip.gso)).collect(),
+                        crate::ancillary::Header { gso: 0, ..ip },
+                    )
+                };
                 for delay in copy.delays {
-                    let mut dg = in_flight(data.to_vec(), src, now, delay, copy.via.clone());
-                    dg.mtu = copy.mtu;
-                    dg.hw = copy.nic.as_deref().and_then(|nic| {
-                        nic_hw_stamp(
-                            &self.nics,
-                            &self.ptp_clocks,
-                            nic,
-                            dg.timestamp,
-                            Some((port, data)),
-                        )
-                    });
-                    s.rx.push(dg, Some(&s.rec));
+                    for &packet in &packets {
+                        let mut dg =
+                            in_flight(packet.to_vec(), src, now, delay, copy.via.clone(), ip);
+                        dg.mtu = copy.mtu;
+                        dg.hw = copy.nic.as_deref().and_then(|nic| {
+                            nic_hw_stamp(
+                                &self.nics,
+                                &self.ptp_clocks,
+                                nic,
+                                dg.timestamp,
+                                Some((port, packet)),
+                            )
+                        });
+                        s.rx.push(dg, Some(&s.rec));
+                    }
                 }
             }
         }
@@ -2481,7 +2772,8 @@ pub struct SimHost {
     me: std::sync::OnceLock<std::sync::Weak<SimHost>>,
     /// The interfaces and routes the profile declared, handed to the sim to build its topology.
     topology: (Vec<(NicSpec, NicCounters)>, Vec<Route>),
-    uname: Uname,
+    /// The tracefs plane, served in front of this host's files.
+    tracefs: Option<Arc<crate::tracefs::TracefsPlane>>,
 }
 
 impl SimHost {
@@ -2497,8 +2789,44 @@ impl SimHost {
         regs.shared.sys.set_privileges(|p| *p = privileges);
         state.shared = Arc::downgrade(&regs.shared);
         drop(state);
+        if let Some(t) = &self.tracefs {
+            t.attach(&regs.shared, self);
+        }
         *self.registries.lock().unwrap() = Some(regs);
         let _ = self.me.set(Arc::downgrade(self));
+    }
+
+    /// The tracefs plane, for the sim's file chain.
+    pub(crate) fn tracefs_plane(&self) -> Option<Arc<dyn snare_interpose::Fs>> {
+        self.tracefs
+            .clone()
+            .map(|t| t as Arc<dyn snare_interpose::Fs>)
+    }
+
+    /// The host's tracefs, if its profile has one: what the code under test registered there
+    /// and the hooks that make the tracers report.
+    pub fn tracefs(&self) -> Option<crate::tracefs::TracefsSim> {
+        self.tracefs.clone().map(crate::tracefs::TracefsSim::new)
+    }
+
+    /// The calling thread's CPU affinity as the host models it: every online CPU until a
+    /// `sched_setaffinity` narrows it. `None` where the host does not model affinity.
+    pub(crate) fn current_affinity(&self) -> Option<Vec<usize>> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut state = self.state.lock().unwrap();
+            let tid = state.resolve(0);
+            let affinity = state.threads[&tid].affinity.clone();
+            if affinity.is_empty() {
+                Some(state.online.to_vec())
+            } else {
+                Some(affinity)
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 
     /// The attached sim's shared state, or `None` before [`attach_fabric`](Self::attach_fabric).
@@ -2570,6 +2898,11 @@ impl SimHost {
     /// (`netif::frag`), then a stalled send queue. A send no socket or endpoint accepts raises the
     /// ICMP port-unreachable path. Takes `registries` and `state` one after the other, never both,
     /// and releases `state` before the capture and endpoint delivery, which can re-enter the host.
+    ///
+    /// `ctl` holds what the send's control messages asked, applied as the fabric applies them
+    /// (`Fabric::udp_send`): the route's interface and source, the source the datagram carries,
+    /// its header fields and transmit stamps, and a segment size, whose send leaves as its
+    /// segments unless it stays on loopback.
     #[cfg(target_os = "linux")]
     fn udp_send(
         &self,
@@ -2577,6 +2910,7 @@ impl SimHost {
         data: Vec<u8>,
         dest: std::net::SocketAddr,
         now: std::time::Duration,
+        ctl: &crate::ancillary::SendCtl,
     ) -> Option<NetResult> {
         if data.len() > if dest.is_ipv4() { 65507 } else { 65527 } {
             return err(libc::EMSGSIZE);
@@ -2599,22 +2933,67 @@ impl SimHost {
         if let Some(errno) = rec.take_error_as(&shared, crate::sockets::Taker::Send) {
             return err(errno);
         }
-        let unhashed = requested.map(|r| std::net::SocketAddr::new(r.ip(), 0));
-        let view = rec.view(local.or(unhashed));
+        let unhashed = crate::fabric::unhashed(requested);
+        if domain == libc::AF_INET6
+            && let Err(errno) =
+                crate::fabric::dgram_crossing(&rec, local.or(unhashed), dest, false, false)
+        {
+            if local.is_none() && requested.is_none() {
+                let mut state = self.state.lock().unwrap();
+                let _ = state.autobind(fd, std::net::Ipv6Addr::UNSPECIFIED.into(), &shared);
+            }
+            return err(errno);
+        }
+        let mut view = rec.view(
+            local
+                .or(unhashed)
+                .map(|local| crate::netif::toward(local, dest)),
+        );
+        if ctl.oif.is_some() {
+            view.device = ctl.oif;
+        }
+        if let Some(src) = ctl.src.filter(|src| src.is_ipv4() == dest.is_ipv4()) {
+            view.local = Some(std::net::SocketAddr::new(
+                src,
+                view.local.map_or(0, |l| l.port()),
+            ));
+        }
         let sender =
             match shared.route_send(&view, dest, crate::netif::Op::Send, station, broadcast) {
                 Ok(sender) => sender,
                 Err(errno) => return err(errno),
             };
-        if let Err(errno) = crate::netif::frag::check_send(
-            &shared,
-            &rec,
-            domain == libc::AF_INET6,
-            &sender,
-            dest,
-            data.len(),
-        ) {
+        let gso = crate::ancillary::gso_size(&rec, ctl);
+        let checked = if gso != 0 {
+            crate::netif::frag::check_gso(&shared, &sender, dest, data.len(), gso)
+        } else {
+            crate::netif::frag::check_send(
+                &shared,
+                &rec,
+                domain == libc::AF_INET6,
+                &sender,
+                dest,
+                data.len(),
+                ctl.dontfrag,
+            )
+        };
+        if let Err(errno) = checked {
             return err(errno);
+        }
+        let local_path = matches!(&sender, crate::netif::Sender::Host(path) if path.local);
+        if data.len() > usize::from(gso) && gso != 0 && !local_path {
+            let segment = crate::ancillary::SendCtl {
+                gso: Some(0),
+                ..*ctl
+            };
+            for chunk in data.chunks(usize::from(gso)) {
+                if let Some(NetResult::Err(errno)) =
+                    self.udp_send(fd, chunk.to_vec(), dest, now, &segment)
+                {
+                    return err(errno);
+                }
+            }
+            return ok(data.len() as i64);
         }
         if let Some(local) = local
             && shared.policies.send_stalled(local)
@@ -2635,19 +3014,24 @@ impl SimHost {
                     },
                     |a| a.ip(),
                 );
-                let Some(port) = state.alloc_ephemeral(ip) else {
+                let Some(sa) = state.autobind(fd, ip, &shared) else {
                     return err(libc::EAGAIN);
                 };
-                let sa = std::net::SocketAddr::new(ip, port);
-                if sa.port() != 0 {
-                    state.bound.insert(sa, fd);
-                }
-                state.udp.get_mut(&fd)?.local = Some(sa);
-                rec.set_local(sa);
                 sa
             }
         };
-        let src = sender.source(local);
+        let src = match ctl.src {
+            Some(ip) => std::net::SocketAddr::new(ip, local.port()),
+            None => sender.source(crate::netif::toward(local, dest)),
+        };
+        let ip = crate::ancillary::Header {
+            gso: if data.len() > usize::from(gso) {
+                gso
+            } else {
+                0
+            },
+            ..crate::ancillary::header(&rec, dest, ctl)
+        };
         let len = data.len();
         let cands = state.udp_cands(dest, joined);
         let copies = shared.fan_out(
@@ -2665,7 +3049,7 @@ impl SimHost {
             }
         }
         let mut reached = copies.len();
-        state.udp_land(copies, &data, src, now);
+        state.udp_land(copies, &data, src, now, ip);
         let hw = sender
             .egress_name()
             .filter(|name| {
@@ -2675,9 +3059,13 @@ impl SimHost {
                     .is_none_or(|nic| !udp_onestep_stamp(nic.hwtstamp[1], dest.port(), &data))
             })
             .and_then(|nic| nic_hw_stamp(&state.nics, &state.ptp_clocks, nic, now, None));
-        crate::tstamp::udp_sent(&rec, crate::tstamp::Stamp::from_real(now), hw, || {
-            crate::tstamp::looped_frame(src, dest, false, &data)
-        });
+        crate::tstamp::udp_sent(
+            &rec,
+            crate::tstamp::Stamp::from_real(now),
+            hw,
+            ctl.tx_flags,
+            || crate::tstamp::looped_frame(src, dest, false, &data),
+        );
         rec.note_tx_nic(sender.egress_name());
         rec.count_udp_sent(dest, &sender);
         drop(state);
@@ -2689,7 +3077,7 @@ impl SimHost {
             &data,
             Some(now),
         );
-        reached += crate::fabric::deliver_to_endpoints(&regs, &sender, src, dest, &data);
+        reached += crate::fabric::deliver_to_endpoints(&regs, &sender, src, dest, &data, ip);
         if reached == 0 {
             shared.unreachable_port(&rec, &sender, src, dest, &data, station);
         }
@@ -2773,7 +3161,15 @@ impl SimHost {
             .collect();
         let devnull =
             snare_interpose::real(|| unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) });
+        let clock = Arc::new(Clock::new(p.tai_offset_secs));
+        let tracefs = Some(Arc::new(crate::tracefs::TracefsPlane::new(
+            p.tracefs.clone(),
+            p.root,
+            p.cpu_count,
+            clock.clone(),
+        )));
         SimHost {
+            tracefs,
             state: Mutex::new(HostState {
                 cpu_count: p.cpu_count,
                 online,
@@ -2787,11 +3183,12 @@ impl SimHost {
                 open: OpenFiles::default(),
                 #[cfg(target_os = "linux")]
                 dirs: OpenFiles::default(),
+                locks: HashMap::default(),
                 threads: std::collections::BTreeMap::new(),
-                thread_ids: HashMap::new(),
+                thread_ids: HashMap::default(),
                 next_tid: TID_BASE,
                 #[cfg(target_os = "linux")]
-                pthreads: HashMap::new(),
+                pthreads: HashMap::default(),
                 nics,
                 default_qdisc: p.default_qdisc,
                 #[cfg(target_os = "linux")]
@@ -2801,17 +3198,17 @@ impl SimHost {
                 #[cfg(target_os = "linux")]
                 qdisc_auto: 0x8000_0000,
                 #[cfg(target_os = "macos")]
-                mac_threads: HashMap::new(),
+                mac_threads: HashMap::default(),
                 #[cfg(target_os = "linux")]
                 udp: UdpSockets::default(),
                 #[cfg(target_os = "linux")]
                 netlinks: NetlinkSockets::default(),
                 #[cfg(target_os = "linux")]
-                bound: HashMap::new(),
+                bound: HashMap::default(),
                 #[cfg(target_os = "linux")]
                 next_ephemeral: 49152,
                 #[cfg(target_os = "linux")]
-                inherited_threads: HashMap::new(),
+                inherited_threads: HashMap::default(),
                 env: p
                     .env
                     .into_iter()
@@ -2823,15 +3220,65 @@ impl SimHost {
                     })
                     .collect(),
                 shared: std::sync::Weak::new(),
+                uname,
+                nodename: p.nodename.into_bytes(),
+                clock: clock.clone(),
             }),
             devnull,
-            clock: Arc::new(Clock::new(p.tai_offset_secs)),
+            clock,
             isolate_env: p.isolate_env,
             registries: Mutex::new(None),
             me: std::sync::OnceLock::new(),
             topology,
-            uname,
         }
+    }
+
+    /// A `kern.*` node of the kernel identity `uname` reports, as macOS serves it (measured on
+    /// macOS 26): `kern.ostype`, `kern.osrelease` and `kern.version`, read-only strings
+    /// (`EPERM` on a write), and `kern.hostname`, which a short buffer reads truncated (see
+    /// [`read_node`]) and only root may write: a name whose NUL would not fit in
+    /// `MAXHOSTNAMELEN` is `EINVAL`, after the old value is read (xnu bsd/kern/kern_sysctl.c
+    /// `sysctl_hostname`). `None` for any other name.
+    ///
+    /// # Safety
+    /// `oldp` is null or writable for `*oldlenp` bytes, `oldlenp` null or valid, and `newp` null
+    /// or readable for `newlen` bytes.
+    #[cfg(target_os = "macos")]
+    unsafe fn kern_node(
+        &self,
+        name: &str,
+        oldp: *mut u8,
+        oldlenp: *mut usize,
+        newp: *const u8,
+        newlen: usize,
+    ) -> Option<HostResult> {
+        let mut state = self.state.lock().unwrap();
+        let u = &state.uname;
+        let value = match name {
+            "kern.ostype" => &u.sysname,
+            "kern.osrelease" => &u.release,
+            "kern.version" => &u.version,
+            "kern.hostname" => {
+                if !newp.is_null() && !state.privileges().root {
+                    return err(libc::EPERM);
+                }
+                let old = [state.hostname(), b"\0"].concat();
+                let read = unsafe { read_node(&old, true, oldp, oldlenp) };
+                if !matches!(read, Some(HostResult::Ok(_))) || newp.is_null() {
+                    return read;
+                }
+                if newlen > NODENAME_MAX {
+                    return err(libc::EINVAL);
+                }
+                state.nodename = unsafe { std::slice::from_raw_parts(newp, newlen) }.to_vec();
+                return ok(0);
+            }
+            _ => return None,
+        };
+        if !newp.is_null() {
+            return err(libc::EPERM);
+        }
+        unsafe { read_node(&[value.as_bytes(), b"\0"].concat(), false, oldp, oldlenp) }
     }
 
     /// The interfaces and routes the host declares, for the sim's topology.
@@ -2921,6 +3368,84 @@ impl SimHost {
         }
         Ok(fd)
     }
+
+    /// The locks of the file or directory host descriptor `fd` names, one inode per path, and
+    /// the lock-call view of the descriptor; `None` for any other fd.
+    fn lock_target(&self, fd: c_int) -> Option<(Arc<Locks>, Target)> {
+        let mut state = self.state.lock().unwrap();
+        let (path, target) = match state.open.get(&fd) {
+            Some(file) => {
+                let mode = file.flags & libc::O_ACCMODE;
+                let target = Target {
+                    readable: mode != libc::O_WRONLY,
+                    writable: mode != libc::O_RDONLY,
+                    cursor: file.cursor as u64,
+                    len: file.data.len() as u64,
+                    description: file.description,
+                };
+                (file.path.clone(), target)
+            }
+            #[cfg(target_os = "linux")]
+            None => {
+                let stream = state.dirs.get(&fd)?;
+                let target = Target {
+                    readable: true,
+                    writable: false,
+                    cursor: 0,
+                    len: 0,
+                    description: stream.description,
+                };
+                (stream.path.clone()?, target)
+            }
+            #[cfg(not(target_os = "linux"))]
+            None => return None,
+        };
+        Some((state.locks.entry(path).or_default().clone(), target))
+    }
+
+    /// Whether a status call on `path` (or, for a null one, descriptor `dirfd`) names one of the
+    /// host's files: `Ok` for one, `ENOENT` for a missing path in a modelled subtree, `None` for
+    /// a path or descriptor the host does not serve.
+    unsafe fn status_target(&self, dirfd: c_int, path: *const c_char) -> Option<Result<(), c_int>> {
+        let state = self.state.lock().unwrap();
+        if path.is_null() {
+            return (state.open.contains_key(&dirfd) || state.is_dir(dirfd)).then_some(Ok(()));
+        }
+        let path = unsafe { path_of(path) }?;
+        #[cfg(target_os = "linux")]
+        if state.dir_entries(&path).is_some() {
+            return Some(Ok(()));
+        }
+        if state.known_file(&path) {
+            Some(Ok(()))
+        } else if state.owns_path(&path) {
+            Some(Err(libc::ENOENT))
+        } else {
+            None
+        }
+    }
+
+    /// Gives up the locks a dropped descriptor held: closing any descriptor of a file releases
+    /// the process's record locks on it, and the last of a description its own.
+    fn release_locks(&self, dropped: Dropped) {
+        let Some(path) = dropped.path else {
+            return;
+        };
+        let locks = self.state.lock().unwrap().locks.get(&path).cloned();
+        if let Some(locks) = locks {
+            locks.release_process();
+            if let Some(description) = dropped.last {
+                locks.release_description(description);
+            }
+        }
+    }
+}
+
+/// What dropping a host descriptor gives up: the file it named and, when it was the last
+/// descriptor of its open file description, that description.
+struct Dropped {
+    path: Option<std::path::PathBuf>,
+    last: Option<u64>,
 }
 
 impl Drop for SimHost {
@@ -2998,7 +3523,7 @@ pub(crate) fn host_stat(
     links: u64,
     boot: Stamp,
 ) -> Option<FsResult> {
-    let result = fill_stat(buf, mode, size, ino_of(path), links);
+    let result = fill_stat(buf, 0, &host_attributes(path, mode, size, links));
     let result = with_times(buf, result, &Times::at(boot), false);
     #[cfg(target_os = "linux")]
     if matches!(result, Some(FsResult::Ok(_))) {
@@ -3007,16 +3532,34 @@ pub(crate) fn host_stat(
             if path.starts_with("/proc") {
                 (*buf.cast::<libc::stat>()).st_blksize = 1024;
             }
-            if path.starts_with("/sys")
-                || path.starts_with("/proc/sys")
-                || path.starts_with("/proc/net")
-            {
-                (*buf.cast::<libc::stat>()).st_uid = 0;
-                (*buf.cast::<libc::stat>()).st_gid = 0;
-            }
         }
     }
     result
+}
+
+/// Whether a synthesized file belongs to root rather than the process: sysfs attributes, sysctls
+/// and `/proc/net` do; the rest of `/proc` and the device nodes are the process's, as its own
+/// `/proc/self` entries are.
+fn root_owned(path: &Path) -> bool {
+    path.starts_with("/sys") || path.starts_with("/proc/sys") || path.starts_with("/proc/net")
+}
+
+/// The [`Attributes`] of a synthesized file, owned by root or by the code under test.
+fn host_attributes(path: &Path, mode: u32, size: u64, links: u64) -> Attributes {
+    let (uid, gid) = if root_owned(path) {
+        (0, 0)
+    } else {
+        let caller = Credentials::current();
+        (caller.uid, caller.gid)
+    };
+    Attributes {
+        mode,
+        size,
+        ino: ino_of(path),
+        nlink: links,
+        uid,
+        gid,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3030,7 +3573,7 @@ pub(crate) fn host_statx(
     links: u64,
     boot: Stamp,
 ) -> Option<FsResult> {
-    let result = fill_statx(buf, mode, size, ino_of(path), links);
+    let result = fill_statx(buf, 0, &host_attributes(path, mode, size, links));
     let result = with_times(buf, result, &Times::at(boot), true);
     if matches!(result, Some(FsResult::Ok(_))) {
         unsafe {
@@ -3042,13 +3585,6 @@ pub(crate) fn host_statx(
             buf.add(48).cast::<u64>().write_unaligned(0);
             if path.starts_with("/proc") {
                 buf.add(4).cast::<u32>().write_unaligned(1024);
-            }
-            if path.starts_with("/sys")
-                || path.starts_with("/proc/sys")
-                || path.starts_with("/proc/net")
-            {
-                buf.add(20).cast::<u32>().write_unaligned(0);
-                buf.add(24).cast::<u32>().write_unaligned(0);
             }
         }
     }
@@ -3096,6 +3632,7 @@ impl Fs for SimHost {
                     writable: true,
                     flags: status_flags(flags),
                     path,
+                    description: crate::fs_locks::description(),
                 },
             );
             set_cloexec(fd, flags);
@@ -3120,6 +3657,7 @@ impl Fs for SimHost {
                     writable: flags & (libc::O_WRONLY | libc::O_RDWR) != 0,
                     flags: status_flags(flags),
                     path,
+                    description: crate::fs_locks::description(),
                 },
             );
             set_cloexec(fd, flags);
@@ -3168,6 +3706,7 @@ impl Fs for SimHost {
                 writable: write,
                 flags: status_flags(flags),
                 path,
+                description: crate::fs_locks::description(),
             },
         );
         set_cloexec(fd, flags);
@@ -3475,18 +4014,65 @@ impl Fs for SimHost {
         host_statx(buf, &path, mode, size, 1, self.boot())
     }
 
-    /// Succeeds for any known file whatever `mode` asks (including `W_OK` on a read-only
-    /// attribute, which the real kernel would refuse for a non-root caller), `ENOENT` inside a
-    /// modelled subtree.
-    unsafe fn access(&self, path: *const c_char, _mode: c_int) -> Option<FsResult> {
+    /// Checks `mode` against a rendered file's mode and owner as `stat` reports them, so a
+    /// caller other than root may not write a read-only attribute or another user's file
+    /// (`EACCES`); `/dev/cpu_dma_latency` is found whatever `mode` asks, and a path inside a
+    /// modelled subtree that names nothing fails with `ENOENT`.
+    unsafe fn access(&self, path: *const c_char, mode: c_int) -> Option<FsResult> {
         let path = unsafe { path_of(path) }?;
         let state = self.state.lock().unwrap();
+        if let Some(data) = state.render(&path) {
+            let attributes = host_attributes(&path, host_file_metadata(&path, data.len()).0, 0, 1);
+            let owner = Owner {
+                mode: attributes.mode & 0o7777,
+                uid: attributes.uid,
+                gid: attributes.gid,
+            };
+            let want = mode as u32 & (fs_perm::READ | fs_perm::WRITE | fs_perm::EXEC);
+            return match Credentials::current().check(&owner, Kind::File, want) {
+                Ok(()) => ok(0),
+                Err(error) => err(error),
+            };
+        }
         if state.known_file(&path) {
             ok(0)
         } else if state.owns_path(&path) {
             err(libc::ENOENT)
         } else {
             None
+        }
+    }
+
+    /// `chmod` of a synthesized file: they keep their modes, so it fails with `EPERM`, as
+    /// procfs refuses any mode change (`proc_setattr`) and a caller other than the owner is
+    /// refused anywhere; root's change of a sysfs attribute or device node is not modelled.
+    unsafe fn chmod(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        _mode: u32,
+        _flags: c_int,
+    ) -> Option<FsResult> {
+        match unsafe { self.status_target(dirfd, path) }? {
+            Ok(()) => err(libc::EPERM),
+            Err(error) => err(error),
+        }
+    }
+
+    /// `chown` of a synthesized file: one naming no id succeeds, any other fails with `EPERM`
+    /// as for [`chmod`](Fs::chmod).
+    unsafe fn chown(
+        &self,
+        dirfd: c_int,
+        path: *const c_char,
+        uid: u32,
+        gid: u32,
+        _flags: c_int,
+    ) -> Option<FsResult> {
+        match unsafe { self.status_target(dirfd, path) }? {
+            Ok(()) if uid == u32::MAX && gid == u32::MAX => ok(0),
+            Ok(()) => err(libc::EPERM),
+            Err(error) => err(error),
         }
     }
 
@@ -3505,54 +4091,34 @@ impl Fs for SimHost {
     /// Closes a host file and its reserved fd. Closing `/dev/cpu_dma_latency` withdraws the
     /// latency request, as releasing the kernel's PM QoS request does.
     unsafe fn close(&self, fd: c_int) -> Option<FsResult> {
-        let mut state = self.state.lock().unwrap();
-        #[cfg(target_os = "linux")]
-        if state.dirs.remove(&fd).is_some() {
-            unsafe { libc::close(fd) };
-            return ok(0);
-        }
-        let file = state.open.remove(&fd)?;
-        if file.is_some_and(|file| file.path == Path::new("/dev/cpu_dma_latency")) {
-            state.cpu_dma_latency = None;
-        }
+        let dropped = self.state.lock().unwrap().forget(fd)?;
         unsafe { libc::close(fd) };
+        self.release_locks(dropped);
         ok(0)
     }
 
     unsafe fn fd_replaced(&self, fd: c_int) -> Option<FsResult> {
-        let mut state = self.state.lock().unwrap();
-        #[cfg(target_os = "linux")]
-        if state.dirs.remove(&fd).is_some() {
-            return ok(0);
-        }
-        let file = state.open.remove(&fd)?;
-        if file.is_some_and(|file| file.path == Path::new("/dev/cpu_dma_latency")) {
-            state.cpu_dma_latency = None;
-        }
+        let dropped = self.state.lock().unwrap().forget(fd)?;
+        self.release_locks(dropped);
         ok(0)
     }
 
     unsafe fn dup(&self, oldfd: c_int, newfd: c_int) -> Option<FsResult> {
         let mut state = self.state.lock().unwrap();
-        let released = if state.open.contains_key(&oldfd) {
-            #[cfg(target_os = "linux")]
-            state.dirs.remove(&newfd);
-            state.open.alias(oldfd, newfd)?
+        let is_file = state.open.contains_key(&oldfd);
+        if !is_file && !state.is_dir(oldfd) {
+            return None;
+        }
+        let dropped = (oldfd != newfd).then(|| state.forget(newfd)).flatten();
+        if is_file {
+            state.open.alias(oldfd, newfd)?;
         } else {
             #[cfg(target_os = "linux")]
-            {
-                if !state.dirs.contains_key(&oldfd) {
-                    return None;
-                }
-                let released = state.open.remove(&newfd).flatten();
-                state.dirs.alias(oldfd, newfd)?;
-                released
-            }
-            #[cfg(not(target_os = "linux"))]
-            return None;
-        };
-        if released.is_some_and(|file| file.path == Path::new("/dev/cpu_dma_latency")) {
-            state.cpu_dma_latency = None;
+            state.dirs.alias(oldfd, newfd)?;
+        }
+        drop(state);
+        if let Some(dropped) = dropped {
+            self.release_locks(dropped);
         }
         ok(newfd as i64)
     }
@@ -3560,17 +4126,7 @@ impl Fs for SimHost {
     unsafe fn dup_to(&self, oldfd: c_int, newfd: c_int, flags: Option<c_int>) -> Option<FsResult> {
         let mut state = self.state.lock().unwrap();
         let is_file = state.open.contains_key(&oldfd);
-        let is_dir = {
-            #[cfg(target_os = "linux")]
-            {
-                state.dirs.contains_key(&oldfd)
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                false
-            }
-        };
-        if !is_file && !is_dir {
+        if !is_file && !state.is_dir(oldfd) {
             return None;
         }
         let result = crate::fabric::duplicate_to(oldfd, newfd, flags);
@@ -3579,35 +4135,38 @@ impl Fs for SimHost {
                 .raw_os_error()
                 .unwrap_or(libc::EBADF));
         }
-        let released = if is_file {
-            #[cfg(target_os = "linux")]
-            state.dirs.remove(&newfd);
-            state.open.alias(oldfd, newfd).flatten()
+        let dropped = (oldfd != newfd).then(|| state.forget(newfd)).flatten();
+        if is_file {
+            state.open.alias(oldfd, newfd);
         } else {
-            let released = state.open.remove(&newfd).flatten();
             #[cfg(target_os = "linux")]
             state.dirs.alias(oldfd, newfd);
-            released
-        };
-        if released.is_some_and(|file| file.path == Path::new("/dev/cpu_dma_latency")) {
-            state.cpu_dma_latency = None;
+        }
+        drop(state);
+        if let Some(dropped) = dropped {
+            self.release_locks(dropped);
         }
         ok(result as i64)
     }
 
+    /// `flock(2)` on a synthesized file or directory, which Linux locks like any other inode
+    /// (measured on `/proc/self/status`, `/sys/class/net/lo/mtu`, `/dev/null` and `/dev/zero`:
+    /// a second open's conflicting `LOCK_NB` request fails with `EWOULDBLOCK`).
+    unsafe fn flock(&self, fd: c_int, operation: c_int) -> Option<FsResult> {
+        let (locks, target) = self.lock_target(fd)?;
+        locks.flock(target.description, operation)
+    }
+
+    /// `fcntl(2)`. The record-lock commands lock the synthesized file as Linux locks any inode,
+    /// a write lock needing a descriptor open for writing (`EBADF`, measured as for `flock`).
     unsafe fn fcntl(&self, fd: c_int, cmd: c_int, arg: i64) -> Option<FsResult> {
+        if crate::fs_locks::is_record_lock(cmd) {
+            let (locks, target) = self.lock_target(fd)?;
+            return unsafe { locks.fcntl(cmd, arg, &target) };
+        }
         let mut state = self.state.lock().unwrap();
         let is_file = state.open.contains_key(&fd);
-        let is_dir = {
-            #[cfg(target_os = "linux")]
-            {
-                state.dirs.contains_key(&fd)
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                false
-            }
-        };
+        let is_dir = state.is_dir(fd);
         if !is_file && !is_dir {
             return None;
         }
@@ -3992,6 +4551,23 @@ impl Host for SimHost {
         self.geteuid()
     }
 
+    /// 0 when running as root, else `UNPRIVILEGED_GID` (1000 on Linux, 20 on macOS).
+    fn getegid(&self) -> Option<u32> {
+        let root = self.state.lock().unwrap().privileges().root;
+        Some(if root { 0 } else { UNPRIVILEGED_GID })
+    }
+
+    /// The one group [`getegid`](Host::getegid) reports.
+    unsafe fn getgroups(&self, size: c_int, list: *mut u32) -> Option<HostResult> {
+        let gid = self.getegid()?;
+        unsafe { crate::proclimits::fill_groups(&[gid], size, list) }
+    }
+
+    fn umask(&self, mask: Option<u32>) -> Option<HostResult> {
+        let shared = self.state.lock().unwrap().shared.upgrade()?;
+        ok(i64::from(shared.sys.umask(mask)))
+    }
+
     /// `_SC_NPROCESSORS_CONF` is the profile's CPU count and `_SC_NPROCESSORS_ONLN` its online
     /// CPUs, as glibc reads them from `/sys/devices/system/cpu/possible` and `online` and macOS from
     /// `hw.ncpu` and `hw.activecpu` (man 3 sysconf).
@@ -4011,15 +4587,45 @@ impl Host for SimHost {
         if buf.is_null() {
             return err(libc::EFAULT);
         }
+        let state = self.state.lock().unwrap();
         let uts = unsafe { &mut *(buf as *mut libc::utsname) };
-        let u = &self.uname;
+        let u = &state.uname;
         put_c_field(&mut uts.sysname, &u.sysname);
-        put_c_field(&mut uts.nodename, &u.nodename);
+        put_c_field(&mut uts.nodename, state.hostname());
         put_c_field(&mut uts.release, &u.release);
         put_c_field(&mut uts.version, &u.version);
         put_c_field(&mut uts.machine, &u.machine);
         #[cfg(target_os = "linux")]
         put_c_field(&mut uts.domainname, "(none)");
+        ok(0)
+    }
+
+    /// Renames the sim's host. Linux checks `CAP_SYS_ADMIN` (`EPERM`), then a length outside
+    /// `0..=__NEW_UTS_LEN` (`EINVAL`), then copies the name (`EFAULT`) (kernel/sys.c,
+    /// `sethostname`). macOS's libc writes `kern.hostname`, which only root may (`EPERM`), and
+    /// the kernel refuses a name that leaves no room for its NUL in `MAXHOSTNAMELEN` (`EINVAL`;
+    /// xnu bsd/kern/kern_sysctl.c `sysctl_hostname`, `sysctl_io_string`).
+    unsafe fn sethostname(&self, name: *const u8, len: i64) -> Option<HostResult> {
+        let mut state = self.state.lock().unwrap();
+        let allowed = if cfg!(target_os = "linux") {
+            state.has_cap(crate::limits::CAP_SYS_ADMIN)
+        } else {
+            state.privileges().root
+        };
+        if !allowed {
+            return err(libc::EPERM);
+        }
+        if !(0..=NODENAME_MAX as i64).contains(&len) {
+            return err(libc::EINVAL);
+        }
+        if name.is_null() && len > 0 {
+            return err(libc::EFAULT);
+        }
+        state.nodename = if len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(name, len as usize) }.to_vec()
+        };
         ok(0)
     }
 
@@ -4327,6 +4933,76 @@ impl Host for SimHost {
         ok(0)
     }
 
+    /// One record per CPU, offline ones included, as xnu's `host_processor_info` walks every
+    /// processor (osfmk/kern/host.c). `PROCESSOR_BASIC_INFO` gives the build target's CPU type
+    /// (`CPU_TYPE_ARM64` with `CPU_SUBTYPE_ARM64E`, or `CPU_TYPE_X86_64` with
+    /// `CPU_SUBTYPE_X86_64_H`, `<mach/machine.h>`), whether the CPU is online, its number and
+    /// whether it is CPU 0, the boot processor. `PROCESSOR_CPU_LOAD_INFO` gives user, system,
+    /// idle and nice ticks at 100 per second (xnu's `hz`): an online CPU has been idle for the
+    /// whole of the clock's monotonic time, as on Linux's `/proc/stat`, and an offline one shows
+    /// none. Other flavors are declined.
+    #[cfg(target_os = "macos")]
+    unsafe fn host_processor_info(
+        &self,
+        flavor: c_int,
+        count: *mut u32,
+        info: *mut *mut c_int,
+        info_count: *mut u32,
+    ) -> Option<HostResult> {
+        const CPU_TYPE: c_int = if cfg!(target_arch = "aarch64") {
+            0x0100_000c
+        } else {
+            0x0100_0007
+        };
+        const CPU_SUBTYPE: c_int = if cfg!(target_arch = "aarch64") { 2 } else { 8 };
+        if flavor != libc::PROCESSOR_BASIC_INFO && flavor != libc::PROCESSOR_CPU_LOAD_INFO {
+            return None;
+        }
+        let (cpus, words) = {
+            let state = self.state.lock().unwrap();
+            let online = state.online_cpus();
+            let idle = state.idle_ticks() as u32 as c_int;
+            let words: Vec<c_int> = (0..state.cpu_count)
+                .flat_map(|cpu| {
+                    let running = online.contains(&cpu);
+                    if flavor == libc::PROCESSOR_BASIC_INFO {
+                        let master = cpu == 0;
+                        vec![
+                            CPU_TYPE,
+                            CPU_SUBTYPE,
+                            running.into(),
+                            cpu as c_int,
+                            master.into(),
+                        ]
+                    } else {
+                        vec![0, 0, if running { idle } else { 0 }, 0]
+                    }
+                })
+                .collect();
+            (state.cpu_count, words)
+        };
+        let mut address: libc::vm_address_t = 0;
+        #[allow(deprecated)]
+        let kr = unsafe {
+            libc::vm_allocate(
+                libc::mach_task_self(),
+                &mut address,
+                std::mem::size_of_val(words.as_slice()),
+                libc::VM_FLAGS_ANYWHERE,
+            )
+        };
+        if kr != libc::KERN_SUCCESS {
+            return ok(kr.into());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(words.as_ptr(), address as *mut c_int, words.len());
+            *count = cpus as u32;
+            *info = address as *mut c_int;
+            *info_count = words.len() as u32;
+        }
+        ok(libc::KERN_SUCCESS.into())
+    }
+
     /// Accepts any Mach thread policy and returns `KERN_SUCCESS` (0).
     #[cfg(target_os = "macos")]
     unsafe fn thread_policy_set(
@@ -4364,10 +5040,12 @@ impl Host for SimHost {
     }
 
     /// Serves `{CTL_NET, PF_ROUTE, 0, family, NET_RT_IFLIST2, ...}` from the topology, the
-    /// protocol-counter nodes from the sim's counters (`netstats::macos`) and the CPU-count `hw.*`
-    /// nodes from the profile (see [`hw_node`]); every other MIB is declined. The usual two-step protocol (man 3 sysctl): a NULL `oldp` reports the
-    /// size needed, a short buffer fails with `ENOMEM`. The address family and interface index
-    /// words (`mib[3]`, `mib[5]`) are not used to filter.
+    /// protocol-counter nodes from the sim's counters (`netstats::macos`), the CPU-count `hw.*`
+    /// nodes from the profile (see [`hw_node`]) and the kernel identity's `kern.*` nodes (see
+    /// [`kern_node`](SimHost::kern_node)); every other MIB is declined. The usual two-step
+    /// protocol (man 3 sysctl): a NULL `oldp` reports the size needed, a short buffer fails with
+    /// `ENOMEM`. The address family and interface index words (`mib[3]`, `mib[5]`) are not used
+    /// to filter.
     #[cfg(target_os = "macos")]
     unsafe fn sysctl(
         &self,
@@ -4376,7 +5054,7 @@ impl Host for SimHost {
         oldp: *mut u8,
         oldlenp: *mut usize,
         newp: *const u8,
-        _newlen: usize,
+        newlen: usize,
     ) -> Option<HostResult> {
         if name.is_null() {
             return None;
@@ -4394,6 +5072,9 @@ impl Host for SimHost {
                 Ok(value) => unsafe { read_hw(&value, oldp, oldlenp, newp) },
                 Err(errno) => err(errno),
             };
+        }
+        if let Some(name) = kern_name_of(mib) {
+            return unsafe { self.kern_node(name, oldp, oldlenp, newp, newlen) };
         }
         if namelen < 5 {
             return None;
@@ -4420,8 +5101,8 @@ impl Host for SimHost {
         ok(0)
     }
 
-    /// `sysctlbyname` for the protocol-counter nodes (see [`sysctl`](Self::sysctl)); every
-    /// other name is declined.
+    /// `sysctlbyname` for the nodes [`sysctl`](Self::sysctl) serves; every other name is
+    /// declined.
     #[cfg(target_os = "macos")]
     unsafe fn sysctlbyname(
         &self,
@@ -4429,7 +5110,7 @@ impl Host for SimHost {
         oldp: *mut u8,
         oldlenp: *mut usize,
         newp: *const u8,
-        _newlen: usize,
+        newlen: usize,
     ) -> Option<HostResult> {
         use crate::netstats::macos;
         let name = unsafe { macos::name_str(name) }?;
@@ -4438,6 +5119,9 @@ impl Host for SimHost {
                 Ok(value) => unsafe { read_hw(&value, oldp, oldlenp, newp) },
                 Err(errno) => err(errno),
             };
+        }
+        if let Some(r) = unsafe { self.kern_node(name, oldp, oldlenp, newp, newlen) } {
+            return Some(r);
         }
         let mib = macos::mib_of(name)?;
         let shared = self.state.lock().unwrap().shared.upgrade()?;
@@ -4470,6 +5154,9 @@ impl Host for SimHost {
                 self.sched_setscheduler(args[0] as i32, args[1] as c_int, args[2] as *const u8)
             },
             n if n == libc::SYS_uname => unsafe { self.uname(args[0] as *mut u8) },
+            n if n == libc::SYS_sethostname => unsafe {
+                self.sethostname(args[0] as *const u8, i64::from(args[1] as c_int))
+            },
             n if n == libc::SYS_sched_getscheduler => unsafe {
                 self.sched_getscheduler(args[0] as i32)
             },
@@ -4540,10 +5227,11 @@ unsafe fn read_ifname(arg: i64) -> Option<String> {
 
 /// Writes `text` into the C string field `field`, truncated to leave room for its NUL, and zeroes
 /// the rest.
-fn put_c_field(field: &mut [c_char], text: &str) {
+fn put_c_field(field: &mut [c_char], text: impl AsRef<[u8]>) {
+    let text = text.as_ref();
     field.fill(0);
     let n = text.len().min(field.len() - 1);
-    for (dst, &b) in field.iter_mut().zip(&text.as_bytes()[..n]) {
+    for (dst, &b) in field.iter_mut().zip(&text[..n]) {
         *dst = b as c_char;
     }
 }
@@ -4623,42 +5311,6 @@ fn udp_membership(group: std::net::IpAddr, bytes: &[u8]) -> Membership {
             interface_addr: None,
             ifindex: word(16),
         },
-    }
-}
-
-/// Parse a `sockaddr_in`/`sockaddr_in6` into a [`std::net::SocketAddr`]: family at 0, port
-/// (network order) at 2, IPv4 address at 4, IPv6 address at 8 (man 7 ip, man 7 ipv6;
-/// include/uapi/linux/in.h, in6.h). The IPv6
-/// flow info and scope id are dropped. `None` for any other family or a length too short for
-/// the family (8 bytes for IPv4 here rather than the full 16, 28 for IPv6).
-///
-/// # Safety
-/// `ptr` points to at least `len` bytes of a `sockaddr`.
-#[cfg(target_os = "linux")]
-unsafe fn read_sockaddr(ptr: *const u8, len: u32) -> Option<std::net::SocketAddr> {
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-    if ptr.is_null() || len < 8 {
-        return None;
-    }
-    let family = unsafe { (ptr as *const u16).read_unaligned() } as c_int;
-    let port = u16::from_be(unsafe { (ptr.add(2) as *const u16).read_unaligned() });
-    match family {
-        libc::AF_INET => {
-            let mut a = [0u8; 4];
-            unsafe { std::ptr::copy_nonoverlapping(ptr.add(4), a.as_mut_ptr(), 4) };
-            Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(a), port)))
-        }
-        libc::AF_INET6 if len >= 28 => {
-            let mut a = [0u8; 16];
-            unsafe { std::ptr::copy_nonoverlapping(ptr.add(8), a.as_mut_ptr(), 16) };
-            Some(SocketAddr::V6(SocketAddrV6::new(
-                Ipv6Addr::from(a),
-                port,
-                0,
-                0,
-            )))
-        }
-        _ => None,
     }
 }
 
@@ -5675,8 +6327,9 @@ impl Net for SimHost {
                     rec,
                     _probe: probe,
                     nonblocking: ty & libc::SOCK_NONBLOCK != 0,
+                    fcntl: crate::fabric::SocketFcntl::default(),
                     descriptors: std::collections::BTreeSet::from([fd]),
-                    sockopts: HashMap::new(),
+                    sockopts: HashMap::default(),
                 },
             );
             if ty & libc::SOCK_CLOEXEC != 0 {
@@ -5705,6 +6358,15 @@ impl Net for SimHost {
             },
         );
         rec.set_type(libc::SOCK_DGRAM);
+        {
+            let inet6 = domain == libc::AF_INET6;
+            let mut state = rec.state();
+            state.inet6 = inet6;
+            state.v6only = inet6
+                && self
+                    .shared()
+                    .is_some_and(|shared| shared.sys.limits().bindv6only);
+        }
         let probe = Arc::new(HostRx {
             host: self.me.get().cloned().unwrap_or_default(),
             id: rec.id.get(),
@@ -5722,8 +6384,9 @@ impl Net for SimHost {
                 peer: None,
                 rx: crate::limits::RxQueue::default(),
                 nonblocking,
+                fcntl: crate::fabric::SocketFcntl::default(),
                 broadcast: false,
-                sockopts: HashMap::new(),
+                sockopts: HashMap::default(),
                 tx_deadline: None,
                 rec,
                 _probe: probe,
@@ -5744,22 +6407,30 @@ impl Net for SimHost {
         ok(fd as i64)
     }
 
-    /// Binds a datagram socket (man 2 bind). The address must be one the topology lets the host
-    /// claim, and a port below `ip_unprivileged_port_start` needs `CAP_NET_BIND_SERVICE` (`EACCES`;
-    /// man 7 ip; Documentation/networking/ip-sysctl.rst, default 1024); both checks are the sim's.
-    /// Port 0 picks an ephemeral port.
-    /// An exact address already bound is `EADDRINUSE`; `SO_REUSEADDR`/`SO_REUSEPORT` sharing is
-    /// not modelled here. A wildcard and a specific address on the same port coexist. Rebinding a
-    /// bound socket, which Linux refuses with `EINVAL`, is not checked.
+    /// Binds a datagram socket (man 2 bind) as the fabric binds one: the address must be of the
+    /// socket's family, a v4-mapped one binding an IPv6 socket to its IPv4 address unless
+    /// `IPV6_V6ONLY` is on (`crate::fabric::bind_addr`), one the topology lets the host claim, and
+    /// a port below `ip_unprivileged_port_start` needs `CAP_NET_BIND_SERVICE` (`EACCES`; man 7 ip;
+    /// Documentation/networking/ip-sysctl.rst, default 1024). It must not collide with another of
+    /// the host's datagram sockets ([`crate::fabric::bind_conflict`]: an overlap is `EADDRINUSE`
+    /// unless both set `SO_REUSEADDR` or both `SO_REUSEPORT`). Port 0 picks an ephemeral port; a
+    /// bound socket is `EINVAL` (net/ipv4/af_inet.c `__inet_bind`).
     #[cfg(target_os = "linux")]
     unsafe fn bind(&self, fd: c_int, addr: *const u8, len: u32) -> Option<NetResult> {
-        if !self.state.lock().unwrap().udp.contains_key(&fd) {
-            return None;
-        }
-        let Some(mut sa) = (unsafe { read_sockaddr(addr, len) }) else {
-            return err(libc::EINVAL);
+        let (rec, domain, id) = {
+            let state = self.state.lock().unwrap();
+            let sock = state.udp.get(&fd)?;
+            if sock.local.is_some() {
+                return err(libc::EINVAL);
+            }
+            (sock.rec.clone(), sock.domain, sock.rec.id.get())
         };
-        if let Some(shared) = self.shared() {
+        let mut sa = match unsafe { crate::fabric::bind_addr(&rec, domain, addr, len, false) } {
+            Ok(sa) => sa,
+            Err(errno) => return err(errno),
+        };
+        let shared = self.shared();
+        if let Some(shared) = &shared {
             if let Err(errno) = shared.claim_address(sa.ip()) {
                 return err(errno);
             }
@@ -5767,21 +6438,37 @@ impl Net for SimHost {
                 return err(errno);
             }
         }
+        let station = shared
+            .as_ref()
+            .is_some_and(|shared| shared.topo().is_station_ip(sa.ip()));
+        let want = crate::fabric::Claim::want(&rec, sa, station);
         let asked = sa;
         let mut state = self.state.lock().unwrap();
         if sa.port() == 0 {
-            let Some(p) = state.alloc_ephemeral(sa.ip()) else {
+            let dual = rec.state().dual_at(sa);
+            let Some(p) = state.alloc_ephemeral(sa.ip(), dual) else {
                 return err(libc::EADDRINUSE);
             };
             sa.set_port(p);
-        } else if state.bound.contains_key(&sa) {
+        } else if state
+            .udp
+            .iter()
+            .filter(|(_, sock)| sock.rec.id.get() != id)
+            .filter_map(|(_, sock)| HostState::udp_claim(sock))
+            .any(|held| crate::fabric::bind_conflict(held, want))
+        {
             return err(libc::EADDRINUSE);
         }
-        state.bound.insert(sa, fd);
+        if let Some(shared) = &shared {
+            rec.state().bound_order = shared.bind_order();
+        }
+        state.bind_udp(sa, id);
         let sock = state.udp.get_mut(&fd).unwrap();
         sock.local = Some(sa);
         sock.requested = Some(asked);
         sock.rec.set_local(sa);
+        drop(state);
+        crate::fabric::bound_at(&rec, sa);
         ok(0)
     }
 
@@ -5804,21 +6491,39 @@ impl Net for SimHost {
             self.state.lock().unwrap().udp_disconnect(fd);
             return ok(0);
         }
-        let Some(dest) = (unsafe { read_sockaddr(addr, len) }) else {
-            return err(libc::EINVAL);
-        };
-        let (local, requested, broadcast, rec) = {
+        let (local, requested, broadcast, rec, domain) = {
             let state = self.state.lock().unwrap();
             let sock = state.udp.get(&fd)?;
-            (sock.local, sock.requested, sock.broadcast, sock.rec.clone())
+            (
+                sock.local,
+                sock.requested,
+                sock.broadcast,
+                sock.rec.clone(),
+                sock.domain,
+            )
         };
-        let unhashed = requested.map(|r| std::net::SocketAddr::new(r.ip(), 0));
+        let (dest, native) = match unsafe {
+            crate::fabric::sock_addr(domain, addr, len, crate::fabric::AddrUse::Datagram)
+        } {
+            Ok(dest) => dest,
+            Err(errno) => return err(errno),
+        };
+        let unhashed = crate::fabric::unhashed(requested);
+        if domain == libc::AF_INET6
+            && let Err(errno) =
+                crate::fabric::dgram_crossing(&rec, local.or(unhashed), dest, native, true)
+        {
+            return err(errno);
+        }
         // man 2 connect on a datagram socket: fix the default peer, taking the route's source
         // address at an ephemeral port first if unbound so the peer can address a reply.
         let regs = self.registries.lock().unwrap().clone()?;
         let station = regs.station_at(dest.ip());
+        let from = local
+            .or(unhashed)
+            .map(|local| crate::netif::toward(local, dest));
         let sender = match regs.shared.route_send(
-            &rec.view(local.or(unhashed)),
+            &rec.view(from),
             dest,
             crate::netif::Op::Connect,
             station,
@@ -5830,21 +6535,19 @@ impl Net for SimHost {
         let mut state = self.state.lock().unwrap();
         match state.udp.get(&fd)?.local {
             None => {
-                let unspecified = if dest.is_ipv4() {
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-                } else {
-                    std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
-                };
-                let unbound = unhashed.unwrap_or(std::net::SocketAddr::new(unspecified, 0));
+                let unbound = from.unwrap_or(std::net::SocketAddr::new(
+                    crate::fabric::unspecified_like(dest.ip()),
+                    0,
+                ));
                 let ip = sender.connected_local(unbound).ip();
-                let Some(p) = state.alloc_ephemeral(ip) else {
+                if state.autobind(fd, ip, &regs.shared).is_none() {
                     return err(libc::EAGAIN);
-                };
-                let sa = std::net::SocketAddr::new(ip, p);
-                state.bound.insert(sa, fd);
-                state.udp.get_mut(&fd).unwrap().local = Some(sa);
+                }
             }
-            Some(bound) => state.rehash(fd, bound, sender.connected_local(bound)),
+            Some(bound) => {
+                let to = sender.connected_local(crate::netif::toward(bound, dest));
+                state.rehash(fd, bound, to);
+            }
         }
         let sock = state.udp.get_mut(&fd).unwrap();
         sock.peer = Some(dest);
@@ -5856,18 +6559,17 @@ impl Net for SimHost {
     }
 
     /// On a netlink socket the buffer is a request: its reply is queued at once and the whole
-    /// length reported sent. On a datagram socket, sends one datagram to `addr`; a NULL `addr`
-    /// is `EINVAL` even when connected (the kernel would use the peer). The address is parsed
-    /// before the fd's ownership is checked, so a NULL or non-INET address on an fd the host does
-    /// not own is also answered `EINVAL` rather than declined. Charges one call latency
-    /// and ticks the virtual realtime clock to stamp the send.
+    /// length reported sent. On a datagram socket, sends one datagram to `addr`, or as `send` to
+    /// the connected peer for a NULL `addr` (man 2 sendto); a non-INET address is `EINVAL`. Any
+    /// other fd is declined. Charges one call latency and ticks the virtual realtime clock to
+    /// stamp the send.
     #[cfg(target_os = "linux")]
     unsafe fn sendto(
         &self,
         fd: c_int,
         buf: *const u8,
         len: usize,
-        _flags: c_int,
+        flags: c_int,
         addr: *const u8,
         addr_len: u32,
     ) -> Option<NetResult> {
@@ -5888,9 +6590,19 @@ impl Net for SimHost {
                 }
                 return ok(len as i64);
             }
+            if !state.udp.contains_key(&fd) {
+                return None;
+            }
         }
-        let Some(dest) = (unsafe { read_sockaddr(addr, addr_len) }) else {
-            return err(libc::EINVAL);
+        if addr.is_null() {
+            return unsafe { self.send(fd, buf, len, flags) };
+        }
+        let domain = self.state.lock().unwrap().udp.get(&fd)?.domain;
+        let dest = match unsafe {
+            crate::fabric::sock_addr(domain, addr, addr_len, crate::fabric::AddrUse::Datagram)
+        } {
+            Ok((dest, _)) => dest,
+            Err(errno) => return err(errno),
         };
         snare_interpose::charge_latency();
         let now = self.clock.tick_realtime();
@@ -5899,19 +6611,16 @@ impl Net for SimHost {
         } else {
             unsafe { std::slice::from_raw_parts(buf, len) }.to_vec()
         };
-        if !self.state.lock().unwrap().udp.contains_key(&fd) {
-            return None;
-        }
-        self.udp_send(fd, data, dest, now)
+        self.udp_send(fd, data, dest, now, &Default::default())
     }
 
-    /// Gathers the iovecs into one datagram (or netlink request), checks and records an
-    /// `SCM_TXTIME` deadline ([`crate::tstamp::txtime_cmsg`]: `EINVAL` without `SO_TXTIME` or
-    /// for a malformed message, as udp_sendmsg's `ip_cmsg_send` reports), then sends as `sendto`.
-    /// Like `sendto`, a message without an INET `msg_name` is `EINVAL`, on any fd that is not a
-    /// host netlink socket, owned or not.
+    /// Gathers the iovecs into one datagram (or netlink request), checks its control messages as
+    /// Linux does ([`crate::ancillary::datagram_send`]; an `SCM_TXTIME` deadline is `EINVAL`
+    /// without `SO_TXTIME` or when malformed, as `__sock_cmsg_send` reports) and records an
+    /// `SCM_TXTIME` deadline, then sends as `sendto` with what they asked: to `msg_name`, or the
+    /// connected peer when it is NULL (`EDESTADDRREQ` without one). Any other fd is declined.
     #[cfg(target_os = "linux")]
-    unsafe fn sendmsg(&self, fd: c_int, msg: *const u8, flags: c_int) -> Option<NetResult> {
+    unsafe fn sendmsg(&self, fd: c_int, msg: *const u8, _flags: c_int) -> Option<NetResult> {
         if msg.is_null() {
             return err(libc::EFAULT);
         }
@@ -5932,7 +6641,7 @@ impl Net for SimHost {
             }
         }
         // A netlink destination is a `sockaddr_nl`, not an INET address, so handle it before
-        // `read_sockaddr` (which only understands AF_INET/AF_INET6) would reject the message.
+        // `crate::fabric::sock_addr` (which only understands AF_INET/AF_INET6) would reject it.
         {
             let mut state = self.state.lock().unwrap();
             if state.netlinks.contains_key(&fd) {
@@ -5946,34 +6655,46 @@ impl Net for SimHost {
                 return ok(data.len() as i64);
             }
         }
-        let Some(dest) =
-            (unsafe { read_sockaddr((*hdr).msg_name as *const u8, (*hdr).msg_namelen) })
-        else {
-            return err(libc::EINVAL);
+        let (rec, domain, peer) = {
+            let state = self.state.lock().unwrap();
+            let sock = state.udp.get(&fd)?;
+            (sock.rec.clone(), sock.domain, sock.peer)
         };
-        let rec = self.state.lock().unwrap().udp.get(&fd)?.rec.clone();
-        match unsafe { crate::tstamp::txtime_cmsg(&rec, hdr) } {
-            Ok(Some(deadline)) => {
-                if let Some(sock) = self.state.lock().unwrap().udp.get_mut(&fd) {
-                    sock.tx_deadline = Some(deadline);
+        let v6 = domain == libc::AF_INET6;
+        let name = unsafe { (*hdr).msg_name } as *const u8;
+        let dest = if name.is_null() {
+            match peer {
+                Some(peer) => peer,
+                None => return err(libc::EDESTADDRREQ),
+            }
+        } else {
+            let len = unsafe { (*hdr).msg_namelen };
+            match unsafe {
+                crate::fabric::sock_addr(domain, name, len, crate::fabric::AddrUse::Datagram)
+            } {
+                Ok((dest, _)) => dest,
+                Err(errno) => return err(errno),
+            }
+        };
+        let shared = self.shared()?;
+        let ctl = match unsafe { crate::ancillary::control(hdr) } {
+            Ok(None) => crate::ancillary::SendCtl::default(),
+            Ok(Some(control)) => {
+                match crate::ancillary::datagram_send(&shared, &rec, &control, v6, dest) {
+                    Ok(ctl) => ctl,
+                    Err(errno) => return err(errno),
                 }
             }
-            Ok(None) => {}
             Err(errno) => return err(errno),
+        };
+        if let Some(deadline) = ctl.txtime
+            && let Some(sock) = self.state.lock().unwrap().udp.get_mut(&fd)
+        {
+            sock.tx_deadline = Some(deadline);
         }
-        let len = data.len();
-        let ptr = data.as_ptr();
-        let dest_bytes = sockaddr_bytes(dest);
-        unsafe {
-            self.sendto(
-                fd,
-                ptr,
-                len,
-                flags,
-                dest_bytes.as_ptr(),
-                dest_bytes.len() as u32,
-            )
-        }
+        snare_interpose::charge_latency();
+        let now = self.clock.tick_realtime();
+        self.udp_send(fd, data, dest, now, &ctl)
     }
 
     /// A netlink request, or a datagram to the connected peer.
@@ -6023,7 +6744,7 @@ impl Net for SimHost {
             .udp
             .get(&fd)
             .and_then(|s| s.peer)?;
-        self.udp_send(fd, data, dest, now)
+        self.udp_send(fd, data, dest, now, &Default::default())
     }
 
     /// Receives a netlink reply or a datagram (man 2 recv). A netlink socket with nothing queued
@@ -6126,7 +6847,8 @@ impl Net for SimHost {
         );
         unsafe { std::ptr::copy_nonoverlapping(dg.data.as_ptr(), buf, n) };
         if !addr.is_null() && !addr_len.is_null() {
-            unsafe { write_sockaddr(dg.src, addr, addr_len) };
+            let src = crate::netif::reported(rec.state().inet6, dg.src);
+            unsafe { write_sockaddr(src, addr, addr_len) };
         }
         ok(if flags & libc::MSG_TRUNC != 0 {
             dg.data.len()
@@ -6148,8 +6870,9 @@ impl Net for SimHost {
     /// does; a nonblocking one, a netlink socket and `MSG_ERRQUEUE` never wait, and are `EAGAIN`
     /// with nothing queued. `MSG_ERRQUEUE` returns the oldest arrived ICMP report or transmit
     /// stamp.
-    /// Control messages: the receive timestamps the socket asked for (`tstamp::rx_cmsgs`), then
-    /// the `SO_RXQ_OVFL` drop count when enabled and non-zero (man 7 socket).
+    /// Control messages: a whole segmented send's `UDP_GRO`, the receive timestamps the socket
+    /// asked for (`tstamp::rx_cmsgs`), the `SO_RXQ_OVFL` drop count when enabled and non-zero
+    /// (man 7 socket), then the IP-level ones it asked for (`ancillary::rx_cmsgs`).
     /// `MSG_TRUNC`/`MSG_CTRUNC` flag a short data or control buffer.
     ///
     /// Netlink deviates from the kernel on a short buffer: `netlink_recvmsg`
@@ -6214,6 +6937,7 @@ impl Net for SimHost {
             return err(libc::EAGAIN);
         }
         let wait = !sock.nonblocking && flags & libc::MSG_DONTWAIT == 0;
+        let v6 = sock.domain == libc::AF_INET6;
         let shared = self.shared()?;
         drop(state);
         let deadline = rec.opts().rcvtimeo.map(crate::readiness::Deadline::timeout);
@@ -6262,19 +6986,22 @@ impl Net for SimHost {
 
         let copied = unsafe { crate::fabric::scatter(hdr, &dg.data) };
         // Write the source address into the name buffer, if the caller supplied one.
-        unsafe { addr_write_from_msg(hdr, dg.src) };
+        unsafe { addr_write_from_msg(hdr, crate::netif::reported(v6, dg.src)) };
 
         let stamp = crate::tstamp::Stamp {
             hw: dg.hw,
             ..crate::tstamp::Stamp::from_real(dg.timestamp)
         };
-        let mut cmsgs = crate::tstamp::rx_cmsgs(
+        let mut cmsgs: Vec<_> = crate::ancillary::gro_cmsg(&rec, &dg.ip)
+            .into_iter()
+            .collect();
+        cmsgs.extend(crate::tstamp::rx_cmsgs(
             self.shared().as_deref(),
             &rec,
             stamp,
             crate::tstamp::Rx::Datagram,
             Some(dg.rx_fallback.as_ref()),
-        );
+        ));
         if rxq_ovfl && drops > 0 {
             cmsgs.push((
                 libc::SOL_SOCKET,
@@ -6282,6 +7009,13 @@ impl Net for SimHost {
                 drops.to_ne_bytes().to_vec(),
             ));
         }
+        cmsgs.extend(crate::ancillary::rx_cmsgs(
+            &shared,
+            &rec,
+            v6,
+            dg.src.ip(),
+            &dg.ip,
+        ));
         let mut msg_flags = 0;
         if copied < dg.data.len() {
             msg_flags |= libc::MSG_TRUNC;
@@ -6350,8 +7084,27 @@ impl Net for SimHost {
                 Err(errno) => err(errno),
             };
         }
-        let v6 = self.state.lock().unwrap().udp.get(&fd)?.domain == libc::AF_INET6;
-        if let Some(result) = unsafe { crate::netif::frag::set(&rec, v6, level, name, val, len) } {
+        let (v6, bound) = {
+            let state = self.state.lock().unwrap();
+            let sock = state.udp.get(&fd)?;
+            (sock.domain == libc::AF_INET6, sock.local.is_some())
+        };
+        if (level, name) == (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY) {
+            return unsafe { crate::fabric::v6only_set(&rec, bound, val, len) };
+        }
+        if level == libc::SOL_SOCKET && (name == libc::SO_REUSEADDR || name == libc::SO_REUSEPORT) {
+            let on = unsafe { crate::fabric::read_int(val, len) } != 0;
+            let mut state = rec.state();
+            if name == libc::SO_REUSEADDR {
+                state.opts.reuseaddr = on;
+            } else {
+                state.opts.reuseport = on;
+            }
+            return ok(0);
+        }
+        if let Some(result) = unsafe { crate::netif::frag::set(&rec, v6, level, name, val, len) }
+            .or_else(|| unsafe { crate::ancillary::set(&rec, v6, level, name, val, len) })
+        {
             return match result {
                 Ok(()) => ok(0),
                 Err(errno) => err(errno),
@@ -6442,6 +7195,9 @@ impl Net for SimHost {
         {
             return err(errno);
         }
+        if crate::fabric::harmless(level, name) {
+            rec.keep_ignored(level, name, &bytes);
+        }
         sock.sockopts.insert((level, name), bytes);
         ok(0)
     }
@@ -6519,7 +7275,22 @@ impl Net for SimHost {
             return ok(0);
         }
         let v6 = self.state.lock().unwrap().udp.get(&fd)?.domain == libc::AF_INET6;
-        if let Some(result) = unsafe { crate::netif::frag::get(&rec, v6, level, name, val, len) } {
+        if (level, name) == (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY) {
+            return unsafe { crate::fabric::v6only_get(&rec, val, len) };
+        }
+        if level == libc::SOL_SOCKET && (name == libc::SO_REUSEADDR || name == libc::SO_REUSEPORT) {
+            let opts = rec.opts();
+            let on = if name == libc::SO_REUSEADDR {
+                opts.reuseaddr
+            } else {
+                opts.reuseport
+            };
+            unsafe { crate::fabric::write_opt(crate::fabric::socket_flag(on, name), val, len) };
+            return ok(0);
+        }
+        if let Some(result) = unsafe { crate::netif::frag::get(&rec, v6, level, name, val, len) }
+            .or_else(|| unsafe { crate::ancillary::get(&rec, v6, level, name, val, len) })
+        {
             return match result {
                 Ok(()) => ok(0),
                 Err(errno) => err(errno),
@@ -6612,9 +7383,10 @@ impl Net for SimHost {
         let sock = state.udp.get(&fd)?;
         // man 2 getsockname: an unbound socket reports the wildcard address on its family.
         let unhashed = sock.requested.map(|r| std::net::SocketAddr::new(r.ip(), 0));
+        let inet6 = sock.domain == libc::AF_INET6;
         let local = sock.local.or(unhashed).unwrap_or_else(|| {
             std::net::SocketAddr::new(
-                if sock.domain == libc::AF_INET6 {
+                if inet6 {
                     std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
                 } else {
                     std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
@@ -6623,7 +7395,7 @@ impl Net for SimHost {
             )
         });
         drop(state);
-        unsafe { write_sockaddr(local, addr, addr_len) };
+        unsafe { write_sockaddr(crate::netif::reported(inet6, local), addr, addr_len) };
         ok(0)
     }
 
@@ -6641,8 +7413,9 @@ impl Net for SimHost {
         let Some(peer) = sock.peer else {
             return err(libc::ENOTCONN);
         };
+        let inet6 = sock.domain == libc::AF_INET6;
         drop(state);
-        unsafe { write_sockaddr(peer, addr, addr_len) };
+        unsafe { write_sockaddr(crate::netif::reported(inet6, peer), addr, addr_len) };
         ok(0)
     }
 
@@ -6692,9 +7465,10 @@ impl Net for SimHost {
         ok(result as i64)
     }
 
-    /// `F_SETFL`/`F_GETFL` share `O_NONBLOCK` across descriptors. Descriptor flags and duplicate
-    /// allocation use the reserved kernel fd.
-    /// Netlink descriptors share their reply queue and status flags.
+    /// `F_SETFL`/`F_GETFL` share `O_NONBLOCK` and the other kept status flags across
+    /// descriptors, and the signal-driven I/O commands are the fabric's
+    /// ([`crate::fabric::SocketFcntl`]). Descriptor flags and duplicate allocation use the
+    /// reserved kernel fd. Netlink descriptors share their reply queue and status flags.
     #[cfg(target_os = "linux")]
     unsafe fn fcntl(&self, fd: c_int, cmd: c_int, arg: i64) -> Option<NetResult> {
         let shared = self.shared();
@@ -6721,20 +7495,26 @@ impl Net for SimHost {
                 ok(result as i64)
             };
         }
-        let nonblocking = if let Some(socket) = state.udp.get_mut(&fd) {
-            &mut socket.nonblocking
+        let (nonblocking, fcntl) = if let Some(socket) = state.udp.get_mut(&fd) {
+            (&mut socket.nonblocking, &mut socket.fcntl)
         } else {
-            &mut state.netlinks.get_mut(&fd)?.nonblocking
+            let netlink = state.netlinks.get_mut(&fd)?;
+            (&mut netlink.nonblocking, &mut netlink.fcntl)
         };
         match cmd {
             libc::F_SETFL => {
+                fcntl.status = match crate::fabric::SocketFcntl::kept_status(arg) {
+                    Ok(kept) => kept,
+                    Err(errno) => return err(errno),
+                };
                 *nonblocking = arg as c_int & libc::O_NONBLOCK != 0;
                 ok(0)
             }
             libc::F_GETFL => {
-                ok((libc::O_RDWR | if *nonblocking { libc::O_NONBLOCK } else { 0 }) as i64)
+                let nonblock = if *nonblocking { libc::O_NONBLOCK } else { 0 };
+                ok((libc::O_RDWR | nonblock | fcntl.status) as i64)
             }
-            _ => err(libc::EINVAL),
+            _ => unsafe { fcntl.command(cmd, arg) }.or_else(|| err(libc::EINVAL)),
         }
     }
 
@@ -6848,6 +7628,23 @@ unsafe fn read_hw(
         HwValue::Int(v) => v.to_ne_bytes().to_vec(),
         HwValue::Str(s) => [s.as_bytes(), b"\0"].concat(),
     };
+    unsafe { read_node(&bytes, false, oldp, oldlenp) }
+}
+
+/// Copies a read-only node's `bytes` out under the conventions [`read_hw`] lists. A `truncate`
+/// node is the exception xnu makes for strings a library call returns through `sysctl`
+/// (`sysctl_io_string` with `trunc`, bsd/kern/kern_newsysctl.c): a buffer too short for it but
+/// not empty gets as much as fits, ended with a NUL, and the call succeeds.
+///
+/// # Safety
+/// As for [`read_hw`].
+#[cfg(target_os = "macos")]
+unsafe fn read_node(
+    bytes: &[u8],
+    truncate: bool,
+    oldp: *mut u8,
+    oldlenp: *mut usize,
+) -> Option<HostResult> {
     if oldlenp.is_null() {
         return if oldp.is_null() {
             ok(0)
@@ -6860,7 +7657,13 @@ unsafe fn read_hw(
             *oldlenp = bytes.len();
             return ok(0);
         }
-        if *oldlenp < bytes.len() {
+        let room = *oldlenp;
+        if truncate && room > 0 && room < bytes.len() {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), oldp, room - 1);
+            *oldp.add(room - 1) = 0;
+            return ok(0);
+        }
+        if room < bytes.len() {
             *oldlenp = 0;
             return err(libc::ENOMEM);
         }
@@ -6868,6 +7671,20 @@ unsafe fn read_hw(
         *oldlenp = bytes.len();
     }
     ok(0)
+}
+
+/// The `kern.*` name of a `{CTL_KERN, KERN_OSTYPE | KERN_OSRELEASE | KERN_VERSION |
+/// KERN_HOSTNAME}` MIB (`<sys/sysctl.h>`), the fixed MIBs of the nodes macOS's `uname` reads
+/// (Libc gen/uname.c).
+#[cfg(target_os = "macos")]
+fn kern_name_of(mib: &[c_int]) -> Option<&'static str> {
+    match *mib {
+        [libc::CTL_KERN, libc::KERN_OSTYPE] => Some("kern.ostype"),
+        [libc::CTL_KERN, libc::KERN_OSRELEASE] => Some("kern.osrelease"),
+        [libc::CTL_KERN, libc::KERN_VERSION] => Some("kern.version"),
+        [libc::CTL_KERN, libc::KERN_HOSTNAME] => Some("kern.hostname"),
+        _ => None,
+    }
 }
 
 /// `CTL_NET` (4, `<sys/sysctl.h>`): the network top-level MIB (man 3 sysctl).
@@ -6934,6 +7751,25 @@ fn build_iflist2(nics: &[NicSnapshot]) -> Vec<u8> {
         put(msg, 96, c.rx_dropped); // ifi_iqdrops
     }
     out
+}
+
+/// The first processor's entry of the machine's `/proc/cpuinfo`, without the blank line that ends
+/// it, read once, bypassing any sim.
+#[cfg(target_os = "linux")]
+fn machine_cpuinfo_entry() -> Option<&'static str> {
+    static ENTRY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ENTRY
+        .get_or_init(|| {
+            let text = snare_interpose::real(|| std::fs::read_to_string("/proc/cpuinfo")).ok()?;
+            text.split("\n\n")
+                .find(|entry| {
+                    entry
+                        .split_once(':')
+                        .is_some_and(|(key, _)| key.trim() == "processor")
+                })
+                .map(str::to_owned)
+        })
+        .as_deref()
 }
 
 /// Render a CPU set in the kernel's cpulist format: sorted, deduplicated, consecutive runs
@@ -7080,7 +7916,13 @@ impl crate::fabric::ForeignUdp for SimHost {
             }
         }
         let reached = copies.len();
-        state.udp_land(copies, data, src, now);
+        state.udp_land(
+            copies,
+            data,
+            src,
+            now,
+            crate::ancillary::Header::plain(dest.ip()),
+        );
         drop(state);
         regs.shared.bump_keys(keys.as_slice());
         reached

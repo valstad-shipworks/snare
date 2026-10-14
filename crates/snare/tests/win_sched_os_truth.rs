@@ -312,8 +312,9 @@ fn power_throttling_reads_back() {
     );
 }
 
-/// The machine's CPU sets: each record's (size, type, id, group, logical processor, core).
-fn cpu_sets() -> Vec<(u32, u32, u32, u16, u8, u8)> {
+/// The machine's CPU sets: each record's (size, type, id, group, logical processor, core,
+/// last-level cache).
+fn cpu_sets() -> Vec<(u32, u32, u32, u16, u8, u8, u8)> {
     let mut need = 0u32;
     unsafe { SetLastError(0) };
     let first = unsafe {
@@ -338,6 +339,7 @@ fn cpu_sets() -> Vec<(u32, u32, u32, u16, u8, u8)> {
             u16::from_ne_bytes([buf[at + 12], buf[at + 13]]),
             buf[at + 14],
             buf[at + 15],
+            buf[at + 16],
         ));
         at += word(at) as usize;
     }

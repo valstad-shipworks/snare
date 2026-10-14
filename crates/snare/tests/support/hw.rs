@@ -816,7 +816,11 @@ pub mod linux {
                 .driver(d.driver, d.version)
                 .bus_info(d.bus_info)
                 .firmware(d.fw_version)
-                .expansion_rom(d.erom_version);
+                .expansion_rom(d.erom_version)
+                .private_flags_count(d.n_priv_flags)
+                .self_test_count(d.testinfo_len)
+                .eeprom_len(d.eedump_len)
+                .register_dump_len(d.regdump_len);
         }
         if let Ok(ts) = ts_info(iface) {
             nic = nic

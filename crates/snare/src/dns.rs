@@ -8,7 +8,6 @@
 //! single mutex is only ever taken under [`snare_interpose::real`] and never held across a wait,
 //! so a lookup's simulated latency never blocks another thread's table edit.
 
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,6 +15,7 @@ use std::time::Duration;
 
 use snare_interpose::{Lookup, Resolver, Reverse};
 
+use crate::HashMap;
 use crate::events::{Fault, RecordedEvent};
 use crate::readiness::{Deadline, readiness};
 use crate::scope::SimShared;

@@ -423,6 +423,7 @@ fn timers_listing_names_owners_and_hints_drain_once() {
             ]
         );
         assert_eq!(exec.timers(1).len(), 1);
+        assert_eq!(exec.timer_count(), 2);
         assert_eq!(exec.drain_hints(), vec![(Arc::from("rx"), 0.5)]);
         assert!(exec.drain_hints().is_empty(), "hints drain once");
         assert_eq!(jump(&exec, Duration::from_secs(1)), 1);

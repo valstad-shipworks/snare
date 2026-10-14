@@ -6,6 +6,11 @@ use std::time::Duration;
 
 use snare::Sim;
 
+#[path = "support/shared_port.rs"]
+mod shared_port;
+
+use shared_port::udp_reuse;
+
 fn receive(socket: &UdpSocket, expected: &[u8]) {
     let mut data = [0u8; 16];
     assert_eq!(socket.recv(&mut data).unwrap(), expected.len());
@@ -33,9 +38,9 @@ fn shared_port_delivery_preserves_exact_wildcard_and_family_selection() {
             let unrelated: Vec<_> = (20_000..20_128)
                 .map(|port| UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).unwrap())
                 .collect();
-            let wildcard = UdpSocket::bind("0.0.0.0:9400").unwrap();
-            let exact = UdpSocket::bind("127.0.0.1:9400").unwrap();
-            let other = UdpSocket::bind("127.0.0.2:9400").unwrap();
+            let wildcard = udp_reuse("0.0.0.0:9400").unwrap();
+            let exact = udp_reuse("127.0.0.1:9400").unwrap();
+            let other = udp_reuse("127.0.0.2:9400").unwrap();
             let ipv6 = UdpSocket::bind("[::1]:9400").unwrap();
             let other_port = UdpSocket::bind("0.0.0.0:9401").unwrap();
             let sender = UdpSocket::bind("127.0.0.1:9500").unwrap();
@@ -63,7 +68,7 @@ fn shared_port_delivery_preserves_exact_wildcard_and_family_selection() {
             sender.send_to(b"alias", "127.0.0.1:9400").unwrap();
             receive(&alias, b"alias");
             drop(alias);
-            let replacement = UdpSocket::bind("127.0.0.1:9400").unwrap();
+            let replacement = udp_reuse("127.0.0.1:9400").unwrap();
             sender.send_to(b"rebound", "127.0.0.1:9400").unwrap();
             receive(&replacement, b"rebound");
             for socket in unrelated {
@@ -89,8 +94,8 @@ fn delivery_run(
         } else {
             "127.0.0.1:9600"
         };
-        let receiver = UdpSocket::bind(bound).unwrap();
-        let extra = shared_port.then(|| UdpSocket::bind("127.0.0.2:9600").unwrap());
+        let receiver = udp_reuse(bound).unwrap();
+        let extra = shared_port.then(|| udp_reuse("127.0.0.2:9600").unwrap());
         let sender = UdpSocket::bind("127.0.0.1:9601").unwrap();
         receiver.set_nonblocking(true).unwrap();
         if faults {

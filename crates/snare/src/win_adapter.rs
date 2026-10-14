@@ -28,7 +28,7 @@
 //! changes are made after it is released, since they wake waiters (the README's wake-after-unlock
 //! rule).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -48,6 +48,7 @@ use windows_sys::Win32::System::Registry::{
     KEY_WRITE, REG_BINARY, REG_CREATED_NEW_KEY, REG_DWORD, REG_OPENED_EXISTING_KEY, REG_SZ,
 };
 
+use crate::HashMap;
 use crate::netif::NicSnapshot;
 use crate::readiness::Deadline;
 use crate::scope::SimShared;

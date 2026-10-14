@@ -39,6 +39,23 @@ jobs:
         with:
           key: ${{ matrix.platform.target }}
 
+      # ring (through the quinn and rcgen dev-dependencies) builds its aarch64 Windows code with
+      # the clang it finds on PATH. The image's LLVM is used where it is installed; otherwise the
+      # Windows-on-Arm release is installed.
+      - name: Clang on PATH (Windows ARM64)
+        if: matrix.platform.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          if (Get-Command clang -ErrorAction SilentlyContinue) { clang --version; exit 0 }
+          $llvm = 'C:\Program Files\LLVM\bin'
+          if (-not (Test-Path "$llvm\clang.exe")) {
+            $installer = "$env:RUNNER_TEMP\llvm-woa64.exe"
+            Invoke-WebRequest https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/LLVM-20.1.8-woa64.exe -OutFile $installer
+            Start-Process $installer -ArgumentList '/S' -Wait
+          }
+          & "$llvm\clang.exe" --version
+          Add-Content $env:GITHUB_PATH $llvm
+
       - name: Cargo check
         run: cargo check --workspace --all-targets --target ${{ matrix.platform.target }}
 

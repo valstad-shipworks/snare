@@ -9,12 +9,12 @@
 //! Apple Libinfo's on macOS (`gen.subproj/getifaddrs.c`, built from the `NET_RT_IFLIST` sysctl).
 //! One block per call lets [`release`] free it with a single `free`.
 
-use std::collections::HashSet;
 use std::ffi::{c_char, c_void};
 use std::mem::size_of;
 use std::net::IpAddr;
 use std::sync::Mutex;
 
+use crate::HashSet;
 use crate::netif::{IpNet, NicSnapshot};
 
 /// The blocks this module handed out and the caller has not freed yet, by address. Process-wide,
@@ -26,7 +26,7 @@ static BLOCKS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 fn remember(block: *mut u8) {
     let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
     blocks
-        .get_or_insert_with(HashSet::new)
+        .get_or_insert_with(HashSet::default)
         .insert(block as usize);
 }
 

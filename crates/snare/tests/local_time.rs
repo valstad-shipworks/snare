@@ -209,6 +209,85 @@ fn deterministic_runs_read_the_zone_alike() {
     assert_eq!(a.0, 11 * 3600);
 }
 
+/// With a negative `tm_isdst`, a local time that occurs twice resolves as the C library resolves
+/// it: glibc keeps the offset its previous mktime found and tries it first, which the sim keeps
+/// per sim; tzcode bisects, and for 2024-11-03 01:30 in New York finds daylight time.
+#[test]
+fn mktime_resolves_a_repeated_local_time_as_the_c_library() {
+    let make = |mon: i32, mday: i32, hour: i32, min: i32| {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        tm.tm_year = 124;
+        tm.tm_mon = mon;
+        tm.tm_mday = mday;
+        tm.tm_hour = hour;
+        tm.tm_min = min;
+        tm.tm_isdst = -1;
+        unsafe { libc::mktime(&mut tm) }
+    };
+    let (after_winter, after_summer) = with_env(&[("TZ", "America/New_York")]).run(|| {
+        make(0, 15, 12, 0);
+        let after_winter = make(10, 3, 1, 30);
+        make(6, 15, 12, 0);
+        (after_winter, make(10, 3, 1, 30))
+    });
+    let (daylight, standard) = (1_730_611_800, 1_730_615_400);
+    if cfg!(target_os = "linux") {
+        assert_eq!((after_winter, after_summer), (standard, daylight));
+    } else {
+        assert_eq!((after_winter, after_summer), (daylight, daylight));
+    }
+}
+
+fn strftime(format: &CStr, tm: &libc::tm) -> String {
+    let mut buf = [0 as libc::c_char; 128];
+    let n = unsafe { libc::strftime(buf.as_mut_ptr(), buf.len(), format.as_ptr(), tm) };
+    let text = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy();
+    text[..n].to_string()
+}
+
+/// strftime(3) reads the zone for `%Z` of a `struct tm` without a zone name, for `%s`, and on
+/// macOS for `%z`, which ignores `tm_gmtoff` there.
+#[test]
+fn strftime_reads_the_sims_zone() {
+    let (names, seconds, offsets) = with_env(&[("TZ", "Asia/Tokyo")]).run(|| {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        tm.tm_year = 123;
+        tm.tm_mon = 10;
+        tm.tm_mday = 15;
+        tm.tm_hour = 7;
+        tm.tm_min = 13;
+        tm.tm_sec = 20;
+        tm.tm_gmtoff = 3600;
+        let names = strftime(c"%Z", &tm);
+        let offsets = strftime(c"%z", &tm);
+        tm.tm_isdst = -1;
+        (names, strftime(c"%s", &tm), offsets)
+    });
+    assert_eq!((names.as_str(), seconds.as_str()), ("JST", "1700000000"));
+    let expected = if cfg!(target_os = "macos") {
+        "+0900"
+    } else {
+        "+0100"
+    };
+    assert_eq!(offsets, expected);
+}
+
+/// The C library's `tzname` follows the zone of the last time converted, which a sim keeps as
+/// its own: after converting a time from before the first transition, `%Z` of a standard time
+/// without a zone name is the zone's local mean time.
+#[test]
+fn strftime_names_follow_the_sims_conversions() {
+    let (before, after) = with_env(&[("TZ", "America/New_York")]).run(|| {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        tm.tm_year = 124;
+        tm.tm_mday = 1;
+        let before = strftime(c"%Z", &tm);
+        local(-3_000_000_000);
+        (before, strftime(c"%Z", &tm))
+    });
+    assert_eq!((before.as_str(), after.as_str()), ("EST", "LMT"));
+}
+
 #[test]
 fn time_reads_the_virtual_realtime_clock() {
     let (t, stored, now) = Sim::builder().fixed_epoch().build().run(|| {

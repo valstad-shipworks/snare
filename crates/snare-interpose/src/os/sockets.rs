@@ -37,6 +37,15 @@ macro_rules! slot {
 
 slot!(SOCKET);
 slot!(SOCKETPAIR);
+slot!(PIPE);
+#[cfg(target_os = "linux")]
+slot!(PIPE2);
+slot!(FORK);
+slot!(SPAWN_ADDDUP2);
+slot!(POSIX_SPAWN);
+slot!(POSIX_SPAWNP);
+#[cfg(target_os = "macos")]
+slot!(SPAWN_ADDINHERIT);
 slot!(CONNECT);
 slot!(BIND);
 slot!(LISTEN);
@@ -74,6 +83,8 @@ slot!(ACCEPT4);
 #[cfg(target_os = "linux")]
 slot!(EVENTFD);
 #[cfg(target_os = "linux")]
+slot!(SIGNALFD);
+#[cfg(target_os = "linux")]
 slot!(EPOLL_CREATE1);
 #[cfg(target_os = "linux")]
 slot!(EPOLL_CTL);
@@ -103,6 +114,23 @@ pub(crate) fn hooks() -> Vec<Hook> {
     vec![
         hook!("socket", socket, SOCKET),
         hook!("socketpair", socketpair, SOCKETPAIR),
+        hook!("pipe", pipe, PIPE),
+        #[cfg(target_os = "linux")]
+        hook!("pipe2", pipe2, PIPE2),
+        hook!("fork", fork, FORK).observed(),
+        hook!("posix_spawn", posix_spawn, POSIX_SPAWN).observed(),
+        hook!("posix_spawnp", posix_spawnp, POSIX_SPAWNP).observed(),
+        hook!(
+            "posix_spawn_file_actions_adddup2",
+            spawn_adddup2,
+            SPAWN_ADDDUP2
+        ),
+        #[cfg(target_os = "macos")]
+        hook!(
+            "posix_spawn_file_actions_addinherit_np",
+            spawn_addinherit,
+            SPAWN_ADDINHERIT
+        ),
         hook!("connect", connect, CONNECT),
         hook!("bind", bind, BIND),
         hook!("listen", listen, LISTEN),
@@ -148,6 +176,8 @@ pub(crate) fn hooks() -> Vec<Hook> {
         #[cfg(target_os = "linux")]
         hook!("eventfd", eventfd, EVENTFD),
         #[cfg(target_os = "linux")]
+        hook!("signalfd", signalfd, SIGNALFD),
+        #[cfg(target_os = "linux")]
         hook!("epoll_create1", epoll_create1, EPOLL_CREATE1),
         #[cfg(target_os = "linux")]
         hook!("epoll_ctl", epoll_ctl, EPOLL_CTL),
@@ -186,6 +216,27 @@ unsafe extern "C" fn eventfd(initval: libc::c_uint, flags: c_int) -> c_int {
     unsafe {
         original::<unsafe extern "C" fn(libc::c_uint, c_int) -> c_int>(&EVENTFD)(initval, flags)
     }
+}
+
+#[cfg(target_os = "linux")]
+/// Hook for `signalfd(2)` (Linux): a backend may mint a descriptor reading the domain's pending
+/// signals of `mask` (see [`crate::virtual_bits`]); otherwise observed and forwarded. A set that
+/// also names signals the domain leaves to the OS reads the domain's alone.
+unsafe extern "C" fn signalfd(fd: c_int, mask: *const libc::sigset_t, flags: c_int) -> c_int {
+    // SAFETY: a non-null `mask` points at the caller's signal set.
+    if let Some(set) = unsafe { mask.as_ref() }
+        && let Some(r) = domain::descriptor_transaction(|| {
+            let bits = crate::virtual_bits(set);
+            // SAFETY: no pointers.
+            dispatch_net(|net| unsafe { net.signalfd(fd, bits, flags) })
+        })
+    {
+        return finish(r) as c_int;
+    }
+    domain::observe("signalfd", None);
+    type SignalfdFn = unsafe extern "C" fn(c_int, *const libc::sigset_t, c_int) -> c_int;
+    // SAFETY: SIGNALFD holds libc's signalfd; the caller's arguments.
+    unsafe { original::<SignalfdFn>(&SIGNALFD)(fd, mask, flags) }
 }
 
 #[cfg(target_os = "linux")]
@@ -810,6 +861,139 @@ unsafe extern "C" fn socketpair(
     }
 }
 
+/// Hook for `pipe(2)`. A pipe stays a real descriptor; the calling thread's [`Net`](crate::Net)
+/// may make it, to keep track of it.
+unsafe extern "C" fn pipe(fds: *mut c_int) -> c_int {
+    // SAFETY: `fds` holds two writable ints.
+    if let Some(r) =
+        domain::descriptor_transaction(|| dispatch_net(|net| unsafe { net.pipe(fds, 0) }))
+    {
+        return finish(r) as c_int;
+    }
+    // SAFETY: PIPE holds libc's pipe.
+    unsafe { original::<unsafe extern "C" fn(*mut c_int) -> c_int>(&PIPE)(fds) }
+}
+
+/// Hook for `pipe2(2)`, as [`pipe`] with `flags` (`O_CLOEXEC`, `O_NONBLOCK`, `O_DIRECT`).
+#[cfg(target_os = "linux")]
+unsafe extern "C" fn pipe2(fds: *mut c_int, flags: c_int) -> c_int {
+    // SAFETY: `fds` holds two writable ints.
+    if let Some(r) =
+        domain::descriptor_transaction(|| dispatch_net(|net| unsafe { net.pipe(fds, flags) }))
+    {
+        return finish(r) as c_int;
+    }
+    // SAFETY: PIPE2 holds libc's pipe2.
+    unsafe { original::<unsafe extern "C" fn(*mut c_int, c_int) -> c_int>(&PIPE2)(fds, flags) }
+}
+
+/// Tells the calling thread's [`Net`](crate::Net) a child process may hold `fd`, or any
+/// descriptor with `None`.
+fn spawning(fd: Option<c_int>) {
+    dispatch_net(|net| {
+        net.spawning(fd);
+        None
+    });
+}
+
+/// Tells the calling thread's [`Net`](crate::Net) it made child process `pid`.
+fn spawned(pid: libc::pid_t) {
+    dispatch_net(|net| {
+        net.spawned(pid);
+        None
+    });
+}
+
+/// Hook for `fork(2)`: the child holds every descriptor of the process.
+unsafe extern "C" fn fork() -> libc::pid_t {
+    spawning(None);
+    domain::observe("fork", None);
+    let _spawn = crate::children::spawning();
+    // SAFETY: FORK holds libc's fork.
+    let pid = unsafe { original::<unsafe extern "C" fn() -> libc::pid_t>(&FORK)() };
+    if pid > 0 {
+        spawned(pid);
+    }
+    pid
+}
+
+type Spawn = unsafe extern "C" fn(
+    *mut libc::pid_t,
+    *const c_char,
+    *const c_void,
+    *const c_void,
+    *const *mut c_char,
+    *const *mut c_char,
+) -> c_int;
+
+/// Hook for `posix_spawn(3)`: tells the calling thread's [`Net`](crate::Net) the child it made.
+unsafe extern "C" fn posix_spawn(
+    pid: *mut libc::pid_t,
+    path: *const c_char,
+    actions: *const c_void,
+    attributes: *const c_void,
+    arguments: *const *mut c_char,
+    environment: *const *mut c_char,
+) -> c_int {
+    domain::observe("posix_spawn", None);
+    let _spawn = crate::children::spawning();
+    // SAFETY: POSIX_SPAWN holds libc's posix_spawn; the caller's arguments.
+    let made = unsafe {
+        original::<Spawn>(&POSIX_SPAWN)(pid, path, actions, attributes, arguments, environment)
+    };
+    if made == 0 && !pid.is_null() {
+        // SAFETY: posix_spawn wrote the child's pid there.
+        spawned(unsafe { *pid });
+    }
+    made
+}
+
+/// Hook for `posix_spawnp(3)`, as [`posix_spawn`].
+unsafe extern "C" fn posix_spawnp(
+    pid: *mut libc::pid_t,
+    file: *const c_char,
+    actions: *const c_void,
+    attributes: *const c_void,
+    arguments: *const *mut c_char,
+    environment: *const *mut c_char,
+) -> c_int {
+    domain::observe("posix_spawnp", None);
+    let _spawn = crate::children::spawning();
+    // SAFETY: POSIX_SPAWNP holds libc's posix_spawnp; the caller's arguments.
+    let made = unsafe {
+        original::<Spawn>(&POSIX_SPAWNP)(pid, file, actions, attributes, arguments, environment)
+    };
+    if made == 0 && !pid.is_null() {
+        // SAFETY: posix_spawnp wrote the child's pid there.
+        spawned(unsafe { *pid });
+    }
+    made
+}
+
+/// Hook for `posix_spawn_file_actions_adddup2(3)`: the child the actions make holds `fd`.
+unsafe extern "C" fn spawn_adddup2(actions: *mut c_void, fd: c_int, newfd: c_int) -> c_int {
+    spawning(Some(fd));
+    // SAFETY: SPAWN_ADDDUP2 holds libc's posix_spawn_file_actions_adddup2; the caller's actions.
+    unsafe {
+        original::<unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int>(&SPAWN_ADDDUP2)(
+            actions, fd, newfd,
+        )
+    }
+}
+
+/// Hook for `posix_spawn_file_actions_addinherit_np` (macOS): the child the actions make
+/// inherits `fd`.
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn spawn_addinherit(actions: *mut c_void, fd: c_int) -> c_int {
+    spawning(Some(fd));
+    // SAFETY: SPAWN_ADDINHERIT holds libc's posix_spawn_file_actions_addinherit_np.
+    unsafe {
+        original::<unsafe extern "C" fn(*mut c_void, c_int) -> c_int>(&SPAWN_ADDINHERIT)(
+            actions, fd,
+        )
+    }
+}
+
 /// Hook for `connect(2)`; a handled connect is an effect other threads see.
 unsafe extern "C" fn connect(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c_int {
     // man 2 connect: `len` is the sockaddr size; a nonblocking connect returns EINPROGRESS.
@@ -1013,6 +1197,12 @@ unsafe extern "C" fn shutdown(fd: c_int, how: c_int) -> c_int {
 /// Hook for `close(2)`. The file plane is asked first, then the network plane, each only for an
 /// fd it owns; another sim's socket is closed in the sim that made it (`domain::close_foreign`);
 /// a real fd closes without being observed.
+///
+/// A signal handler that cuts short a socket's linger (`SO_LINGER`) fails the close on macOS, the
+/// descriptor gone either way: XNU's `soclose_locked` (bsd/kern/uipc_socket.c) lingers in a sleep
+/// that catches signals and hands its error back, EINTR, and under `SA_RESTART` the call is made
+/// again on the descriptor it already freed, EBADF. Linux's `tcp_close` only stops lingering, and
+/// close returns 0. Measured on both; pinned by crates/snare/tests/signal_interrupts.rs.
 unsafe extern "C" fn close(fd: c_int) -> c_int {
     let real = || {
         let result = unsafe { original::<unsafe extern "C" fn(c_int) -> c_int>(&CLOSE)(fd) };
@@ -1026,6 +1216,7 @@ unsafe extern "C" fn close(fd: c_int) -> c_int {
             i64::from(result)
         }
     };
+    crate::signals::take_close_interrupted();
     let handled = domain::descriptor_transaction(|| {
         if let Some(FilePlane::Served(fs, serial)) = domain::file_plane(fd) {
             crate::owners::release_file_of(fd, serial);
@@ -1049,6 +1240,13 @@ unsafe extern "C" fn close(fd: c_int) -> c_int {
         crate::owners::forget_real(fd);
         Some(real())
     });
+    if let Some(restart) = crate::signals::take_close_interrupted()
+        && cfg!(target_os = "macos")
+    {
+        // SAFETY: setting the calling thread's errno.
+        unsafe { set_errno(if restart { libc::EBADF } else { libc::EINTR }) };
+        return -1;
+    }
     if let Some(result) = handled {
         return finish(result) as c_int;
     }
@@ -1283,6 +1481,11 @@ unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, len: size_t) -> ssize_t {
     {
         return finish(r) as ssize_t;
     }
+    if let Some(r) = dispatch_net(|net| net.await_readable(fd))
+        && r < 0
+    {
+        return finish(r) as ssize_t;
+    }
     // SAFETY: READ holds libc's read.
     unsafe {
         original::<unsafe extern "C" fn(c_int, *mut c_void, size_t) -> ssize_t>(&READ)(fd, buf, len)
@@ -1308,11 +1511,78 @@ unsafe extern "C" fn write(fd: c_int, buf: *const c_void, len: size_t) -> ssize_
         domain::note_effect("write");
         return finish(r) as ssize_t;
     }
-    // SAFETY: WRITE holds libc's write.
+    if len > 0
+        && let Some(r) = dispatch_net(|net| net.await_writable(fd))
+    {
+        if r < 0 {
+            return finish(r) as ssize_t;
+        }
+        // SAFETY: `buf` points to `len` readable bytes.
+        return finish(unsafe { write_pipe(fd, buf.cast(), len) }) as ssize_t;
+    }
+    // SAFETY: as below.
+    unsafe { real_write(fd, buf.cast(), len) }
+}
+
+/// libc's `write`.
+///
+/// # Safety
+/// `buf` points to `len` readable bytes.
+unsafe fn real_write(fd: c_int, buf: *const u8, len: usize) -> ssize_t {
+    // SAFETY: WRITE holds libc's write; the caller's buffer.
     unsafe {
         original::<unsafe extern "C" fn(c_int, *const c_void, size_t) -> ssize_t>(&WRITE)(
-            fd, buf, len,
+            fd,
+            buf.cast(),
+            len,
         )
+    }
+}
+
+/// A blocking write of the `len` bytes at `buf` to `fd`, a pipe the sim made that
+/// [`Net::await_writable`](crate::Net::await_writable) has just found room in: written
+/// `PIPE_BUF` bytes at a time, each once the pipe has room for it, so that every wait for room is
+/// one a signal handler interrupts. A write that small never blocks once the pipe polls writable:
+/// Linux reports `POLLOUT` with a free slot, which takes up to a page (fs/pipe.c `pipe_poll`,
+/// `pipe_write`), and XNU with `PIPE_BUF` bytes free (bsd/kern/sys_pipe.c `filt_pipewrite`).
+/// A wait a handler interrupts once some bytes are written ends the call with their count, as the
+/// hosts end a write cut short (man 7 pipe; measured on both). A wait the sim gives up as
+/// deadlocked leaves the rest to one write in the OS. Returns the count, or a negative errno.
+///
+/// # Safety
+/// `buf` points to `len` readable bytes.
+pub(crate) unsafe fn write_pipe(fd: c_int, buf: *const u8, len: usize) -> i64 {
+    let mut written = 0usize;
+    loop {
+        let chunk = (len - written).min(libc::PIPE_BUF);
+        // SAFETY: within the caller's buffer.
+        let r = unsafe { real_write(fd, buf.add(written), chunk) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+            return if written > 0 { written as i64 } else { -i64::from(e) };
+        }
+        written += r as usize;
+        if written >= len {
+            return written as i64;
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: one pollfd; a zero timeout.
+        if crate::real(|| unsafe { libc::poll(&mut pfd, 1, 0) }) > 0 {
+            continue;
+        }
+        match dispatch_net(|net| net.await_writable(fd)) {
+            Some(r) if r < 0 => return written as i64,
+            Some(_) => {}
+            None => {
+                // SAFETY: within the caller's buffer.
+                let r = unsafe { real_write(fd, buf.add(written), len - written) };
+                return written as i64 + r.max(0) as i64;
+            }
+        }
     }
 }
 
@@ -1366,10 +1636,12 @@ unsafe fn fcntl_inner(fd: c_int, cmd: c_int, arg: i64) -> c_int {
         Some(FilePlane::Gone) => return finish(-i64::from(libc::EBADF)) as c_int,
         None => {}
     }
-    // SAFETY: no pointer args for the fcntl commands a socket sees (flags, dup).
-    if let Some(r) = domain::dispatch_owned(fd, |net| unsafe { net.fcntl(fd, cmd, arg) })
-    {
-        return finish(r) as c_int;
+    // SAFETY: `arg` is what the caller passed for `cmd`, a pointer only for the commands that
+    // take one.
+    match domain::dispatch_owned_result(fd, |net| unsafe { net.fcntl(fd, cmd, arg) }) {
+        Some(crate::net::NetResult::Ok(value)) => return value as c_int,
+        Some(crate::net::NetResult::Err(errno)) => return finish(-i64::from(errno)) as c_int,
+        None => {}
     }
     // SAFETY: FCNTL holds libc's fcntl.
     unsafe { original::<FcntlFn>(&FCNTL)(fd, cmd, arg) }

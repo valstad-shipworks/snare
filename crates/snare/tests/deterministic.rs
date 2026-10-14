@@ -190,6 +190,25 @@ fn randomness_across_threads_replays() {
     assert_eq!(hashes.len(), 3);
 }
 
+/// std draws a thread's hash keys at its first `RandomState` and keeps them, so building the sim
+/// must not draw them on the thread that then runs it: the code under test's `HashMap` order there
+/// comes from the seed, as on a thread the sim was not built on.
+#[test]
+fn hash_order_on_the_thread_that_built_the_sim_comes_from_the_seed() {
+    let order = || {
+        let map: std::collections::HashMap<u32, ()> = (0..32).map(|i| (i, ())).collect();
+        map.into_keys().collect::<Vec<_>>()
+    };
+    let built_elsewhere = dsim(1);
+    let seeded = std::thread::spawn(move || built_elsewhere.run(order))
+        .join()
+        .unwrap();
+    let built_here = std::thread::spawn(move || dsim(1).run(order))
+        .join()
+        .unwrap();
+    assert_eq!(built_here, seeded);
+}
+
 /// A lock in static data, held most of the time by a thread outside every sim.
 #[cfg(target_os = "macos")]
 static HELD_OUTSIDE: Mutex<()> = Mutex::new(());
@@ -375,8 +394,16 @@ fn paused_det_parks_and_unmanaged_advance_releases_in_lineage_order() {
         let time = sim.time();
         sim.run(|| {
             let real = snare::real(Instant::now);
+            let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let controller = snare::real(|| {
+                let started = started.clone();
                 std::thread::spawn(move || {
+                    // A sleeper's thread can take longer than the 100 ms below to start on a
+                    // loaded machine; one that read the clock only after the advance would sleep
+                    // past it.
+                    while started.load(std::sync::atomic::Ordering::Acquire) < 4 {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
                     std::thread::sleep(Duration::from_millis(100));
                     time.advance(Duration::from_secs(1));
                 })
@@ -385,8 +412,10 @@ fn paused_det_parks_and_unmanaged_advance_releases_in_lineage_order() {
             let sleepers: Vec<_> = (0..4u64)
                 .map(|i| {
                     let log = log.clone();
+                    let started = started.clone();
                     std::thread::spawn(move || {
                         let start = Instant::now();
+                        started.fetch_add(1, std::sync::atomic::Ordering::Release);
                         std::thread::sleep(Duration::from_millis(10 * (4 - i)));
                         log.lock().unwrap().push((i, start.elapsed()));
                     })

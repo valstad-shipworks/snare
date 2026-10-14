@@ -15,13 +15,14 @@
 //! over `MaxSynRetransmissions`. Each point of the schedule is a virtual timer the sim can jump
 //! to, so a 127 s Linux connect timeout costs no wall time.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::c_int;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::HashMap;
 use crate::events::{Direction, Fault, RecordedEvent};
 use crate::netif::{Presence, Sender};
 use crate::pcapng::TcpTap;

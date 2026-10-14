@@ -20,12 +20,12 @@
 //! constant and struct below is the System V gABI's, as spelled in glibc's `elf/elf.h`. The
 //! `dlopen` hook calls [`patch_new_objects`] after each successful load.
 
-use std::collections::HashSet;
 use std::ffi::{CStr, c_int, c_void};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use super::record;
+use crate::HashSet;
 use crate::hooks::{self, Hook};
 use crate::state::Passthrough;
 
@@ -145,7 +145,7 @@ pub(crate) fn patch_new_objects() {
     unsafe { libc::dl_iterate_phdr(Some(collect), (&raw mut found).cast()) };
 
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    let seen = seen.get_or_insert_with(HashSet::new);
+    let seen = seen.get_or_insert_with(HashSet::default);
     for object in found {
         if !seen.insert(object.base) || object.is_system() {
             continue;

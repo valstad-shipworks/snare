@@ -39,6 +39,26 @@ fn err(errno: c_int) -> Option<HostResult> {
     Some(HostResult::Err(errno))
 }
 
+/// Copies `groups` out as `getgroups(2)` does: with `size` 0 only the count, `EINVAL` when `size`
+/// is negative or too small to hold them all.
+pub(crate) unsafe fn fill_groups(
+    groups: &[u32],
+    size: c_int,
+    list: *mut u32,
+) -> Option<HostResult> {
+    if size == 0 {
+        return ok(groups.len() as i64);
+    }
+    if size < 0 || (size as usize) < groups.len() {
+        return err(libc::EINVAL);
+    }
+    if list.is_null() {
+        return err(libc::EFAULT);
+    }
+    unsafe { std::ptr::copy_nonoverlapping(groups.as_ptr(), list, groups.len()) };
+    ok(groups.len() as i64)
+}
+
 /// The host's `RLIM_INFINITY` as snare's [`Rlimit::INFINITY`]: macOS uses `(1 << 63) - 1` and
 /// treats anything above it as infinite too (xnu bsd/kern/kern_resource.c `dosetrlimit` clamps
 /// to it).
@@ -630,6 +650,10 @@ impl ProcHost {
 }
 
 impl Host for ProcHost {
+    fn umask(&self, mask: Option<u32>) -> Option<HostResult> {
+        ok(i64::from(self.sys().umask(mask)))
+    }
+
     unsafe fn getrlimit(&self, resource: c_int, rlim: *mut u8) -> Option<HostResult> {
         unsafe { getrlimit(self.sys(), resource, rlim) }
     }

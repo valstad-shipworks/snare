@@ -444,15 +444,23 @@ fn synthetic_metadata_matches_proc_and_sysfs_os_truth() {
         .map(|path| {
             let named = std::fs::metadata(path).unwrap();
             let opened = std::fs::File::open(path).unwrap().metadata().unwrap();
+            // The process's own files are owned by whoever runs the test natively and by the
+            // sim's user inside it; both read as "own".
+            let euid = unsafe { libc::geteuid() };
             let fields = |value: &std::fs::Metadata| {
+                let (uid, gid) = if value.uid() == euid {
+                    (u32::MAX, u32::MAX)
+                } else {
+                    (value.uid(), value.gid())
+                };
                 (
                     value.mode(),
                     value.len(),
                     value.nlink(),
                     value.blocks(),
                     value.blksize(),
-                    value.uid(),
-                    value.gid(),
+                    uid,
+                    gid,
                 )
             };
             assert_eq!(fields(&named), fields(&opened), "{path}");
@@ -465,6 +473,7 @@ fn synthetic_metadata_matches_proc_and_sysfs_os_truth() {
     let sim = Sim::builder()
         .host(
             snare::HostProfile::new()
+                .root(unsafe { libc::geteuid() } == 0)
                 .nic(snare::Nic::new("eth0", 7))
                 .build(),
         )

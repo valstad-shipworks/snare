@@ -3,7 +3,9 @@
 //! order and close in the order they are closed, each one's datagram reaches only it; ephemeral
 //! UDP ports go lowest free first from 49152 and a freed port is the next one taken; thousands of
 //! TCP connections to one listener with an explicit large backlog are accepted in connect
-//! order, each from the next ephemeral port. The ephemeral range filling up is pinned too.
+//! order, each from the next ephemeral port. The ephemeral range filling up is pinned too, and so
+//! is a bind among ten thousand TCP and ten thousand UDP sockets colliding with exactly the
+//! socket of its own protocol on its port.
 //!
 //! The descriptors themselves are real ones `dup`ed from one placeholder, so their numbers belong
 //! to the process (other tests in the binary hold some) and only their distinctness is pinned. Each
@@ -176,6 +178,8 @@ fn ephemeral_udp_ports_go_lowest_free_first() {
     });
 }
 
+/// A wildcard's ephemeral port skips every port an address of its family holds, until the last
+/// socket there (and its alias) closes. A specific address skips the wildcard's port too.
 #[test]
 fn wildcard_ephemeral_ports_wait_for_the_last_address_and_alias() {
     Sim::new().run(|| {
@@ -194,23 +198,31 @@ fn wildcard_ephemeral_ports_wait_for_the_last_address_and_alias() {
         let wildcard = UdpSocket::bind("0.0.0.0:0").unwrap();
         assert_eq!(wildcard.local_addr().unwrap().port(), 49152);
         let specific = UdpSocket::bind("127.0.0.1:0").unwrap();
-        assert_eq!(specific.local_addr().unwrap().port(), 49152);
+        assert_eq!(specific.local_addr().unwrap().port(), 49153);
         drop(specific);
         let specific = UdpSocket::bind("127.0.0.1:0").unwrap();
-        assert_eq!(specific.local_addr().unwrap().port(), 49152);
+        assert_eq!(specific.local_addr().unwrap().port(), 49153);
     });
 }
 
+/// A dual-stack wildcard (std leaves `IPV6_V6ONLY` at the host's default, off on unix) takes a
+/// port free in both families, and an IPv4 wildcard skips the dual-stack one's; Windows' IPv6-only
+/// wildcard keeps to its own family. A specific address skips its own and its family's wildcard.
 #[test]
-fn wildcard_ephemeral_ports_are_independent_between_address_families() {
+fn wildcard_ephemeral_ports_span_both_families_for_dual_stack_sockets() {
+    let (v6_port, v4_port, v6_specific_port) = if cfg!(windows) {
+        (49152, 49153, 49153)
+    } else {
+        (49153, 49154, 49152)
+    };
     Sim::new().run(|| {
         let v4 = UdpSocket::bind("127.0.0.1:49152").unwrap();
         let v6 = UdpSocket::bind("[::]:0").unwrap();
-        assert_eq!(v6.local_addr().unwrap().port(), 49152);
+        assert_eq!(v6.local_addr().unwrap().port(), v6_port);
         let v4_wildcard = UdpSocket::bind("0.0.0.0:0").unwrap();
-        assert_eq!(v4_wildcard.local_addr().unwrap().port(), 49153);
+        assert_eq!(v4_wildcard.local_addr().unwrap().port(), v4_port);
         let v6_specific = UdpSocket::bind("[::1]:0").unwrap();
-        assert_eq!(v6_specific.local_addr().unwrap().port(), 49152);
+        assert_eq!(v6_specific.local_addr().unwrap().port(), v6_specific_port);
         drop(v4);
         let reused = UdpSocket::bind("0.0.0.0:0").unwrap();
         assert_eq!(reused.local_addr().unwrap().port(), 49152);
@@ -339,5 +351,33 @@ fn tcp_ephemeral_ports_never_repeat_a_live_connection() {
                 }
             }
         }
+    });
+}
+
+#[test]
+fn binds_among_ten_thousand_sockets_meet_only_those_on_their_port() {
+    raise_nofile();
+    Sim::new().run(|| {
+        let mut tcp: Vec<TcpListener> = (0..SOCKETS as u16)
+            .map(|i| TcpListener::bind(loopback(10_000 + i)).unwrap())
+            .collect();
+        let mut udp: Vec<UdpSocket> = (0..SOCKETS as u16)
+            .map(|i| UdpSocket::bind(loopback(30_000 + i)).unwrap())
+            .collect();
+        let in_use = |e: std::io::Error| e.kind() == ErrorKind::AddrInUse;
+        for port in [10_000, 15_000, 19_999] {
+            assert!(TcpListener::bind(loopback(port)).is_err_and(in_use));
+        }
+        for port in [30_000, 35_000, 39_999] {
+            assert!(UdpSocket::bind(loopback(port)).is_err_and(in_use));
+        }
+        let udp_beside_tcp = UdpSocket::bind(loopback(15_000)).unwrap();
+        let tcp_beside_udp = TcpListener::bind(loopback(35_000)).unwrap();
+        drop(tcp.remove(5_000));
+        drop(udp.remove(5_000));
+        let rebound = TcpListener::bind(loopback(15_000)).unwrap();
+        assert!(TcpListener::bind(loopback(15_000)).is_err_and(in_use));
+        assert!(UdpSocket::bind(loopback(35_000)).is_ok());
+        drop((udp_beside_tcp, tcp_beside_udp, rebound));
     });
 }

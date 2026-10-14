@@ -24,6 +24,8 @@ pub(crate) const CAP_NET_BIND_SERVICE: c_int = 10;
 pub(crate) const CAP_NET_ADMIN: c_int = 12;
 pub(crate) const CAP_NET_RAW: c_int = 13;
 pub(crate) const CAP_IPC_LOCK: c_int = 14;
+#[cfg(unix)]
+pub(crate) const CAP_SYS_ADMIN: c_int = 21;
 pub(crate) const CAP_SYS_NICE: c_int = 23;
 pub(crate) const CAP_SYS_RESOURCE: c_int = 24;
 
@@ -269,6 +271,13 @@ pub struct SysLimits {
     pub tcp_syn_linear_timeouts: u8,
     /// Maximum `listen` backlog (`net.core.somaxconn` on Linux, `kern.ipc.somaxconn` on macOS).
     pub listen_backlog_max: usize,
+    /// Whether a new IPv6 socket starts with `IPV6_V6ONLY` on, so that bound to the wildcard it
+    /// takes no IPv4 traffic (RFC 3493 §5.3): Linux `net.ipv6.bindv6only` and macOS
+    /// `net.inet6.ip6.v6only`, both off by default (Documentation/networking/ip-sysctl.rst; XNU
+    /// bsd/netinet6/in6_proto.c `ip6_v6only`). Windows has no such knob: an IPv6 socket is
+    /// IPv6-only until the option is cleared ([Microsoft Learn: Dual-Stack
+    /// Sockets](https://learn.microsoft.com/en-us/windows/win32/winsock/dual-stack-sockets)).
+    pub bindv6only: bool,
     /// Linux's maximum GSO skb size before protocol headers. Zero disables aggregation;
     /// the default is the legacy 65536-byte netdevice limit. Device-specific limits require
     /// a measured profile value; `from_real_host` does not read this driver setting.
@@ -347,6 +356,7 @@ impl SysLimits {
                 tcp_syn_retries: 6,
                 tcp_syn_linear_timeouts: 0,
                 listen_backlog_max: 128,
+                bindv6only: false,
                 tcp_gso_max_size: 0,
                 udp_rcvbuf_overshoot: false,
                 skb_small_truesize: 960,
@@ -366,6 +376,7 @@ impl SysLimits {
                 tcp_syn_retries: 6,
                 tcp_syn_linear_timeouts: 4,
                 listen_backlog_max: 4096,
+                bindv6only: false,
                 tcp_gso_max_size: 65536,
                 udp_rcvbuf_overshoot: false,
                 skb_small_truesize: 960,
@@ -385,6 +396,7 @@ impl SysLimits {
                 tcp_syn_retries: 6,
                 tcp_syn_linear_timeouts: 0,
                 listen_backlog_max: 200,
+                bindv6only: true,
                 tcp_gso_max_size: 0,
                 udp_rcvbuf_overshoot: false,
                 skb_small_truesize: 960,
@@ -447,6 +459,11 @@ impl SysLimits {
                 Err(error) => return Err(error),
             },
             listen_backlog_max: one("/proc/sys/net/core/somaxconn")?,
+            bindv6only: match one("/proc/sys/net/ipv6/bindv6only") {
+                Ok(value) => value != 0,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error),
+            },
             tcp_gso_max_size: stock.tcp_gso_max_size,
             udp_rcvbuf_overshoot: kernel_before(
                 &std::fs::read_to_string("/proc/sys/kernel/osrelease")?,
@@ -491,6 +508,7 @@ impl SysLimits {
             tcp_rmem_default: sysctl(c"net.inet.tcp.recvspace")?,
             tcp_wmem_default: sysctl(c"net.inet.tcp.sendspace")?,
             listen_backlog_max: sysctl(c"kern.ipc.somaxconn")?,
+            bindv6only: sysctl(c"net.inet6.ip6.v6only")? != 0,
             ..Self::host()
         })
     }
@@ -545,6 +563,22 @@ impl SysLimits {
     }
 }
 
+/// The uid of the first user a stock install creates: 1000 on Linux (`UID_MIN` in man 5
+/// login.defs), 501 on macOS (the uid the first account gets, as observed with `id -u` on
+/// macOS 26; Apple documents no source for it).
+#[cfg(unix)]
+pub(crate) const UNPRIVILEGED_UID: u32 = if cfg!(target_os = "macos") { 501 } else { 1000 };
+
+/// The primary group of that user: on Linux a group of its own with the same id (`USERGROUPS_ENAB`
+/// and `GID_MIN` in man 5 login.defs), on macOS `staff`, 20 (`id -g` on macOS 26).
+#[cfg(unix)]
+pub(crate) const UNPRIVILEGED_GID: u32 = if cfg!(target_os = "macos") { 20 } else { 1000 };
+
+/// The umask a sim starts with: 022, "the typical default value for the process umask" (man 2
+/// umask), and what a login shell on Linux and macOS sets.
+#[cfg(unix)]
+const DEFAULT_UMASK: u32 = 0o022;
+
 /// One sim's privileges and limits.
 pub(crate) struct SysConfig {
     privileges: Mutex<Privileges>,
@@ -552,6 +586,13 @@ pub(crate) struct SysConfig {
     /// The memory the code under test has locked, charged against `RLIMIT_MEMLOCK`.
     #[cfg(unix)]
     wired: Mutex<crate::proclimits::Wired>,
+    /// The sim's file mode creation mask (man 2 umask).
+    #[cfg(unix)]
+    umask: std::sync::atomic::AtomicU32,
+    /// A `SimHost` says who the code under test is (`geteuid` and the rest); without one the
+    /// sim reports the real process's ids.
+    #[cfg(unix)]
+    identity: std::sync::atomic::AtomicBool,
 }
 
 impl SysConfig {
@@ -562,7 +603,42 @@ impl SysConfig {
             limits: Mutex::new(SysLimits::host()),
             #[cfg(unix)]
             wired: Mutex::new(crate::proclimits::Wired::default()),
+            #[cfg(unix)]
+            umask: std::sync::atomic::AtomicU32::new(DEFAULT_UMASK),
+            #[cfg(unix)]
+            identity: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// `umask(2)`: sets the mask to `mask` (`None` leaves it) and returns the one before.
+    #[cfg(unix)]
+    pub(crate) fn umask(&self, mask: Option<u32>) -> u32 {
+        use std::sync::atomic::Ordering;
+        match mask {
+            Some(mask) => self.umask.swap(mask & 0o777, Ordering::AcqRel),
+            None => self.umask.load(Ordering::Acquire),
+        }
+    }
+
+    /// Marks the ids as modelled by a `SimHost`.
+    #[cfg(unix)]
+    pub(crate) fn model_identity(&self) {
+        self.identity
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The effective uid and gid the code under test sees: root's or the unprivileged user's
+    /// under a `SimHost`, as its `geteuid` reports, else `None` for the real process's.
+    #[cfg(unix)]
+    pub(crate) fn identity(&self) -> Option<(u32, u32)> {
+        if !self.identity.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        Some(if self.privileges().root {
+            (0, 0)
+        } else {
+            (UNPRIVILEGED_UID, UNPRIVILEGED_GID)
+        })
     }
 
     /// The locked-memory table, locked. Taken with no other snare lock held.

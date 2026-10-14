@@ -107,8 +107,10 @@ pub(crate) struct Inner {
     #[allow(dead_code)] // read once the Host symbol hooks land
     host: Option<Arc<dyn Host>>,
     /// The environment-variable backend; see [`dispatch_env`].
-    #[cfg_attr(not(unix), allow(dead_code))]
     env: Option<Arc<dyn Env>>,
+    /// The domain's own time zone; see [`DomainBuilder::time_zone`].
+    #[cfg(windows)]
+    time_zone: Option<Arc<crate::os::tz_windows::Zone>>,
     /// The name-lookup backend; see [`dispatch_resolver`].
     resolver: Option<Arc<dyn Resolver>>,
     /// The signal-disposition table; see [`dispatch_signals`]. Without one, signals aimed at the
@@ -118,14 +120,10 @@ pub(crate) struct Inner {
     injected: AtomicU64,
     /// How many times a thread has entered the domain ([`Domain::enter`]), for root lineages.
     entries: AtomicU64,
-    /// Signals `pthread_kill` aimed at another of the domain's threads, by lineage, as bitmasks
-    /// with bit `n` for signal `n` (see `post_signal`).
-    #[cfg_attr(not(unix), allow(dead_code))]
-    thread_signals: Mutex<std::collections::HashMap<u64, u64>>,
-    /// Whether `thread_signals` may be non-empty: a lock-free fast check so every hooked call
-    /// (see [`drain_signals`]) need not take the lock.
-    #[cfg_attr(not(unix), allow(dead_code))]
-    signals_pending: AtomicBool,
+    /// The threads' signal masks and the signals pending for them or the process; see
+    /// [`crate::signals::State`].
+    #[cfg(unix)]
+    signal_state: crate::signals::State,
     /// Every unmodelled call the domain's threads made, with its count; see [`observe`].
     unmodelled: Mutex<BTreeMap<Unmodelled, u64>>,
     /// Count of the participants this domain currently manages — the basis for quiescence
@@ -139,6 +137,10 @@ pub(crate) struct Inner {
     /// Of `parked`, the participants in a sim wait: one that gives up once the domain is quiescent
     /// with no time left to pass. The rest wait natively (a join, a lock) and never give up.
     sim_parked: AtomicUsize,
+    /// How many of its backends' waiters a readiness bump woke and have yet to re-check, as the
+    /// backends count them ([`settling_gauge`]): while any has, the domain is not quiescent, and
+    /// the waiter that re-checks last moves the epoch if it waits on.
+    settling: Arc<AtomicUsize>,
     /// Participants caught in a spin (see [`clock_spin`]): running, but waiting on time like the
     /// parked ones. Not counted in `parked`, so no sim wait takes the domain for quiescent while
     /// one spins.
@@ -167,12 +169,19 @@ pub(crate) struct Inner {
     /// Places another sim made ready for this domain's threads that are to follow descriptors
     /// handed over to it, by lineage (see `follow`).
     #[cfg_attr(not(unix), allow(dead_code))]
-    followers: Mutex<std::collections::HashMap<u64, SendInherited>>,
+    followers: Mutex<crate::HashMap<u64, SendInherited>>,
     /// The threads blocked on one of the domain's descriptors (see [`fd_wait`]).
     #[cfg_attr(not(unix), allow(dead_code))]
     fd_waits: Mutex<Vec<follow::FdWaiter>>,
     /// Values kept for the life of the sim by type (see [`sim_local`]).
     locals: Mutex<SimLocals>,
+    /// Whether a library's process-wide state ties the domain to another sim (see
+    /// [`share_statics`]).
+    shares_statics: AtomicBool,
+    /// While the domain is quiescent and shares statics, the threads of other sims a time skip
+    /// waits on, with the epoch it was quiescent at and whether one was still pending when last
+    /// asked (see [`Inner::skip_held_off`]).
+    skip_holders: Mutex<(Option<u64>, Holders, bool)>,
 }
 
 impl Drop for Inner {
@@ -260,7 +269,49 @@ impl Inner {
 
     /// The first layer's answer to [`Layer::idle_wait`]; see the free [`idle_wait`].
     fn idle_wait(&self) -> Option<std::time::Duration> {
-        self.layers.iter().find_map(|layer| layer.idle_wait())
+        self.layers
+            .iter()
+            .find_map(|layer| layer.idle_wait())
+            .or_else(|| self.skip_pending().then_some(HOLDER_POLL))
+    }
+
+    /// Whether a time skip of the domain, quiescent as it is, waits on threads of other sims: it
+    /// shares a library's process-wide state with them, and a thread of another sim running as it
+    /// became quiescent may still be carrying a wake to it that it has yet to make (tokio's signal
+    /// listeners: whichever runtime's driver drains its signal pipe first takes the process-wide
+    /// record of the signal and wakes every runtime's listeners, this one's from its own thread).
+    /// The threads are those [`Holders`] follows, listed again whenever the epoch moves. Called
+    /// under passthrough.
+    fn skip_held_off(&self) -> bool {
+        if !self.shares_statics.load(Ordering::SeqCst) {
+            return false;
+        }
+        let epoch = self.accounting.epoch();
+        let mut held = self
+            .skip_holders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (at, holders, pending) = &mut *held;
+        if *at != Some(epoch) {
+            *at = Some(epoch);
+            holders.begin(self.accounting.serial.0);
+            *pending = true;
+        }
+        *pending = *pending && holders.pending();
+        *pending
+    }
+
+    /// Whether the last [`skip_held_off`](Self::skip_held_off) found a thread to wait on, and the
+    /// domain is still at that epoch.
+    fn skip_pending(&self) -> bool {
+        if !self.shares_statics.load(Ordering::SeqCst) {
+            return false;
+        }
+        let held = self
+            .skip_holders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        held.2 && held.0 == Some(self.accounting.epoch())
     }
 
     /// The virtual and real time a thread's row changes state at, kept only while an executive is
@@ -364,6 +415,18 @@ impl Inner {
         }
         let live = self.participants.load(Ordering::SeqCst);
         live > 0 && self.parked.load(Ordering::SeqCst) >= live
+    }
+
+    /// The epoch move for a participant parking with `parked` participants parked once it has, or
+    /// waking with `parked` parked until it did: only one that may leave every participant
+    /// parked, or end that, can change quiescence and moves the epoch. Under a deterministic
+    /// schedule, whose idleness the parked count does not tell, every one does.
+    fn counted_move(&self, parked: usize) -> EpochBump {
+        if self.sched.is_some() || parked >= self.participants.load(Ordering::SeqCst) {
+            self.accounting.bump()
+        } else {
+            self.accounting.stir()
+        }
     }
 
     /// Whether a participant the OS has released from a native wait (woken on its address, or its
@@ -526,8 +589,17 @@ impl Domain {
             previous_class: accounting::swap_class(ThreadClass::Participant, None),
             previous_held: ptr::null(),
             previous_followable: follow::set_followable(false),
+            previous_root: swap_root(true),
+            #[cfg(unix)]
+            previous_mask: 0,
             _not_send: PhantomData,
         };
+        #[cfg(unix)]
+        if self.0.signals.is_some() {
+            let mask = crate::signals::real_mask();
+            managed.previous_mask =
+                crate::signals::joined(&self.0.signal_state, thread_lineage(), true, mask);
+        }
         self.0
             .accounting
             .record_handle(crate::os::current_thread_handle(), thread_lineage());
@@ -763,9 +835,10 @@ impl Domain {
             .collect()
     }
 
-    /// A counter that moves on whenever the domain's quiescence may have changed: a participant
-    /// parking or waking, a class change, a lease taken or given back, a deterministic schedule
-    /// going idle.
+    /// A counter that moves on whenever the domain's quiescence may have changed: the last running
+    /// participant parking or the first waking (outside a deterministic schedule, a participant
+    /// parking or waking while another runs throughout cannot change it and leaves the epoch be),
+    /// a class change, a lease taken or given back, a deterministic schedule going idle.
     pub fn epoch(&self) -> u64 {
         self.0.accounting.epoch()
     }
@@ -799,7 +872,11 @@ impl Domain {
     /// timestamps, and with `audit` it logs effects and calls it cannot account for. `false` if an
     /// executive is already attached.
     pub fn attach_executive(&self, audit: bool) -> bool {
-        self.0.accounting.attach(audit)
+        let attached = self.0.accounting.attach(audit);
+        if attached && let Some(sched) = &self.0.sched {
+            sched.take_unexplained();
+        }
+        attached
     }
 
     /// Ends an executive's ownership: an open timestamp's gate opens and its baton is let go.
@@ -954,6 +1031,34 @@ impl Domain {
         }
     }
 
+    /// [`quiescence`](Self::quiescence) while a participant runs outside a deterministic schedule,
+    /// which needs no caller's lock: whether a waiter is still waking cannot matter then. `None`
+    /// when that is not so, for the caller to ask [`quiescence`](Self::quiescence).
+    pub fn busy_quiescence(&self) -> Option<Quiescence> {
+        let running = |inner: &Inner| {
+            let parked = inner.parked.load(Ordering::SeqCst);
+            let live = inner.participants.load(Ordering::SeqCst);
+            (parked < live).then_some((parked, live))
+        };
+        if self.0.sched.is_some() {
+            return None;
+        }
+        running(&self.0)?;
+        let _passthrough = Passthrough::enter();
+        let core = self.0.accounting.core();
+        let epoch = self.0.accounting.epoch();
+        let (parked, live) = running(&self.0)?;
+        Some(Quiescence {
+            quiescent: false,
+            epoch,
+            runnable: u32::try_from(live - parked).unwrap_or(u32::MAX),
+            busy: u32::try_from(self.0.accounting.lease_count()).unwrap_or(u32::MAX),
+            blocked: u32::try_from(parked).unwrap_or(u32::MAX),
+            next_deadline: None,
+            blocker: Some((BlockerKind::Runnable, self.0.first_running(&core))),
+        })
+    }
+
     /// Every participant's row, then one row per lease. Times are on the domain's monotonic
     /// clock as its layers report it.
     pub fn participants(&self) -> Vec<ParticipantInfo> {
@@ -1014,7 +1119,18 @@ impl Domain {
     /// sim sees (an effect of one of its threads, a move of its epoch) happened before the wake.
     /// Counted with or without an audit.
     pub fn outside_wakes(&self) -> u64 {
+        self.count_unexplained_wakes();
         self.0.accounting.outside_wakes()
+    }
+
+    /// Counts the progress a deterministic schedule's re-polls found that no wake of its own has
+    /// explained by now as outside wakes.
+    fn count_unexplained_wakes(&self) {
+        if let Some(sched) = &self.0.sched {
+            self.0
+                .accounting
+                .count_outside_wakes(sched.take_unexplained());
+        }
     }
 
     /// The domain's id, unique in the process.
@@ -1027,6 +1143,12 @@ impl Domain {
         self.0.accounting.os_threads()
     }
 
+    /// The CPU time the participants outside any wait have used so far, summed; `None` where a
+    /// thread's cannot be read.
+    pub(crate) fn running_cpu_time(&self) -> Option<std::time::Duration> {
+        self.0.accounting.running_cpu_time()
+    }
+
     /// Whether a live thread of the domain holds the pthread mutex at `mutex`.
     #[cfg(target_os = "macos")]
     pub(crate) fn holds_native_mutex(&self, mutex: usize) -> bool {
@@ -1035,6 +1157,7 @@ impl Domain {
 
     /// What the audit has seen since the executive attached (empty without audit).
     pub fn audit(&self) -> AuditReport {
+        self.count_unexplained_wakes();
         self.0.accounting.audit_report()
     }
 
@@ -1059,6 +1182,7 @@ impl Domain {
         };
         let settling = inner.settling();
         let moved = inner.quiescent(settling)
+            && !inner.skip_held_off()
             && (inner.layers.iter().any(|layer| layer.try_time_skip())
                 || (inner.stalled(settling)
                     && inner
@@ -1094,7 +1218,7 @@ impl Domain {
     pub(crate) fn progress(&self) -> crate::stall::Progress {
         let _passthrough = Passthrough::enter();
         let waits = self.0.sched.as_ref().map_or(0, |sched| sched.lock().waits);
-        (self.0.accounting.epoch(), self.0.virtual_now(), waits)
+        (self.0.accounting.activity(), self.0.virtual_now(), waits)
     }
 
     /// The name of the participant holding a deterministic schedule's baton, if one does.
@@ -1149,6 +1273,8 @@ impl Domain {
             label: None,
             lineage,
             held,
+            #[cfg(unix)]
+            signal_mask: 0,
         });
         let spawned = real(|| {
             std::thread::Builder::new()
@@ -1161,6 +1287,10 @@ impl Domain {
                     }
                     // SAFETY: made above for this thread alone.
                     let child = unsafe { adopt(inherited.0) };
+                    #[cfg(unix)]
+                    if let Some(domain) = signal_domain() {
+                        crate::signals::mark_injected(domain.state(), lineage);
+                    }
                     // Parking and unparking at once passes an open timestamp's gate (see
                     // `unpark`); a deterministic schedule holds the thread in `started` instead.
                     if domain_sched_free() {
@@ -1182,6 +1312,14 @@ impl Domain {
             unsafe { drop(Arc::from_raw(raw)) };
         }
         spawned
+    }
+
+    /// Whether a signal `sig` sent to the domain's process now would stay pending or go to a
+    /// thread's `sigwait`: every thread of the domain blocks it, or one waits for it. `false` for
+    /// a domain without a signal table.
+    #[cfg(unix)]
+    pub fn holds_signal(&self, sig: core::ffi::c_int) -> bool {
+        self.0.signals.is_some() && self.0.signal_state.holds(sig)
     }
 
     /// The domain managing the calling thread.
@@ -1214,8 +1352,9 @@ pub struct DomainBuilder {
     fs: Option<Arc<dyn Fs>>,
     #[cfg_attr(not(unix), allow(dead_code))]
     host: Option<Arc<dyn Host>>,
-    #[cfg_attr(not(unix), allow(dead_code))]
     env: Option<Arc<dyn Env>>,
+    #[cfg(windows)]
+    time_zone: Option<Arc<crate::os::tz_windows::Zone>>,
     resolver: Option<Arc<dyn Resolver>>,
     signals: Option<Arc<dyn Signals>>,
     /// See [`stuck_after`](Self::stuck_after).
@@ -1265,6 +1404,22 @@ impl DomainBuilder {
         self
     }
 
+    /// Gives the domain a local time zone of its own on Windows: `name` is a Windows zone's
+    /// registry key name (`"W. Europe Standard Time"`) or an IANA name (`"Europe/Oslo"`), which
+    /// stands for the Windows zone the Unicode CLDR maps it to. The domain's local-time calls
+    /// convert with that zone's rules from the registry, and the UCRT's with a zone state of the
+    /// domain's own. Without one, local time is the machine's.
+    ///
+    /// Panics if `name` names no zone in this machine's registry.
+    #[cfg(windows)]
+    #[track_caller]
+    pub fn time_zone(mut self, name: &str) -> Self {
+        let zone = crate::os::tz_windows::Zone::find(name)
+            .unwrap_or_else(|| panic!("no Windows time zone for {name:?}"));
+        self.time_zone = Some(Arc::new(zone));
+        self
+    }
+
     /// Answers the domain's name lookups from `resolver`; see [`Resolver`].
     pub fn resolver(mut self, resolver: Arc<dyn Resolver>) -> Self {
         self.resolver = Some(resolver);
@@ -1282,7 +1437,8 @@ impl DomainBuilder {
     /// back, virtual time standing still, and no wait begun in a deterministic schedule. Never
     /// while a lease is held, an executive's timestamp is open, every participant is blocked, or
     /// the clock is not virtual (see [`Layer::virtual_now`]), since such a clock moves on its own.
-    /// The report, listing each participant, goes straight to the process's stderr, past a test
+    /// The running participants must also have used `after` of CPU time; with none used, the
+    /// limit is ten times `after`, and at least 5 s. The report, listing each participant, goes straight to the process's stderr, past a test
     /// harness's output capture, before the abort: a stuck thread cannot be unwound from outside.
     /// Panics on a zero `after`, under which every sample would be a stall.
     #[track_caller]
@@ -1303,18 +1459,21 @@ impl DomainBuilder {
             fs: self.fs,
             host: self.host,
             env: self.env,
+            #[cfg(windows)]
+            time_zone: self.time_zone,
             resolver: self.resolver,
             signals: self.signals,
             injected: AtomicU64::new(0),
             entries: AtomicU64::new(0),
-            thread_signals: Mutex::default(),
-            signals_pending: AtomicBool::new(false),
+            #[cfg(unix)]
+            signal_state: crate::signals::State::default(),
             unmodelled: Mutex::default(),
             #[cfg(windows)]
             timer_word_wakes: Mutex::default(),
             participants: AtomicUsize::new(0),
             parked: AtomicUsize::new(0),
             sim_parked: AtomicUsize::new(0),
+            settling: Arc::default(),
             spinning: AtomicUsize::new(0),
             clock_spinning: AtomicUsize::new(0),
             accounting: Accounting::default(),
@@ -1326,6 +1485,8 @@ impl DomainBuilder {
             followers: Mutex::default(),
             fd_waits: Mutex::default(),
             locals: Mutex::default(),
+            shares_statics: AtomicBool::new(false),
+            skip_holders: Mutex::new((None, Holders::NONE, false)),
         }));
         crate::census::register(&domain);
         if let Some(after) = self.stuck_after {
@@ -1345,7 +1506,10 @@ impl DomainBuilder {
 pub struct Managed {
     /// The domain the thread was in before this guard (null for none), reinstalled on drop.
     previous: *const Inner,
-    /// The domain this guard installed: a strong count from `Arc::into_raw`, released on drop.
+    /// The domain this guard installed: a strong count from `Arc::into_raw`, released on drop. A
+    /// thread that follows into another domain (`follow::follow`) gives the count up as it leaves,
+    /// and may outlive the domain, so a guard that is not a root's releases the domain installed
+    /// when it drops instead and never reads this one again.
     domain: *const Inner,
     /// Entered the domain directly (`Domain::enter`) rather than being started inside it, so its
     /// leaving is the thread's exit from the domain's schedule.
@@ -1358,6 +1522,11 @@ pub struct Managed {
     previous_held: *const accounting::Held,
     /// Whether the thread could follow a descriptor to another domain before this guard.
     previous_followable: bool,
+    /// Whether the thread was a root of its domain before this guard.
+    previous_root: bool,
+    /// The thread's mask of virtual signals before this guard, restored on drop.
+    #[cfg(unix)]
+    previous_mask: u64,
     /// Makes the guard `!Send` and `!Sync`.
     _not_send: PhantomData<*const ()>,
 }
@@ -1388,6 +1557,17 @@ thread_local! {
     static LINEAGE: std::cell::Cell<Lineage> = const {
         std::cell::Cell::new(Lineage { id: 0, children: 0 })
     };
+}
+
+thread_local! {
+    /// The calling thread entered its domain itself ([`Domain::enter`]) rather than being started
+    /// inside it.
+    static ROOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets whether the calling thread is a root of its domain, returning what it was.
+fn swap_root(root: bool) -> bool {
+    ROOT.try_with(|r| r.replace(root)).unwrap_or(false)
 }
 
 /// Installs `next` as the calling thread's lineage and returns the one it replaced (the default
@@ -1456,9 +1636,17 @@ impl Drop for Managed {
         let current = state::replace_domain(self.previous);
         let domain = if self.root { self.domain } else { current };
         follow::set_followable(self.previous_followable);
+        swap_root(self.previous_root);
         accounting::swap_held(self.previous_held);
         let lineage = swap_lineage(self.previous_lineage).id;
         let (class, _) = accounting::swap_class(self.previous_class.0, self.previous_class.1);
+        #[cfg(unix)]
+        // SAFETY: the domain pointer is live until the Arc below is dropped.
+        if let Some(joined) = unsafe { domain.as_ref() }
+            && joined.signals.is_some()
+        {
+            crate::signals::left(&joined.signal_state, lineage, self.previous_mask);
+        }
         if !domain.is_null() {
             if self.root {
                 // SAFETY: the domain pointer is live until the Arc below is dropped.
@@ -1540,63 +1728,73 @@ pub(crate) fn dispatch_signals<T>(op: impl FnOnce(&dyn Signals) -> T) -> Option<
     Some(op(signals))
 }
 
-/// Leaves `sig` pending for the domain thread with OS handle `handle`, to be delivered at its next
-/// hooked call. `false` when the thread is not one of the calling thread's domain.
+/// The calling thread's domain, if it has a signal table: what [`crate::signals`] keeps its masks
+/// and pending signals in and wakes waiters through.
+#[cfg(unix)]
+pub(crate) fn signal_domain() -> Option<SignalDomain> {
+    let domain = here()?;
+    domain.signals.as_ref()?;
+    Some(SignalDomain(domain))
+}
+
+/// See [`signal_domain`].
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+pub(crate) struct SignalDomain(&'static Inner);
+
+#[cfg(unix)]
+impl SignalDomain {
+    pub(crate) fn state(self) -> &'static crate::signals::State {
+        &self.0.signal_state
+    }
+
+    pub(crate) fn table(self) -> &'static dyn Signals {
+        self.0
+            .signals
+            .as_deref()
+            .expect("a signal domain has a table")
+    }
+
+    /// Wakes the domain's blocked calls to look for a signal left pending for thread `lineage`,
+    /// or for the process with `None`.
+    pub(crate) fn wake(self, lineage: Option<u64>) {
+        self.table().wake_waiters();
+        if let Some(lineage) = lineage
+            && let Some(sched) = self.0.sched.as_ref().filter(|sched| !sched.detached())
+        {
+            sched.wake_thread(lineage);
+        }
+    }
+}
+
+/// Leaves `sig` pending for the domain thread with OS handle `handle`, to be delivered once its
+/// mask lets it through, at its next hooked call or by the interruptible call it is blocked in.
+/// `false` when the thread is not one of the calling thread's domain.
 ///
 /// This emulates `pthread_kill` (POSIX `pthread_kill`; man 3 pthread_kill): the signal is
 /// directed at that thread and stays pending until it next enters a hook, standing in for the
-/// kernel delivering it on return to user space. Pending signals form a set, so a signal posted
-/// twice before delivery is delivered once, as for standard signals (man 7 signal, "Queueing
-/// and delivery semantics for standard signals"). The only caller, the `pthread_kill` hook,
-/// posts just the virtual signals (`signals::is_virtual`: `SIGHUP`, `SIGINT`, `SIGTERM`, all
-/// standard signals); a real-time signal, which Linux would queue (man 7 signal, "Real-time
-/// signals"), would be merged here. `sig` must lie in 1..=63 for the `u64` mask and for
-/// [`drain_signals`] to see it: macOS numbers stop below `NSIG` = 32 (`<sys/signal.h>`), but Linux
-/// numbers run to `SIGRTMAX` = `_NSIG` = 64 (include/uapi/asm-generic/signal.h).
+/// kernel delivering it on return to user space, or, in a blocked call, interrupting it (see
+/// [`crate::signals::interruptible`]). The only caller, the `pthread_kill` hook, posts just the
+/// virtual signals (`signals::is_virtual`), all standard signals (see
+/// [`crate::signals::send_to_thread`]).
 #[cfg(unix)]
 pub(crate) fn post_signal(handle: usize, sig: core::ffi::c_int) -> bool {
-    let Some(domain) = here() else {
+    let Some(domain) = signal_domain() else {
         return false;
     };
-    if domain.signals.is_none() {
-        return false;
-    }
-    let Some(lineage) = domain.accounting.lineage_of(handle) else {
+    let Some(lineage) = domain.0.accounting.lineage_of(handle) else {
         return false;
     };
-    let _passthrough = Passthrough::enter();
-    *domain
-        .thread_signals
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(lineage)
-        .or_default() |= 1 << sig;
-    domain.signals_pending.store(true, Ordering::SeqCst);
+    crate::signals::send_to_thread(domain, lineage, sig);
     true
 }
 
-/// Delivers the signals left pending for the calling thread, if any, lowest number first, outside
-/// the `thread_signals` lock. `signals_pending` is read `Relaxed` as a hint only: a post it misses
-/// is delivered at the thread's next hooked call.
+/// Delivers the signals left pending for the calling thread that its mask lets through, if any
+/// have been since it last looked (see [`crate::signals::drain`]).
 #[cfg(unix)]
-fn drain_signals(domain: &Inner) {
-    if !domain.signals_pending.load(Ordering::Relaxed) {
-        return;
-    }
-    let bits = {
-        let _passthrough = Passthrough::enter();
-        let mut pending = domain
-            .thread_signals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let bits = pending.remove(&thread_lineage()).unwrap_or(0);
-        domain
-            .signals_pending
-            .store(!pending.is_empty(), Ordering::SeqCst);
-        bits
-    };
-    for sig in (1..64).filter(|sig| bits & (1 << sig) != 0) {
-        crate::signals::deliver(sig, crate::SignalSource::Process, true);
+fn drain_signals(domain: &'static Inner) {
+    if domain.signals.is_some() {
+        crate::signals::drain(SignalDomain(domain));
     }
 }
 
@@ -1703,6 +1901,8 @@ fn park_if(domain: &Inner, sim: bool, waiting: impl FnOnce() -> bool) -> Option<
         #[cfg(target_os = "linux")]
         pre_released: false,
         #[cfg(target_os = "linux")]
+        moved: false,
+        #[cfg(target_os = "linux")]
         claimed: false,
         #[cfg(windows)]
         woken: false,
@@ -1726,7 +1926,7 @@ fn park_if(domain: &Inner, sim: bool, waiting: impl FnOnce() -> bool) -> Option<
     if sim {
         domain.sim_parked.fetch_add(1, Ordering::SeqCst);
     }
-    domain.parked.fetch_add(1, Ordering::SeqCst);
+    let parked = domain.parked.fetch_add(1, Ordering::SeqCst) + 1;
     let lineage = thread_lineage();
     #[cfg(windows)]
     let mut wait = wait;
@@ -1741,8 +1941,15 @@ fn park_if(domain: &Inner, sim: bool, waiting: impl FnOnce() -> bool) -> Option<
         domain.accounting.keyed.fetch_add(1, Ordering::SeqCst);
         enlist_keyed(key, domain, lineage);
     }
-    let bump = domain.accounting.bump();
-    if domain.parked.load(Ordering::SeqCst) >= domain.participants.load(Ordering::SeqCst) {
+    let settling = domain.settling.load(Ordering::SeqCst) > 0 && domain.sched.is_none();
+    let bump = if settling {
+        domain.accounting.stir()
+    } else {
+        domain.counted_move(parked)
+    };
+    if !settling
+        && domain.parked.load(Ordering::SeqCst) >= domain.participants.load(Ordering::SeqCst)
+    {
         domain.accounting.note_quiet(&mut core);
     }
     Some(bump)
@@ -1761,10 +1968,19 @@ fn held_at_gate(core: &Core) -> bool {
 /// gate but otherwise changing nothing, for a caller that must let go of its own lock before
 /// waiting with [`pass_gate`].
 fn unpark(domain: &Inner, sim: bool, may_wait: bool) -> Option<EpochBump> {
-    unpark_inner(domain, sim, may_wait, false)
+    unpark_inner(domain, sim, may_wait, false, false)
 }
 
-fn unpark_inner(domain: &Inner, sim: bool, may_wait: bool, woken: bool) -> Option<EpochBump> {
+/// Counts the calling participant running again, as [`unpark`]; with `settled`, it is the waiter
+/// whose re-check ended its domain's settling, so the domain was not quiescent before and is not
+/// after: the epoch stays.
+fn unpark_inner(
+    domain: &Inner,
+    sim: bool,
+    may_wait: bool,
+    woken: bool,
+    settled: bool,
+) -> Option<EpochBump> {
     let _passthrough = Passthrough::enter();
     let stamp = domain.row_stamp();
     let mut core = domain.accounting.core();
@@ -1781,7 +1997,7 @@ fn unpark_inner(domain: &Inner, sim: bool, may_wait: bool, woken: bool) -> Optio
     if accounting::swap_gated(false) {
         core.gated -= 1;
     }
-    domain.parked.fetch_sub(1, Ordering::SeqCst);
+    let parked = domain.parked.fetch_sub(1, Ordering::SeqCst);
     if sim {
         domain.sim_parked.fetch_sub(1, Ordering::SeqCst);
     }
@@ -1796,7 +2012,12 @@ fn unpark_inner(domain: &Inner, sim: bool, may_wait: bool, woken: bool) -> Optio
         domain.accounting.keyed.fetch_sub(1, Ordering::SeqCst);
         delist_keyed(domain, lineage);
     }
-    Some(domain.accounting.bump())
+    Some(if settled && domain.sched.is_none() {
+        domain.accounting.note_stirred(&mut core);
+        domain.accounting.stir()
+    } else {
+        domain.counted_move(parked)
+    })
 }
 
 /// [`unpark`] for a participant back from a contended pthread mutex, which it now holds: the
@@ -1813,22 +2034,41 @@ fn unpark_holding(domain: &Inner) -> Option<EpochBump> {
     }
     let _passthrough = Passthrough::enter();
     let stamp = domain.row_stamp();
-    domain.parked.fetch_sub(1, Ordering::SeqCst);
+    let parked = domain.parked.fetch_sub(1, Ordering::SeqCst);
     domain.accounting.record_running(thread_lineage(), stamp);
-    Some(domain.accounting.bump())
+    Some(domain.counted_move(parked))
 }
 
 /// As [`mark_sim_waiting`]`(false)`, for a backend that holds its own lock while it leaves the
 /// wait: `None`, still parked, while the calling participant must wait at an open timestamp's
 /// gate, which it does with [`pass_gate`] once it has let go of that lock.
 pub fn try_leave_sim_wait() -> Option<EpochBump> {
+    leave_sim_wait(false)
+}
+
+/// As [`try_leave_sim_wait`], for a waiter whose re-check after a readiness bump just ended its
+/// domain's settling (its backend took the last mark off the [`settling_gauge`] while holding the
+/// lock it holds now): the domain could not be quiescent in between, so leaving moves no epoch.
+pub fn try_leave_sim_wait_settled() -> Option<EpochBump> {
+    leave_sim_wait(true)
+}
+
+fn leave_sim_wait(settled: bool) -> Option<EpochBump> {
     let Some(domain) = here() else {
         return Some(EpochBump::NONE);
     };
     if !accounting::participant() {
         return Some(EpochBump::NONE);
     }
-    unpark(domain, true, false)
+    unpark_inner(domain, true, false, false, settled)
+}
+
+/// The calling thread's domain's count of waiters a readiness bump woke that have yet to re-check
+/// (`None` off a domain). A backend whose waits mark waiters woken adds each mark and takes it off
+/// once the waiter has re-checked; a participant parking while any is marked moves no epoch, as
+/// the domain cannot be quiescent until the last re-check, which moves it if its waiter waits on.
+pub fn settling_gauge() -> Option<Arc<AtomicUsize>> {
+    here().map(|domain| domain.settling.clone())
 }
 
 /// Waits, still counted parked, while an executive's timestamp holds the calling participant at
@@ -1990,6 +2230,7 @@ fn release_elsewhere(key: usize, n: usize, signal: impl Fn(&mut Core, usize)) {
 ///
 /// Skips the census lock unless some participant is parked on a key (`Accounting::keyed`), so a
 /// wake nobody in the sim waits on pays only an atomic load.
+#[cfg(unix)]
 pub(crate) fn note_release(key: usize, n: usize) {
     if state::passthrough() {
         return;
@@ -2010,7 +2251,11 @@ pub(crate) fn note_release(key: usize, n: usize) {
     }
 }
 
-#[cfg(windows)]
+/// A wake on `key` for up to `n` waiters, counted as `note_release` counts one, with `release`, the
+/// real wake, made under the census lock: a waiter parking on `key` then sees either the wake
+/// counted or what `release` did (a semaphore's post, which [`native_wait_on_checked`] looks for
+/// as it parks), never neither, which would leave it counted parked through a wait that cannot
+/// block and its domain looking quiescent until it returned.
 pub(crate) fn release_native<R>(key: usize, n: usize, release: impl FnOnce() -> R) -> R {
     if state::passthrough() {
         return release();
@@ -2054,6 +2299,7 @@ pub(crate) fn note_futex_release(
     let _pass = Passthrough::enter();
     let mut core = domain.accounting.core();
     core.signal_masked_in_space(key, n, mask, Some(private));
+    core.explain_moved(key, thread_lineage());
     if accounting::participant() {
         core.clear_quiet();
     }
@@ -2093,6 +2339,7 @@ pub(crate) fn release_native_futex(
             let mut core = domain.accounting.core();
             let result = release();
             core.signal_futex(key, result, mask, private, &word);
+            core.explain_moved(key, thread_lineage());
             if accounting::participant() {
                 core.clear_quiet();
             }
@@ -2385,7 +2632,7 @@ pub fn current_sim() -> Option<SimId> {
 
 /// Per-sim values by type, made by [`sim_local`] and taken by [`Domain::take_locals`].
 #[derive(Default)]
-pub struct SimLocals(std::collections::HashMap<std::any::TypeId, Arc<dyn std::any::Any + Send + Sync>>);
+pub struct SimLocals(crate::HashMap<std::any::TypeId, Arc<dyn std::any::Any + Send + Sync>>);
 
 impl SimLocals {
     /// Whether there are none.
@@ -2484,7 +2731,7 @@ fn time_skip_inner(yielding: Option<bool>) -> bool {
                         >= domain.participants.load(Ordering::SeqCst)
             },
         );
-        if !quiescent {
+        if !quiescent || domain.skip_held_off() {
             return false;
         }
     }
@@ -2495,6 +2742,23 @@ fn time_skip_inner(yielding: Option<bool>) -> bool {
         domain.wake_waiters();
     }
     moved
+}
+
+/// Whether the calling thread's domain shares a library's process-wide state with other sims (see
+/// [`share_statics`]), so its time skips may wait on their threads.
+pub(crate) fn shares_statics() -> bool {
+    here().is_some_and(|domain| domain.shares_statics.load(Ordering::SeqCst))
+}
+
+/// Whether a time skip of the calling thread's domain waits on threads of other sims (see
+/// [`Inner::skip_held_off`]). A deterministic schedule asks with its own lock let go, as other
+/// sims' census locks are taken meanwhile.
+pub(crate) fn skip_held_off() -> bool {
+    let Some(domain) = here() else {
+        return false;
+    };
+    let _passthrough = Passthrough::enter();
+    domain.skip_held_off()
 }
 
 /// Whether the calling thread's domain is stalled: quiescent outside a deterministic schedule, with
@@ -2663,6 +2927,19 @@ pub(crate) fn wake_unscheduled() {
     }
 }
 
+/// Passes `ready` the readiness keys of the calling thread's domain's waits on real descriptors
+/// that are ready (see [`Layer::real_ready`]).
+#[cfg(unix)]
+pub(crate) fn real_ready(ready: &mut dyn FnMut(crate::ReadinessKey)) {
+    if let Some(domain) = here() {
+        let _passthrough = Passthrough::enter();
+        let key = domain.key();
+        for layer in &domain.layers {
+            layer.real_ready(key, ready);
+        }
+    }
+}
+
 /// Whether any layer of the calling thread's domain has woken a waiter that has yet to run (see
 /// [`Layer::settling`]); `false` off a domain.
 fn settling() -> bool {
@@ -2717,7 +2994,7 @@ fn enter_native_wait() {
     notify_native_wait();
 }
 
-fn notify_native_wait() {
+pub(crate) fn notify_native_wait() {
     // Completing quiescence from outside the sim's wait loops would otherwise go unnoticed until
     // their next quiescence poll; wake them so they time-skip or give up now.
     if !executive_attached() && quiescent_here() {
@@ -2784,7 +3061,9 @@ pub(crate) fn take_timer_word_wakes() -> Vec<TimerWordWake> {
 /// On return the thread waits at an open timestamp's gate, rejoins a deterministic schedule that
 /// let it go, and takes any signal posted to it while it was blocked: the wait is not interrupted
 /// as a real `pthread_kill` would interrupt it (man 7 signal, "Interruption of system calls and
-/// library functions by signal handlers"), so delivery waits for it to return.
+/// library functions by signal handlers"), so delivery waits for it to return. A wait made inside
+/// an interruptible call (a kicked semaphore wait, see `signals::kickable`) leaves them to that
+/// call instead.
 pub(crate) fn native_wait<R>(wait: impl FnOnce() -> R) -> R {
     native_wait_if(wait, |_| true)
 }
@@ -2793,12 +3072,34 @@ pub(crate) fn native_wait_if<R>(wait: impl FnOnce() -> R, woken: impl FnOnce(&R)
     native_wait_inner(wait, woken)
 }
 
-#[cfg(any(windows, target_os = "linux"))]
 pub(crate) fn native_wait_at_checked<R>(
     deadline: Option<std::time::Duration>,
     preflight: impl FnOnce() -> Option<R>,
     wait: impl FnOnce() -> R,
     woken: impl FnOnce(&R) -> bool,
+) -> R {
+    native_wait_at_inner(deadline, preflight, wait, woken, true)
+}
+
+/// As [`native_wait_at_checked`], for a wait that runs its own time skip once parked: parking
+/// neither wakes the sim's waiters nor offers the layers an idle skip, which `wait` does with
+/// [`notify_native_wait`] if its own skip does not move time.
+#[cfg(windows)]
+pub(crate) fn native_wait_at_skipping<R>(
+    deadline: Option<std::time::Duration>,
+    preflight: impl FnOnce() -> Option<R>,
+    wait: impl FnOnce() -> R,
+    woken: impl FnOnce(&R) -> bool,
+) -> R {
+    native_wait_at_inner(deadline, preflight, wait, woken, false)
+}
+
+fn native_wait_at_inner<R>(
+    deadline: Option<std::time::Duration>,
+    preflight: impl FnOnce() -> Option<R>,
+    wait: impl FnOnce() -> R,
+    woken: impl FnOnce(&R) -> bool,
+    offer: bool,
 ) -> R {
     if !counts_native_waits() {
         return preflight().unwrap_or_else(wait);
@@ -2813,7 +3114,9 @@ pub(crate) fn native_wait_at_checked<R>(
         return ready.unwrap();
     };
     drop(bump);
-    notify_native_wait();
+    if offer {
+        notify_native_wait();
+    }
     native_wait_parked(wait, woken)
 }
 
@@ -2828,24 +3131,58 @@ fn native_wait_inner<R>(wait: impl FnOnce() -> R, woken: impl FnOnce(&R) -> bool
 fn native_wait_parked<R>(wait: impl FnOnce() -> R, woken: impl FnOnce(&R) -> bool) -> R {
     let result = wait();
     let domain = here().unwrap();
-    drop(unpark_holding(domain).or_else(|| unpark_inner(domain, false, true, woken(&result))));
+    drop(unpark_holding(domain).or_else(|| unpark_inner(domain, false, true, woken(&result), false)));
     rejoin_schedule();
-    if let Some(domain) = here() {
+    if let Some(domain) = here()
+        && !interruptible_here()
+    {
         drain_signals(domain);
     }
     woken::follow_woken(None);
     result
 }
 
-/// As [`native_wait`], for a wait a [`det_wake`] on `key` ends: a thread the deterministic
-/// schedule let go takes the baton in the order that wake gives it, when a run is active again.
-pub(crate) fn native_wait_on<R>(key: crate::sched::DetKey, wait: impl FnOnce() -> R) -> R {
+#[cfg(unix)]
+fn interruptible_here() -> bool {
+    crate::signals::in_interruptible()
+}
+
+#[cfg(not(unix))]
+fn interruptible_here() -> bool {
+    false
+}
+
+/// As [`native_wait`], for a wait on an object that keeps what releases it, a semaphore's count,
+/// and that a [`det_wake`] on `key` ends: a thread the deterministic schedule let go takes the
+/// baton in the order that wake gives it, when a run is active again. `take` tries for the count
+/// without blocking as the thread parks, under the census lock, and the wait returns at once with
+/// it. A post made before the wait began, which no waiter was there to count released, would
+/// otherwise leave the thread counted parked through a wait that cannot block, and the domain
+/// quiescent to a peer that skips time meanwhile. The post itself is made under the same lock
+/// ([`release_native`]), so it is either counted as this waiter's release or found by `take`.
+pub(crate) fn native_wait_on_checked<R>(
+    key: crate::sched::DetKey,
+    take: impl FnOnce() -> Option<R>,
+    wait: impl FnOnce() -> R,
+) -> R {
     if accounting::participant()
         && let Some(sched) = here().and_then(|domain| domain.sched.as_ref())
     {
         sched.wait_outside(thread_lineage(), key);
     }
-    native_wait(wait)
+    native_wait_at_checked(None, take, wait, |_| true)
+}
+
+/// Whether the calling participant's native wait has been counted released by a wake that
+/// reached every waiter on its address. Until it leaves the wait the domain is never quiescent and
+/// time stands still, so a wait that sees no change of its own must return all the same.
+#[cfg(windows)]
+pub(crate) fn wait_woken() -> bool {
+    let Some(domain) = here() else {
+        return false;
+    };
+    let _passthrough = Passthrough::enter();
+    domain.accounting.core().wait_woken(thread_lineage())
 }
 
 /// A participant the deterministic schedule let go, back from a native wait while a run is active,
@@ -2878,6 +3215,27 @@ pub(crate) fn native_cond_wait<R>(relock: &dyn Fn(bool), wait: impl FnOnce() -> 
     result
 }
 
+/// As [`native_cond_wait`], unless `ready`, asked under the census lock as the participant parks,
+/// finds what it waits for already arrived: then `None`, without waiting. A wake made after it
+/// asks finds the participant parked.
+#[cfg(unix)]
+pub(crate) fn native_cond_wait_checked<R>(
+    relock: &dyn Fn(bool),
+    ready: impl FnOnce() -> bool,
+    wait: impl FnOnce() -> R,
+) -> Option<R> {
+    if !counts_native_waits() {
+        return (!ready()).then(wait);
+    }
+    drop(park_if(here().unwrap(), false, || !ready())?);
+    notify_native_wait();
+    let result = wait();
+    leave_cond_wait(relock, true);
+    rejoin_schedule();
+    woken::follow_woken(Some(relock));
+    Some(result)
+}
+
 /// Unparks a participant returning from a condition-variable wait. While a timestamp's gate is
 /// closed it lets go of the caller's mutex, waits at the gate and retakes the mutex, then tries
 /// again: the gate may close again while it retakes the mutex.
@@ -2886,7 +3244,7 @@ fn leave_cond_wait(relock: &dyn Fn(bool), mut woken: bool) {
         return;
     };
     loop {
-        if let Some(bump) = unpark_inner(domain, false, false, woken) {
+        if let Some(bump) = unpark_inner(domain, false, false, woken, false) {
             drop(bump);
             return;
         }
@@ -2895,6 +3253,30 @@ fn leave_cond_wait(relock: &dyn Fn(bool), mut woken: bool) {
         pass_gate();
         relock(true);
     }
+}
+
+/// Runs `wait`, a real wait on the native wait object at `key` that the calling participant's
+/// domain does not count (a grace for a holder outside the sim, an attempt of a wait
+/// [`hold_off_while`] holds off), listed meanwhile as one that a wake on `key` may reach in place
+/// of a parked waiter: `woken` tells whether its result is a wake's, which then takes the release
+/// the wake was counted for. Off a participant it only runs `wait`.
+pub(crate) fn uncounted_wait<R>(
+    key: usize,
+    wait: impl FnOnce() -> R,
+    woken: impl FnOnce(&R) -> bool,
+) -> R {
+    let Some(domain) = here().filter(|_| counts_native_waits()) else {
+        return wait();
+    };
+    {
+        let _passthrough = Passthrough::enter();
+        domain.accounting.core().begin_uncounted(key);
+    }
+    let result = wait();
+    let woken = woken(&result);
+    let _passthrough = Passthrough::enter();
+    domain.accounting.core().end_uncounted(key, woken);
+    result
 }
 
 /// Notes that the calling participant is about to join the thread with OS handle `handle`, so
@@ -2952,6 +3334,7 @@ const NATIVE_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(
 /// `None`.
 ///
 /// `relock` is a condition variable's mutex, as for [`native_cond_wait`].
+#[cfg(unix)]
 pub(crate) fn timed_native_wait<R>(
     after: std::time::Duration,
     spurious: Option<R>,
@@ -2961,6 +3344,7 @@ pub(crate) fn timed_native_wait<R>(
     timed_native_wait_if(after, spurious, relock, attempt, |_| true)
 }
 
+#[cfg(unix)]
 pub(crate) fn timed_native_wait_if<R>(
     after: std::time::Duration,
     spurious: Option<R>,
@@ -2971,7 +3355,6 @@ pub(crate) fn timed_native_wait_if<R>(
     timed_native_wait_inner(after, spurious, relock, || None, attempt, woken)
 }
 
-#[cfg(any(windows, target_os = "linux"))]
 pub(crate) fn timed_native_wait_checked<R>(
     after: std::time::Duration,
     preflight: impl FnOnce() -> Option<R>,
@@ -3032,7 +3415,17 @@ fn timed_native_wait_inner<R>(
         notify_native_wait();
     }
     let mut was_woken = false;
+    let mut first = true;
     let outcome = loop {
+        // A wait that leaves its domain quiescent moves time on before its first real slice: a
+        // slice runs to the end of a real timeout, which on Windows rounds up to the system timer's
+        // tick.
+        if std::mem::take(&mut first) && counted && quiescent_here() && time_skip() {
+            wake_waiters();
+            if now(ClockKind::Monotonic).is_some_and(|t| t >= deadline) {
+                break TimedWait::TimedOut;
+            }
+        }
         let slice = now(ClockKind::Monotonic)
             .and_then(|t| real_span(deadline.saturating_sub(t)))
             .map_or(NATIVE_WAIT_SLICE, |span| span.min(NATIVE_WAIT_SLICE));
@@ -3069,7 +3462,7 @@ fn timed_native_wait_inner<R>(
     if counted {
         match relock {
             Some(relock) => leave_cond_wait(relock, was_woken),
-            None => drop(unpark_inner(here().unwrap(), false, true, was_woken)),
+            None => drop(unpark_inner(here().unwrap(), false, true, was_woken, false)),
         }
         rejoin_schedule();
     }
@@ -3125,8 +3518,12 @@ pub fn charge_latency() {
             .iter()
             .any(|layer| layer.charge_latency(CALL_LATENCY))
     };
-    if fired {
-        wake_waiters();
+    if fired && let Some(domain) = here() {
+        let _passthrough = Passthrough::enter();
+        let key = domain.key();
+        for layer in &domain.layers {
+            layer.wake_due(key);
+        }
     }
     with_sched(|sched| sched.release_due_native_at(virtual_now()));
     // A thread busy-polling would otherwise keep the baton forever.
@@ -3281,6 +3678,273 @@ pub(crate) fn backing_off() -> bool {
                 spin.events > 0 && !spin.polling
             })
             .unwrap_or(false)
+}
+
+/// How much CPU time a running participant of another sim uses before it can no longer be holding
+/// a lock a wait is held off for ([`Holders`]). A snare choice, far past a lock's critical
+/// section: the process-wide locks sims share (parking_lot's bucket locks, std's statics) are held
+/// for a few hundred instructions, and never across a wait.
+const HOLDER_RUN: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// The longest a wait or a time skip is held off for the participants of other sims
+/// ([`Holders`]). A snare choice: long past the time a loaded machine leaves a runnable thread
+/// unscheduled, short of the stall watchdog's off-CPU limit.
+const HOLDERS_LIMIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How often a wait polls a time skip [`Inner::skip_held_off`] holds back. A snare choice: short
+/// beside a time skip, long beside the work a thread of another sim has left to do.
+pub(crate) const HOLDER_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// How many threads of other sims [`Holders`] follows. A snare choice; past it a wait is held off
+/// for [`HOLDERS_LIMIT`].
+const HOLDERS_ROOM: usize = 64;
+
+/// How many sims one look of [`Holders::pending`] follows the running participants of in place of
+/// a thread that waits. A snare choice; past it a wait is held off for [`HOLDERS_LIMIT`].
+const EXPAND_ROOM: usize = 8;
+
+/// A thread of another sim that [`Holders`] follows.
+#[derive(Clone, Copy)]
+struct Followed {
+    /// Its sim's serial.
+    sim: u64,
+    lineage: u64,
+    /// Its OS thread id.
+    os_id: u64,
+    /// Its CPU time when last read.
+    cpu: std::time::Duration,
+    /// Whether that reading was seen to move. The OS brings a running thread's CPU time up to
+    /// date only now and then (on macOS when it is switched or every few milliseconds), so the
+    /// first reading may lag what it has run by more than [`HOLDER_RUN`]; from the first move
+    /// on, a further move is time it ran since.
+    synced: bool,
+}
+
+/// The threads of other sims that may hold a process-wide lock the calling participant waits for.
+/// A lock's slow path parks on a word or condition variable that names no holder (a parking_lot
+/// bucket lock queues its waiters without spinning once one is queued), and a holder inside a
+/// short critical section on another sim's thread lets go as soon as that thread runs; the OS may
+/// leave it unscheduled far longer than any real grace on a loaded machine, and the waiter's sim
+/// would meanwhile read as quiescent and skip time.
+///
+/// Followed are the participants of every other live sim running as the wait began. A holder
+/// waits only for another such lock (parking_lot takes two bucket locks at once), so one that
+/// leaves, parks for good, or runs for [`HOLDER_RUN`] holds the lock no longer. One that waits
+/// with its row marked (`Row::holding_off`) may be such a holder: while it is held off by an
+/// earlier wait than this one it is waited on; once it is counted parked, or held off by a later
+/// wait, the running participants of its sim, which it may be waiting on in turn, are followed in
+/// its place, so no two waits wait on each other. Threads no sim manages are not followed: a lock
+/// they hold is one held outside the simulation.
+struct Holders {
+    threads: [Option<Followed>; HOLDERS_ROOM],
+    /// Some running participant of another sim could not be followed.
+    unfollowed: bool,
+    /// When the threads were listed, as [`accounting::real_elapsed`].
+    since: std::time::Duration,
+    /// The wait's place among every marked wait of the process (see `Row::holding_off`).
+    order: u64,
+    /// Whether another sim was live as the wait began.
+    others: bool,
+}
+
+/// The next place among the marked waits of the process (see `Row::holding_off`).
+fn next_order() -> u64 {
+    static ORDER: AtomicU64 = AtomicU64::new(1);
+    ORDER.fetch_add(1, Ordering::Relaxed)
+}
+
+impl Holders {
+    /// None followed. A few kilobytes, kept off the stack of the hook that uses it: a thread on
+    /// the smallest stack the OS allows waits through it too.
+    const NONE: Holders = Holders {
+        threads: [None; HOLDERS_ROOM],
+        unfollowed: false,
+        since: std::time::Duration::ZERO,
+        order: 0,
+        others: false,
+    };
+
+    /// Lists the threads of every sim but the one with serial `own` (none for 0) that a wait of
+    /// its may wait on, in place of those listed before.
+    fn begin(&mut self, own: u64) {
+        *self = Holders::NONE;
+        self.since = accounting::real_elapsed();
+        self.order = next_order();
+        if own == 0 {
+            return;
+        }
+        let _passthrough = Passthrough::enter();
+        crate::census::each_other(SimId(own), |other| {
+            self.others = true;
+            self.follow(other);
+        });
+    }
+
+    /// Follows the participants of `sim` that run, or are held off by an earlier wait than this
+    /// one, and are not followed yet.
+    fn follow(&mut self, sim: &Domain) {
+        let serial = sim.0.accounting.serial.0;
+        let order = self.order;
+        let threads = &mut self.threads;
+        let mut unfollowed = false;
+        sim.0
+            .accounting
+            .each_running(|lineage, os_id, holding_off| {
+                if holding_off > order
+                    || threads
+                        .iter()
+                        .flatten()
+                        .any(|t| (t.sim, t.lineage) == (serial, lineage))
+                {
+                    return;
+                }
+                match threads.iter_mut().find(|slot| slot.is_none()) {
+                    Some(slot) => {
+                        *slot = Some(Followed {
+                            sim: serial,
+                            lineage,
+                            os_id,
+                            cpu: crate::census::thread_cpu_time(os_id).unwrap_or_default(),
+                            synced: false,
+                        });
+                    }
+                    None => unfollowed = true,
+                }
+            });
+        self.unfollowed |= unfollowed;
+    }
+
+    /// Whether one of the threads may still hold the lock, and [`HOLDERS_LIMIT`] has not passed.
+    fn pending(&mut self) -> bool {
+        if accounting::real_elapsed().saturating_sub(self.since) >= HOLDERS_LIMIT {
+            return false;
+        }
+        let _passthrough = Passthrough::enter();
+        let mut expand = [0u64; EXPAND_ROOM];
+        let mut n = 0;
+        for slot in &mut self.threads {
+            let Some(followed) = slot else {
+                continue;
+            };
+            let state = crate::census::find(followed.sim)
+                .and_then(|sim| sim.0.accounting.holder_state(followed.lineage));
+            let holding = match state {
+                None => false,
+                Some((true, 0)) => match crate::census::thread_cpu_time(followed.os_id) {
+                    None => true,
+                    Some(cpu) if !followed.synced => {
+                        followed.synced = cpu != followed.cpu;
+                        followed.cpu = cpu;
+                        true
+                    }
+                    Some(cpu) => cpu.saturating_sub(followed.cpu) < HOLDER_RUN,
+                },
+                Some((false, 0)) => false,
+                Some((true, order)) if order < self.order => true,
+                Some(_) => {
+                    if !expand[..n].contains(&followed.sim) {
+                        match expand.get_mut(n) {
+                            Some(free) => {
+                                *free = followed.sim;
+                                n += 1;
+                            }
+                            None => self.unfollowed = true,
+                        }
+                    }
+                    false
+                }
+            };
+            if !holding {
+                *slot = None;
+            }
+        }
+        for &sim in &expand[..n] {
+            if let Some(sim) = crate::census::find(sim) {
+                self.follow(&sim);
+            }
+        }
+        self.unfollowed || self.threads.iter().any(Option::is_some)
+    }
+}
+
+/// The calling participant's row marked with a wait's place (see `Row::holding_off`) while it
+/// lives.
+pub(crate) struct HoldingOff {
+    domain: Option<Domain>,
+    /// Whether the wait was held off at all.
+    #[cfg_attr(windows, allow(dead_code))]
+    held: bool,
+}
+
+impl HoldingOff {
+    /// No mark: the wait is not held off, and no sim follows it.
+    const NONE: HoldingOff = HoldingOff {
+        domain: None,
+        held: false,
+    };
+
+    fn enter(order: u64, held: bool) -> Self {
+        let domain = Domain::current();
+        if let Some(domain) = &domain {
+            domain.0.accounting.set_holding_off(thread_lineage(), order);
+        }
+        HoldingOff { domain, held }
+    }
+
+    /// Whether the wait was held off for a while before it was to be counted.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) fn held(&self) -> bool {
+        self.held
+    }
+}
+
+impl Drop for HoldingOff {
+    fn drop(&mut self) {
+        if let Some(domain) = self.domain.take() {
+            domain.0.accounting.set_holding_off(thread_lineage(), 0);
+        }
+    }
+}
+
+/// Holds the calling participant's wait off while a thread of another sim may hold what it waits
+/// for ([`Holders`]): runs `attempt`, a real wait the domain does not count that returns `None`
+/// once its short timeout runs out, again and again meanwhile. `Ok` with its result once it
+/// returns one; otherwise `Err` with the mark the wait, now to be counted, keeps until it returns.
+/// For a wait whose attempts each notice what reached it since the wait began (a futex word's
+/// value, an address's, a condition variable's signals), so no wake falls between two. A thread
+/// left over from an ended run waits counted at once, where a running sim's wake can find it to
+/// follow (see `woken`).
+pub(crate) fn hold_off_while<R>(mut attempt: impl FnMut() -> Option<R>) -> Result<R, HoldingOff> {
+    if !counts_native_waits() || dormant() {
+        return Err(HoldingOff::NONE);
+    }
+    let own = here().map_or(0, |domain| domain.accounting.serial.0);
+    HOLDERS
+        .try_with(|holders| {
+            let Ok(mut holders) = holders.try_borrow_mut() else {
+                return Err(HoldingOff::NONE);
+            };
+            holders.begin(own);
+            if !holders.others {
+                return Err(HoldingOff::NONE);
+            }
+            let mut held = false;
+            while holders.pending() {
+                held = true;
+                let _holding_off = HoldingOff::enter(holders.order, true);
+                if let Some(result) = attempt() {
+                    return Ok(result);
+                }
+            }
+            Err(HoldingOff::enter(holders.order, held))
+        })
+        .unwrap_or(Err(HoldingOff::NONE))
+}
+
+thread_local! {
+    /// The threads of other sims the calling participant's wait is held off for
+    /// ([`hold_off_while`]).
+    static HOLDERS: std::cell::RefCell<Holders> = const { std::cell::RefCell::new(Holders::NONE) };
 }
 
 /// Ends the calling thread's spin: it made a hooked call other than a clock read or a yield, began
@@ -3489,6 +4153,21 @@ pub fn idle_wait() -> Option<std::time::Duration> {
     unsafe { &*domain }.idle_wait()
 }
 
+/// Whether the calling thread's domain's clock moves with real time while the sim waits on
+/// something outside it (see [`Layer::waits_outside`]).
+pub fn waits_outside() -> bool {
+    let domain = state::domain();
+    if domain.is_null() {
+        return false;
+    }
+    let _passthrough = Passthrough::enter();
+    // SAFETY: see `Domain::current`.
+    unsafe { &*domain }
+        .layers
+        .iter()
+        .any(|layer| layer.waits_outside())
+}
+
 /// The calling managed thread's virtual clock, as its layers report it, or `None` off a domain or
 /// where nothing models the clock. A backend uses this to stamp timestamps against simulated time
 /// rather than the host clock — it works even while the backend runs under passthrough.
@@ -3617,6 +4296,23 @@ pub fn descriptor_transaction<R>(op: impl FnOnce() -> R) -> R {
     op()
 }
 
+/// Notes that the calling thread's sim reaches `fd`, a descriptor another sim made that a library
+/// keeps in a static: the two sims share that library's process-wide state, so a time skip of
+/// either waits on the other's running threads (see [`Inner::skip_held_off`]).
+#[cfg(unix)]
+pub fn share_statics(fd: core::ffi::c_int) {
+    let Some(domain) = here() else {
+        return;
+    };
+    let _passthrough = Passthrough::enter();
+    domain.shares_statics.store(true, Ordering::SeqCst);
+    if let crate::owners::Owner::Sim { serial, .. } = crate::owners::owner(fd)
+        && let Some(minter) = crate::census::find(serial)
+    {
+        minter.0.shares_statics.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Defers descriptor cleanup until the current ownership transaction has completed.
 #[cfg(unix)]
 pub fn defer_descriptor_cleanup(cleanup: Box<dyn FnOnce()>) {
@@ -3659,8 +4355,16 @@ pub(crate) fn descriptor_close_can_wait(fd: core::ffi::c_int) -> bool {
 /// Linux kernel would, a negative errno on failure: man 2 intro, "RETURN VALUE"); `None` means the call goes to the OS. Available on
 /// every platform: the unix socket hooks and the Windows `pcap`/`wpcap` hooks both consult it.
 pub(crate) fn dispatch_net(
-    mut op: impl FnMut(&dyn Net) -> Option<crate::net::NetResult>,
+    op: impl FnMut(&dyn Net) -> Option<crate::net::NetResult>,
 ) -> Option<i64> {
+    dispatch_net_result(op).map(crate::net::NetResult::into_raw)
+}
+
+/// [`dispatch_net`] keeping the backend's result whole, for a call whose successful value can be
+/// negative.
+fn dispatch_net_result(
+    mut op: impl FnMut(&dyn Net) -> Option<crate::net::NetResult>,
+) -> Option<crate::net::NetResult> {
     if state::passthrough() {
         return None;
     }
@@ -3672,11 +4376,7 @@ pub(crate) fn dispatch_net(
     let _passthrough = Passthrough::enter();
     // SAFETY: see `Domain::current`.
     let domain = unsafe { &*domain };
-    domain
-        .net
-        .iter()
-        .find_map(|net| op(net.as_ref()))
-        .map(crate::net::NetResult::into_raw)
+    domain.net.iter().find_map(|net| op(net.as_ref()))
 }
 
 #[cfg(windows)]
@@ -3828,11 +4528,21 @@ pub(crate) fn net_owns(fd: core::ffi::c_int) -> bool {
 #[cfg(unix)]
 pub(crate) fn dispatch_owned(
     fd: core::ffi::c_int,
-    mut op: impl FnMut(&dyn Net) -> Option<crate::net::NetResult>,
+    op: impl FnMut(&dyn Net) -> Option<crate::net::NetResult>,
 ) -> Option<i64> {
+    dispatch_owned_result(fd, op).map(crate::net::NetResult::into_raw)
+}
+
+/// [`dispatch_owned`] keeping the backend's result whole, for a call whose successful value can
+/// be negative: `fcntl(F_GETOWN)` reports a process group as one.
+#[cfg(unix)]
+pub(crate) fn dispatch_owned_result(
+    fd: core::ffi::c_int,
+    mut op: impl FnMut(&dyn Net) -> Option<crate::net::NetResult>,
+) -> Option<crate::net::NetResult> {
     loop {
         if net_owns(fd) {
-            if let Some(r) = dispatch_net(&mut op) {
+            if let Some(r) = dispatch_net_result(&mut op) {
                 return Some(r);
             }
             if net_owns(fd) {
@@ -3842,7 +4552,7 @@ pub(crate) fn dispatch_owned(
         match elsewhere(fd) {
             Elsewhere::Real => return None,
             Elsewhere::Retry => continue,
-            Elsewhere::Fail(errno) => return Some(-i64::from(errno)),
+            Elsewhere::Fail(errno) => return Some(crate::net::NetResult::Err(errno)),
         }
     }
 }
@@ -4131,8 +4841,8 @@ pub(crate) fn dispatch_host(
 
 /// Offers an environment call to the calling thread's [`Env`], if it has one. `Some(r)` means the
 /// simulated environment handled it (authoritatively); `None` means the call goes to the real OS
-/// environment. Available on all platforms (unix `getenv`/`setenv`/`unsetenv` use it today).
-#[cfg_attr(not(unix), allow(dead_code))]
+/// environment. The Unix `getenv`/`setenv`/`unsetenv` hooks and the Windows environment hooks use
+/// it.
 pub(crate) fn dispatch_env<T>(op: impl FnOnce(&dyn Env) -> T) -> Option<T> {
     if state::passthrough() {
         return None;
@@ -4191,6 +4901,21 @@ pub(crate) fn time_zone_setting() -> Option<crate::os::tz::Setting> {
     })
 }
 
+/// The calling managed thread's domain's own time zone ([`DomainBuilder::time_zone`]); `None` in
+/// passthrough, off a domain, or when the domain has none.
+#[cfg(windows)]
+pub(crate) fn time_zone() -> Option<Arc<crate::os::tz_windows::Zone>> {
+    if state::passthrough() {
+        return None;
+    }
+    let domain = state::domain();
+    if domain.is_null() {
+        return None;
+    }
+    // SAFETY: see `Domain::current`.
+    unsafe { &*domain }.time_zone.clone()
+}
+
 /// What a thread being created takes from its creator: a strong reference to the domain, its
 /// class and its lineage.
 ///
@@ -4209,6 +4934,10 @@ pub(crate) struct Inherited {
     pub(crate) lineage: u64,
     /// The child's mutex-hold record, owned by the domain's census.
     held: *const accounting::Held,
+    /// The virtual signals the child starts blocking: its creator's (man 3 pthread_create: "The
+    /// new thread inherits a copy of the creating thread's signal mask").
+    #[cfg(unix)]
+    signal_mask: u64,
 }
 
 /// An [`Inherited`] handed to a thread [`Domain::spawn_injected`] creates.
@@ -4258,6 +4987,8 @@ pub(crate) fn inherit_with(class: ThreadClass, label: Option<&'static str>) -> O
         label,
         lineage,
         held,
+        #[cfg(unix)]
+        signal_mask: crate::signals::mask(),
     })
 }
 
@@ -4274,9 +5005,12 @@ pub(crate) unsafe fn adopt(inherited: Inherited) -> Child {
         label,
         lineage,
         held,
+        #[cfg(unix)]
+        signal_mask,
     } = inherited;
     // `inherit` already counted a participant live; `Managed::drop` does the matching decrement.
-    let managed = Managed {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut managed = Managed {
         previous: state::replace_domain(domain),
         domain,
         root: false,
@@ -4287,8 +5021,19 @@ pub(crate) unsafe fn adopt(inherited: Inherited) -> Child {
         previous_class: accounting::swap_class(class, label),
         previous_held: accounting::swap_held(held),
         previous_followable: follow::set_followable(true),
+        previous_root: swap_root(false),
+        #[cfg(unix)]
+        previous_mask: 0,
         _not_send: PhantomData,
     };
+    #[cfg(unix)]
+    // SAFETY: `domain` is live (see above).
+    if let Some(inner) = unsafe { domain.as_ref() }
+        && inner.signals.is_some()
+    {
+        managed.previous_mask =
+            crate::signals::joined(&inner.signal_state, lineage, false, signal_mask);
+    }
     // SAFETY: `domain` is live (see above).
     unsafe { &(*domain).accounting }.record_handle(crate::os::current_thread_handle(), lineage);
     if class == ThreadClass::Participant
@@ -4452,6 +5197,8 @@ fn det_block_with_timer(
             futex_private: accounting::wait_futex_private(),
             #[cfg(target_os = "linux")]
             pre_released: false,
+            #[cfg(target_os = "linux")]
+            moved: false,
             #[cfg(target_os = "linux")]
             claimed: false,
             #[cfg(windows)]

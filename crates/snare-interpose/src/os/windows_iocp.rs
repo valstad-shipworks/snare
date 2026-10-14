@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{GetLastError, RtlNtStatusToDosError, SetLastError};
 
+use crate::{HashMap, HashSet};
 use crate::domain::{self, Domain, WeakDomain};
 use crate::hooks::{Hook, hook, original};
 use crate::net::{CompletionCall, CompletionQuery};

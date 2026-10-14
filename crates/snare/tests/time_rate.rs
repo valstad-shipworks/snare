@@ -22,6 +22,26 @@ fn after_real(delay: Duration, f: impl FnOnce() + Send + 'static) -> JoinHandle<
     })
 }
 
+/// As [`after_real`], repeating `f` every `delay` until `done` is set: a timed wait the sim's
+/// thread begins only after a move of the clock, on a loaded machine, still sees the next.
+fn every_real(
+    delay: Duration,
+    done: Arc<AtomicBool>,
+    f: impl Fn() + Send + 'static,
+) -> JoinHandle<()> {
+    snare::real(|| {
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(delay);
+                f();
+                if done.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+        })
+    })
+}
+
 fn real_now() -> Instant {
     snare::real(Instant::now)
 }
@@ -218,7 +238,9 @@ fn set_time_value_wakes_sleeper() {
         let controller = after_real(Duration::from_millis(100), move || {
             time.set_value(time.value() + Duration::from_secs(20));
         });
-        std::thread::sleep(Duration::from_secs(10));
+        std::thread::sleep(
+            (start + Duration::from_secs(10)).saturating_duration_since(Instant::now()),
+        );
         assert!(start.elapsed() >= Duration::from_secs(20));
         snare::real(|| controller.join().unwrap());
     });
@@ -234,7 +256,9 @@ fn paused_sleep_parks_until_advance() {
         let controller = after_real(Duration::from_millis(200), move || {
             time.advance(Duration::from_secs(5));
         });
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(
+            (start + Duration::from_secs(5)).saturating_duration_since(Instant::now()),
+        );
         assert!(
             real_since(real) >= Duration::from_millis(150),
             "the sleep parked"
@@ -278,11 +302,13 @@ fn paused_rcvtimeo_holds() {
         sock.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let real = real_now();
         let start = Instant::now();
-        let controller = after_real(Duration::from_millis(200), move || {
+        let done = Arc::new(AtomicBool::new(false));
+        let controller = every_real(Duration::from_millis(200), done.clone(), move || {
             time.advance(Duration::from_secs(2));
         });
         let mut buf = [0u8; 8];
         let err = sock.recv_from(&mut buf).unwrap_err();
+        done.store(true, Ordering::Release);
         assert!(
             start.elapsed() >= Duration::from_secs(1),
             "the whole timeout elapsed on the clock"
@@ -330,7 +356,8 @@ fn paused_condvar_wait_timeout_holds() {
     sim.run(|| {
         let pair = Arc::new((Mutex::new(()), Condvar::new()));
         let real = real_now();
-        let controller = after_real(Duration::from_millis(200), move || {
+        let done = Arc::new(AtomicBool::new(false));
+        let controller = every_real(Duration::from_millis(200), done.clone(), move || {
             time.advance(Duration::from_secs(2));
         });
         let (lock, cv) = &*pair;
@@ -338,6 +365,7 @@ fn paused_condvar_wait_timeout_holds() {
         let (_guard, result) = cv
             .wait_timeout_while(guard, Duration::from_secs(1), |_| true)
             .unwrap();
+        done.store(true, Ordering::Release);
         assert!(result.timed_out());
         assert!(
             real_since(real) >= Duration::from_millis(150),
@@ -354,7 +382,8 @@ fn advance_expires_long_native_wait() {
     sim.run(|| {
         let pair = Arc::new((Mutex::new(()), Condvar::new()));
         let real = real_now();
-        let controller = after_real(Duration::from_millis(100), move || {
+        let done = Arc::new(AtomicBool::new(false));
+        let controller = every_real(Duration::from_millis(100), done.clone(), move || {
             time.advance(Duration::from_secs(7200));
         });
         let (lock, cv) = &*pair;
@@ -362,6 +391,7 @@ fn advance_expires_long_native_wait() {
         let (_guard, result) = cv
             .wait_timeout_while(guard, Duration::from_secs(3600), |_| true)
             .unwrap();
+        done.store(true, Ordering::Release);
         assert!(result.timed_out());
         assert!(real_since(real) < Duration::from_secs(30));
         snare::real(|| controller.join().unwrap());

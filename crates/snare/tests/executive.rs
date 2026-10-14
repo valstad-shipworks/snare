@@ -3,7 +3,7 @@
 //! its own.
 
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -287,6 +287,84 @@ fn jump_refused_while_a_participant_runs() {
         assert_eq!(&*name, "spinner");
         stop.store(true, Ordering::SeqCst);
         run.join().unwrap();
+    });
+}
+
+#[test]
+fn the_epoch_holds_while_a_participant_runs_throughout() {
+    let sim = Sim::new();
+    let stop = AtomicBool::new(false);
+    let spinning = AtomicBool::new(false);
+    let rounds = AtomicU32::new(0);
+    let notified = Arc::new(AtomicBool::new(false));
+    thread::scope(|s| {
+        let exec = sim.executive(ExecutiveConfig::default()).unwrap();
+        let run = s.spawn(|| {
+            sim.run(|| {
+                let (to_echo, echo_rx) = mpsc::channel::<u32>();
+                let (to_main, main_rx) = mpsc::channel::<u32>();
+                thread::scope(|inner| {
+                    let spinner = thread::Builder::new()
+                        .name("spinner".into())
+                        .spawn_scoped(inner, || {
+                            spinning.store(true, Ordering::SeqCst);
+                            while !stop.load(Ordering::SeqCst) {
+                                std::hint::spin_loop();
+                            }
+                        })
+                        .unwrap();
+                    let echo = thread::Builder::new()
+                        .name("echo".into())
+                        .spawn_scoped(inner, move || {
+                            while let Ok(n) = echo_rx.recv() {
+                                to_main.send(n).unwrap();
+                            }
+                        })
+                        .unwrap();
+                    while !spinning.load(Ordering::SeqCst) {
+                        std::hint::spin_loop();
+                    }
+                    for n in 0..500 {
+                        to_echo.send(n).unwrap();
+                        assert_eq!(main_rx.recv().unwrap(), n);
+                        rounds.fetch_add(1, Ordering::SeqCst);
+                    }
+                    while !stop.load(Ordering::SeqCst) {
+                        std::hint::spin_loop();
+                    }
+                    drop(to_echo);
+                    echo.join().unwrap();
+                    spinner.join().unwrap();
+                });
+            })
+        });
+        let _stop = SetOnDrop(&stop);
+        while rounds.load(Ordering::SeqCst) == 0 {
+            real_sleep(Duration::from_micros(100));
+        }
+        let seen = exec.epoch();
+        let fired = notified.clone();
+        exec.arm_notify(seen, Arc::new(move || fired.store(true, Ordering::SeqCst)));
+        let started = real_now();
+        while rounds.load(Ordering::SeqCst) < 500 {
+            assert!(
+                real_since(started) < Duration::from_secs(20),
+                "the ping-pong never finished"
+            );
+            real_sleep(Duration::from_micros(200));
+        }
+        assert_eq!(
+            exec.epoch(),
+            seen,
+            "participants parking and waking beside a running one leave quiescence as it was"
+        );
+        assert!(!notified.load(Ordering::SeqCst));
+        stop.store(true, Ordering::SeqCst);
+        run.join().unwrap();
+        assert!(
+            notified.load(Ordering::SeqCst),
+            "the sim settling moves the epoch"
+        );
     });
 }
 

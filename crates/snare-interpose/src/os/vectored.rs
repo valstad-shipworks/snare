@@ -16,7 +16,7 @@ use libc::{iovec, off_t, ssize_t};
 use crate::domain::{self, dispatch_fs_fd};
 use crate::hooks::{Hook, hook, original};
 use crate::net::NetResult;
-use crate::os::sockets::finish;
+use crate::os::sockets::{finish, write_pipe};
 
 macro_rules! slot {
     ($name:ident) => {
@@ -189,6 +189,11 @@ unsafe extern "C" fn readv(fd: c_int, iov: *const iovec, count: c_int) -> ssize_
     }) {
         return finish(r) as ssize_t;
     }
+    if let Some(r) = domain::dispatch_net(|net| net.await_readable(fd))
+        && r < 0
+    {
+        return finish(r) as ssize_t;
+    }
     // SAFETY: READV holds libc's readv.
     unsafe {
         original::<unsafe extern "C" fn(c_int, *const iovec, c_int) -> ssize_t>(&READV)(
@@ -219,6 +224,21 @@ unsafe extern "C" fn writev(fd: c_int, iov: *const iovec, count: c_int) -> ssize
     if let Some(r) = handled {
         domain::note_effect("writev");
         return finish(r) as ssize_t;
+    }
+    if let Ok(gathered) = &iovecs
+        && gathered.total > 0
+        && let Some(r) = domain::dispatch_net(|net| net.await_writable(fd))
+    {
+        if r < 0 {
+            return finish(r) as ssize_t;
+        }
+        let mut written = 0;
+        gathered.write(|buf, len| {
+            // SAFETY: the gathered buffer holds `len` readable bytes.
+            written = unsafe { write_pipe(fd, buf, len) };
+            None
+        });
+        return finish(written) as ssize_t;
     }
     // SAFETY: WRITEV holds libc's writev.
     unsafe {

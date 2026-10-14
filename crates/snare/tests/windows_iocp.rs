@@ -626,3 +626,98 @@ fn native_file_and_device_fallthrough_remains_visible_to_the_audit() {
         });
     }
 }
+
+#[test]
+fn polls_beside_idle_sockets_report_each_change() {
+    install_completion_hooks();
+    use std::io::{Read, Write};
+    use std::time::Duration;
+    for deterministic in [false, true] {
+        let builder = Sim::builder().stuck_after(Duration::from_secs(5));
+        let sim = if deterministic {
+            builder.deterministic().build()
+        } else {
+            builder.build()
+        };
+        sim.run(|| {
+            let mut poll = mio::Poll::new().unwrap();
+            let mut idle: Vec<_> = (0..64)
+                .map(|i| {
+                    let mut sock =
+                        mio::net::UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                    poll.registry()
+                        .register(&mut sock, mio::Token(100 + i), mio::Interest::READABLE)
+                        .unwrap();
+                    sock
+                })
+                .collect();
+            let mut listener = mio::net::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let server = listener.local_addr().unwrap();
+            poll.registry()
+                .register(&mut listener, mio::Token(1), mio::Interest::READABLE)
+                .unwrap();
+            let mut events = mio::Events::with_capacity(128);
+            poll.poll(&mut events, Some(Duration::ZERO)).unwrap();
+            assert!(events.is_empty());
+
+            let targets = [
+                idle[40].local_addr().unwrap(),
+                idle[3].local_addr().unwrap(),
+            ];
+            let client = std::thread::spawn(move || {
+                let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                for target in targets {
+                    sender.send_to(b"idle no more", target).unwrap();
+                }
+                let mut stream = std::net::TcpStream::connect(server).unwrap();
+                stream.write_all(b"hello").unwrap();
+                stream
+            });
+
+            let mut seen = Vec::new();
+            let mut stream = None;
+            let mut read = Vec::new();
+            while seen.len() < 2 || read.len() < 5 {
+                poll.poll(&mut events, None).unwrap();
+                for event in &events {
+                    match event.token() {
+                        mio::Token(1) => {
+                            let (mut accepted, _) = listener.accept().unwrap();
+                            poll.registry()
+                                .register(&mut accepted, mio::Token(2), mio::Interest::READABLE)
+                                .unwrap();
+                            stream = Some(accepted);
+                        }
+                        mio::Token(2) => {
+                            let mut buf = [0u8; 16];
+                            loop {
+                                match stream.as_mut().unwrap().read(&mut buf) {
+                                    Ok(n) => read.extend_from_slice(&buf[..n]),
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                    Err(e) => panic!("{e}"),
+                                }
+                            }
+                        }
+                        mio::Token(token) => {
+                            let sock = &mut idle[token - 100];
+                            let mut buf = [0u8; 16];
+                            assert_eq!(sock.recv(&mut buf).unwrap(), 12);
+                            assert_eq!(
+                                sock.recv(&mut buf).unwrap_err().kind(),
+                                std::io::ErrorKind::WouldBlock
+                            );
+                            seen.push(token - 100);
+                        }
+                    }
+                }
+            }
+            seen.sort_unstable();
+            assert_eq!(seen, [3, 40]);
+            assert_eq!(read, b"hello");
+            let client = client.join().unwrap();
+            poll.poll(&mut events, Some(Duration::ZERO)).unwrap();
+            assert!(events.is_empty());
+            drop(client);
+        });
+    }
+}

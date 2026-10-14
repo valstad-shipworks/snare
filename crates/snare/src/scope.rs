@@ -2,7 +2,7 @@
 //! through one `Arc`, and how a thread finds the sim it runs in.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -45,6 +45,8 @@ pub(crate) struct SimShared {
     pub(crate) events: EventLog,
     /// The next port [`ephemeral_port`](Self::ephemeral_port) hands out.
     next_ephemeral: AtomicU16,
+    /// The next [`bind_order`](Self::bind_order).
+    next_bind: AtomicU64,
     /// The sim's domain, set once it is created; weak so the shared state never keeps it alive.
     pub(crate) domain: OnceLock<WeakDomain>,
     /// [`real_now`](crate::readiness::real_now) when the sim was built: the zero of its timeline
@@ -69,6 +71,9 @@ pub(crate) struct SimShared {
     pub(crate) strict_sockopts: AtomicBool,
     /// The first strict refusal was written to stderr.
     pub(crate) strict_reported: AtomicBool,
+    /// The pipes the sim's threads made.
+    #[cfg(unix)]
+    pub(crate) pipes: crate::realfd::Pipes,
 }
 
 impl SimShared {
@@ -85,6 +90,7 @@ impl SimShared {
             rx_timestamp_startup: crate::tstamp::RxStartup::default(),
             events: EventLog::new(),
             next_ephemeral: AtomicU16::new(EPHEMERAL_FIRST),
+            next_bind: AtomicU64::new(1),
             domain: OnceLock::new(),
             real_origin: crate::readiness::real_now(),
             executive: AtomicBool::new(false),
@@ -98,6 +104,8 @@ impl SimShared {
             stats: Arc::default(),
             strict_sockopts: AtomicBool::new(false),
             strict_reported: AtomicBool::new(false),
+            #[cfg(unix)]
+            pipes: crate::realfd::Pipes::default(),
         })
     }
 
@@ -243,6 +251,12 @@ impl SimShared {
         self.next_ephemeral
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, next)
             .unwrap_or(EPHEMERAL_FIRST)
+    }
+
+    /// The next number in the order sockets and testers take addresses in, which decides which of
+    /// several sharing an address receives ([`crate::netif::Cand::order`]).
+    pub(crate) fn bind_order(&self) -> u64 {
+        self.next_bind.fetch_add(1, Ordering::Relaxed)
     }
 
     /// A handle to the sim's clock. Panics on a sim without a virtual clock.

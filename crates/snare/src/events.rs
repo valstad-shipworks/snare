@@ -157,6 +157,10 @@ pub enum RecordedEvent {
         origin: crate::SignalOrigin,
         delivery: crate::SignalDelivery,
     },
+    /// Something the code under test did to the host's tracefs that a real kernel would
+    /// punish (see [`TracefsFault`](crate::TracefsFault)).
+    #[cfg(unix)]
+    Tracefs(crate::TracefsFault),
 }
 
 /// A fault injected into the code under test, as it took effect.

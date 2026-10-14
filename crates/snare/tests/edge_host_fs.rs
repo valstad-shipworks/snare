@@ -163,11 +163,10 @@ fn stat_fields_are_fixed() {
         assert_eq!((st.st_uid, st.st_gid), (uid, gid));
         assert_eq!(st.st_ino as u64 & 1, 1);
         // Declared nodes carry the instant the sim was built, Unix time 1_700_000_000 on a
-        // fixed-epoch clock, in all three times (tests/fs_times.rs covers how they move); the device
-        // stays 0.
+        // fixed-epoch clock, in all three times (tests/fs_times.rs covers how they move).
         assert_eq!(
-            (st.st_mtime, st.st_atime, st.st_ctime, st.st_dev as i64),
-            (1_700_000_000, 1_700_000_000, 1_700_000_000, 0)
+            (st.st_mtime, st.st_atime, st.st_ctime),
+            (1_700_000_000, 1_700_000_000, 1_700_000_000)
         );
         assert_eq!(
             raw_stat("/o/f").unwrap().st_ino,
@@ -181,6 +180,7 @@ fn stat_fields_are_fixed() {
             (0, 2, 0)
         );
         assert_ne!(d.st_ino, st.st_ino);
+        assert_eq!(d.st_dev, st.st_dev, "one file system, one device");
 
         let m = std::fs::metadata("/o/f").unwrap();
         assert_eq!(
@@ -196,6 +196,24 @@ fn stat_fields_are_fixed() {
         assert_eq!(fst.st_ino, st.st_ino);
         assert_eq!((fst.st_mode as u32, fst.st_size), (0o100644, 1025));
     });
+}
+
+/// Each file system is a device of its own, so files of two never share (`st_dev`, `st_ino`),
+/// the identity SQLite keys its locks and shared memory by.
+#[test]
+fn file_systems_have_devices_of_their_own() {
+    let identity = || {
+        sim(owned().file("/o/f", "x").build()).run(|| {
+            let st = raw_stat("/o/f").unwrap();
+            (st.st_dev, st.st_ino)
+        })
+    };
+    let (first, second) = (identity(), identity());
+    assert_eq!(
+        first.1, second.1,
+        "the same declarations number inodes alike"
+    );
+    assert_ne!(first.0, second.0);
 }
 
 #[test]

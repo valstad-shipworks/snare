@@ -4,7 +4,8 @@
 //! `GetPriorityClass`, `timeBeginPeriod`/`timeEndPeriod` — against in-process state, deterministically,
 //! without ever touching the real scheduler or timer resolution.
 //!
-//! It also models the process's working-set bounds (`SetProcessWorkingSetSizeEx` /
+//! It also models the machine's processors (counts, topology and the process affinity mask,
+//! through [`crate::win_cpu`]), the process's working-set bounds (`SetProcessWorkingSetSizeEx` /
 //! `GetProcessWorkingSetSizeEx`) and, through [`crate::win_adapter`], the network adapters'
 //! device nodes and registry keys that SetupAPI, the registry and the Configuration Manager reach.
 //!
@@ -15,7 +16,6 @@
 //! or a call into the sim. This file also holds the Windows [`Sim`] and [`SimBuilder`], which
 //! mirror the unix ones in `lib.rs` method for method, minus the file system and `SimHost`.
 
-use std::collections::HashMap;
 use std::ffi::c_int;
 use std::mem::size_of_val;
 use std::sync::{Arc, Mutex};
@@ -24,8 +24,10 @@ use std::time::Duration;
 use snare_interpose::NetResult as HostResult;
 use snare_interpose::{Domain, Host, Layer};
 
+use crate::HashMap;
 use crate::clock::{Clock, ClockLayer};
 use crate::scope::SimShared;
+use crate::win_cpu::Topology;
 use windows_sys::Win32::Foundation::{
     CloseHandle, CompareObjectHandles, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED,
     ERROR_CALL_NOT_IMPLEMENTED, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
@@ -40,14 +42,15 @@ use windows_sys::Win32::System::Memory::{
     QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MIN_ENABLE,
 };
 use windows_sys::Win32::System::Threading::{
-    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess,
-    GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId, GetProcessIdOfThread, GetThreadId,
-    HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_MODE_BACKGROUND_BEGIN,
-    PROCESS_MODE_BACKGROUND_END, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SET_INFORMATION, PROCESS_SET_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
-    REALTIME_PRIORITY_CLASS, THREAD_MODE_BACKGROUND_BEGIN, THREAD_MODE_BACKGROUND_END,
-    THREAD_PRIORITY_NORMAL, THREAD_QUERY_INFORMATION, THREAD_QUERY_LIMITED_INFORMATION,
-    THREAD_SET_INFORMATION, THREAD_SET_LIMITED_INFORMATION,
+    ABOVE_NORMAL_PRIORITY_CLASS, ALL_PROCESSOR_GROUPS, BELOW_NORMAL_PRIORITY_CLASS,
+    GetCurrentProcess, GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId,
+    GetProcessIdOfThread, GetThreadId, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS,
+    NORMAL_PRIORITY_CLASS, PROCESS_MODE_BACKGROUND_BEGIN, PROCESS_MODE_BACKGROUND_END,
+    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION,
+    PROCESS_SET_LIMITED_INFORMATION, PROCESS_SET_QUOTA, REALTIME_PRIORITY_CLASS,
+    THREAD_MODE_BACKGROUND_BEGIN, THREAD_MODE_BACKGROUND_END, THREAD_PRIORITY_NORMAL,
+    THREAD_QUERY_INFORMATION, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SET_INFORMATION,
+    THREAD_SET_LIMITED_INFORMATION,
 };
 
 /// Per-thread scheduling state. `priority` is the `SetThreadPriority` view; `affinity` the explicit
@@ -163,10 +166,12 @@ impl Drop for NativeHandle {
     }
 }
 
-struct PreservedLastError(u32);
+/// Puts the thread's last error back as it was when dropped, so the real calls a model makes do
+/// not show through to the code under test.
+pub(crate) struct PreservedLastError(u32);
 
 impl PreservedLastError {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(unsafe { GetLastError() })
     }
 }
@@ -300,6 +305,8 @@ const PHYSICAL_MEMORY: usize = 16 << 30;
 /// Everything [`WinHost`] models, behind its one mutex.
 struct HostState {
     /// One bit per simulated logical CPU, low bits first; fixed at build.
+    system_affinity: u64,
+    /// The process affinity mask, a subset of `system_affinity`; `SetProcessAffinityMask` sets it.
     process_affinity: u64,
     /// How many consecutive logical CPUs share a core; fixed at build.
     threads_per_core: u32,
@@ -335,7 +342,15 @@ impl HostState {
 
     /// The number of logical CPUs the host has.
     fn cpus(&self) -> u32 {
-        self.process_affinity.count_ones()
+        self.system_affinity.count_ones()
+    }
+
+    /// The host's processors.
+    fn topology(&self) -> Topology {
+        Topology {
+            cpus: self.cpus(),
+            threads_per_core: self.threads_per_core,
+        }
     }
 
     /// Resolves a Win32 thread handle to the key its state lives under, ensuring an entry exists.
@@ -427,23 +442,21 @@ impl WinHost {
     /// ([Microsoft Learn: SetThreadAffinityMask, Syntax](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setthreadaffinitymask))
     /// and covers one processor group, "a static set of up to 64 logical processors"
     /// ([Microsoft Learn: Processor Groups](https://learn.microsoft.com/en-us/windows/win32/procthread/processor-groups)).
-    /// 64 is special-cased because `1 << 64` overflows.
     fn new(cpus: usize, threads_per_core: usize) -> Self {
         let cpus = cpus.clamp(1, 64);
-        let threads_per_core = threads_per_core.clamp(1, cpus) as u32;
-        let process_affinity = if cpus == 64 {
-            u64::MAX
-        } else {
-            (1u64 << cpus) - 1
+        let topology = Topology {
+            cpus: cpus as u32,
+            threads_per_core: threads_per_core.clamp(1, cpus) as u32,
         };
         WinHost {
             state: Mutex::new(HostState {
-                process_affinity,
-                threads_per_core,
+                system_affinity: topology.mask(),
+                process_affinity: topology.mask(),
+                threads_per_core: topology.threads_per_core,
                 priority_class: NORMAL_PRIORITY_CLASS,
                 process_background: false,
                 threads: Vec::new(),
-                time_periods: HashMap::new(),
+                time_periods: HashMap::default(),
                 working_set: WorkingSet::INITIAL,
                 mmcss: Vec::new(),
                 next_mmcss_handle: 0x4d4d_0004,
@@ -976,11 +989,13 @@ impl Host for WinHost {
     }
 
     /// One `CpuSetInformation` record per simulated logical processor, ids from
-    /// [`FIRST_CPU_SET`], in group 0 and NUMA node 0, efficiency class 0, sharing last-level
-    /// cache 0, no flags set. Each run of `threads_per_core` logical processors is one core, whose
-    /// `CoreIndex` is its first logical processor's index, as Windows reports SMT siblings
-    /// (measured on Windows Server 2025, 2 cores of 2 threads each). A buffer too small for all of them fails with
-    /// `ERROR_INSUFFICIENT_BUFFER` and `*returned` the size needed.
+    /// [`FIRST_CPU_SET`], in group 0 and NUMA node 0, efficiency class 0, no flags set. Each run
+    /// of `threads_per_core` logical processors is one core, whose `CoreIndex` is its first
+    /// logical processor's index, as Windows reports SMT siblings (measured on Windows Server
+    /// 2025, 2 cores of 2 threads each); `LastLevelCacheIndex` follows the caches
+    /// `GetLogicalProcessorInformationEx` reports (see [`Topology::last_level_cache_index`]). A
+    /// buffer too small for all of them fails with `ERROR_INSUFFICIENT_BUFFER` and `*returned`
+    /// the size needed.
     unsafe fn system_cpu_set_information(
         &self,
         info: *mut u8,
@@ -989,10 +1004,8 @@ impl Host for WinHost {
         _process: u64,
         _flags: u32,
     ) -> Option<HostResult> {
-        let (cpus, threads_per_core) = {
-            let state = self.state.lock().unwrap();
-            (state.cpus(), state.threads_per_core)
-        };
+        let topology = self.state.lock().unwrap().topology();
+        let (cpus, threads_per_core) = (topology.cpus, topology.threads_per_core);
         let need = cpus as usize * CPU_SET_RECORD;
         if !returned.is_null() {
             // SAFETY: the caller's out-pointer.
@@ -1007,6 +1020,7 @@ impl Host for WinHost {
             record[8..12].copy_from_slice(&(FIRST_CPU_SET + cpu).to_ne_bytes());
             record[14] = cpu as u8;
             record[15] = (cpu - cpu % threads_per_core) as u8;
+            record[16] = topology.last_level_cache_index(cpu);
             // SAFETY: `need` bytes fit in the caller's `len`.
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -1110,6 +1124,120 @@ impl Host for WinHost {
             return Some(HostResult::Err(ERROR_INSUFFICIENT_BUFFER as c_int));
         }
         Some(HostResult::Ok(1))
+    }
+
+    /// Reports the simulated processors in place of the machine's.
+    unsafe fn system_info(&self, info: *mut u8) -> Option<HostResult> {
+        let topology = self.state.lock().unwrap().topology();
+        // SAFETY: the caller's SYSTEM_INFO.
+        unsafe { topology.write_system_info(info) };
+        Some(HostResult::Ok(0))
+    }
+
+    /// Every processor is in group 0, so group 0 and `ALL_PROCESSOR_GROUPS` count them all, and
+    /// any other group is `ERROR_INVALID_PARAMETER`, as on a one-group machine (measured on
+    /// Windows 11). Every processor is active.
+    fn processor_count(&self, _maximum: bool, group: u16) -> Option<HostResult> {
+        if group != 0 && group != ALL_PROCESSOR_GROUPS {
+            return Some(HostResult::Err(ERROR_INVALID_PARAMETER as c_int));
+        }
+        Some(HostResult::Ok(i64::from(self.state.lock().unwrap().cpus())))
+    }
+
+    /// One processor group, active.
+    fn processor_group_count(&self, _maximum: bool) -> Option<HostResult> {
+        Some(HostResult::Ok(1))
+    }
+
+    /// See [`Topology::logical_processor_information`].
+    unsafe fn logical_processor_information(
+        &self,
+        relationship: Option<i32>,
+        info: *mut u8,
+        len: *mut u32,
+    ) -> Option<HostResult> {
+        let topology = self.state.lock().unwrap().topology();
+        // SAFETY: the caller's buffer and length.
+        Some(
+            match unsafe { topology.logical_processor_information(relationship, info, len) } {
+                Ok(()) => HostResult::Ok(1),
+                Err(error) => HostResult::Err(error as c_int),
+            },
+        )
+    }
+
+    /// The process affinity mask, and every simulated processor as the system's. A handle
+    /// without query access is `ERROR_ACCESS_DENIED`, as on Windows 11.
+    unsafe fn get_process_affinity_mask(
+        &self,
+        process: u64,
+        process_mask: *mut usize,
+        system_mask: *mut usize,
+    ) -> Option<HostResult> {
+        if let Err(error) = current_process(
+            process,
+            PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+        ) {
+            return Some(HostResult::Err(error as c_int));
+        }
+        let state = self.state.lock().unwrap();
+        // SAFETY: the caller's DWORD_PTRs.
+        unsafe {
+            process_mask.write_unaligned(state.process_affinity as usize);
+            system_mask.write_unaligned(state.system_affinity as usize);
+        }
+        Some(HostResult::Ok(1))
+    }
+
+    /// Sets the process affinity mask, which must be a nonzero subset of the system's
+    /// (`ERROR_INVALID_PARAMETER` otherwise), and moves every thread onto it: a thread's
+    /// `SetThreadAffinityMask` then returns the new process mask as its previous one, as
+    /// measured on Windows 11. Needs `PROCESS_SET_INFORMATION`.
+    fn set_process_affinity_mask(&self, process: u64, mask: u64) -> Option<HostResult> {
+        if let Err(error) = current_process(process, PROCESS_SET_INFORMATION) {
+            return Some(HostResult::Err(error as c_int));
+        }
+        let mut state = self.state.lock().unwrap();
+        if mask == 0 || mask & !state.system_affinity != 0 {
+            return Some(HostResult::Err(ERROR_INVALID_PARAMETER as c_int));
+        }
+        state.process_affinity = mask;
+        for (_, thread) in &mut state.threads {
+            thread.affinity = None;
+        }
+        Some(HostResult::Ok(1))
+    }
+
+    /// One NUMA node, 0.
+    fn numa_highest_node(&self) -> Option<HostResult> {
+        Some(HostResult::Ok(0))
+    }
+
+    /// Node 0 holds every processor, in group 0; any other node is `ERROR_INVALID_PARAMETER`,
+    /// as measured on Windows 11.
+    unsafe fn numa_node_processor_mask(&self, node: u16, affinity: *mut u8) -> Option<HostResult> {
+        if node != 0 {
+            return Some(HostResult::Err(ERROR_INVALID_PARAMETER as c_int));
+        }
+        let mut record = [0u8; 16];
+        record[..8].copy_from_slice(&self.state.lock().unwrap().system_affinity.to_ne_bytes());
+        // SAFETY: the caller's GROUP_AFFINITY.
+        unsafe { std::ptr::copy_nonoverlapping(record.as_ptr(), affinity, record.len()) };
+        Some(HostResult::Ok(1))
+    }
+
+    /// See [`Topology::power_information`].
+    unsafe fn processor_power_information(
+        &self,
+        input: *const u8,
+        _input_len: u32,
+        output: *mut u8,
+        output_len: u32,
+    ) -> Option<HostResult> {
+        let topology = self.state.lock().unwrap().topology();
+        // SAFETY: the caller's output buffer.
+        let status = unsafe { topology.power_information(input, output, output_len) };
+        Some(HostResult::Ok(i64::from(status)))
     }
 
     /// Timer-resolution requests are paired by period. They do not change the virtual clock's
@@ -1704,9 +1832,28 @@ pub struct SimBuilder {
     adapters: Vec<(String, crate::Adapter)>,
     /// See [`strict_sockopts`](Self::strict_sockopts).
     strict_sockopts: bool,
+    /// See [`isolate_env`](Self::isolate_env).
+    isolate_env: bool,
+    /// The isolated environment's variables, in the order set.
+    env: Vec<(String, String)>,
+    /// See [`time_zone`](Self::time_zone).
+    time_zone: Option<String>,
 }
 
 impl SimBuilder {
+    /// Gives the sim a local time zone of its own: an IANA name (`"Europe/Oslo"`), which stands
+    /// for the Windows zone the Unicode CLDR maps it to, or a Windows zone's registry key name
+    /// (`"W. Europe Standard Time"`). The Win32 zone and conversion calls, and the UCRT's local
+    /// time, use that zone's rules from this machine's registry, at the sim's time. Without one,
+    /// local time is the machine's zone, at the sim's time on a virtual clock. See the README's
+    /// "Local time".
+    ///
+    /// [`build`](Self::build) panics if `name` names no zone in the registry.
+    pub fn time_zone(mut self, name: impl Into<String>) -> Self {
+        self.time_zone = Some(name.into());
+        self
+    }
+
     /// What the code under test may do (default [`Privileges::all`](crate::Privileges::all)); see
     /// [`crate::set_privileges`].
     pub fn privileges(mut self, privileges: crate::Privileges) -> Self {
@@ -1742,17 +1889,54 @@ impl SimBuilder {
         self
     }
 
-    /// The number of logical CPUs the process affinity mask spans (default 8, clamped to 1..=64).
-    /// 8 is a snare choice: a typical small workstation, enough for affinity tests to pin
-    /// threads apart.
+    /// Sets an environment variable the code under test reads, and isolates its environment (see
+    /// [`isolate_env`](Self::isolate_env)). Set in order, so a later name equal to an earlier one
+    /// without regard to case replaces its value and keeps its spelling, as
+    /// `SetEnvironmentVariableW` does. A name may start with `=`, as the `=C:` drive directories
+    /// do. Tester code reaches the real environment inside [`snare::real`](crate::real).
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.isolate_env = true;
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Serves the code under test's environment from the sim, starting with the variables
+    /// [`env`](Self::env) sets and no others: `std::env::var`, `set_var`, `remove_var` and `vars`,
+    /// the Win32 `GetEnvironmentVariable`, `SetEnvironmentVariable`, `GetEnvironmentStrings`,
+    /// `SetEnvironmentStringsW` and `ExpandEnvironmentStrings` calls, and the C runtime's `getenv`,
+    /// `_putenv` and their kin, which keep their own copy as the real C runtime does. A child
+    /// process created without an environment of its own gets the sim's. Changes stay in the sim
+    /// and last across its runs.
+    pub fn isolate_env(mut self) -> Self {
+        self.isolate_env = true;
+        self
+    }
+
+    /// The number of logical processors the simulated machine has (default 8, clamped to 1..=64,
+    /// one processor group). The affinity masks and CPU sets span them, and they are what the code
+    /// under test counts: `GetSystemInfo`/`GetNativeSystemInfo`, `GetActiveProcessorCount`,
+    /// `GetMaximumProcessorCount`, `GetLogicalProcessorInformation(Ex)`,
+    /// `GetProcessAffinityMask`, the NUMA node masks and `CallNtPowerInformation`'s processor
+    /// records all report them. So `std::thread::available_parallelism`, `num_cpus` and sysinfo
+    /// see this count rather than the machine's, and so do the worker pools tokio and rayon size
+    /// from `available_parallelism` when not told a size.
+    ///
+    /// The default is fixed rather than taken from the machine so that a test sees the same
+    /// processors wherever it runs: affinity masks, CPU set ids and default worker counts are the
+    /// same on a workstation, a CI runner and a VM, which affinity tests rely on to pin threads
+    /// to processors that exist. 8 is a snare choice: a typical small workstation, enough to pin
+    /// threads apart. A test that wants the machine's count passes
+    /// `std::thread::available_parallelism()` read before [`run`](Sim::run).
     pub fn cpus(mut self, count: usize) -> Self {
         self.cpus = Some(count);
         self
     }
 
     /// How many hardware threads each core runs (default 1, clamped to 1..=[`cpus`](Self::cpus)):
-    /// consecutive logical CPUs are grouped into cores of this many, which
-    /// `GetSystemCpuSetInformation` reports as sharing a `CoreIndex`.
+    /// consecutive logical processors are grouped into cores of this many, which
+    /// `GetSystemCpuSetInformation` reports as sharing a `CoreIndex` and
+    /// `GetLogicalProcessorInformation(Ex)` as one core, flagged `LTP_PC_SMT` when it runs more
+    /// than one; `num_cpus::get_physical` counts those cores.
     pub fn threads_per_core(mut self, count: usize) -> Self {
         self.threads_per_core = Some(count);
         self
@@ -1884,7 +2068,9 @@ impl SimBuilder {
     ///
     /// Panics if [`real_dns`](Self::real_dns) is combined with
     /// [`deterministic`](Self::deterministic), if a [`resolve_real`](Self::resolve_real) lookup
-    /// fails, or if the [`pcapng`](Self::pcapng) file cannot be created.
+    /// fails, if the [`pcapng`](Self::pcapng) file cannot be created, if an [`env`](Self::env)
+    /// name is empty or holds `=` past its first character, or if the
+    /// [`time_zone`](Self::time_zone) names no zone in the registry.
     #[track_caller]
     pub fn build(self) -> Sim {
         self.dns.check(self.deterministic);
@@ -1936,8 +2122,14 @@ impl SimBuilder {
         if self.deterministic {
             builder = builder.deterministic();
         }
+        if let Some(name) = &self.time_zone {
+            builder = builder.time_zone(name);
+        }
         if let Some(after) = self.stuck_after {
             builder = builder.stuck_after(after);
+        }
+        if self.isolate_env {
+            builder = builder.env(Arc::new(snare_interpose::WinEnv::new(self.env)));
         }
         let domain = builder.install();
         let _ = shared.domain.set(domain.downgrade());

@@ -207,7 +207,9 @@ fn concurrent_sims_keep_independent_exact_clocks() {
     let held = thread::scope(|s| {
         let held = s.spawn(|| {
             paused.run(|| {
-                let start = Instant::now();
+                // The sim's start rather than this thread's: under load the advance below can
+                // come before this thread first reads the clock.
+                let start = Instant::now() - Duration::from_nanos(ns());
                 sched::park(Some(start + MS));
                 ns()
             })

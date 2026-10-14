@@ -9,18 +9,21 @@
 //! Lock order: `Clock::control` before either timer table; the participants' table (`pending`)
 //! before the foreign one when both are held in turn, never both at once. No timer table is held
 //! while a waker runs: wakers taken under one are woken by [`wake_all`] after it is let go, on the
-//! clock's `snare-timer-wakes` thread. `control` may still be held then (a charge, or a time skip that
-//! only prunes), so a waker must not move the clock itself.
+//! clock's `snare-timer-wakes` thread, or for the interposer's own timer wakes on the thread that
+//! took them. `control` may still be held then (a charge, or a time skip that only prunes), so a
+//! waker must not move the clock itself.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
-use std::task::Waker;
+use std::task::{RawWaker, RawWakerVTable, Waker};
 use std::time::Duration;
 
 use snare_interpose::{ClockKind, Flow, Layer, RaceCell, SleepRequest, SpinStep, ThreadClass};
+
+use crate::HashMap;
 
 /// 2^32, the scale of the 32.32 fixed-point rate in [`Line::rate_q32`].
 const Q32: f64 = 4_294_967_296.0;
@@ -256,7 +259,18 @@ impl Entry {
 #[derive(Default)]
 struct Timers {
     entries: BTreeMap<u64, Entry>,
-    wake_deadlines: HashMap<u64, u64>,
+    /// Each registered wake's deadline and place in its entry, so a cancel among many wakes tied
+    /// on one deadline finds it at once.
+    wake_deadlines: HashMap<u64, (u64, WakeSlot)>,
+}
+
+/// Where a registered wake sits in its [`Entry`].
+#[derive(Clone, Copy)]
+enum WakeSlot {
+    /// `Entry::wakers[i]`, not yet delivered.
+    Pending(usize),
+    /// `Entry::awaiting[i]`, delivered and holding its deadline.
+    Held(usize),
 }
 
 impl Deref for Timers {
@@ -275,12 +289,10 @@ impl DerefMut for Timers {
 
 impl Timers {
     fn register_wake(&mut self, at: u64, id: u64, owner: Option<u64>, waker: Waker) {
-        self.entries
-            .entry(at)
-            .or_default()
-            .wakers
-            .push((id, owner, waker));
-        self.wake_deadlines.insert(id, at);
+        let wakers = &mut self.entries.entry(at).or_default().wakers;
+        self.wake_deadlines
+            .insert(id, (at, WakeSlot::Pending(wakers.len())));
+        wakers.push((id, owner, waker));
     }
 
     fn take_wakers_at(&mut self, at: u64, hold: bool, out: &mut Vec<Waker>) -> bool {
@@ -288,6 +300,8 @@ impl Timers {
         let any = !entry.wakers.is_empty();
         for (id, _, waker) in entry.wakers.drain(..) {
             if hold {
+                self.wake_deadlines
+                    .insert(id, (at, WakeSlot::Held(entry.awaiting.len())));
                 entry.awaiting.push(id);
             } else {
                 self.wake_deadlines.remove(&id);
@@ -298,14 +312,26 @@ impl Timers {
     }
 
     fn cancel_wake(&mut self, id: u64) -> Option<Option<Waker>> {
-        let at = self.wake_deadlines.remove(&id)?;
+        let (at, slot) = self.wake_deadlines.remove(&id)?;
         let entry = self.entries.get_mut(&at).unwrap();
-        let waker = if let Some(i) = entry.wakers.iter().position(|&(key, _, _)| key == id) {
-            Some(entry.wakers.swap_remove(i).2)
-        } else {
-            let i = entry.awaiting.iter().position(|&key| key == id).unwrap();
-            entry.awaiting.swap_remove(i);
-            None
+        let waker = match slot {
+            WakeSlot::Pending(i) => {
+                debug_assert_eq!(entry.wakers[i].0, id);
+                let (_, _, waker) = entry.wakers.swap_remove(i);
+                if let Some(&(moved, _, _)) = entry.wakers.get(i) {
+                    self.wake_deadlines
+                        .insert(moved, (at, WakeSlot::Pending(i)));
+                }
+                Some(waker)
+            }
+            WakeSlot::Held(i) => {
+                debug_assert_eq!(entry.awaiting[i], id);
+                entry.awaiting.swap_remove(i);
+                if let Some(&moved) = entry.awaiting.get(i) {
+                    self.wake_deadlines.insert(moved, (at, WakeSlot::Held(i)));
+                }
+                None
+            }
         };
         if entry.is_empty() {
             self.entries.remove(&at);
@@ -443,6 +469,18 @@ pub(crate) struct Clock {
     dormant_v: AtomicU64,
     /// Real nanoseconds since the process origin when the dormant spell began.
     dormant_real: AtomicU64,
+    /// What holds the clock to real time for something outside the sim: threads waiting on a
+    /// descriptor it may write (see [`hold_outside`](Clock::hold_outside)), and child processes
+    /// the sim made that still run (see [`hold_child`](Clock::hold_child)).
+    outside: AtomicUsize,
+    /// The reading when the first of those holds began.
+    outside_v: AtomicU64,
+    /// Real nanoseconds since the process origin when it began.
+    outside_real: AtomicU64,
+    /// The child processes the sim made that still hold the clock (see
+    /// [`hold_child`](Clock::hold_child)), each with when it was first seen to have exited.
+    #[cfg(unix)]
+    children: Mutex<Vec<(libc::pid_t, Option<u64>)>>,
     /// The thread this clock's wakers run on, once one has run (see [`wake_all`]).
     runner: RaceCell<Arc<WakeRunner>>,
     /// The [`Domain::key`](snare_interpose::Domain::key) of the sim the clock serves, whose
@@ -514,6 +552,11 @@ impl Clock {
             dormant: AtomicBool::new(false),
             dormant_v: AtomicU64::new(0),
             dormant_real: AtomicU64::new(0),
+            outside: AtomicUsize::new(0),
+            outside_v: AtomicU64::new(0),
+            outside_real: AtomicU64::new(0),
+            #[cfg(unix)]
+            children: Mutex::new(Vec::new()),
             runner: RaceCell::new(),
             domain: AtomicUsize::new(0),
             owner: Mutex::new(None),
@@ -561,6 +604,86 @@ impl Clock {
             let real = real_nanos().saturating_sub(self.dormant_real.load(Ordering::Acquire));
             self.dormant_v.load(Ordering::Acquire).saturating_add(real)
         })
+    }
+
+    /// Counts a thread into (`true`) or out of a wait on a descriptor something outside the sim
+    /// may write: a pipe a child process may hold. While one waits a time skip lands no further
+    /// past the reading the first of them began at than real time has moved since, as while
+    /// dormant, so a timeout cannot pass before the outside has had that long to answer, and a
+    /// quiescent sim waits for it rather than giving up.
+    #[cfg(unix)]
+    pub(crate) fn hold_outside(&self, on: bool) {
+        self.controlled(|| {
+            if !on {
+                self.outside.fetch_sub(1, Ordering::AcqRel);
+            } else if self.outside.fetch_add(1, Ordering::AcqRel) == 0 {
+                self.outside_v.store(self.peek(), Ordering::Release);
+                self.outside_real.store(real_nanos(), Ordering::Release);
+            }
+        });
+    }
+
+    /// Holds the clock to real time while child process `pid` runs, as a wait on a descriptor it
+    /// may write does (see [`hold_outside`](Self::hold_outside)): whatever the sim waits for from
+    /// it, its exit included, happens in real time. Let go once the child is reaped, or
+    /// [`CHILD_GRACE`] after it has exited, so its `SIGCHLD` reaches the code under test first.
+    #[cfg(unix)]
+    pub(crate) fn hold_child(&self, pid: libc::pid_t) {
+        self.hold_outside(true);
+        self.children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((pid, None));
+    }
+
+    /// Lets go of child process `pid`'s hold on the clock (see [`hold_child`](Self::hold_child)):
+    /// its exit has reached the code under test.
+    #[cfg(unix)]
+    pub(crate) fn release_child(&self, pid: libc::pid_t) {
+        let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = children.iter().position(|(child, _)| *child == pid) {
+            children.swap_remove(at);
+            self.outside.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Lets go of the holds of children that are gone (see [`hold_child`](Self::hold_child)).
+    #[cfg(unix)]
+    fn release_children(&self) {
+        let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        if children.is_empty() {
+            return;
+        }
+        let now = real_nanos();
+        children.retain_mut(|(pid, exited)| {
+            let gone = match child_status(*pid) {
+                None => true,
+                Some(false) => false,
+                Some(true) => {
+                    now.saturating_sub(*exited.get_or_insert(now)) >= CHILD_GRACE.as_nanos() as u64
+                }
+            };
+            if gone {
+                self.outside.fetch_sub(1, Ordering::AcqRel);
+            }
+            !gone
+        });
+    }
+
+    /// The furthest a time skip may land while dormant or holding for the outside (see
+    /// [`set_dormant`](Self::set_dormant) and [`hold_outside`](Self::hold_outside)); `None` when
+    /// neither holds.
+    fn pace_limit(&self) -> Option<u64> {
+        #[cfg(unix)]
+        self.release_children();
+        let outside = (self.outside.load(Ordering::Acquire) > 0).then(|| {
+            let real = real_nanos().saturating_sub(self.outside_real.load(Ordering::Acquire));
+            self.outside_v.load(Ordering::Acquire).saturating_add(real)
+        });
+        match (self.dormant_limit(), outside) {
+            (Some(dormant), Some(outside)) => Some(dormant.min(outside)),
+            (dormant, outside) => dormant.or(outside),
+        }
     }
 
     /// Places the clock on the process's timeline, once, before the first sim built on it runs;
@@ -960,7 +1083,7 @@ impl Clock {
                 readiness.wait_until("sleep", Some(deadline), || {
                     self.peek() >= wake || self.jumps()
                 });
-                if done() {
+                if done() || snare_interpose::interrupted() {
                     return;
                 }
             }
@@ -969,7 +1092,7 @@ impl Clock {
         loop {
             snare_interpose::note_wait_deadline(Some(Duration::from_nanos(wake)));
             readiness.wait_due("sleep", wake, || self.peek() >= wake || self.jumps());
-            if done() {
+            if done() || snare_interpose::interrupted() {
                 break;
             }
         }
@@ -1333,7 +1456,9 @@ impl Clock {
             return None;
         }
         let id = wake_id();
-        let owner = snare_interpose::Domain::current().map(|_| snare_interpose::thread_lineage());
+        let owner = snare_interpose::Domain::current()
+            .filter(|_| !in_clock_wake())
+            .map(|_| snare_interpose::thread_lineage());
         let real_at = (self.is_scaled() && !self.is_driven() && !self.is_paused())
             .then(|| self.line().0.real_at(at))
             .flatten();
@@ -1743,6 +1868,23 @@ impl Clock {
         out
     }
 
+    /// How many timers [`pending_timers`](Self::pending_timers) would list with no limit.
+    pub(crate) fn pending_timer_count(&self) -> usize {
+        [false, true]
+            .into_iter()
+            .map(|foreign| {
+                self.timers(foreign)
+                    .values()
+                    .map(|entry| {
+                        entry.owners.len().max(entry.waits as usize)
+                            + entry.events as usize
+                            + entry.wakers.len()
+                    })
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
     /// When, in real time since the process origin, a driven clock running at a rate above zero
     /// next reaches a pending timer of any thread. `None` when it never does on its own (rate 0,
     /// nothing pending, or the timer is past the grant's horizon).
@@ -1805,7 +1947,7 @@ impl Clock {
         let Some((&next, _)) = pending.iter().next() else {
             return (false, pruned);
         };
-        if self.dormant_limit().is_some_and(|limit| next >= limit) {
+        if self.pace_limit().is_some_and(|limit| next >= limit) {
             return (false, pruned);
         }
         // Land just past the deadline as the code under test reads the clock, as a real timer
@@ -1851,7 +1993,7 @@ impl Clock {
                     timers.first_key_value().map(|(&wake, _)| wake)
                 })
                 .min()
-                .filter(|&next| self.dormant_limit().is_none_or(|limit| next < limit));
+                .filter(|&next| self.pace_limit().is_none_or(|limit| next < limit));
             if let Some(next) = next {
                 let landing = creep_past(next);
                 self.monotonic_nanos.fetch_max(landing, Ordering::Relaxed);
@@ -1927,7 +2069,7 @@ impl Clock {
         if self.is_paused() || self.is_driven() {
             return Some(HELD_POLL);
         }
-        if let Some(limit) = self.dormant_limit().filter(|_| !self.is_scaled()) {
+        if let Some(limit) = self.pace_limit().filter(|_| !self.is_scaled()) {
             let now = self.peek();
             let earliest = [false, true]
                 .into_iter()
@@ -1953,6 +2095,33 @@ impl Clock {
         let span = self.real_span(Duration::from_nanos(earliest - now))?;
         Some(span.max(Duration::from_micros(1)))
     }
+}
+
+/// How long, in real time, a child process the sim made keeps holding the clock after it has
+/// exited and before it is reaped (see [`Clock::hold_child`]). A snare choice, long past the
+/// delivery of the `SIGCHLD` its exit raises.
+#[cfg(unix)]
+const CHILD_GRACE: Duration = Duration::from_millis(100);
+
+/// Whether child process `pid` has exited, without reaping it; `None` once it has been reaped
+/// (or is no child of the process).
+#[cfg(unix)]
+fn child_status(pid: libc::pid_t) -> Option<bool> {
+    snare_interpose::real(|| {
+        // SAFETY: zeroed is a valid siginfo_t.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` has room for the result; WNOWAIT leaves the child to be reaped.
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        // SAFETY: waitid filled `info`, its pid zero while the child runs (man 2 waitid, WNOHANG).
+        (waited == 0).then(|| unsafe { info.si_pid() } != 0)
+    })
 }
 
 /// Whether a wait at or before `now` is still registered: the clock reached it and its waiter has
@@ -1990,7 +2159,7 @@ fn take_upto(timers: &mut Timers, upto: u64) -> (bool, Vec<Waker>) {
 ///
 /// They run on a thread of their own, outside the sim: the thread moving the clock may be the
 /// one a waker wakes, midway into its own blocking call, and a channel or a parker does not wake
-/// the thread that signals it.
+/// the thread that signals it. A batch of [`owned`] wakers alone runs on the calling thread.
 fn wake_all(runner: &RaceCell<Arc<WakeRunner>>, wakers: Vec<Waker>) {
     if wakers.is_empty() {
         return;
@@ -1999,7 +2168,50 @@ fn wake_all(runner: &RaceCell<Arc<WakeRunner>>, wakers: Vec<Waker>) {
         wakers.into_iter().for_each(Waker::wake);
         return;
     }
+    if wakers.iter().all(is_owned) {
+        let previous = CLOCK_WAKE.replace(true);
+        wakers.into_iter().for_each(Waker::wake);
+        CLOCK_WAKE.set(previous);
+        return;
+    }
     snare_interpose::real(|| WakeRunner::started(runner).run(wakers));
+}
+
+/// `waker`, from [`Layer::register_owned_wake`], marked as the interposer's own: it signals a
+/// native wait object and takes only locks no thread holds while it moves the clock, so
+/// [`wake_all`] runs it on the thread that took it rather than handing it to the runner.
+fn owned(waker: Waker) -> Waker {
+    let data = Box::into_raw(Box::new(waker)).cast::<()>();
+    // SAFETY: `data` is a boxed `Waker` that `OWNED`'s functions own and free exactly once.
+    unsafe { Waker::from_raw(RawWaker::new(data, &OWNED)) }
+}
+
+fn is_owned(waker: &Waker) -> bool {
+    std::ptr::eq(waker.vtable(), &OWNED)
+}
+
+static OWNED: RawWakerVTable =
+    RawWakerVTable::new(owned_clone, owned_wake, owned_wake_by_ref, owned_drop);
+
+unsafe fn owned_clone(data: *const ()) -> RawWaker {
+    // SAFETY: `data` is the boxed `Waker` of a live owned waker.
+    let waker = unsafe { &*data.cast::<Waker>() }.clone();
+    RawWaker::new(Box::into_raw(Box::new(waker)).cast(), &OWNED)
+}
+
+unsafe fn owned_wake(data: *const ()) {
+    // SAFETY: waking consumes the owned waker, and with it the box.
+    unsafe { Box::from_raw(data.cast_mut().cast::<Waker>()) }.wake();
+}
+
+unsafe fn owned_wake_by_ref(data: *const ()) {
+    // SAFETY: `data` is the boxed `Waker` of a live owned waker.
+    unsafe { &*data.cast::<Waker>() }.wake_by_ref();
+}
+
+unsafe fn owned_drop(data: *const ()) {
+    // SAFETY: dropping the owned waker frees its box once.
+    drop(unsafe { Box::from_raw(data.cast_mut().cast::<Waker>()) });
 }
 
 /// The thread a [`Clock`] runs its wakers on (see [`wake_all`]), started unmanaged on first use
@@ -2174,7 +2386,7 @@ impl Layer for ClockLayer {
     }
 
     fn register_owned_wake(&self, at: Duration, waker: Waker, foreign: bool) -> Option<u64> {
-        self.0.register_wake(nanos(at), waker, foreign)
+        self.0.register_wake(nanos(at), owned(waker), foreign)
     }
 
     fn take_timer_wakes(&self) -> bool {
@@ -2221,11 +2433,19 @@ impl Layer for ClockLayer {
         self.0.idle_wait()
     }
 
+    fn waits_outside(&self) -> bool {
+        self.0.outside.load(Ordering::Acquire) > 0
+    }
+
     fn wake_waiters(&self, domain: usize) {
         crate::readiness::readiness().bump_time(domain);
     }
 
     fn wake_waiters_after_readiness(&self, _domain: usize) {}
+
+    fn wake_due(&self, domain: usize) {
+        crate::readiness::readiness().bump_due(domain, self.0.peek());
+    }
 
     fn wake_unscheduled(&self, domain: usize) {
         crate::readiness::readiness().bump_time_unscheduled(domain);
@@ -2328,6 +2548,40 @@ mod tests {
                 clock.cancel_wake(id);
             }
             assert!(clock.timers(false).is_empty());
+        });
+    }
+
+    #[test]
+    fn cancelling_moved_tied_wakes_finds_their_new_slots() {
+        crate::Sim::new().run(|| {
+            let clock = Clock::new(0);
+            clock.set_discrete(true);
+            let fired = Arc::new(Mutex::new(Vec::new()));
+            let ids: Vec<_> = (0..4)
+                .map(|id| {
+                    clock
+                        .register_wake(
+                            10,
+                            Waker::from(Arc::new(RecordedWake {
+                                id,
+                                fired: fired.clone(),
+                            })),
+                            false,
+                        )
+                        .unwrap()
+                })
+                .collect();
+            clock.cancel_wake(ids[0]);
+            clock.cancel_wake(ids[3]);
+            clock.fire_upto(0, 10).1.into_iter().for_each(Waker::wake);
+            assert_eq!(*fired.lock().unwrap(), [2, 1]);
+            assert!(reached_wait(&clock.timers(false), 10));
+            clock.cancel_wake(ids[2]);
+            assert!(reached_wait(&clock.timers(false), 10));
+            clock.cancel_wake(ids[1]);
+            let timers = clock.timers(false);
+            assert!(timers.is_empty());
+            assert!(timers.wake_deadlines.is_empty());
         });
     }
 

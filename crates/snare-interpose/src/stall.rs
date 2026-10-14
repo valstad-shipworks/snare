@@ -1,7 +1,7 @@
 //! Telling a stuck domain from a waiting one, in real time.
 //!
-//! A domain makes progress when its epoch moves (a participant parks or wakes, a lease is taken or
-//! given back, a class changes), when its virtual clock moves (a time skip, a write from outside,
+//! A domain makes progress when a participant parks or wakes, when its epoch moves (a lease is
+//! taken or given back, a class changes), when its virtual clock moves (a time skip, a write from outside,
 //! a scaled or granted clock flowing, the latency a hooked call is charged, a clock spin's step),
 //! or, under a deterministic schedule, when a participant begins a wait there. What a thread does between
 //! hooked calls is invisible to it: a participant spinning on an atomic, or computing, keeps the
@@ -16,12 +16,15 @@
 //!   [`STALL_WARN`] and the schedule carries on.
 //! - *Busy*: with [`DomainBuilder::stuck_after`](crate::DomainBuilder::stuck_after) set, a
 //!   [`Watchdog`] thread fails the run once a participant has been running for that long with no
-//!   progress, no lease held and no executive's timestamp open, on a virtual clock. A lease is how
-//!   a thread declares work the simulation cannot see; an open timestamp is the executive's own
-//!   business; a blocked participant is waiting, not stuck; and a clock that is not virtual (the
-//!   real one, or one that ticks as it is read) moves on its own, so nothing waits on a spinner
-//!   to move it. Nor does it watch a dormant domain (every run ended): what the threads left
-//!   over from a run do is no longer the test's.
+//!   progress, no lease held and no executive's timestamp open, on a virtual clock, and the
+//!   participants outside any wait have used that much CPU time meanwhile: one the OS has not let
+//!   run (a loaded machine) is not stuck yet. One blocked in a call snare does not see uses no
+//!   CPU time either, so it is failed only after [`off_cpu_limit`] of real time without progress.
+//!   A lease is how a thread declares work the simulation cannot see; an open timestamp is the
+//!   executive's own business; a blocked participant is waiting, not stuck; and a clock that is
+//!   not virtual (the real one, or one that ticks as it is read) moves on its own, so nothing
+//!   waits on a spinner to move it. Nor does it watch a dormant domain (every run ended): what
+//!   the threads left over from a run do is no longer the test's.
 //!
 //! A busy stall cannot be unwound into the test: the stuck thread never reaches a hook, and one
 //! thread cannot make another panic. The watchdog attempts its report on the process's standard
@@ -46,10 +49,22 @@ pub(crate) const STALL_WARN: Duration = Duration::from_secs(1);
 pub(crate) enum Idle {
     /// The clock is held.
     Held,
+    /// The clock moves with real time while the sim waits on a child process.
+    Process,
     /// A lease holds the domain busy.
     Leased,
     /// Only lock and address waits remain, which only something outside the simulation can release.
     Outside,
+    /// A time skip waits on threads of other sims that share the process's statics with it.
+    HeldOff,
+}
+
+/// How long a busy domain may go without progress while its running participants use no CPU time
+/// before [`Watchdog`] fails it: ten times `after`, and at least 5 s. A snare choice: a loaded
+/// machine leaves a thread unscheduled for far less, while a participant blocked in a call snare
+/// does not hook (a real pipe nobody writes, `waitpid`, `sigwait`) waits for good.
+fn off_cpu_limit(after: Duration) -> Duration {
+    after.saturating_mul(10).max(Duration::from_secs(5))
 }
 
 /// What [`Watchdog`] compares from one sample to the next: the epoch, the virtual monotonic time
@@ -72,6 +87,10 @@ pub(crate) fn warn(why: Idle) {
             "every participant is blocked on a held clock; advance or resume it, or have its \
              executive move it, from outside the simulation"
         }
+        Idle::Process => {
+            "every participant is blocked, waiting on a child process or on what one may write; \
+             the clock moves with real time until it is done"
+        }
         Idle::Leased => {
             "every participant is blocked while a lease holds the simulation busy; drop the busy \
              lease or setup scope"
@@ -79,6 +98,11 @@ pub(crate) fn warn(why: Idle) {
         Idle::Outside => {
             "every participant is blocked and nothing in the simulation can wake them. Still \
              polling in case something outside the simulation does"
+        }
+        Idle::HeldOff => {
+            "every participant is blocked while threads of another sim that shares the \
+             process's statics with this one run, and may yet wake one; time moves once they \
+             park"
         }
     };
     eprintln!(
@@ -132,8 +156,9 @@ pub(crate) struct Watchdog {
 
 impl Watchdog {
     /// Starts the watchdog for `domain`, failing the run once a participant has kept it busy for
-    /// `after` of real time with no progress. The thread is spawned under passthrough, so the
-    /// domain never adopts it, and holds only a weak reference between samples.
+    /// `after` of real time, and of the busy participants' CPU time, with no progress. The thread
+    /// is spawned under passthrough, so the domain never adopts it, and holds only a weak
+    /// reference between samples.
     pub(crate) fn start(domain: WeakDomain, after: Duration) -> Arc<Watchdog> {
         let watchdog = Arc::new(Watchdog::default());
         let watch = watchdog.clone();
@@ -160,7 +185,7 @@ impl Watchdog {
     /// instant progress was last seen while the domain stays busy.
     fn run(&self, domain: &WeakDomain, after: Duration) {
         let tick = (after / 8).clamp(Duration::from_millis(1), Duration::from_millis(250));
-        let mut last: Option<(Progress, Instant)> = None;
+        let mut last: Option<(Progress, Instant, Option<Duration>)> = None;
         loop {
             {
                 let stop = self.stop.lock().unwrap_or_else(|e| e.into_inner());
@@ -182,29 +207,57 @@ impl Watchdog {
                 continue;
             }
             let now = Instant::now();
+            let cpu = domain.running_cpu_time();
             match last {
-                Some((seen, since)) if seen == progress => {
-                    if now - since >= after {
-                        fail(&domain, now - since, after);
+                Some((seen, since, cpu_since)) if seen == progress => {
+                    let stalled = now - since;
+                    let busy = match (cpu_since, cpu) {
+                        (Some(from), Some(to)) => to.saturating_sub(from) >= after,
+                        _ => true,
+                    };
+                    if stalled >= after && busy {
+                        fail(&domain, stalled, after, Stall::Spinning);
+                    }
+                    if stalled >= off_cpu_limit(after) {
+                        fail(&domain, stalled, after, Stall::OffCpu);
                     }
                 }
-                _ => last = Some((progress, now)),
+                _ => last = Some((progress, now, cpu)),
             }
         }
     }
 }
 
+/// What a busy stall looks like from outside.
+enum Stall {
+    /// The running participants use CPU time.
+    Spinning,
+    /// They use none: blocked in calls snare does not hook.
+    OffCpu,
+}
+
 /// Writes the busy-stall report to the process's standard error and aborts.
-fn fail(domain: &Domain, stalled: Duration, after: Duration) -> ! {
+fn fail(domain: &Domain, stalled: Duration, after: Duration, stall: Stall) -> ! {
     let at = domain.progress().1.unwrap_or_default();
+    let why = match stall {
+        Stall::Spinning => {
+            "A participant that makes no hooked call — spinning on an atomic, or computing — keeps \
+             the simulation from going quiescent, so the discrete clock cannot move and nothing \
+             waiting on it wakes. Make it block, sleep or yield, or hold `busy()` across work the \
+             simulation cannot see."
+        }
+        Stall::OffCpu => {
+            "The running participants used no CPU time meanwhile: one is blocked in a call snare \
+             does not hook (a real pipe or file, `waitpid`, `sigwait`), which keeps the simulation \
+             from going quiescent as a spin does. Make what it waits on happen, or hold `busy()` \
+             across the call."
+        }
+    };
     let report = format!(
         "snare: stuck: the simulation made no progress for {stalled:?} of real time (stuck_after \
          {after:?}) while a participant kept it busy: virtual time stood at {at:?}, no participant \
-         blocked or woke, and no lease was held. A participant that makes no hooked call — \
-         spinning on an atomic, or computing — keeps the simulation from going quiescent, so the \
-         discrete clock cannot move and nothing waiting on it wakes. Make it block, sleep or \
-         yield, or hold `busy()` across work the simulation cannot see. Aborting: a stuck thread \
-         cannot be unwound from outside.\n{}{}",
+         blocked or woke, and no lease was held. {why} Aborting: a stuck thread cannot be unwound \
+         from outside.\n{}{}",
         domain
             .baton_holder()
             .map(|name| format!("  {name} holds the deterministic schedule's baton\n"))
