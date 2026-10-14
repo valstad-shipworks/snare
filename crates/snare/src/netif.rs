@@ -2789,7 +2789,19 @@ impl SimShared {
             {
                 continue;
             }
-            let (mut delays, faults) = self.policies.link_deliveries(policy.as_ref(), c.addr, len);
+            // The address policy is the one at the address the datagram is addressed to. A
+            // socket bound at the wildcard keeps that as its delivery address even once a
+            // connect gives it a specific local address (what `getsockname` and the socket
+            // table then report, and what a test sets its policy at), so a wildcard candidate
+            // with no policy of its own takes the policy at the datagram's destination.
+            let policy_at = if c.addr.ip().is_unspecified() && !self.policies.has_udp(c.addr) {
+                SocketAddr::new(dest.ip(), c.addr.port())
+            } else {
+                c.addr
+            };
+            let (mut delays, faults) =
+                self.policies
+                    .link_deliveries(policy.as_ref(), policy_at, len);
             let held = self
                 .policies
                 .held_until_pair(src, dest, c.addr)

@@ -268,6 +268,11 @@ impl Policies {
         policy
     }
 
+    /// Whether a UDP policy is set at `addr`.
+    pub(crate) fn has_udp(&self, addr: SocketAddr) -> bool {
+        self.by_addr.lock().unwrap().contains_key(&addr)
+    }
+
     /// The copies of a `len`-byte datagram addressed to `to` that arrive, each as the delay before
     /// it can be received — none (lost or too big), one, or two (duplicated, each with its own
     /// jitter) — and the fault, if any. Draws in a fixed order: loss, then duplication, then one
