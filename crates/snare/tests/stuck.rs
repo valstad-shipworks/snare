@@ -8,14 +8,27 @@
 
 use std::net::UdpSocket;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use snare::{Sim, SimBuilder};
 
 const MS: Duration = Duration::from_millis(1);
+
+/// The threshold of the scenarios that must never trip while a participant runs. A hypervisor
+/// that takes the CPU from a guest leaves the guest charging that time to the thread it took it
+/// from, so a CI runner's half-second stall reads as a spin; this stays well clear of one.
+const QUIET: Duration = Duration::from_secs(2);
+
+/// Held by each scenario the parent runs, so they run one at a time: each is timed against real
+/// time, which scenarios spinning side by side would starve, and children spawned side by side on
+/// Windows inherit each other's pipe ends, so one's stderr stays open until another exits.
+fn serial() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Whether this process is the child a [`run_child`] started.
 fn child() -> bool {
@@ -121,6 +134,7 @@ fn assert_tripped(name: &str, deterministic: bool) {
 
 #[test]
 fn spinner_trips_watchdog_on_discrete_clock() {
+    let _serial = serial();
     if !child() {
         assert_tripped("child_spinner_discrete", false);
     }
@@ -128,6 +142,7 @@ fn spinner_trips_watchdog_on_discrete_clock() {
 
 #[test]
 fn spinner_trips_watchdog_under_deterministic() {
+    let _serial = serial();
     if !child() {
         assert_tripped("child_spinner_deterministic", true);
     }
@@ -158,6 +173,7 @@ fn child_spinner_holding_stderr_deterministic() {
 
 #[test]
 fn a_stderr_lock_held_by_a_stuck_participant_cannot_block_the_watchdog() {
+    let _serial = serial();
     if !child() {
         for name in [
             "child_spinner_holding_stderr_discrete",
@@ -207,6 +223,7 @@ fn child_spinner_with_a_full_stderr_pipe() {
 #[cfg(unix)]
 #[test]
 fn a_full_stderr_pipe_cannot_block_the_watchdog() {
+    let _serial = serial();
     if child() {
         return;
     }
@@ -263,7 +280,7 @@ fn waiting_work(sim: &Sim) {
 
         {
             let _lease = snare::sched::busy("real work");
-            snare::real(|| thread::sleep(200 * MS));
+            snare::real(|| thread::sleep(2 * QUIET));
         }
 
         let (to_peer, from_main) = std::sync::mpsc::channel::<u32>();
@@ -285,15 +302,17 @@ fn waiting_work(sim: &Sim) {
 
 #[test]
 fn waiting_and_polling_never_trip_on_discrete_clock() {
+    let _serial = serial();
     if !child() {
-        waiting_work(&Sim::builder().stuck_after(50 * MS).build());
+        waiting_work(&Sim::builder().stuck_after(QUIET).build());
     }
 }
 
 #[test]
 fn waiting_and_polling_never_trip_under_deterministic() {
+    let _serial = serial();
     if !child() {
-        waiting_work(&Sim::builder().deterministic().stuck_after(50 * MS).build());
+        waiting_work(&Sim::builder().deterministic().stuck_after(QUIET).build());
     }
 }
 
@@ -325,6 +344,7 @@ fn off_the_cpu(sim: &Sim) {
 #[cfg(unix)]
 #[test]
 fn a_participant_off_the_cpu_never_trips_on_discrete_clock() {
+    let _serial = serial();
     if !child() {
         off_the_cpu(&Sim::builder().stuck_after(50 * MS).build());
     }
@@ -333,6 +353,7 @@ fn a_participant_off_the_cpu_never_trips_on_discrete_clock() {
 #[cfg(unix)]
 #[test]
 fn a_participant_off_the_cpu_never_trips_under_deterministic() {
+    let _serial = serial();
     if !child() {
         off_the_cpu(&Sim::builder().deterministic().stuck_after(50 * MS).build());
     }
@@ -387,6 +408,7 @@ fn assert_tripped_off_the_cpu(name: &str) {
 #[cfg(unix)]
 #[test]
 fn a_participant_blocked_for_good_off_the_cpu_trips_on_discrete_clock() {
+    let _serial = serial();
     if !child() {
         assert_tripped_off_the_cpu("child_blocked_for_good_discrete");
     }
@@ -395,6 +417,7 @@ fn a_participant_blocked_for_good_off_the_cpu_trips_on_discrete_clock() {
 #[cfg(unix)]
 #[test]
 fn a_participant_blocked_for_good_off_the_cpu_trips_under_deterministic() {
+    let _serial = serial();
     if !child() {
         assert_tripped_off_the_cpu("child_blocked_for_good_deterministic");
     }
@@ -402,6 +425,7 @@ fn a_participant_blocked_for_good_off_the_cpu_trips_under_deterministic() {
 
 #[test]
 fn paused_clock_waits_never_trip() {
+    let _serial = serial();
     if child() {
         return;
     }
@@ -444,9 +468,10 @@ fn ping_pong_reads(builder: SimBuilder) -> Vec<Duration> {
 
 #[test]
 fn watchdog_leaves_deterministic_runs_unchanged() {
+    let _serial = serial();
     if !child() {
         let plain = ping_pong_reads(Sim::builder());
-        let watched = ping_pong_reads(Sim::builder().stuck_after(20 * MS));
+        let watched = ping_pong_reads(Sim::builder().stuck_after(QUIET));
         assert_eq!(plain, watched);
     }
 }
@@ -478,6 +503,7 @@ fn child_clock_spin_paused_deterministic() {
 
 #[test]
 fn clock_spin_on_a_paused_clock_trips_the_watchdog() {
+    let _serial = serial();
     if child() {
         return;
     }
@@ -494,7 +520,7 @@ fn clock_spin_on_a_paused_clock_trips_the_watchdog() {
 /// A clock spin that moves time is progress: a spin of three hours of virtual time that burns real
 /// time on every turn, long past the threshold, never trips the watchdog.
 fn slow_clock_spin(builder: SimBuilder) {
-    let threshold = 300 * MS;
+    let threshold = QUIET;
     let sim = builder.stuck_after(threshold).build();
     let real = sim.run(|| {
         let start = Instant::now();
@@ -527,6 +553,7 @@ fn child_slow_clock_spin_deterministic() {
 
 #[test]
 fn a_clock_spin_that_moves_time_never_trips() {
+    let _serial = serial();
     if child() {
         return;
     }
@@ -534,7 +561,7 @@ fn a_clock_spin_that_moves_time_never_trips() {
         "child_slow_clock_spin_discrete",
         "child_slow_clock_spin_deterministic",
     ] {
-        let (ok, stderr) = run_child(name);
+        let (ok, stderr) = run_child_with_timeout(name, Duration::from_secs(300));
         assert!(ok, "{name} tripped:\n{stderr}");
     }
 }
