@@ -576,6 +576,9 @@ struct Waiters {
     stale: usize,
     /// Where its threads sleep.
     changed: Arc<Parker>,
+    /// The lineage of the thread that last went to sleep on it, 0 before any: what a blocker
+    /// names while it is stale.
+    sleeper: u64,
     keys: Vec<WakeKey>,
     broad: bool,
     time_sensitive: bool,
@@ -660,6 +663,7 @@ impl State {
             sleeping: 0,
             stale: 0,
             changed: Arc::default(),
+            sleeper: 0,
             keys: Vec::new(),
             broad: true,
             time_sensitive: true,
@@ -673,6 +677,7 @@ impl State {
         waiters.generation = 0;
         waiters.sleeping = 0;
         waiters.stale = 0;
+        waiters.sleeper = 0;
         waiters.keys.clear();
         waiters.broad = keys.is_none();
         waiters.time_sensitive = keys.is_none();
@@ -704,6 +709,14 @@ impl State {
             .any(|w| w.domain == domain && w.stale > 0)
     }
 
+    /// The lineage of a sleeper of `domain` woken that has yet to re-check, when one is known.
+    fn settler(&self, domain: usize) -> Option<u64> {
+        self.waiters
+            .iter()
+            .find(|w| w.domain == domain && w.stale > 0 && w.sleeper != 0)
+            .map(|w| w.sleeper)
+    }
+
     /// Counts a sleeper of `domain` asleep, returning the parker it sleeps on, its generation for
     /// [`awake`](Self::awake) and the parker's signals so far.
     fn asleep(
@@ -721,6 +734,7 @@ impl State {
             waiters.keys.extend_from_slice(keys);
         }
         waiters.sleeping += 1;
+        waiters.sleeper = snare_interpose::thread_lineage();
         let seen = waiters.changed.signals();
         (waiters.changed.clone(), waiters.generation, seen)
     }
@@ -1623,6 +1637,19 @@ impl Readiness {
         })
     }
 
+    /// [`locked`](Self::locked), also handing `f` the lineage of a woken waiter yet to run, when
+    /// one is known, for a blocker to name.
+    pub(crate) fn locked_naming<R>(
+        &self,
+        domain: usize,
+        f: impl FnOnce(bool, Option<u64>) -> R,
+    ) -> R {
+        snare_interpose::real(|| {
+            let state = self.state.lock().unwrap();
+            f(state.settling(domain), state.settler(domain))
+        })
+    }
+
     #[cfg(windows)]
     pub(crate) fn skip_clock<R>(
         &self,
@@ -1800,6 +1827,23 @@ mod tests {
             due: Some(due),
             steady: false,
         }
+    }
+
+    #[test]
+    fn a_woken_sleeper_is_named_until_it_rechecks() {
+        let mut state = State {
+            waiters: Vec::new(),
+            spare: Vec::new(),
+            next_waiter: 0,
+        };
+        let id = sleeping(&mut state, &[WakeKey::Thread(1)], timed(u64::MAX));
+        state.waiters.last_mut().unwrap().sleeper = 42;
+        assert_eq!(state.settler(7), None, "asleep, it holds nothing up");
+        state.bump(7, WakeEvent::Keys(&[WakeKey::Thread(1)]), |_| {});
+        assert_eq!(state.settler(7), Some(42));
+        assert!(state.awake(id, 0));
+        assert!(state.rechecked(id));
+        assert_eq!(state.settler(7), None);
     }
 
     #[test]

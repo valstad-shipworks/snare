@@ -359,6 +359,7 @@ impl Inner {
         &self,
         core: &mut Core,
         settling: bool,
+        settler: Option<u64>,
         sched: Option<&crate::sched::State>,
         due: impl FnOnce() -> Option<Arc<str>>,
     ) -> Option<(BlockerKind, Arc<str>)> {
@@ -378,7 +379,8 @@ impl Inner {
             }
         }
         if settling {
-            return Some((BlockerKind::Settling, Arc::from("woken waiter")));
+            let name = settler.map_or_else(|| Arc::from("woken waiter"), |l| self.display_name(l));
+            return Some((BlockerKind::Settling, name));
         }
         if core.released > 0 {
             return Some((BlockerKind::Settling, Arc::from("released joiner")));
@@ -932,7 +934,7 @@ impl Domain {
         let _passthrough = Passthrough::enter();
         let mut core = self.0.accounting.core();
         let mut sched = self.0.sched.as_ref().map(crate::sched::Scheduler::lock);
-        if let Some(blocker) = self.0.blocker(&mut core, settling, sched.as_deref(), due) {
+        if let Some(blocker) = self.0.blocker(&mut core, settling, None, sched.as_deref(), due) {
             return Err(blocker);
         }
         if enter {
@@ -1007,6 +1009,17 @@ impl Domain {
     /// The domain's quiescence as an executive sees it, read under the same locks as
     /// [`if_quiescent`](Self::if_quiescent); `next_deadline` is left for the caller.
     pub fn quiescence(&self, settling: bool, due: impl FnOnce() -> Option<Arc<str>>) -> Quiescence {
+        self.quiescence_naming(settling, None, due)
+    }
+
+    /// [`quiescence`](Self::quiescence), with `settler` the lineage of a woken waiter yet to run,
+    /// which a [`BlockerKind::Settling`] blocker then names.
+    pub fn quiescence_naming(
+        &self,
+        settling: bool,
+        settler: Option<u64>,
+        due: impl FnOnce() -> Option<Arc<str>>,
+    ) -> Quiescence {
         let _passthrough = Passthrough::enter();
         let mut core = self.0.accounting.core();
         let sched = self.0.sched.as_ref().map(crate::sched::Scheduler::lock);
@@ -1019,7 +1032,7 @@ impl Domain {
                 (live.saturating_sub(parked), parked)
             }
         };
-        let blocker = self.0.blocker(&mut core, settling, sched.as_deref(), due);
+        let blocker = self.0.blocker(&mut core, settling, settler, sched.as_deref(), due);
         Quiescence {
             quiescent: blocker.is_none(),
             epoch,
