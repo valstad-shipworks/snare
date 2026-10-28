@@ -4,8 +4,8 @@ use super::Thread;
 use crate::detour::error::{Error, OsError, Result};
 use core::mem;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE,
-    WAIT_OBJECT_0,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, GetThreadContext, SetThreadContext};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -38,6 +38,10 @@ fn last_error() -> Error {
     Error::Thread(OsError::last_os_error())
 }
 
+/// How long a terminating thread is given to finish exiting before its refusal to be suspended
+/// counts as a failure.
+const EXIT_WAIT_MS: u32 = 1000;
+
 /// A suspended thread, which is resumed once dropped.
 pub(crate) struct Suspended {
     handle: HANDLE,
@@ -51,9 +55,15 @@ pub(crate) struct Suspended {
 impl Suspended {
     /// Suspends the thread of `handle`, closing the handle on failure if owned.
     fn new(handle: HANDLE, id: u32, owned: bool, allow_exited: bool) -> Result<Option<Self>> {
-        let fail = |error| {
+        let fail = |error: Error| {
+            // A thread already terminating refuses suspension with ERROR_ACCESS_DENIED
+            // (STATUS_THREAD_IS_TERMINATING) before its handle is signalled. It runs no more user
+            // code, so it is waited out rather than failing the suspension.
+            let terminating = matches!(&error, Error::Thread(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32));
+            let wait = if terminating { EXIT_WAIT_MS } else { 0 };
             // SAFETY: The handle is open and has SYNCHRONIZE rights in this mode.
-            let exited = allow_exited && unsafe { WaitForSingleObject(handle, 0) } == WAIT_OBJECT_0;
+            let exited =
+                allow_exited && unsafe { WaitForSingleObject(handle, wait) } == WAIT_OBJECT_0;
             if owned {
                 // SAFETY: The handle is owned.
                 unsafe { CloseHandle(handle) };

@@ -10,7 +10,7 @@ use std::io::Write;
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::os::unix::thread::JoinHandleExt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -81,13 +81,76 @@ fn result(r: isize) -> (isize, c_int) {
     (r, if r < 0 { errno() } else { 0 })
 }
 
+/// The calling thread's id as `blocked` looks it up, set by the thread `interrupt` starts.
+static CALLER: AtomicI64 = AtomicI64::new(0);
+
+#[cfg(target_os = "linux")]
+fn caller_id() -> i64 {
+    // SAFETY: gettid has no preconditions.
+    i64::from(unsafe { libc::gettid() })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn caller_id() -> i64 {
+    1
+}
+
+/// Whether the host has the thread asleep in the kernel.
+#[cfg(target_os = "linux")]
+fn blocked(_: &std::thread::JoinHandle<(isize, c_int)>) -> bool {
+    let tid = CALLER.load(Ordering::SeqCst);
+    tid != 0
+        && std::fs::read_to_string(format!("/proc/self/task/{tid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(") ")
+                    .map(|(_, rest)| rest.starts_with(['S', 'D']))
+            })
+            .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn blocked(thread: &std::thread::JoinHandle<(isize, c_int)>) -> bool {
+    // SAFETY: the thread runs until joined; a zeroed thread_basic_info is valid, and the count is
+    // its size in integers.
+    unsafe {
+        let port = libc::pthread_mach_thread_np(thread.as_pthread_t());
+        let mut info: libc::thread_basic_info = std::mem::zeroed();
+        let mut count = libc::THREAD_BASIC_INFO_COUNT;
+        libc::thread_info(
+            port,
+            libc::THREAD_BASIC_INFO as _,
+            (&raw mut info).cast(),
+            &mut count,
+        ) == libc::KERN_SUCCESS
+            && info.run_state == libc::TH_STATE_WAITING
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn blocked(_: &std::thread::JoinHandle<(isize, c_int)>) -> bool {
+    true
+}
+
 /// Runs `call` on a thread of its own, sends that thread `SIGINT` once it has had 50 ms to block,
-/// and 50 ms later runs `release`, which lets a call that went on finish.
+/// and 50 ms later runs `release`, which lets a call that went on finish. On the host the signal
+/// also waits for the thread to be asleep in the kernel: a loaded machine can leave it short of
+/// its call for longer, and a signal handled before the call leaves the call to go on.
 fn interrupt(call: Call, release: Box<dyn FnOnce()>) -> (Ended, usize, Vec<(isize, c_int)>) {
     AFTER.lock().unwrap().clear();
     let before = HANDLED.load(Ordering::SeqCst);
-    let thread = std::thread::spawn(call);
+    CALLER.store(0, Ordering::SeqCst);
+    let thread = std::thread::spawn(move || {
+        CALLER.store(caller_id(), Ordering::SeqCst);
+        call()
+    });
     std::thread::sleep(Duration::from_millis(50));
+    if !snare::sched::in_sim() {
+        let start = std::time::Instant::now();
+        while !blocked(&thread) && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
     // SAFETY: the thread runs until joined below.
     assert_eq!(
         unsafe { libc::pthread_kill(thread.as_pthread_t(), libc::SIGINT) },
