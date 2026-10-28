@@ -316,8 +316,19 @@ fn nanosleep() -> Scenario {
             let mut left: libc::timespec = unsafe { std::mem::zeroed() };
             let r = result(unsafe { libc::nanosleep(&request, &mut left) } as isize);
             if r.0 < 0 {
-                assert!(left.tv_sec == 0 && left.tv_nsec > 0, "{}", left.tv_nsec);
-                assert!(left.tv_nsec < 200_000_000, "{}", left.tv_nsec);
+                // The host reports what was left when the call returned, which a loaded machine
+                // can delay past the request's end; the sim's clock waits for the woken thread.
+                let side = if snare::sched::in_sim() {
+                    "sim"
+                } else {
+                    "host"
+                };
+                assert_eq!(left.tv_sec, 0, "{side}");
+                assert!(left.tv_nsec < 200_000_000, "{side}: {}", left.tv_nsec);
+                assert!(
+                    left.tv_nsec > 0 || side == "host",
+                    "{side}: nothing left of an interrupted sleep"
+                );
             }
             r
         }),
