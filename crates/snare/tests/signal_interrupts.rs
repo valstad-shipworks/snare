@@ -123,7 +123,10 @@ fn blocked(thread: &std::thread::JoinHandle<(isize, c_int)>) -> bool {
             (&raw mut info).cast(),
             &mut count,
         ) == libc::KERN_SUCCESS
-            && info.run_state == libc::TH_STATE_WAITING
+            && matches!(
+                info.run_state,
+                libc::TH_STATE_WAITING | libc::TH_STATE_UNINTERRUPTIBLE
+            )
     }
 }
 
@@ -134,8 +137,9 @@ fn blocked(_: &std::thread::JoinHandle<(isize, c_int)>) -> bool {
 
 /// Runs `call` on a thread of its own, sends that thread `SIGINT` once it has had 50 ms to block,
 /// and 50 ms later runs `release`, which lets a call that went on finish. On the host the signal
-/// also waits for the thread to be asleep in the kernel: a loaded machine can leave it short of
-/// its call for longer, and a signal handled before the call leaves the call to go on.
+/// also waits, for up to a second, for the thread to be asleep in the kernel: a loaded machine
+/// can leave it short of its call for longer, and a signal handled before the call leaves the
+/// call to go on. The bound stays well inside the 5 s timeouts some calls carry.
 fn interrupt(call: Call, release: Box<dyn FnOnce()>) -> (Ended, usize, Vec<(isize, c_int)>) {
     AFTER.lock().unwrap().clear();
     let before = HANDLED.load(Ordering::SeqCst);
@@ -145,16 +149,20 @@ fn interrupt(call: Call, release: Box<dyn FnOnce()>) -> (Ended, usize, Vec<(isiz
         call()
     });
     std::thread::sleep(Duration::from_millis(50));
-    if !snare::sched::in_sim() {
-        let start = std::time::Instant::now();
-        while !blocked(&thread) && start.elapsed() < Duration::from_secs(5) {
+    let start = std::time::Instant::now();
+    let asleep = snare::sched::in_sim() || {
+        while !blocked(&thread) && start.elapsed() < Duration::from_secs(1) {
             std::thread::sleep(Duration::from_millis(1));
         }
-    }
+        blocked(&thread)
+    };
     // SAFETY: the thread runs until joined below.
+    let sent = unsafe { libc::pthread_kill(thread.as_pthread_t(), libc::SIGINT) };
     assert_eq!(
-        unsafe { libc::pthread_kill(thread.as_pthread_t(), libc::SIGINT) },
-        0
+        sent,
+        0,
+        "the call's thread was gone by the signal (seen asleep: {asleep}, after {:?})",
+        start.elapsed()
     );
     std::thread::sleep(Duration::from_millis(50));
     release();

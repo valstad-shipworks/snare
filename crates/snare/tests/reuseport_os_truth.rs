@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use snare::Sim;
@@ -466,9 +467,7 @@ fn binds() -> Vec<String> {
         for held in kinds() {
             for want in kinds() {
                 for bits in 0..if tcp { 32 } else { 16 } {
-                    let once = || second_bind(tcp, held, want, bits);
-                    let (a, b) = (once(), once());
-                    lines.push(if a == b { a } else { once() });
+                    lines.push(agreed(|| second_bind(tcp, held, want, bits)));
                 }
             }
         }
@@ -476,8 +475,21 @@ fn binds() -> Vec<String> {
     lines
 }
 
-/// One case of [`binds`]. Another program on the host may hold the port the first socket got in
-/// the other family, so [`binds`] runs a case again when two runs disagree and takes the third.
+/// The first result `case` gives twice in up to five runs, else its last. Another program on the
+/// host may hold the port a case's first socket got in the other family, failing that run alone.
+fn agreed(case: impl Fn() -> String) -> String {
+    let mut seen: Vec<String> = Vec::new();
+    for _ in 0..5 {
+        let line = case();
+        if seen.contains(&line) {
+            return line;
+        }
+        seen.push(line);
+    }
+    seen.pop().expect("five runs")
+}
+
+/// One case of [`binds`], which [`agreed`] runs until two runs agree.
 fn second_bind(tcp: bool, held: Kind, want: Kind, bits: u8) -> String {
     let t = if tcp { "tcp" } else { "udp" };
     let (held_share, want_share, listening) = (bits & 3, (bits >> 2) & 3, bits & 16 != 0);
@@ -855,8 +867,15 @@ fn sims() -> Vec<(&'static str, Sim)> {
 }
 
 /// Runs `scenario` on the host and in each of [`sims`] and compares the lines.
+/// Held while a scenario runs on the host, so the tests' real sockets never take each other's
+/// ports: a case binds the port one family's socket got in the other family.
+static HOST: Mutex<()> = Mutex::new(());
+
 fn compare(scenario: fn() -> Vec<String>) {
-    let real = scenario();
+    let real = {
+        let _host = HOST.lock().unwrap_or_else(|e| e.into_inner());
+        scenario()
+    };
     for (name, sim) in sims() {
         let sim = sim.run(scenario);
         let diff: Vec<String> = real
