@@ -503,8 +503,8 @@ impl Executive {
             return q;
         }
         let mut next = None;
-        let mut q = readiness().locked(self.domain.key(), |settling| {
-            self.domain.quiescence(settling, || {
+        let mut q = readiness().locked_naming(self.domain.key(), |settling, settler| {
+            self.domain.quiescence_naming(settling, settler, || {
                 next = self.next_deadline();
                 self.timer_blocker(None)
             })
