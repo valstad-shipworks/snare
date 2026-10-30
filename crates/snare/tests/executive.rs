@@ -4,7 +4,7 @@
 
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1179,4 +1179,113 @@ fn a_wait_landed_on_by_a_timestamp_times_out() {
             "the wait timed out {waited:?} in"
         );
     });
+}
+
+#[test]
+fn a_wait_whose_deadline_a_landings_creep_reaches_times_out() {
+    let sim = Sim::new();
+    thread::scope(|s| {
+        let exec = sim.executive(ExecutiveConfig::default()).unwrap();
+        let run = s.spawn(|| {
+            sim.run(|| {
+                let poller = thread::spawn(|| {
+                    thread::sleep(30 * MS - CREEP);
+                    thread::park_timeout(Duration::ZERO);
+                });
+                let waited = deadline_loop(30 * MS);
+                poller.join().unwrap();
+                waited
+            })
+        });
+        settle_at(&exec, 30 * MS - CREEP);
+        let start = real_now();
+        while !run.is_finished() {
+            assert!(
+                real_since(start) < Duration::from_secs(10),
+                "the wait is spinning at its deadline"
+            );
+            if exec.jump_to(Duration::from_secs(1)).is_err() {
+                real_sleep(MS);
+            }
+        }
+        let waited = run.join().unwrap();
+        assert!(
+            waited >= 30 * MS && waited <= 30 * MS + CREEP,
+            "the wait timed out {waited:?} in"
+        );
+    });
+}
+
+/// A thread of a process-wide pool, started by whichever sim first asks it for a sleep: it sleeps
+/// each request out and answers how long that took on the clock it read.
+fn pool_sleep(d: Duration) -> Duration {
+    type Request = (Duration, mpsc::Sender<Duration>);
+    static POOL: OnceLock<Mutex<mpsc::Sender<Request>>> = OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<Request>();
+        thread::spawn(move || {
+            for (d, reply) in rx {
+                let start = Instant::now();
+                thread::sleep(d);
+                let _ = reply.send(start.elapsed());
+            }
+        });
+        Mutex::new(tx)
+    });
+    let (reply, answer) = mpsc::channel();
+    pool.lock().unwrap().send((d, reply)).unwrap();
+    answer.recv().unwrap()
+}
+
+/// Jumps to each next deadline until `run` finishes, failing the test after ten seconds of real
+/// time.
+fn drive<T>(exec: &Executive, run: &thread::JoinHandle<T>) {
+    let start = real_now();
+    while !run.is_finished() {
+        assert!(
+            real_since(start) < Duration::from_secs(10),
+            "the sim never finished, at {:?}: {:?}",
+            exec.now(),
+            exec.quiescence()
+        );
+        let q = exec.quiescence();
+        match q.next_deadline {
+            Some(next) if q.quiescent => drop(exec.jump_to(next)),
+            _ => real_sleep(Duration::from_micros(50)),
+        }
+    }
+}
+
+#[test]
+fn a_pool_thread_left_by_an_earlier_sim_sleeps_on_the_clock_of_the_executive_driven_sim_waking_it()
+{
+    for round in 0..3 {
+        let sim = Sim::new();
+        let exec = sim.executive(ExecutiveConfig::default()).unwrap();
+        let begun = exec.now();
+        let real = real_now();
+        let run = sim.run(|| {
+            thread::spawn(|| {
+                let start = Instant::now();
+                let slept = pool_sleep(20 * MS);
+                (slept, start.elapsed())
+            })
+        });
+        drive(&exec, &run);
+        let (slept, waited) = run.join().unwrap();
+        assert!(
+            slept >= 20 * MS && slept <= 20 * MS + CREEP,
+            "sim {round}: the pool slept {slept:?} on the clock it read"
+        );
+        assert!(
+            waited >= 20 * MS && exec.now() - begun >= 20 * MS,
+            "sim {round}: the caller waited {waited:?}, the sim's clock moved {:?}",
+            exec.now() - begun
+        );
+        assert!(
+            real_since(real) < Duration::from_secs(1),
+            "sim {round}: 20 ms of sim time took {:?} of real time",
+            real_since(real)
+        );
+    }
 }

@@ -1326,12 +1326,39 @@ impl Clock {
                 return false;
             }
             self.floor.fetch_max(after, Ordering::AcqRel);
+            if after == horizon {
+                self.creep_past_timer_at(after);
+            }
             let reached = self.reached(before, after);
             let (_, wakers) = self.fire_upto(before, after);
             (reached, wakers)
         };
         self.wake_taken(fired.1);
         fired.0
+    }
+
+    /// Raises a driven clock's horizon [`creep_past`] `t` when a participant timer falls exactly
+    /// at `t`, the horizon a charge has just carried the clock to. A landing's creep can end on
+    /// another thread's deadline: the charge fires that timer there, and its waiter re-waits a zero
+    /// timeout until the clock is strictly past its deadline (flume's `recv_timeout` takes
+    /// `checked_duration_since`'s `Some(0)` as time left), which only a creep past this timer
+    /// allows. Never reaches an open timestamp, which the clock stays short of until it ends.
+    /// Called under `control`.
+    fn creep_past_timer_at(&self, t: u64) {
+        let reach = creep_past(t);
+        let stamp = self.stamp.load(Ordering::Acquire);
+        if stamp != 0 && reach >= stamp {
+            return;
+        }
+        if !self.timers(false).contains_key(&t) {
+            return;
+        }
+        self.publish_line(
+            self.monotonic_nanos.load(Ordering::Relaxed),
+            self.anchor_real.load(Ordering::Relaxed),
+            self.rate_q32.load(Ordering::Relaxed),
+            reach,
+        );
     }
 
     /// Whether any timer, foreign or not, falls in `(before, after]`.

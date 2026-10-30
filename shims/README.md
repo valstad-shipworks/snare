@@ -41,6 +41,7 @@ sim drops.
 | `async-global-executor/` | `async-global-executor` 2.4 | async-std's global executor and its worker threads, one set per sim |
 | `blocking/` | `blocking` 1.7 | the `unblock` thread pool, one per sim |
 | `smol/` | `smol` 2.0 | `smol::spawn`'s global executor and its "smol-N" threads, one set per sim; the threads exit, and the executor's unfinished tasks are dropped, when the sim ends |
+| `futures-timer/` | `futures-timer` 3.0 | the "futures-timer" helper thread every `Delay` is timed on, one per sim and shut down with it; the process-wide one only outside every sim |
 | `rayon-core/` with `--cfg snare_parallel_rayon` | `rayon-core` 1 | the global pool (`rayon::join`, `par_iter` outside `install`, `rayon::spawn`, `build_global`) is the sim's own; its workers exit when the sim ends |
 
 They are opt-in, since most suites need few or none of them:
@@ -52,7 +53,7 @@ $ cargo snare test --parallel all
 ```
 
 `--parallel` takes runtime names (`async-std`, `smol`, `rayon`), crate names (`async-io`,
-`async-global-executor`, `blocking`, `rayon-core`), `all` and `none`, comma-separated or repeated.
+`async-global-executor`, `blocking`, `rayon-core`, `futures-timer`), `all` and `none`, comma-separated or repeated.
 To keep the selection with the code, put it in the manifest; `cargo snare test` reads the union of
 the workspace's and every member's list, and a `--parallel` on the command line replaces it:
 
@@ -97,6 +98,7 @@ async-io    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.
 async-global-executor = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
 blocking    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
 smol        = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
+futures-timer = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.5.0" }
 ```
 
 Patch only the crates the graph has (cargo warns about an unused patch), build with `--cfg snare`,

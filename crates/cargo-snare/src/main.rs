@@ -104,7 +104,7 @@ struct TestArgs {
 
     /// Give each sim its own copy of these crates' process-wide state, so sims using them can
     /// run concurrently instead of taking turns: `async-std`, `smol`, `rayon`, `async-io`,
-    /// `async-global-executor`, `blocking`, `all`, or `none`. Comma-separated or repeated;
+    /// `async-global-executor`, `blocking`, `futures-timer`, `all`, or `none`. Comma-separated or repeated;
     /// replaces `parallel = [...]` from `[workspace.metadata.snare]` and
     /// `[package.metadata.snare]`.
     #[arg(long, value_name = "NAMES", value_delimiter = ',')]

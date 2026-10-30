@@ -137,6 +137,8 @@ jobs:
           - { shim: blocking, os: ubuntu-latest }
           - { shim: smol, os: ubuntu-latest, plain: true }
           - { shim: smol, os: macos-latest }
+          - { shim: futures-timer, os: ubuntu-latest, plain: true }
+          - { shim: futures-timer, os: macos-latest }
           - { shim: quanta-0.12, os: ubuntu-latest, plain: true, test_args: --test-threads=1 }
           - { shim: quanta-0.12, os: macos-latest, test_args: --test-threads=1 }
           - { shim: quanta-0.13, os: ubuntu-latest, plain: true }
