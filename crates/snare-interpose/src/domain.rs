@@ -873,21 +873,31 @@ impl Domain {
     /// Hands the domain to an executive that moves its time from outside: its census is kept with
     /// timestamps, and with `audit` it logs effects and calls it cannot account for. `false` if an
     /// executive is already attached.
+    ///
+    /// The attachment counts as a run in progress until [`detach_executive`](Self::detach_executive):
+    /// a harness that drives the sim through an executive enters it only to spawn its threads, and
+    /// the sim it drives is live all the same, so a thread of a dormant sim one of its threads
+    /// wakes follows into it, and its own threads stay put.
     pub fn attach_executive(&self, audit: bool) -> bool {
         let attached = self.0.accounting.attach(audit);
-        if attached && let Some(sched) = &self.0.sched {
-            sched.take_unexplained();
+        if attached {
+            self.0.begin_run();
+            if let Some(sched) = &self.0.sched {
+                sched.take_unexplained();
+            }
         }
         attached
     }
 
-    /// Ends an executive's ownership: an open timestamp's gate opens and its baton is let go.
+    /// Ends an executive's ownership: an open timestamp's gate opens and its baton is let go, and
+    /// the run its attachment counted ends.
     pub fn detach_executive(&self) {
         self.0.accounting.detach();
         if let Some(sched) = &self.0.sched {
             sched.release_external();
         }
         drop(self.0.accounting.bump());
+        self.0.end_run();
     }
 
     /// Whether an executive owns this domain's time.

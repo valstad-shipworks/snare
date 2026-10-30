@@ -138,6 +138,11 @@ can change which reports fit and drop:
   `EINVAL`, as does every command beyond the flags and duplication on the fabric's epoll, kqueue,
   eventfd and timerfd descriptors, where the host answers some (Linux `F_SETOWN` takes any file).
   `strict_sockopts` does not validate these commands.
+- `select` on fabric descriptors (`fabric.rs` `Net::select`) waits through the fabric's `poll`,
+  so its microsecond timeout is rounded up to whole milliseconds: a 200 µs wait lasts 1 ms on the
+  sim's clock, where the host waits the microseconds asked for. Code that waits out sub-millisecond
+  deadlines with `select` (a raw-socket receive inside a 1 ms cycle) runs late under the sim.
+  Linux's `select` also writes the time left back into the `timeval`, which the fabric never does.
 
 ## Windows
 

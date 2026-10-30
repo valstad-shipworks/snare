@@ -92,7 +92,7 @@ impl Shim {
 }
 
 /// Every shim, in the order they are patched.
-pub(crate) const SHIMS: [Shim; 14] = [
+pub(crate) const SHIMS: [Shim; 15] = [
     Shim::new("io-uring", "io-uring", "0.7", Need::Default),
     Shim::new("xsk-rs", "xsk-rs", "0.8", Need::Default),
     Shim::new("sc", "sc", "0.2", Need::Default),
@@ -113,6 +113,7 @@ pub(crate) const SHIMS: [Shim; 14] = [
     .since((3, 1, 0)),
     Shim::new("blocking", "blocking", "1", Need::Parallel).since((3, 1, 0)),
     Shim::new("smol", "smol", "2", Need::Parallel).since((3, 1, 0)),
+    Shim::new("futures-timer", "futures-timer", "3", Need::Parallel).since((3, 5, 0)),
 ];
 
 /// Crates whose per-sim mode is a cfg read by their default shim rather than a shim of its own.
@@ -120,7 +121,7 @@ pub(crate) const PARALLEL_CFGS: [(&str, &str); 1] = [("rayon-core", "snare_paral
 
 /// The names `--parallel` and `parallel = [...]` accept, each with the crates it turns per-sim
 /// state on for. A runtime brings every crate its global state lives in.
-pub(crate) const PARALLEL_NAMES: [(&str, &[&str]); 9] = [
+pub(crate) const PARALLEL_NAMES: [(&str, &[&str]); 10] = [
     (
         "all",
         &[
@@ -129,6 +130,7 @@ pub(crate) const PARALLEL_NAMES: [(&str, &[&str]); 9] = [
             "blocking",
             "smol",
             "rayon-core",
+            "futures-timer",
         ],
     ),
     (
@@ -141,6 +143,7 @@ pub(crate) const PARALLEL_NAMES: [(&str, &[&str]); 9] = [
     ("async-io", &["async-io"]),
     ("async-global-executor", &["async-global-executor"]),
     ("blocking", &["blocking"]),
+    ("futures-timer", &["futures-timer"]),
     ("none", &[]),
 ];
 
@@ -280,7 +283,9 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(shipped((3, 0, 1)), ["io-uring", "xsk-rs", "sc", "syscalls"]);
-        assert_eq!(shipped((3, 1, 0)).len(), SHIMS.len());
+        assert_eq!(shipped((3, 1, 0)).len(), SHIMS.len() - 1);
+        assert_eq!(shipped((3, 4, 0)).last(), Some(&"smol"));
+        assert_eq!(shipped((3, 5, 0)).len(), SHIMS.len());
     }
     use super::*;
 

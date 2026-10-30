@@ -666,9 +666,12 @@ dormant waiter returns first. A place nobody takes within 200 ms of real time �
 thread the census never saw — is given back. Under `deterministic()` the place joins the schedule
 where the wake was made, as a spawn does, so runs replay. To leave no worker still spinning
 between jobs (rayon's yield 32 times before they park), a run's end waits, a bounded real time,
-until its leftover participants have all come to rest in a wait. Threads of a sim whose run is in
-progress never move, nor do background, helper or driver threads; a pool two sims share while both
-are running still serves both from one world (see `OPEN_BUGS.md`).
+until its leftover participants have all come to rest in a wait. An attached
+[`Executive`](#controlling-time) counts as a run in progress until it is dropped: a harness that
+drives the sim from outside enters it only to spawn its threads, and the sim is live all the same.
+Threads of a sim whose run is in progress never move, nor do background, helper or driver threads;
+a pool two sims share while both are running still serves both from one world (see
+`OPEN_BUGS.md`), which the parallel-only shims lift for the pools they cover.
 
 **A new sim continues the process's time.** Each plain sim's clocks start where the furthest
 clock of every sim built before it had got to (see [Controlling time](#controlling-time)), so a
@@ -708,9 +711,9 @@ reaches a descriptor another running sim holds waits until that run ends, but on
 touches the library's memory (a timer queued while the reactor's notifier is already pending)
 gives snare nothing to wait at, so tests that share a process-wide reactor must take turns (a
 static `Mutex` held across the test, or `--test-threads=1`). `cargo snare test --parallel
-<smol|async-std|rayon|all>` patches in shims that give each sim its own reactor, executor and
-thread pool and lift this for async-io, smol, async-std and rayon's global pool (see
-[Shims](#shims-shims)).
+<smol|async-std|rayon|futures-timer|all>` patches in shims that give each sim its own reactor,
+executor, thread pool and timer thread and lift this for async-io, smol, async-std, rayon's global
+pool and futures-timer (see [Shims](#shims-shims)).
 
 ## Controlling time
 
@@ -791,7 +794,7 @@ Sim's clock is owned by an Executive". The clock is frozen at its reading until 
 | `grant(Grant { anchor_v, anchor_wall, rate, horizon })` | Time runs from `anchor_v` at the real instant `anchor_wall`, `rate` virtual seconds per real second (in `[0, 1e6]`, NaN as 0), never past `horizon`. An anchor behind the clock anchors at the clock's reading, now. Timers the clock flows past fire as real time reaches them. |
 | `freeze()` | Holds the clock where it is (horizon at the reading, rate 0). |
 | `next_deadline()` | The earliest participant timer after the reading. Background timers are never jump targets; they fire as the clock passes them. |
-| `jump_to(t)` | If the sim is quiescent — checked under the sim's locks in the same step as the move, so no participant starts running in between — moves the clock to `t` or to the earliest participant timer before it, exactly onto that deadline, and returns how many waits and events were due there; `Err(NotQuiescent)` changes nothing. The horizon rises to reach just past the landing — 1 ns, or on Windows 100 ns or one `QueryPerformanceCounter` tick where that is longer — so a wait that recomputes a zero timeout at its deadline can creep over it on the latency its call is charged; the rate stays the grant's. Code that runs after the landing may therefore read up to that much past it. |
+| `jump_to(t)` | If the sim is quiescent — checked under the sim's locks in the same step as the move, so no participant starts running in between — moves the clock to `t` or to the earliest participant timer before it, exactly onto that deadline, and returns how many waits and events were due there; `Err(NotQuiescent)` changes nothing. The horizon rises to reach just past the landing — 1 ns, or on Windows 100 ns or one `QueryPerformanceCounter` tick where that is longer — so a wait that recomputes a zero timeout at its deadline can creep over it on the latency its call is charged; the rate stays the grant's. A charge that carries the clock onto a participant timer at the horizon raises it just past that timer the same way, so a creep that ends on another thread's deadline does not hold its waiter at it. Code that runs after the landing may therefore read up to that much past it. |
 | `enter_timestamp(t)` / `leave_timestamp(t)` | The calling thread becomes the driver and acts at `t`: it reads exactly `t` from every clock and the code under test reads at least `t`, while the clock itself stands just before `t`, so timers at `t` are still pending. Participants released meanwhile — by what the driver sends, or by timers before `t` — wait at a gate, still counted blocked, until `leave_timestamp(t)` moves the clock to `t` (its horizon just past `t`, as for `jump_to`), fires what is due there (returning the count) and opens the gate. It wakes only waiters something reached: a timestamp at which nothing was sent and nothing came due leaves a quiescent sim quiescent. |
 | `enter_timestamp_checked(t)` | As `enter_timestamp`, only if the sim is quiescent and no participant timer falls before `t`, checked in the same step; on `Err` nothing changes but the calling thread becoming the driver. |
 | `with_driver_time(t, f)` | On a driver thread (a pool worker doing the executive's work), runs `f` reading `t` as the sim's time; its sends are held at the gate like the executive's own. |
@@ -1998,6 +2001,8 @@ under `[package.metadata.snare]` / `[workspace.metadata.snare]`):
   one per sim, so async-std tasks and blocking jobs of one sim never run on another's threads.
 - **`smol`** — `smol::spawn`'s global executor and "smol-N" threads, one set per sim.
 - **`rayon-core`** with `--cfg snare_parallel_rayon` — rayon's global pool, one per sim.
+- **`futures-timer`** — the "futures-timer" thread every `Delay` is timed on, one per sim, shut
+  down when the sim drops.
 
 ```console
 $ cargo snare test --parallel smol        # async-io + blocking + smol
@@ -2049,7 +2054,7 @@ crates/cargo-snare/       the `cargo snare` subcommand
 probes/interpose-probe/   test-fixture DLL for the Windows module-loading test (unpublished)
 shims/                    drop-in [patch.crates-io] crates: io-uring, xsk-rs, sc, syscalls, quanta, minstant,
                           fastant, fastrand, rayon-core; with --parallel: async-io, async-global-executor,
-                          blocking, smol
+                          blocking, smol, futures-timer
 scripts/                  Windows VM and hardware test runners, socket-buffer and runtime measurements
 ```
 
