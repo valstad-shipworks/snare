@@ -1198,8 +1198,17 @@ fn a_wait_whose_deadline_a_landings_creep_reaches_times_out() {
             })
         });
         settle_at(&exec, 30 * MS - CREEP);
-        jump(&exec, Duration::from_secs(1));
-        let waited = join_soon(run);
+        let start = real_now();
+        while !run.is_finished() {
+            assert!(
+                real_since(start) < Duration::from_secs(10),
+                "the wait is spinning at its deadline"
+            );
+            if exec.jump_to(Duration::from_secs(1)).is_err() {
+                real_sleep(MS);
+            }
+        }
+        let waited = run.join().unwrap();
         assert!(
             waited >= 30 * MS && waited <= 30 * MS + CREEP,
             "the wait timed out {waited:?} in"
