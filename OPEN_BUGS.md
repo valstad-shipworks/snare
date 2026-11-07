@@ -311,7 +311,7 @@ are real model gaps:
   out of a plane's namespace does; `EBADF` once its sim is gone) and leaves the working directory
   alone (`fs_shared_descriptors.rs`). An `*at` call relative to such a descriptor still reaches its
   `/dev/null` placeholder and fails with `ENOTDIR`.
-- File timestamps follow the sim's clock (README, "File timestamps"), with these limits:
+- File timestamps follow the sim's clock (docs/files.md, "File timestamps"), with these limits:
   - Writes through a mapping of a `VirtualFs` file stamp its modification time at the first
     `stat` after the host object it is mapped from shows them in its own times: on Linux at the
     write fault, on macOS at `msync` or page-out. A mapping write within the same host timestamp
@@ -524,7 +524,7 @@ Supported model boundaries and unverified approximations. These do not establish
   in the first sim, is served from that world. Build the runtime in each sim.
 - **Pool threads following a later sim:** a participant left over from an ended run follows a
   running sim that wakes it through a condition variable, futex, semaphore, parker or
-  `WaitOnAddress` (README, "Process-wide pools"). Work it picks up with no wake stays in its old
+  `WaitOnAddress` (docs/scheduling.md, "Process-wide pools"). Work it picks up with no wake stays in its old
   world: a worker still spinning when the later sim posts work (a run's end waits up to 200 ms of
   real time with no thread coming to rest, 1 s for one that has never blocked or keeps yielding,
   5 s in all, for its leftovers to park), or one polling
@@ -634,7 +634,7 @@ Supported model boundaries and unverified approximations. These do not establish
   (SRW) locks record their holders, allocating, under it. The executive's arm callback runs
   on the thread that has just won a contended mutex, which may be one of the allocator's.
 - **Long clock-reading loops:** a loop that reads the clock with no other hooked call between
-  reads is a clock spin whether it waits on time or works (README, "Clock spins"). Its first
+  reads is a clock spin whether it waits on time or works (docs/scheduling.md, "Clock spins"). Its first
   65,536 reads cost 1 µs each, as calls that do not block do; past those its steps grow toward
   one second, so a computation reading the clock that many times between hooked calls (an
   allocator under sustained churn, a per-item timestamp over hundreds of thousands of items)

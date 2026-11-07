@@ -117,10 +117,23 @@ static SEEN: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
 /// The address the process's default symbol lookup gives `hook.name`, or 0 if no loaded object
 /// defines it (`dlsym(3)`, `RTLD_DEFAULT`).
+///
+/// A symbol glibc keeps only for programs linked against an older release (a compat version,
+/// such as x86_64's `__xstat@GLIBC_2.2.5` since 2.33) has no default version, so `dlsym` misses
+/// it; it is looked up at the target's base glibc version instead (`dlvsym(3)`).
 pub(super) fn resolve(hook: &Hook) -> usize {
     let name = format!("{}\0", hook.name);
     // SAFETY: `name` is NUL-terminated; nothing is patched yet, so this is the real dlsym.
-    unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr().cast()) as usize }
+    let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr().cast()) as usize };
+    if found != 0 {
+        return found;
+    }
+    #[cfg(target_arch = "x86_64")]
+    const BASE: &std::ffi::CStr = c"GLIBC_2.2.5";
+    #[cfg(target_arch = "aarch64")]
+    const BASE: &std::ffi::CStr = c"GLIBC_2.17";
+    // SAFETY: both strings are NUL-terminated; as above, this is the real dlvsym.
+    unsafe { libc::dlvsym(libc::RTLD_DEFAULT, name.as_ptr().cast(), BASE.as_ptr()) as usize }
 }
 
 /// Patches every object loaded so far; later objects are patched from the `dlopen` hook.

@@ -85,6 +85,8 @@ pub struct LinkStats {
 pub struct Nic {
     name: String,
     ifindex: u32,
+    /// The hardware address; `None` lets the topology derive one.
+    mac: Option<[u8; 6]>,
     mtu: i32,
     driver: String,
     driver_version: String,
@@ -149,6 +151,7 @@ impl Nic {
             rx_queues: 1,
             tx_queues: 1,
             msi_irqs: Vec::new(),
+            mac: None,
             link_stats: LinkStats::default(),
             ptp_index: None,
             networks: Vec::new(),
@@ -185,6 +188,7 @@ impl Nic {
     fn topology_fact(&self) -> (NicSpec, NicCounters) {
         let mut spec = NicSpec::new(self.name.clone())
             .index(self.ifindex)
+            .mac_opt(self.mac)
             .mtu(self.mtu.max(0) as u32)
             .link(self.carrier.unwrap_or(self.operstate == "up"))
             .policy(self.policy.clone());
@@ -230,6 +234,13 @@ impl Nic {
     pub fn queues(mut self, rx: usize, tx: usize) -> Self {
         self.rx_queues = rx;
         self.tx_queues = tx;
+        self
+    }
+
+    /// The interface's hardware address, as `getifaddrs`' `AF_PACKET` entry, `SIOCGIFHWADDR`
+    /// and rtnetlink's `IFLA_ADDRESS` report it.
+    pub fn mac(mut self, mac: [u8; 6]) -> Self {
+        self.mac = Some(mac);
         self
     }
 
@@ -540,6 +551,12 @@ struct NicState {
     no_queue: bool,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     msi_irqs: Vec<u32>,
+    /// The NAPI instances the driver registered, one per queue vector.
+    #[cfg(target_os = "linux")]
+    napis: Vec<NapiState>,
+    /// Per-queue and per-device receive and transmit tuning under `/sys/class/net/<if>/`.
+    #[cfg(target_os = "linux")]
+    queue_tuning: QueueTuning,
     /// The driver's `ethtool` capabilities and what has been set through them.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     ethtool: crate::ethtool::NicEthtool,
@@ -634,6 +651,8 @@ pub struct HostProfile {
     /// The tracefs under `/sys/kernel/tracing`, if the kernel has one.
     tracefs: Option<crate::tracefs::Tracefs>,
     nics: Vec<Nic>,
+    /// Interrupt lines besides the NICs' MSI vectors.
+    irqs: Vec<IrqSpec>,
     /// The root qdisc kind reported by sysctl and `RTM_GETQDISC`.
     default_qdisc: String,
     /// Seconds `CLOCK_TAI` leads `CLOCK_REALTIME`.
@@ -661,6 +680,12 @@ pub struct HostProfile {
     kernel_release: String,
     kernel_version: Option<String>,
     machine: String,
+    /// `/proc/cmdline`; `None` derives one from the profile.
+    cmdline: Option<String>,
+    /// Sysctls besides the modelled network ones, by dotted key.
+    sysctls: std::collections::BTreeMap<String, String>,
+    /// The CPU quota of the code under test's cgroup, `(quota, period)` in microseconds.
+    cgroup_cpu_max: Option<(u64, u64)>,
 }
 
 #[cfg(target_os = "linux")]
@@ -722,6 +747,7 @@ impl HostProfile {
             root: false,
             tracefs: None,
             nics: Vec::new(),
+            irqs: Vec::new(),
             default_qdisc: "fq_codel".to_string(),
             tai_offset_secs: 37,
             ptp_clocks: std::collections::BTreeMap::new(),
@@ -735,6 +761,9 @@ impl HostProfile {
             kernel_release: DEFAULT_KERNEL_RELEASE.to_string(),
             kernel_version: None,
             machine: DEFAULT_MACHINE.to_string(),
+            cmdline: None,
+            sysctls: std::collections::BTreeMap::new(),
+            cgroup_cpu_max: None,
         }
     }
 
@@ -868,9 +897,64 @@ impl HostProfile {
         self
     }
 
+    /// The kernel command line `/proc/cmdline` reports. Without one it is a boot image and root
+    /// device followed by `isolcpus=` and `nohz_full=` for the profile's
+    /// [`isolated`](Self::isolated) and [`nohz_full`](Self::nohz_full) CPUs.
+    pub fn kernel_cmdline(mut self, cmdline: impl Into<String>) -> Self {
+        self.cmdline = Some(cmdline.into());
+        self
+    }
+
+    /// A sysctl under `/proc/sys`, by its dotted key (`kernel.sched_rt_runtime_us`), read and,
+    /// for root, written as the code under test finds it. `kernel.sched_rt_runtime_us`
+    /// (950000), `kernel.sched_rt_period_us` (1000000) and `kernel.timer_migration` (1) start at
+    /// the kernel's defaults without one.
+    pub fn sysctl(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.sysctls.insert(key.into(), value.into());
+        self
+    }
+
+    /// Puts the code under test in a cgroup v2 whose `cpu.max` allows `quota` microseconds of CPU
+    /// time every `period`, as a container runtime or `systemd-run -p CPUQuota=` does; Rust's
+    /// `available_parallelism` counts `quota / period` CPUs at most. Without one the code under
+    /// test sits at the root of the hierarchy, with no quota, whatever the machine's own cgroup.
+    pub fn cgroup_cpu_max(mut self, quota: u64, period: u64) -> Self {
+        self.cgroup_cpu_max = Some((quota, period));
+        self
+    }
+
     /// Attach a simulated [`Nic`].
     pub fn nic(mut self, nic: Nic) -> Self {
         self.nics.push(nic);
+        self
+    }
+
+    /// An interrupt line besides the NICs' MSI vectors, under `/proc/irq/<number>/` with `name`
+    /// as its handler (`/sys/kernel/irq/<number>/actions`). It starts on every online CPU and
+    /// moves like any other.
+    pub fn irq(mut self, number: u32, name: impl Into<String>) -> Self {
+        self.irqs.push(IrqSpec {
+            number,
+            name: name.into(),
+            managed: None,
+        });
+        self
+    }
+
+    /// A kernel-managed interrupt line (a multi-queue device's queue vector, such as NVMe's),
+    /// spread by the kernel onto `cpus`. Writing its affinity fails with `EIO`, as for
+    /// `irq_can_set_affinity_usr` (kernel/irq/manage.c).
+    pub fn managed_irq<I: IntoIterator<Item = usize>>(
+        mut self,
+        number: u32,
+        name: impl Into<String>,
+        cpus: I,
+    ) -> Self {
+        self.irqs.push(IrqSpec {
+            number,
+            name: name.into(),
+            managed: Some(cpus.into_iter().collect()),
+        });
         self
     }
 
@@ -1200,6 +1284,105 @@ struct OpenFile {
     description: u64,
 }
 
+/// An interrupt line the profile declares; see [`HostProfile::irq`].
+struct IrqSpec {
+    number: u32,
+    name: String,
+    /// The CPUs the kernel spread a managed line onto; `None` for one user space may move.
+    managed: Option<Vec<usize>>,
+}
+
+/// The first pid a kernel thread takes. Linux's `kthreadd` is pid 2 and its children follow;
+/// they stay below [`TID_BASE`], so a kernel thread never shares a pid with a simulated thread.
+#[cfg(target_os = "linux")]
+const KTHREAD_PID_BASE: i32 = 2;
+
+/// The first NAPI id. The kernel hands them out from `MIN_NAPI_ID`, `NR_CPUS + 1`
+/// (include/net/busy_poll.h), and `NR_CPUS` is 8192 on distribution x86_64 kernels.
+#[cfg(target_os = "linux")]
+const NAPI_ID_BASE: u32 = 8193;
+
+/// The per-CPU kernel threads a `PREEMPT_RT` kernel runs on every CPU at `SCHED_FIFO` 1:
+/// timer softirqs (`ktimers`, kernel/softirq.c), RCU core work with boosting (`rcuc`,
+/// kernel/rcu/tree.c, `rcutree.kthread_prio` 1) and lazy irq_work (`irq_work`,
+/// kernel/irq_work.c). Every kernel also runs `ksoftirqd/N` at `SCHED_OTHER`.
+#[cfg(target_os = "linux")]
+const RT_PERCPU_KTHREADS: [&str; 3] = ["ktimers", "rcuc", "irq_work"];
+
+/// The `SCHED_FIFO` priority a forced-threaded interrupt handler runs at (kernel/irq/manage.c,
+/// `setup_irq_thread`: `sched_set_fifo`, which is `MAX_RT_PRIO / 2`).
+#[cfg(target_os = "linux")]
+const IRQ_THREAD_PRIORITY: c_int = 50;
+
+/// `DQL_MAX_LIMIT` (include/linux/dynamic_queue_limits.h), `UINT_MAX / 2 - DQL_MAX_OBJECT`:
+/// `byte_queue_limits/limit_max` before anything sets it, and its ceiling.
+#[cfg(target_os = "linux")]
+const DQL_MAX_LIMIT: u64 = (u32::MAX / 2 - u32::MAX / 16) as u64;
+
+/// One NAPI instance of an interface (net/core/dev.c `netif_napi_add`).
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct NapiState {
+    id: u32,
+    /// The queue vector that schedules it (`netif_napi_set_irq`).
+    irq: Option<u32>,
+    /// Its `napi/<if>-<id>` thread while the interface runs NAPI in threads.
+    thread: Option<i32>,
+}
+
+/// What `/sys/class/net/<if>/` and its `queues/` hold besides the modelled link attributes.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Default)]
+struct QueueTuning {
+    /// `napi_defer_hard_irqs`.
+    defer_hard_irqs: u32,
+    /// `gro_flush_timeout`, in nanoseconds.
+    gro_flush_timeout_ns: u64,
+    /// `queues/rx-<n>/rps_cpus`, for the queues it was set on.
+    rps: std::collections::BTreeMap<usize, Vec<usize>>,
+    /// `queues/tx-<n>/xps_cpus`, likewise.
+    xps: std::collections::BTreeMap<usize, Vec<usize>>,
+    /// `queues/tx-<n>/byte_queue_limits/limit_max`, likewise; [`DQL_MAX_LIMIT`] otherwise.
+    bql_limit_max: std::collections::BTreeMap<usize, u64>,
+}
+
+/// A writable per-interface file under `/sys/class/net/<if>/`.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+enum NicAttr {
+    DeferHardIrqs,
+    GroFlushTimeout,
+    Rps(usize),
+    Xps(usize),
+    BqlLimitMax(usize),
+}
+
+/// A writable `/proc/irq` file.
+#[derive(Clone, Copy)]
+enum IrqAttr {
+    Default,
+    Line(u32, CpuFormat),
+}
+
+#[derive(Clone, Copy)]
+enum CpuFormat {
+    Mask,
+    List,
+}
+
+/// One interrupt line under `/proc/irq`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct IrqLine {
+    /// Its handlers, as `/sys/kernel/irq/<n>/actions` lists them.
+    name: String,
+    /// The CPUs it may be delivered to, as last set (`smp_affinity`).
+    affinity: Vec<usize>,
+    managed: bool,
+    /// Its handler thread (`irq/<n>-<name>`), on a `PREEMPT_RT` kernel, which forces every
+    /// handler into a thread.
+    thread: Option<i32>,
+}
+
 /// Per-(virtual)-thread scheduling state. `policy`/`rt_priority` are the `sched_setscheduler`
 /// view; `nice` the `setpriority` view; `affinity` the CPU mask (empty means "every online CPU").
 /// Fields default to `SCHED_OTHER` (policy 0), priority 0, nice 0, and an empty affinity mask
@@ -1211,6 +1394,42 @@ struct ThreadState {
     nice: c_int,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     affinity: Vec<usize>,
+    /// Its `comm`, once it named itself; a new thread starts with its creator's (man 5 proc,
+    /// /proc/pid/comm). `None` is the process's own name.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    name: Option<Vec<u8>>,
+    /// Its start routine returned, so `/proc/self/task` no longer lists it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    exited: bool,
+    /// A kernel thread of the simulated host, its own process under `/proc`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    kernel: bool,
+    /// Bound to its CPU by the kernel (`PF_NO_SETAFFINITY`): `sched_setaffinity` fails with
+    /// `EINVAL`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    bound: bool,
+}
+
+/// The pid in a `/proc/<pid>/comm` or `/proc/self/task/<pid>/comm` path.
+#[cfg(target_os = "linux")]
+fn pid_of_comm(p: &str) -> Option<i32> {
+    let rest = p
+        .strip_prefix("/proc/self/task/")
+        .or_else(|| p.strip_prefix("/proc/"))?;
+    rest.strip_suffix("/comm")?.parse().ok()
+}
+
+/// The process's own `comm`, what a thread that never named itself shows.
+#[cfg(target_os = "linux")]
+fn process_comm() -> Vec<u8> {
+    snare_interpose::real(|| std::fs::read("/proc/self/comm"))
+        .map(|mut name| {
+            if name.last() == Some(&b'\n') {
+                name.pop();
+            }
+            name
+        })
+        .unwrap_or_default()
 }
 
 /// The first simulated tid minted. A snare choice: any positive base works; 4000 keeps simulated
@@ -1630,6 +1849,28 @@ pub(crate) struct HostState {
     #[cfg(target_os = "linux")]
     pthreads: HashMap<u64, i32>,
     nics: HashMap<String, NicState>,
+    /// Every interrupt line, by number.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    irqs: std::collections::BTreeMap<u32, IrqLine>,
+    /// The affinity new interrupts start with (`/proc/irq/default_smp_affinity`).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    default_irq_affinity: Vec<usize>,
+    /// `/proc/cmdline`, without its newline.
+    #[cfg(target_os = "linux")]
+    cmdline: String,
+    /// [`HostProfile::cgroup_cpu_max`].
+    #[cfg(target_os = "linux")]
+    cgroup_cpu_max: Option<(u64, u64)>,
+    /// The sysctls under `/proc/sys` the host serves besides the modelled ones, by path under it
+    /// (`kernel/sched_rt_runtime_us`).
+    #[cfg(target_os = "linux")]
+    sysctls: std::collections::BTreeMap<String, String>,
+    /// The next pid a kernel thread takes, from [`KTHREAD_PID_BASE`].
+    #[cfg(target_os = "linux")]
+    next_kpid: i32,
+    /// The next NAPI id registered, from [`NAPI_ID_BASE`].
+    #[cfg(target_os = "linux")]
+    next_napi_id: u32,
     default_qdisc: String,
     /// PHC index to its offset from `CLOCK_REALTIME` in ns: the profile's clocks plus each NIC's
     /// `ptp_index`.
@@ -1970,8 +2211,88 @@ impl HostState {
             return Some(self.proc_stat().into_bytes());
         }
         #[cfg(target_os = "linux")]
+        if p == "/proc/interrupts" {
+            return Some(self.proc_interrupts().into_bytes());
+        }
+        // Documentation/core-api/irq/irq-affinity.rst and man 5 proc (/proc/irq).
+        #[cfg(target_os = "linux")]
+        if p == "/proc/irq/default_smp_affinity" {
+            return Some(with_newline(format_cpu_mask(
+                &self.default_irq_affinity,
+                self.cpu_count,
+            )));
+        }
+        #[cfg(target_os = "linux")]
+        if let Some((n, file)) = p.strip_prefix("/proc/irq/").and_then(|r| r.split_once('/'))
+            && let Some(line) = n.parse().ok().and_then(|n: u32| self.irqs.get(&n))
+        {
+            let text = match file {
+                "smp_affinity" => format_cpu_mask(&line.affinity, self.cpu_count),
+                "smp_affinity_list" => format_cpu_list(&line.affinity),
+                "effective_affinity" => format_cpu_mask(&self.irq_effective(line), self.cpu_count),
+                "effective_affinity_list" => format_cpu_list(&self.irq_effective(line)),
+                "node" => "0".to_string(),
+                _ => return None,
+            };
+            return Some(with_newline(text));
+        }
+        // Documentation/ABI/testing/sysfs-kernel-irq: the line's handler names.
+        #[cfg(target_os = "linux")]
+        if let Some(n) = p
+            .strip_prefix("/sys/kernel/irq/")
+            .and_then(|r| r.strip_suffix("/actions"))
+            && let Some(line) = n.parse().ok().and_then(|n: u32| self.irqs.get(&n))
+        {
+            return Some(with_newline(line.name.clone()));
+        }
+        // man 5 proc_pid_comm: /proc/<tid>/comm and /proc/self/task/<tid>/comm, for a simulated
+        // tid; a real pid's files are the real kernel's.
+        #[cfg(target_os = "linux")]
+        if let Some(tid) = pid_of_comm(p)
+            && let Some(t) = self.host_thread(tid)
+        {
+            let name = match &t.name {
+                Some(name) => name.clone(),
+                None => process_comm(),
+            };
+            return Some([name.as_slice(), b"\n"].concat());
+        }
+        #[cfg(target_os = "linux")]
         if p == "/proc/cpuinfo" {
             return self.cpuinfo().map(String::into_bytes);
+        }
+        #[cfg(target_os = "linux")]
+        if p == "/proc/cmdline" {
+            return Some(with_newline(self.cmdline.clone()));
+        }
+        // man 7 cgroups: the code under test's cgroup v2 membership. Its cgroup is the root of
+        // the hierarchy, or with a `cpu.max` quota one of its own beneath it.
+        #[cfg(target_os = "linux")]
+        match p {
+            "/proc/self/cgroup" | "/proc/thread-self/cgroup" => {
+                let at = if self.cgroup_cpu_max.is_some() {
+                    "/snare.scope"
+                } else {
+                    "/"
+                };
+                return Some(with_newline(format!("0::{at}")));
+            }
+            "/sys/fs/cgroup/cgroup.controllers"
+            | "/sys/fs/cgroup/snare.scope/cgroup.controllers" => {
+                return Some(with_newline("cpuset cpu io memory pids".to_string()));
+            }
+            "/sys/fs/cgroup/snare.scope/cpu.max" => {
+                let (quota, period) = self.cgroup_cpu_max?;
+                return Some(with_newline(format!("{quota} {period}")));
+            }
+            _ => {}
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(value) = p
+            .strip_prefix("/proc/sys/")
+            .and_then(|key| self.sysctls.get(key))
+        {
+            return Some(with_newline(value.clone()));
         }
         // The kernel identity, as `uname` reports it (Documentation/admin-guide/sysctl/kernel.rst,
         // "domainname & hostname", "osrelease, ostype & version").
@@ -1988,6 +2309,29 @@ impl HostState {
                 _ => return None,
             };
             return Some([text, b"\n"].concat());
+        }
+        #[cfg(target_os = "linux")]
+        if let Some((name, attr)) = self.nic_attr(Path::new(p)) {
+            let nic = &self.nics[&name];
+            let t = &nic.queue_tuning;
+            // Documentation/ABI/testing/sysfs-class-net and sysfs-class-net-queues.
+            let text = match attr {
+                NicAttr::DeferHardIrqs => t.defer_hard_irqs.to_string(),
+                NicAttr::GroFlushTimeout => t.gro_flush_timeout_ns.to_string(),
+                NicAttr::Rps(q) => {
+                    format_cpu_mask(t.rps.get(&q).map_or(&[][..], |c| c), self.cpu_count)
+                }
+                NicAttr::Xps(q) => {
+                    format_cpu_mask(t.xps.get(&q).map_or(&[][..], |c| c), self.cpu_count)
+                }
+                NicAttr::BqlLimitMax(q) => t
+                    .bql_limit_max
+                    .get(&q)
+                    .copied()
+                    .unwrap_or(DQL_MAX_LIMIT)
+                    .to_string(),
+            };
+            return Some(with_newline(text));
         }
         if let Some(rest) = p.strip_prefix("/sys/class/net/")
             && let Some((name, attr)) = rest.split_once('/')
@@ -2086,6 +2430,493 @@ impl HostState {
             return Err(libc::EOPNOTSUPP);
         }
         self.nics.get_mut(nic).unwrap().ethtool.threaded_napi = value == 1;
+        #[cfg(target_os = "linux")]
+        if value == 1 {
+            self.start_napi_threads(nic);
+        } else {
+            self.stop_napi_threads(nic);
+        }
+        Ok(())
+    }
+
+    /// The thread `pid` names when the host owns it: a simulated thread (from [`TID_BASE`]) or a
+    /// kernel thread. Lower pids the code under test merely passed to a `sched_*` call are the
+    /// real machine's.
+    #[cfg(target_os = "linux")]
+    fn host_thread(&self, pid: i32) -> Option<&ThreadState> {
+        self.threads
+            .get(&pid)
+            .filter(|t| pid >= TID_BASE || t.kernel)
+    }
+
+    /// `/proc/interrupts` (fs/proc/interrupts.c, `show_interrupts`): a header of the online
+    /// CPUs, then one row per line with a count per CPU, its chip and its handlers. Nothing
+    /// is counted, so every count is 0.
+    #[cfg(target_os = "linux")]
+    fn proc_interrupts(&self) -> String {
+        let online = self.online_cpus();
+        let mut out = String::from("    ");
+        for cpu in &online {
+            out.push_str(&format!(" {:>10}", format!("CPU{cpu}")));
+        }
+        out.push('\n');
+        for (n, line) in &self.irqs {
+            out.push_str(&format!("{n:>4}:"));
+            for _ in &online {
+                out.push_str(&format!(" {:>10}", 0));
+            }
+            out.push_str(&format!("  PCI-MSIX-edge      {}\n", line.name));
+        }
+        out
+    }
+
+    /// Starts what the kernel runs before any code under test: each online CPU's per-CPU
+    /// threads, every interface's queue vectors and NAPI instances, and on `PREEMPT_RT` the
+    /// profile's interrupt lines' handler threads.
+    #[cfg(target_os = "linux")]
+    fn boot_kernel(&mut self) {
+        let online = self.online.clone();
+        for &cpu in &online {
+            self.spawn_kthread(
+                format!("ksoftirqd/{cpu}"),
+                libc::SCHED_OTHER,
+                0,
+                vec![cpu],
+                true,
+            );
+            if self.preempt_rt {
+                for kind in RT_PERCPU_KTHREADS {
+                    self.spawn_kthread(
+                        format!("{kind}/{cpu}"),
+                        libc::SCHED_FIFO,
+                        1,
+                        vec![cpu],
+                        true,
+                    );
+                }
+            }
+        }
+        let lines: Vec<u32> = self.irqs.keys().copied().collect();
+        for n in lines {
+            self.start_irq_thread(n);
+        }
+        let mut names: Vec<String> = self.nics.keys().cloned().collect();
+        names.sort_by_key(|n| self.nics[n].ifindex);
+        for name in names {
+            self.request_nic_vectors(&name);
+        }
+    }
+
+    /// A kernel thread named `name`, under `policy` at `priority` on `affinity`; `bound` ones
+    /// are pinned there by the kernel. Returns its pid.
+    #[cfg(target_os = "linux")]
+    fn spawn_kthread(
+        &mut self,
+        name: String,
+        policy: c_int,
+        priority: c_int,
+        affinity: Vec<usize>,
+        bound: bool,
+    ) -> i32 {
+        let pid = self.next_kpid;
+        assert!(
+            pid < TID_BASE,
+            "more kernel threads than pids below the simulated tids"
+        );
+        self.next_kpid += 1;
+        self.threads.insert(
+            pid,
+            ThreadState {
+                policy,
+                rt_priority: priority,
+                nice: 0,
+                affinity,
+                name: Some(name.into_bytes()),
+                exited: false,
+                kernel: true,
+                bound,
+            },
+        );
+        pid
+    }
+
+    /// Line `n`'s handler thread, on a `PREEMPT_RT` kernel, following its effective affinity.
+    #[cfg(target_os = "linux")]
+    fn start_irq_thread(&mut self, n: u32) {
+        if !self.preempt_rt {
+            return;
+        }
+        let line = &self.irqs[&n];
+        let name = format!("irq/{n}-{}", line.name);
+        let affinity = self.irq_effective(line);
+        let pid = self.spawn_kthread(name, libc::SCHED_FIFO, IRQ_THREAD_PRIORITY, affinity, false);
+        self.irqs.get_mut(&n).unwrap().thread = Some(pid);
+    }
+
+    /// How many queue vectors `nic` runs: its combined channels (or receive ones without
+    /// combined), else one per MSI vector after the first, capped by the vectors it has.
+    #[cfg(target_os = "linux")]
+    fn queue_vector_count(nic: &NicState) -> usize {
+        let available = nic.msi_irqs.len().saturating_sub(1).max(1);
+        let wanted = nic
+            .ethtool
+            .channels
+            .map(|c| c.combined.max(c.rx).max(1) as usize)
+            .unwrap_or(available);
+        wanted.min(available)
+    }
+
+    /// `nic`'s queue vectors and NAPI instances, as its driver requests them when it brings up
+    /// its queues: igb's layout (drivers/net/ethernet/intel/igb/igb_main.c,
+    /// `igb_request_msix`), the first MSI vector for link and other causes, named after the
+    /// interface, then one `<if>-TxRx-<n>` per queue vector; a lone vector after the interface.
+    /// Each line starts on the default affinity, and each queue vector registers a NAPI
+    /// instance with a fresh id, in a thread when the interface runs NAPI in threads.
+    #[cfg(target_os = "linux")]
+    fn request_nic_vectors(&mut self, name: &str) {
+        let nic = &self.nics[name];
+        let msi = nic.msi_irqs.clone();
+        let vectors = Self::queue_vector_count(nic);
+        let mut lines: Vec<(u32, String)> = Vec::new();
+        let mut queue_irqs: Vec<Option<u32>> = Vec::new();
+        match msi.as_slice() {
+            [] => queue_irqs.push(None),
+            [lone] => {
+                lines.push((*lone, name.to_string()));
+                queue_irqs.push(Some(*lone));
+            }
+            [other, queues @ ..] => {
+                lines.push((*other, name.to_string()));
+                for (i, &irq) in queues.iter().take(vectors).enumerate() {
+                    lines.push((irq, format!("{name}-TxRx-{i}")));
+                    queue_irqs.push(Some(irq));
+                }
+            }
+        }
+        for (n, line_name) in lines {
+            self.irqs.insert(
+                n,
+                IrqLine {
+                    name: line_name,
+                    affinity: self.default_irq_affinity.clone(),
+                    managed: false,
+                    thread: None,
+                },
+            );
+            self.start_irq_thread(n);
+        }
+        let napis: Vec<NapiState> = queue_irqs
+            .into_iter()
+            .map(|irq| {
+                let id = self.next_napi_id;
+                self.next_napi_id += 1;
+                NapiState {
+                    id,
+                    irq,
+                    thread: None,
+                }
+            })
+            .collect();
+        self.nics.get_mut(name).unwrap().napis = napis;
+        if self.nics[name].ethtool.threaded_napi {
+            self.start_napi_threads(name);
+        }
+    }
+
+    /// Frees `nic`'s queue vectors and unregisters its NAPI instances, with their threads.
+    #[cfg(target_os = "linux")]
+    fn release_nic_vectors(&mut self, name: &str) {
+        let msi = self.nics[name].msi_irqs.clone();
+        for n in msi {
+            if let Some(line) = self.irqs.remove(&n)
+                && let Some(pid) = line.thread
+            {
+                self.threads.remove(&pid);
+            }
+        }
+        let napis = std::mem::take(&mut self.nics.get_mut(name).unwrap().napis);
+        for pid in napis.into_iter().filter_map(|n| n.thread) {
+            self.threads.remove(&pid);
+        }
+    }
+
+    /// A `napi/<if>-<id>` thread for each of `nic`'s NAPI instances that has none
+    /// (net/core/dev.c `napi_kthread_create`): `SCHED_OTHER` on every online CPU.
+    #[cfg(target_os = "linux")]
+    fn start_napi_threads(&mut self, name: &str) {
+        let online = self.online.clone();
+        let ids: Vec<(usize, u32)> = self.nics[name]
+            .napis
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.thread.is_none())
+            .map(|(i, n)| (i, n.id))
+            .collect();
+        for (i, id) in ids {
+            let pid = self.spawn_kthread(
+                format!("napi/{name}-{id}"),
+                libc::SCHED_OTHER,
+                0,
+                online.clone(),
+                false,
+            );
+            self.nics.get_mut(name).unwrap().napis[i].thread = Some(pid);
+        }
+    }
+
+    /// Stops `nic`'s NAPI threads (NAPI back in softirq context).
+    #[cfg(target_os = "linux")]
+    fn stop_napi_threads(&mut self, name: &str) {
+        let pids: Vec<i32> = self
+            .nics
+            .get_mut(name)
+            .unwrap()
+            .napis
+            .iter_mut()
+            .filter_map(|n| n.thread.take())
+            .collect();
+        for pid in pids {
+            self.threads.remove(&pid);
+        }
+    }
+
+    /// Moves line `n`'s handler thread onto the line's effective affinity, as the thread does
+    /// itself on its next run after the affinity changes (kernel/irq/manage.c,
+    /// `irq_thread_check_affinity`).
+    #[cfg(target_os = "linux")]
+    fn follow_irq_affinity(&mut self, n: u32) {
+        let Some(line) = self.irqs.get(&n) else {
+            return;
+        };
+        let Some(pid) = line.thread else { return };
+        let affinity = self.irq_effective(line);
+        if let Some(t) = self.threads.get_mut(&pid) {
+            t.affinity = affinity;
+        }
+    }
+
+    /// The sysctl `path` is, if the host serves it from its table.
+    #[cfg(target_os = "linux")]
+    fn sysctl_attr(&self, path: &Path) -> Option<String> {
+        let key = path.to_str()?.strip_prefix("/proc/sys/")?;
+        self.sysctls.contains_key(key).then(|| key.to_string())
+    }
+
+    /// A write to a table sysctl, as kernel/sysctl.c's handlers take it: a numeric one takes an
+    /// integer (`EINVAL` otherwise); `kernel/sched_rt_runtime_us` -1 or at most the period
+    /// (kernel/sched/rt.c `sched_rt_handler`), `kernel/timer_migration` 0 or 1
+    /// (`proc_dointvec_minmax`), both `EINVAL` outside.
+    #[cfg(target_os = "linux")]
+    fn store_sysctl(&mut self, key: &str, text: &[u8]) -> Result<(), c_int> {
+        let text = std::str::from_utf8(text).map_err(|_| libc::EINVAL)?;
+        let text = text.trim_end_matches('\n').trim().to_string();
+        let numeric = self.sysctls[key].trim().parse::<i64>().is_ok();
+        if numeric {
+            let v: i64 = text.parse().map_err(|_| libc::EINVAL)?;
+            let period = self
+                .sysctls
+                .get("kernel/sched_rt_period_us")
+                .and_then(|p| p.parse::<i64>().ok())
+                .unwrap_or(1_000_000);
+            let ok = match key {
+                "kernel/sched_rt_runtime_us" => v == -1 || (0..=period).contains(&v),
+                "kernel/timer_migration" => (0..=1).contains(&v),
+                _ => true,
+            };
+            if !ok {
+                return Err(libc::EINVAL);
+            }
+        }
+        self.sysctls.insert(key.to_string(), text);
+        Ok(())
+    }
+
+    /// A task's affinity before anything sets it: the online CPUs less those `isolcpus=`
+    /// takes from the scheduler's domains, which init starts without and every task inherits
+    /// (kernel/sched/isolation.c, `HK_TYPE_DOMAIN`); every online CPU when that leaves none.
+    #[cfg(target_os = "linux")]
+    fn default_affinity(&self) -> Vec<usize> {
+        let housekeeping: Vec<usize> = self
+            .online
+            .iter()
+            .copied()
+            .filter(|c| !self.isolated.contains(c))
+            .collect();
+        if housekeeping.is_empty() {
+            self.online.clone()
+        } else {
+            housekeeping
+        }
+    }
+
+    /// The per-interface tuning file `path` is, if it is one of an existing queue's.
+    #[cfg(target_os = "linux")]
+    fn nic_attr(&self, path: &Path) -> Option<(String, NicAttr)> {
+        let rest = path.to_str()?.strip_prefix("/sys/class/net/")?;
+        let (name, attr) = rest.split_once('/')?;
+        let nic = self.nics.get(name)?;
+        let queue = |dir: &str, file: &str, count: usize| -> Option<usize> {
+            let q: usize = attr.strip_prefix(dir)?.strip_suffix(file)?.parse().ok()?;
+            (q < count).then_some(q)
+        };
+        let attr = match attr {
+            "napi_defer_hard_irqs" => NicAttr::DeferHardIrqs,
+            "gro_flush_timeout" => NicAttr::GroFlushTimeout,
+            _ => {
+                if let Some(q) = queue("queues/rx-", "/rps_cpus", nic.rx_queues) {
+                    NicAttr::Rps(q)
+                } else if let Some(q) = queue("queues/tx-", "/xps_cpus", nic.tx_queues) {
+                    NicAttr::Xps(q)
+                } else {
+                    NicAttr::BqlLimitMax(queue(
+                        "queues/tx-",
+                        "/byte_queue_limits/limit_max",
+                        nic.tx_queues,
+                    )?)
+                }
+            }
+        };
+        Some((name.to_string(), attr))
+    }
+
+    /// A write to a per-interface tuning file, as net/core/net-sysfs.c takes it.
+    /// `napi_defer_hard_irqs` and `gro_flush_timeout` (`netdev_store`): `EPERM` without
+    /// `CAP_NET_ADMIN`, `EINVAL` for text `kstrtoul` rejects, `ERANGE` for a deferral above
+    /// `S32_MAX`. `rps_cpus` (`store_rps_map`) and `xps_cpus` (`xps_cpus_store`): `EPERM`
+    /// without `CAP_NET_ADMIN`, a cpumask as `bitmap_parse` reads it; RPS drops isolated CPUs
+    /// (`housekeeping_cpumask(HK_TYPE_DOMAIN)`) and refuses with `EINVAL` a mask left empty by
+    /// that. `limit_max` (`bql_set`): `EINVAL` above [`DQL_MAX_LIMIT`].
+    #[cfg(target_os = "linux")]
+    fn store_nic_attr(&mut self, name: &str, attr: NicAttr, text: &[u8]) -> Result<(), c_int> {
+        let number = |text: &[u8]| -> Result<u64, c_int> {
+            let text = std::str::from_utf8(text).map_err(|_| libc::EINVAL)?;
+            let text = text.strip_suffix('\n').unwrap_or(text);
+            if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+                u64::from_str_radix(hex, 16)
+            } else if text.len() > 1 && text.starts_with('0') {
+                u64::from_str_radix(&text[1..], 8)
+            } else {
+                text.strip_prefix('+').unwrap_or(text).parse()
+            }
+            .map_err(|_| libc::EINVAL)
+        };
+        let needs_admin = !matches!(attr, NicAttr::BqlLimitMax(_));
+        if needs_admin && !self.has_cap(CAP_NET_ADMIN) {
+            return Err(libc::EPERM);
+        }
+        let cpu_count = self.cpu_count;
+        let isolated = self.isolated.clone();
+        let t = &mut self.nics.get_mut(name).unwrap().queue_tuning;
+        match attr {
+            NicAttr::DeferHardIrqs => {
+                let n = number(text)?;
+                if n > i32::MAX as u64 {
+                    return Err(libc::ERANGE);
+                }
+                t.defer_hard_irqs = n as u32;
+            }
+            NicAttr::GroFlushTimeout => t.gro_flush_timeout_ns = number(text)?,
+            NicAttr::Rps(q) => {
+                let asked = parse_cpu_mask(text, cpu_count)?;
+                let kept: Vec<usize> = asked
+                    .iter()
+                    .copied()
+                    .filter(|c| !isolated.contains(c))
+                    .collect();
+                if !asked.is_empty() && kept.is_empty() {
+                    return Err(libc::EINVAL);
+                }
+                t.rps.insert(q, kept);
+            }
+            NicAttr::Xps(q) => {
+                t.xps.insert(q, parse_cpu_mask(text, cpu_count)?);
+            }
+            NicAttr::BqlLimitMax(q) => {
+                let n = number(text)?;
+                if n > DQL_MAX_LIMIT {
+                    return Err(libc::EINVAL);
+                }
+                t.bql_limit_max.insert(q, n);
+            }
+        }
+        Ok(())
+    }
+
+    /// The CPUs line `irq` is delivered to (`effective_affinity`): x86's vector allocator
+    /// takes one CPU of the affinity. Snare takes the first online one, and for a managed line
+    /// the first not isolated (`isolcpus=managed_irq`), falling back to the first.
+    #[cfg(target_os = "linux")]
+    fn irq_effective(&self, line: &IrqLine) -> Vec<usize> {
+        let online: Vec<usize> = line
+            .affinity
+            .iter()
+            .copied()
+            .filter(|c| self.online.contains(c))
+            .collect();
+        let pick = if line.managed {
+            online
+                .iter()
+                .copied()
+                .find(|c| !self.isolated.contains(c))
+                .or_else(|| online.first().copied())
+        } else {
+            online.first().copied()
+        };
+        pick.into_iter().collect()
+    }
+
+    /// What a write to `path` under `/proc/irq` changes, if it is one of its writable files.
+    fn irq_attr(&self, path: &Path) -> Option<IrqAttr> {
+        let rest = path.to_str()?.strip_prefix("/proc/irq/")?;
+        if rest == "default_smp_affinity" {
+            return Some(IrqAttr::Default);
+        }
+        let (n, file) = rest.split_once('/')?;
+        let n: u32 = n.parse().ok()?;
+        if !self.irqs.contains_key(&n) {
+            return None;
+        }
+        match file {
+            "smp_affinity" => Some(IrqAttr::Line(n, CpuFormat::Mask)),
+            "smp_affinity_list" => Some(IrqAttr::Line(n, CpuFormat::List)),
+            _ => None,
+        }
+    }
+
+    /// A write to a `/proc/irq` file, as kernel/irq/proc.c takes it. A line's affinity:
+    /// `EIO` for a managed line (`irq_can_set_affinity_usr`); one naming no online CPU puts the
+    /// line back on the default affinity and succeeds (`irq_select_affinity_usr`). The default
+    /// (`write_default_affinity`): a mask only, `EINVAL` when it names no online CPU.
+    fn store_irq(&mut self, attr: IrqAttr, text: &[u8]) -> Result<(), c_int> {
+        let cpu_count = self.cpu_count;
+        let online = self.online.clone();
+        let touches_online = |cpus: &[usize]| cpus.iter().any(|c| online.contains(c));
+        match attr {
+            IrqAttr::Default => {
+                let cpus = parse_cpu_mask(text, cpu_count)?;
+                if !touches_online(&cpus) {
+                    return Err(libc::EINVAL);
+                }
+                self.default_irq_affinity = cpus;
+            }
+            IrqAttr::Line(n, format) => {
+                if self.irqs[&n].managed {
+                    return Err(libc::EIO);
+                }
+                let cpus = match format {
+                    CpuFormat::Mask => parse_cpu_mask(text, cpu_count)?,
+                    CpuFormat::List => parse_cpu_list(text, cpu_count)?,
+                };
+                let cpus = if touches_online(&cpus) {
+                    cpus
+                } else {
+                    self.default_irq_affinity.clone()
+                };
+                self.irqs.get_mut(&n).unwrap().affinity = cpus;
+                #[cfg(target_os = "linux")]
+                self.follow_irq_affinity(n);
+            }
+        }
         Ok(())
     }
 
@@ -2219,6 +3050,84 @@ impl HostState {
             }
         };
         let mut entries = vec![entry("."), entry("..")];
+        let file = |name: &str| DirEntry {
+            name: name.as_bytes().to_vec(),
+            ino: ino_of(&path.join(name)),
+            dtype: libc::DT_REG,
+        };
+        if path == Path::new("/proc/irq") {
+            entries.push(file("default_smp_affinity"));
+            entries.extend(self.irqs.keys().map(|n| entry(&n.to_string())));
+            return Some(entries);
+        }
+        if path == Path::new("/sys/kernel/irq") {
+            entries.extend(self.irqs.keys().map(|n| entry(&n.to_string())));
+            return Some(entries);
+        }
+        if path
+            .to_str()
+            .and_then(|p| p.strip_prefix("/proc/irq/"))
+            .and_then(|n| n.parse::<u32>().ok())
+            .is_some_and(|n| self.irqs.contains_key(&n))
+        {
+            for name in [
+                "smp_affinity",
+                "smp_affinity_list",
+                "effective_affinity",
+                "effective_affinity_list",
+                "node",
+            ] {
+                entries.push(file(name));
+            }
+            return Some(entries);
+        }
+        if path
+            .to_str()
+            .and_then(|p| p.strip_prefix("/sys/kernel/irq/"))
+            .and_then(|n| n.parse::<u32>().ok())
+            .is_some_and(|n| self.irqs.contains_key(&n))
+        {
+            entries.push(file("actions"));
+            return Some(entries);
+        }
+        // man 5 proc_pid_task: one directory per thread of the process still running.
+        if path == Path::new("/proc/self/task") {
+            entries.extend(
+                self.threads
+                    .iter()
+                    .filter(|(tid, t)| **tid >= TID_BASE && !t.kernel && !t.exited)
+                    .map(|(tid, _)| entry(&tid.to_string())),
+            );
+            return Some(entries);
+        }
+        // man 5 proc: one directory per process. The simulated host's are its kernel threads
+        // and the code under test itself; `self` and `thread-self` link to the caller's own.
+        if path == Path::new("/proc") {
+            let link = |name: &str| DirEntry {
+                name: name.as_bytes().to_vec(),
+                ino: ino_of(&path.join(name)),
+                dtype: libc::DT_LNK,
+            };
+            entries.push(link("self"));
+            entries.push(link("thread-self"));
+            let me = snare_interpose::real(|| unsafe { libc::getpid() });
+            let mut pids: Vec<i32> = self
+                .threads
+                .iter()
+                .filter(|(_, t)| t.kernel)
+                .map(|(pid, _)| *pid)
+                .chain(std::iter::once(me))
+                .collect();
+            pids.sort_unstable();
+            entries.extend(pids.iter().map(|pid| entry(&pid.to_string())));
+            for name in ["irq", "net", "sys"] {
+                entries.push(entry(name));
+            }
+            for name in ["cpuinfo", "interrupts", "stat"] {
+                entries.push(file(name));
+            }
+            return Some(entries);
+        }
         if path == Path::new("/sys/class/net") {
             let mut names: Vec<_> = self.nics.keys().collect();
             names.sort();
@@ -2264,10 +3173,29 @@ impl HostState {
             "/proc/sys/net",
             "/proc/self/status",
             "/proc/thread-self/status",
+            "/proc/self/task",
+            "/proc/irq",
+            "/proc/interrupts",
         ];
         let Some(p) = path.to_str() else {
             return false;
         };
+        #[cfg(target_os = "linux")]
+        if pid_of_comm(p).is_some_and(|pid| self.host_thread(pid).is_some())
+            || p == "/proc/cmdline"
+            || p.strip_prefix("/proc/sys/")
+                .is_some_and(|k| self.sysctls.contains_key(k))
+            || matches!(
+                p,
+                "/proc/self/cgroup"
+                    | "/proc/thread-self/cgroup"
+                    | "/sys/fs/cgroup/cpu.max"
+                    | "/sys/fs/cgroup/cgroup.controllers"
+            )
+            || p.starts_with("/sys/fs/cgroup/snare.scope")
+        {
+            return true;
+        }
         PREFIXES
             .iter()
             .any(|pre| p == *pre || p.starts_with(&format!("{pre}/")))
@@ -2465,8 +3393,75 @@ impl HostState {
                 nl_message(NLMSG_ERROR, 0, seq, &body)
             }
             GENL_ID_CTRL => build_genl_ctrl_reply(req, seq),
+            NETDEV_FAMILY_ID => self.netdev_reply(req, seq),
             _ => build_getlink_dump(&[], seq),
         }
+    }
+
+    /// A `netdev` family request (Documentation/netlink/specs/netdev.yaml). `NETDEV_CMD_NAPI_GET`
+    /// dumps every NAPI instance, or those of the interface its `NETDEV_A_NAPI_IFINDEX` names:
+    /// ifindex, id, its interrupt, and the pid of its thread when NAPI runs in threads. Every
+    /// other command is `EOPNOTSUPP`.
+    #[cfg(target_os = "linux")]
+    fn netdev_reply(&self, req: &[u8], seq: u32) -> Vec<u8> {
+        const NETDEV_CMD_NAPI_GET: u8 = 11;
+        const NETDEV_A_NAPI_IFINDEX: u16 = 1;
+        const NETDEV_A_NAPI_ID: u16 = 2;
+        const NETDEV_A_NAPI_IRQ: u16 = 3;
+        const NETDEV_A_NAPI_PID: u16 = 4;
+        const NLMSG_ERROR: u16 = 2;
+        const NLMSG_DONE: u16 = 3;
+        const NLM_F_MULTI: u16 = 2;
+        let cmd = req.get(16).copied().unwrap_or(0);
+        if cmd != NETDEV_CMD_NAPI_GET {
+            let mut body = Vec::new();
+            body.extend_from_slice(&(-libc::EOPNOTSUPP).to_ne_bytes());
+            body.extend_from_slice(&req[..req.len().min(16)]);
+            return nl_message(NLMSG_ERROR, 0, seq, &body);
+        }
+        let ifindex = req
+            .get(20..)
+            .and_then(|attrs| find_nlattr(attrs, NETDEV_A_NAPI_IFINDEX))
+            .and_then(|v| v.get(..4))
+            .map(|v| u32::from_ne_bytes(v.try_into().unwrap()));
+        let mut nics: Vec<&NicState> = self
+            .nics
+            .values()
+            .filter(|n| ifindex.is_none_or(|i| n.ifindex == i))
+            .collect();
+        nics.sort_by_key(|n| n.ifindex);
+        let mut out = Vec::new();
+        for nic in nics {
+            for napi in &nic.napis {
+                let mut body = vec![NETDEV_CMD_NAPI_GET, 1, 0, 0];
+                push_rtattr(
+                    &mut body,
+                    NETDEV_A_NAPI_IFINDEX,
+                    &nic.ifindex.to_ne_bytes(),
+                    false,
+                );
+                push_rtattr(&mut body, NETDEV_A_NAPI_ID, &napi.id.to_ne_bytes(), false);
+                if let Some(irq) = napi.irq {
+                    push_rtattr(&mut body, NETDEV_A_NAPI_IRQ, &irq.to_ne_bytes(), false);
+                }
+                if let Some(pid) = napi.thread {
+                    push_rtattr(
+                        &mut body,
+                        NETDEV_A_NAPI_PID,
+                        &(pid as u32).to_ne_bytes(),
+                        false,
+                    );
+                }
+                out.extend_from_slice(&nl_message(NETDEV_FAMILY_ID, NLM_F_MULTI, seq, &body));
+            }
+        }
+        out.extend_from_slice(&nl_message(
+            NLMSG_DONE,
+            NLM_F_MULTI,
+            seq,
+            &0i32.to_ne_bytes(),
+        ));
+        out
     }
 
     /// The reply to an `RTM_GETLINK` without `NLM_F_DUMP`: the one `RTM_NEWLINK` of the interface
@@ -2787,6 +3782,7 @@ impl SimHost {
         let mut state = self.state.lock().unwrap();
         let privileges = crate::Privileges::from_caps(state.caps, state.root);
         regs.shared.sys.set_privileges(|p| *p = privileges);
+        let _ = regs.shared.kernel_release.set(state.uname.release.clone());
         state.shared = Arc::downgrade(&regs.shared);
         drop(state);
         if let Some(t) = &self.tracefs {
@@ -3106,6 +4102,38 @@ impl SimHost {
         };
         #[cfg(target_os = "linux")]
         let default_qdisc = p.default_qdisc.clone();
+        let irqs = irq_lines(&p.irqs, &online);
+        let default_irq_affinity = online.clone();
+        #[cfg(target_os = "linux")]
+        let cmdline = p.cmdline.clone().unwrap_or_else(|| {
+            let mut line = format!(
+                "BOOT_IMAGE=/boot/vmlinuz-{} root=/dev/vda1 ro",
+                uname.release
+            );
+            if !p.isolated.is_empty() {
+                line.push_str(&format!(" isolcpus={}", format_cpu_list(&p.isolated)));
+            }
+            if !p.nohz_full.is_empty() {
+                line.push_str(&format!(" nohz_full={}", format_cpu_list(&p.nohz_full)));
+            }
+            line
+        });
+        #[cfg(target_os = "linux")]
+        let sysctls = {
+            let mut table: std::collections::BTreeMap<String, String> = [
+                ("kernel.sched_rt_runtime_us", "950000"),
+                ("kernel.sched_rt_period_us", "1000000"),
+                ("kernel.timer_migration", "1"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+            table.extend(p.sysctls.clone());
+            table
+                .into_iter()
+                .map(|(k, v)| (k.replace('.', "/"), v))
+                .collect()
+        };
         let nics = p
             .nics
             .into_iter()
@@ -3152,6 +4180,10 @@ impl SimHost {
                         num_tx_queues,
                         no_queue: n.no_queue,
                         msi_irqs: n.msi_irqs,
+                        #[cfg(target_os = "linux")]
+                        napis: Vec::new(),
+                        #[cfg(target_os = "linux")]
+                        queue_tuning: QueueTuning::default(),
                         ethtool,
                         #[cfg(target_os = "linux")]
                         qdiscs,
@@ -3168,7 +4200,7 @@ impl SimHost {
             p.cpu_count,
             clock.clone(),
         )));
-        SimHost {
+        let host = SimHost {
             tracefs,
             state: Mutex::new(HostState {
                 cpu_count: p.cpu_count,
@@ -3190,6 +4222,18 @@ impl SimHost {
                 #[cfg(target_os = "linux")]
                 pthreads: HashMap::default(),
                 nics,
+                irqs,
+                default_irq_affinity,
+                #[cfg(target_os = "linux")]
+                cmdline,
+                #[cfg(target_os = "linux")]
+                cgroup_cpu_max: p.cgroup_cpu_max,
+                #[cfg(target_os = "linux")]
+                sysctls,
+                #[cfg(target_os = "linux")]
+                next_kpid: KTHREAD_PID_BASE,
+                #[cfg(target_os = "linux")]
+                next_napi_id: NAPI_ID_BASE,
                 default_qdisc: p.default_qdisc,
                 #[cfg(target_os = "linux")]
                 ptp_clocks,
@@ -3230,7 +4274,10 @@ impl SimHost {
             registries: Mutex::new(None),
             me: std::sync::OnceLock::new(),
             topology,
-        }
+        };
+        #[cfg(target_os = "linux")]
+        host.state.lock().unwrap().boot_kernel();
+        host
     }
 
     /// A `kern.*` node of the kernel identity `uname` reports, as macOS serves it (measured on
@@ -3481,8 +4528,13 @@ fn host_file_metadata(path: &Path, length: usize) -> (u32, u64) {
     #[cfg(target_os = "linux")]
     {
         if path.starts_with("/proc") {
+            let irq_writable = path.starts_with("/proc/irq")
+                && matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some("smp_affinity" | "smp_affinity_list" | "default_smp_affinity")
+                );
             return (
-                if path.starts_with("/proc/sys") {
+                if path.starts_with("/proc/sys") || irq_writable {
                     0o100644
                 } else {
                     0o100444
@@ -3500,6 +4552,9 @@ fn host_file_metadata(path: &Path, length: usize) -> (u32, u64) {
                         | "tx_queue_len"
                         | "gro_flush_timeout"
                         | "napi_defer_hard_irqs"
+                        | "rps_cpus"
+                        | "xps_cpus"
+                        | "limit_max"
                 )
             );
             return (if writable { 0o100644 } else { 0o100444 }, unsafe {
@@ -3541,7 +4596,10 @@ pub(crate) fn host_stat(
 /// and `/proc/net` do; the rest of `/proc` and the device nodes are the process's, as its own
 /// `/proc/self` entries are.
 fn root_owned(path: &Path) -> bool {
-    path.starts_with("/sys") || path.starts_with("/proc/sys") || path.starts_with("/proc/net")
+    path.starts_with("/sys")
+        || path.starts_with("/proc/sys")
+        || path.starts_with("/proc/net")
+        || path.starts_with("/proc/irq")
 }
 
 /// The [`Attributes`] of a synthesized file, owned by root or by the code under test.
@@ -3689,7 +4747,13 @@ impl Fs for SimHost {
         let write = flags & libc::O_WRONLY != 0 || flags & libc::O_RDWR != 0;
         // Sysfs attributes are root-owned; the writable ones are mode 0644
         // (Documentation/ABI/testing/sysfs-class-net), so only root may open them for writing.
-        if write && !(state.threaded_attr(&path).is_some() && state.privileges().root) {
+        #[cfg(target_os = "linux")]
+        let tuning = state.nic_attr(&path).is_some() || state.sysctl_attr(&path).is_some();
+        #[cfg(not(target_os = "linux"))]
+        let tuning = false;
+        let writable =
+            state.threaded_attr(&path).is_some() || state.irq_attr(&path).is_some() || tuning;
+        if write && !(writable && state.privileges().root) {
             return err(libc::EACCES);
         }
         let fd = match self.reserve_fd() {
@@ -3817,6 +4881,45 @@ impl Fs for SimHost {
                 Ok(()) => ok(len as i64),
                 Err(e) => err(e),
             };
+        }
+        let irq = state
+            .open
+            .get(&fd)
+            .filter(|f| f.writable)
+            .and_then(|f| state.irq_attr(&f.path));
+        if let Some(attr) = irq {
+            let text = unsafe { std::slice::from_raw_parts(buf, len) };
+            return match state.store_irq(attr, text) {
+                Ok(()) => ok(len as i64),
+                Err(e) => err(e),
+            };
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let tuning = state
+                .open
+                .get(&fd)
+                .filter(|f| f.writable)
+                .and_then(|f| state.nic_attr(&f.path));
+            if let Some((nic, attr)) = tuning {
+                let text = unsafe { std::slice::from_raw_parts(buf, len) };
+                return match state.store_nic_attr(&nic, attr, text) {
+                    Ok(()) => ok(len as i64),
+                    Err(e) => err(e),
+                };
+            }
+            let sysctl = state
+                .open
+                .get(&fd)
+                .filter(|f| f.writable)
+                .and_then(|f| state.sysctl_attr(&f.path));
+            if let Some(key) = sysctl {
+                let text = unsafe { std::slice::from_raw_parts(buf, len) };
+                return match state.store_sysctl(&key, text) {
+                    Ok(()) => ok(len as i64),
+                    Err(e) => err(e),
+                };
+            }
         }
         if let Some(file) = state.open.get(&fd) {
             return err(if file.writable {
@@ -4471,7 +5574,20 @@ impl Host for SimHost {
     fn thread_inherit(&self, lineage: u64) {
         let mut state = self.state.lock().unwrap();
         let tid = state.current_tid();
-        let sched = state.threads[&tid].clone();
+        let mut sched = state.threads[&tid].clone();
+        // man 2 sched_setscheduler, SCHED_RESET_ON_FORK: a child of a SCHED_FIFO or SCHED_RR
+        // thread starts under SCHED_OTHER, a negative nice value resets to 0, and the child
+        // does not carry the flag. CPU affinity is inherited either way.
+        if sched.policy & libc::SCHED_RESET_ON_FORK != 0 {
+            let policy = sched.policy & !libc::SCHED_RESET_ON_FORK;
+            if policy == libc::SCHED_FIFO || policy == libc::SCHED_RR {
+                sched.policy = libc::SCHED_OTHER;
+                sched.rt_priority = 0;
+            } else {
+                sched.policy = policy;
+            }
+            sched.nice = sched.nice.max(0);
+        }
         state.inherited_threads.insert(lineage, sched);
     }
     #[cfg(target_os = "linux")]
@@ -4484,6 +5600,18 @@ impl Host for SimHost {
                 .insert(unsafe { libc::pthread_self() } as u64, tid);
             state.threads.insert(tid, sched);
         }
+    }
+    #[cfg(target_os = "linux")]
+    fn thread_named(&self, name: &[u8]) {
+        let mut state = self.state.lock().unwrap();
+        let tid = state.current_tid();
+        state.threads.get_mut(&tid).unwrap().name = Some(name.to_vec());
+    }
+    #[cfg(target_os = "linux")]
+    fn thread_exit(&self) {
+        let mut state = self.state.lock().unwrap();
+        let tid = state.current_tid();
+        state.threads.get_mut(&tid).unwrap().exited = true;
     }
     #[cfg(target_os = "linux")]
     fn thread_cancel(&self, lineage: u64) {
@@ -4716,7 +5844,12 @@ impl Host for SimHost {
             return err(libc::EINVAL);
         }
         let tid = state.resolve(pid);
-        state.threads.get_mut(&tid).unwrap().affinity = wanted;
+        let thread = state.threads.get_mut(&tid).unwrap();
+        // kernel/sched/syscalls.c `sched_setaffinity`: PF_NO_SETAFFINITY is EINVAL.
+        if thread.bound {
+            return err(libc::EINVAL);
+        }
+        thread.affinity = wanted;
         ok(0)
     }
 
@@ -4738,7 +5871,7 @@ impl Host for SimHost {
         unsafe {
             libc::CPU_ZERO(&mut *set);
             if affinity.is_empty() {
-                for cpu in state.online.iter().copied().filter(|&c| c < count) {
+                for cpu in state.default_affinity().into_iter().filter(|&c| c < count) {
                     libc::CPU_SET(cpu, &mut *set);
                 }
             } else {
@@ -6060,6 +7193,12 @@ fn find_nlattr(attrs: &[u8], want: u16) -> Option<&[u8]> {
     None
 }
 
+/// The `netdev` generic-netlink family's id. A snare choice: the kernel allocates
+/// generic-netlink family ids dynamically (`idr_alloc_cyclic` from GENL_START_ALLOC,
+/// net/netlink/genetlink.c), so any id works.
+#[cfg(target_os = "linux")]
+const NETDEV_FAMILY_ID: u16 = 24;
+
 /// Answer a genetlink controller `CTRL_CMD_GETFAMILY`: resolve the `"netdev"` family to a fixed
 /// id. An unknown family (or a non-`GETFAMILY` command) yields `NLMSG_ERROR(-ENODEV)`. The
 /// controller commands and `CTRL_ATTR_*` are in `<linux/genetlink.h>`; see also
@@ -6078,9 +7217,6 @@ fn build_genl_ctrl_reply(req: &[u8], seq: u32) -> Vec<u8> {
     const CTRL_ATTR_FAMILY_NAME: u16 = 2;
     const GENL_ID_CTRL: u16 = 16;
     const NLMSG_ERROR: u16 = 2;
-    // A snare choice: the kernel allocates generic-netlink family ids dynamically
-    // (`idr_alloc_cyclic` from GENL_START_ALLOC, net/netlink/genetlink.c), so any id works.
-    const NETDEV_FAMILY_ID: u16 = 24;
 
     let cmd = req.get(16).copied().unwrap_or(0);
     let name = req
@@ -6211,6 +7347,7 @@ impl Net for SimHost {
                 if data.is_null() {
                     return err(libc::EFAULT);
                 }
+                let channels = nic.ethtool.channels;
                 let ctx = crate::ethtool::Ctx {
                     net_admin: has_net_admin,
                     link_up,
@@ -6220,7 +7357,15 @@ impl Net for SimHost {
                     bus_info: &nic.bus_info,
                     queues: (&mut nic.rx_queues, &mut nic.tx_queues),
                 };
-                match unsafe { nic.ethtool.ioctl(ctx, data) } {
+                let result = unsafe { nic.ethtool.ioctl(ctx, data) };
+                // A driver changes its queue count by tearing its interrupt scheme down and
+                // building it again (igb `igb_reinit_queues`): every vector is requested
+                // anew on the default affinity, with new handler threads and NAPI ids.
+                if result.is_ok() && nic.ethtool.channels != channels {
+                    state.release_nic_vectors(&name);
+                    state.request_nic_vectors(&name);
+                }
+                match result {
                     Ok(()) => ok(0),
                     Err(e) => err(e),
                 }
@@ -7770,6 +8915,116 @@ fn machine_cpuinfo_entry() -> Option<&'static str> {
                 .map(str::to_owned)
         })
         .as_deref()
+}
+
+/// The profile's own interrupt lines; the NICs' come from [`HostState::request_nic_vectors`].
+/// Each starts on the online CPUs but a managed one, which stays where the kernel spread it.
+fn irq_lines(extra: &[IrqSpec], online: &[usize]) -> std::collections::BTreeMap<u32, IrqLine> {
+    let mut out = std::collections::BTreeMap::new();
+    for spec in extra {
+        out.insert(
+            spec.number,
+            IrqLine {
+                name: spec.name.clone(),
+                affinity: spec.managed.clone().unwrap_or_else(|| online.to_vec()),
+                managed: spec.managed.is_some(),
+                thread: None,
+            },
+        );
+    }
+    out
+}
+
+/// A CPU set as the kernel prints a cpumask (`%*pb`): hex, as many digits as `cpu_count`
+/// CPUs need, a comma between each 32-CPU group (lib/vsprintf.c `bitmap_string`).
+#[cfg(target_os = "linux")]
+fn format_cpu_mask(cpus: &[usize], cpu_count: usize) -> String {
+    let digits = cpu_count.max(1).div_ceil(4);
+    let mut out = String::new();
+    for d in (0..digits).rev() {
+        let nibble = (0..4)
+            .filter(|b| cpus.contains(&(d * 4 + b)))
+            .fold(0u8, |n, b| n | (1 << b));
+        out.push(char::from_digit(u32::from(nibble), 16).unwrap());
+        if d % 8 == 0 && d != 0 {
+            out.push(',');
+        }
+    }
+    out
+}
+
+/// `text` as a cpumask written to procfs (lib/bitmap-str.c `bitmap_parse`): hex digits, with
+/// a comma allowed between 32-bit groups and one trailing newline. `EINVAL` for anything else,
+/// `EOVERFLOW` for a CPU at or past `cpu_count`.
+fn parse_cpu_mask(text: &[u8], cpu_count: usize) -> Result<Vec<usize>, c_int> {
+    let text = std::str::from_utf8(text).map_err(|_| libc::EINVAL)?;
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut cpus = Vec::new();
+    let digits: Vec<char> = text.chars().filter(|&c| c != ',').collect();
+    for (i, c) in digits.iter().rev().enumerate() {
+        let nibble = c.to_digit(16).ok_or(libc::EINVAL)?;
+        for b in 0..4 {
+            if nibble & (1 << b) != 0 {
+                let cpu = i * 4 + b;
+                if cpu >= cpu_count {
+                    return Err(libc::EOVERFLOW);
+                }
+                cpus.push(cpu);
+            }
+        }
+    }
+    cpus.sort_unstable();
+    Ok(cpus)
+}
+
+/// `text` as a cpulist written to procfs (lib/bitmap-str.c `bitmap_parselist`): `a`, `a-b`
+/// and `a-b:used/group` items, comma-separated, one trailing newline allowed. `EINVAL` for
+/// anything else, `ERANGE` for a CPU at or past `cpu_count`.
+fn parse_cpu_list(text: &[u8], cpu_count: usize) -> Result<Vec<usize>, c_int> {
+    let text = std::str::from_utf8(text).map_err(|_| libc::EINVAL)?;
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    let mut cpus = Vec::new();
+    if text.is_empty() {
+        return Ok(cpus);
+    }
+    let number = |s: &str| s.parse::<usize>().map_err(|_| libc::EINVAL);
+    for item in text.split(',') {
+        let (span, stride) = match item.split_once(':') {
+            Some((span, stride)) => {
+                let (used, group) = stride.split_once('/').ok_or(libc::EINVAL)?;
+                let (used, group) = (number(used)?, number(group)?);
+                if used == 0 || group == 0 || used > group {
+                    return Err(libc::EINVAL);
+                }
+                (span, Some((used, group)))
+            }
+            None => (item, None),
+        };
+        let (start, end) = match span.split_once('-') {
+            Some((a, b)) => (number(a)?, number(b)?),
+            None => {
+                let n = number(span)?;
+                (n, n)
+            }
+        };
+        if start > end {
+            return Err(libc::EINVAL);
+        }
+        if end >= cpu_count {
+            return Err(libc::ERANGE);
+        }
+        for cpu in start..=end {
+            if stride.is_none_or(|(used, group)| (cpu - start) % group < used) {
+                cpus.push(cpu);
+            }
+        }
+    }
+    cpus.sort_unstable();
+    cpus.dedup();
+    Ok(cpus)
 }
 
 /// Render a CPU set in the kernel's cpulist format: sorted, deduplicated, consecutive runs

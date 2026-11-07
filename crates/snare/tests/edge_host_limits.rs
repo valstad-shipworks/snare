@@ -333,6 +333,44 @@ mod linux {
     }
 
     #[test]
+    fn a_reset_on_fork_thread_starts_its_children_at_sched_other() {
+        let sim = Sim::builder()
+            .host(HostProfile::new().cpus(4).build())
+            .privileges(unprivileged(50))
+            .build();
+        let (parent, child, child_affinity) = sim.run(|| {
+            assert_eq!(
+                sched(0, libc::SCHED_FIFO | libc::SCHED_RESET_ON_FORK, 10),
+                0
+            );
+            let mut one: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            unsafe { libc::CPU_SET(1, &mut one) };
+            let size = std::mem::size_of::<libc::cpu_set_t>();
+            assert_eq!(unsafe { libc::sched_setaffinity(0, size, &one) }, 0);
+            let child = std::thread::spawn(move || {
+                let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+                assert_eq!(unsafe { libc::sched_getaffinity(0, size, &mut set) }, 0);
+                let cpus: Vec<usize> = (0..4)
+                    .filter(|&c| unsafe { libc::CPU_ISSET(c, &set) })
+                    .collect();
+                let mut param = libc::sched_param { sched_priority: -1 };
+                assert_eq!(unsafe { libc::sched_getparam(0, &mut param) }, 0);
+                ((getsched(0).0, param.sched_priority), cpus)
+            })
+            .join()
+            .unwrap();
+            (getsched(0).0, child.0, child.1)
+        });
+        assert_eq!(parent, libc::SCHED_FIFO | libc::SCHED_RESET_ON_FORK);
+        assert_eq!(
+            child,
+            (libc::SCHED_OTHER, 0),
+            "the child neither runs real-time nor keeps the flag"
+        );
+        assert_eq!(child_affinity, vec![1], "affinity is inherited");
+    }
+
+    #[test]
     fn policy_is_kept_on_a_thread_across_runs() {
         let sim = hosted(unprivileged(50));
         sim.run(|| assert_eq!(sched(0, libc::SCHED_FIFO, 5), 0));

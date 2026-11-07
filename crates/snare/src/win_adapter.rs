@@ -25,8 +25,8 @@
 //! Manager refuse.
 //!
 //! All state sits behind one mutex, never held while the topology is changed: a restart's link
-//! changes are made after it is released, since they wake waiters (the README's wake-after-unlock
-//! rule).
+//! changes are made after it is released, since they wake waiters (the wake-after-unlock rule in
+//! `docs/scheduling.md`).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

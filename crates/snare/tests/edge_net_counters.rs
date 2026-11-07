@@ -146,8 +146,16 @@ fn scenario() -> String {
 
 #[cfg(target_os = "linux")]
 fn os_view() -> String {
-    let snmp = std::fs::read_to_string("/proc/net/snmp").unwrap();
-    let snmp6 = std::fs::read_to_string("/proc/net/snmp6").unwrap();
+    // UDP-Lite's rows follow the kernel the sim presents (Linux 7.1 removed them), so they are
+    // left out to keep the golden the same on every machine.
+    let without_udplite = |text: String| -> String {
+        text.lines()
+            .filter(|l| !l.starts_with("UdpLite"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    let snmp = without_udplite(std::fs::read_to_string("/proc/net/snmp").unwrap());
+    let snmp6 = without_udplite(std::fs::read_to_string("/proc/net/snmp6").unwrap());
     format!("/proc/net/snmp\n{snmp}/proc/net/snmp6\n{snmp6}")
 }
 

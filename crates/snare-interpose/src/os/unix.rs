@@ -822,6 +822,10 @@ extern "C" fn managed_start(start: *mut c_void) -> *mut c_void {
         Some(crate::host::HostResult::Ok(0))
     });
     let result = routine(argument);
+    domain::dispatch_host(|host| {
+        host.thread_exit();
+        Some(crate::host::HostResult::Ok(0))
+    });
     drop(child);
     result
 }
@@ -872,7 +876,14 @@ unsafe extern "C" fn pthread_setname_np(thread: pthread_t, name: *const c_char) 
         // SAFETY: pthread_self has no preconditions.
         let handle = (thread != unsafe { libc::pthread_self() }).then(|| handle_key(thread));
         // SAFETY: the OS accepted `name`, so it is a C string.
-        domain::record_thread_name(handle, unsafe { CStr::from_ptr(name) }.to_bytes());
+        let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+        domain::record_thread_name(handle, name);
+        if handle.is_none() {
+            domain::dispatch_host(|host| {
+                host.thread_named(name);
+                Some(crate::host::HostResult::Ok(0))
+            });
+        }
     }
     r
 }

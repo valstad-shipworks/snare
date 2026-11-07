@@ -1845,8 +1845,8 @@ impl SimBuilder {
     /// for the Windows zone the Unicode CLDR maps it to, or a Windows zone's registry key name
     /// (`"W. Europe Standard Time"`). The Win32 zone and conversion calls, and the UCRT's local
     /// time, use that zone's rules from this machine's registry, at the sim's time. Without one,
-    /// local time is the machine's zone, at the sim's time on a virtual clock. See the README's
-    /// "Local time".
+    /// local time is the machine's zone, at the sim's time on a virtual clock. See
+    /// `docs/local-time.md`.
     ///
     /// [`build`](Self::build) panics if `name` names no zone in the registry.
     pub fn time_zone(mut self, name: impl Into<String>) -> Self {

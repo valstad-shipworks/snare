@@ -38,6 +38,11 @@ pub trait Host: Send + Sync + 'static {
     fn thread_inherit(&self, lineage: u64) {}
     fn thread_adopt(&self, lineage: u64) {}
     fn thread_cancel(&self, lineage: u64) {}
+    /// The calling thread named itself `name` (`pthread_setname_np` on its own handle, without
+    /// the NUL), as its `comm` shows it.
+    fn thread_named(&self, name: &[u8]) {}
+    /// The calling managed thread's start routine returned: the thread is exiting.
+    fn thread_exit(&self) {}
     unsafe fn clock_gettime(&self, id: i32, buf: *mut u8) -> Option<HostResult> {
         None
     }

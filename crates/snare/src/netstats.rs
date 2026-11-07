@@ -358,7 +358,19 @@ pub(crate) mod linux {
     }
 
     /// `/proc/net/snmp`.
-    pub(crate) fn snmp(c: &ProtoCounters) -> Vec<u8> {
+    /// Whether a kernel of `release` still has UDP-Lite, whose `/proc/net/snmp` and
+    /// `/proc/net/snmp6` rows Linux 7.1 removed with the protocol. A release that does not
+    /// parse is taken as an older kernel.
+    pub(crate) fn has_udplite(release: &str) -> bool {
+        let mut parts = release
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|p| !p.is_empty())
+            .map(|p| p.parse::<u32>().unwrap_or(0));
+        let (major, minor) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+        (major, minor) < (7, 1)
+    }
+
+    pub(crate) fn snmp(c: &ProtoCounters, udplite: bool) -> Vec<u8> {
         let mut out = String::new();
         let (u, t4, t6) = (&c.udp4, &c.tcp4, &c.tcp6);
         let tin = u.arrived() + t4.in_segs;
@@ -401,13 +413,15 @@ pub(crate) mod linux {
         tcp[..4].copy_from_slice(&[1, 200, 120_000, -1]);
         pair(&mut out, "Tcp", TCP, &tcp);
         pair(&mut out, "Udp", UDP, &udp_values(u));
-        pair(&mut out, "UdpLite", UDP, &values(UDP, &[]));
+        if udplite {
+            pair(&mut out, "UdpLite", UDP, &values(UDP, &[]));
+        }
         out.into_bytes()
     }
 
     /// `/proc/net/snmp6`: one `%-32s\t%lu` line per counter (net/ipv6/proc.c
     /// `snmp6_seq_show_item`). `snmp6_udplite6_list` has no `IgnoredMulti`.
-    pub(crate) fn snmp6(c: &ProtoCounters) -> Vec<u8> {
+    pub(crate) fn snmp6(c: &ProtoCounters, udplite: bool) -> Vec<u8> {
         let mut out = String::new();
         let mut line = |name: String, v: u64| {
             let _ = writeln!(out, "{name:<32}\t{v}");
@@ -434,8 +448,10 @@ pub(crate) mod linux {
         for (f, v) in UDP.split_whitespace().zip(&udp) {
             line(format!("Udp6{f}"), *v as u64);
         }
-        for f in UDP.split_whitespace().filter(|f| *f != "IgnoredMulti") {
-            line(format!("UdpLite6{f}"), 0);
+        if udplite {
+            for f in UDP.split_whitespace().filter(|f| *f != "IgnoredMulti") {
+                line(format!("UdpLite6{f}"), 0);
+            }
         }
         out.into_bytes()
     }
