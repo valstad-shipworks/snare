@@ -76,6 +76,7 @@ pub(crate) struct SimShared {
     pub(crate) pipes: crate::realfd::Pipes,
     /// The kernel release the sim presents (`uname -r`), set by a `SimHost`; `None` is the
     /// machine's own.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) kernel_release: OnceLock<String>,
 }
 
