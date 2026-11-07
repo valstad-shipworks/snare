@@ -98,7 +98,7 @@ async-io    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.
 async-global-executor = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
 blocking    = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
 smol        = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.1.1" }
-futures-timer = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.5.0" }
+futures-timer = { git = "https://github.com/valstad-shipworks/snare", tag = "v3.5.1" }
 ```
 
 Patch only the crates the graph has (cargo warns about an unused patch), build with `--cfg snare`,

@@ -74,6 +74,10 @@ pub(crate) struct SimShared {
     /// The pipes the sim's threads made.
     #[cfg(unix)]
     pub(crate) pipes: crate::realfd::Pipes,
+    /// The kernel release the sim presents (`uname -r`), set by a `SimHost`; `None` is the
+    /// machine's own.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) kernel_release: OnceLock<String>,
 }
 
 impl SimShared {
@@ -106,6 +110,7 @@ impl SimShared {
             strict_reported: AtomicBool::new(false),
             #[cfg(unix)]
             pipes: crate::realfd::Pipes::default(),
+            kernel_release: OnceLock::new(),
         })
     }
 

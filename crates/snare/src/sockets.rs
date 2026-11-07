@@ -1648,8 +1648,8 @@ impl SimShared {
 /// Binds open socket `id` of the calling thread's sim to interface `nic`, or unbinds it with
 /// `None`, as the code under test would with Linux `SO_BINDTODEVICE`, macOS `IP_BOUND_IF` or
 /// Windows `IP_UNICAST_IF`: its sends leave through `nic` and, where the host OS filters receives
-/// by device, it only receives what arrives there (the README's "Interfaces and routing" gives
-/// each host's rules). An unknown interface fails with the
+/// by device, it only receives what arrives there (`docs/interfaces.md` gives each host's
+/// rules). An unknown interface fails with the
 /// code the option gives for one: `ENODEV` on Linux (net/core/sock.c `sock_setbindtodevice`),
 /// `ENXIO` on macOS (bsd/netinet/in_pcb.c `inp_bindif`) and `WSAEINVAL` on Windows; a socket that
 /// is not open is `NotFound`. Unlike the option, it is never refused for want of privilege.

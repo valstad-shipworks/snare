@@ -202,6 +202,14 @@ slot!(FACCESSAT);
 #[cfg(target_os = "linux")]
 slot!(STATX);
 #[cfg(target_os = "linux")]
+slot!(XSTAT);
+#[cfg(target_os = "linux")]
+slot!(LXSTAT);
+#[cfg(target_os = "linux")]
+slot!(FXSTAT);
+#[cfg(target_os = "linux")]
+slot!(FXSTATAT);
+#[cfg(target_os = "linux")]
 slot!(OPEN64);
 #[cfg(target_os = "linux")]
 slot!(OPENAT64);
@@ -315,6 +323,25 @@ pub(crate) fn hooks() -> Vec<Hook> {
         hook!("fstatat64", fstatat, FSTATAT),
         #[cfg(target_os = "linux")]
         hook!("statx", statx, STATX),
+        // glibc before 2.33 had no `stat` symbols: its <sys/stat.h> turned each call into the
+        // versioned `__xstat` family, which a program linked against an older glibc (a
+        // manylinux wheel's library, a zig- or cross-built binary) still imports.
+        #[cfg(target_os = "linux")]
+        hook!("__xstat", xstat, XSTAT),
+        #[cfg(target_os = "linux")]
+        hook!("__xstat64", xstat, XSTAT),
+        #[cfg(target_os = "linux")]
+        hook!("__lxstat", lxstat, LXSTAT),
+        #[cfg(target_os = "linux")]
+        hook!("__lxstat64", lxstat, LXSTAT),
+        #[cfg(target_os = "linux")]
+        hook!("__fxstat", fxstat, FXSTAT),
+        #[cfg(target_os = "linux")]
+        hook!("__fxstat64", fxstat, FXSTAT),
+        #[cfg(target_os = "linux")]
+        hook!("__fxstatat", fxstatat, FXSTATAT),
+        #[cfg(target_os = "linux")]
+        hook!("__fxstatat64", fxstatat, FXSTATAT),
         // dir streams (man 3 opendir / readdir). Linux `readdir64` is the LFS alias returning
         // `struct dirent64` (d_off/d_ino are 64-bit); macOS x86_64 uses the `$INODE64` variants.
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
@@ -797,6 +824,80 @@ unsafe extern "C" fn fstatat(
         )(dirfd, path, buf, flags)
     };
     host_metadata(result, buf.cast(), false)
+}
+
+/// The `__xstat` family's version argument for the one `struct stat` layout these targets have
+/// (glibc `sysdeps/unix/sysv/linux/x86_64/bits/stat.h` `_STAT_VER_LINUX` 1; the generic
+/// `_STAT_VER` 0 on aarch64). A call naming another version goes to glibc unmodelled.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const STAT_VER: c_int = 1;
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+const STAT_VER: c_int = 0;
+
+/// Hook for `__xstat(ver, path, buf)`: `stat` behind glibc's pre-2.33 ABI.
+#[cfg(target_os = "linux")]
+unsafe extern "C" fn xstat(ver: c_int, path: *const c_char, buf: *mut libc::stat) -> c_int {
+    if ver == STAT_VER {
+        // SAFETY: the caller's `stat` arguments, passed on.
+        return unsafe { stat(path, buf) };
+    }
+    // SAFETY: XSTAT holds libc's __xstat.
+    unsafe {
+        original::<unsafe extern "C" fn(c_int, *const c_char, *mut libc::stat) -> c_int>(&XSTAT)(
+            ver, path, buf,
+        )
+    }
+}
+
+/// Hook for `__lxstat(ver, path, buf)`: `lstat` behind glibc's pre-2.33 ABI.
+#[cfg(target_os = "linux")]
+unsafe extern "C" fn lxstat(ver: c_int, path: *const c_char, buf: *mut libc::stat) -> c_int {
+    if ver == STAT_VER {
+        // SAFETY: the caller's `lstat` arguments, passed on.
+        return unsafe { lstat(path, buf) };
+    }
+    // SAFETY: LXSTAT holds libc's __lxstat.
+    unsafe {
+        original::<unsafe extern "C" fn(c_int, *const c_char, *mut libc::stat) -> c_int>(&LXSTAT)(
+            ver, path, buf,
+        )
+    }
+}
+
+/// Hook for `__fxstat(ver, fd, buf)`: `fstat` behind glibc's pre-2.33 ABI.
+#[cfg(target_os = "linux")]
+unsafe extern "C" fn fxstat(ver: c_int, fd: c_int, buf: *mut libc::stat) -> c_int {
+    if ver == STAT_VER {
+        // SAFETY: the caller's `fstat` arguments, passed on.
+        return unsafe { fstat(fd, buf) };
+    }
+    // SAFETY: FXSTAT holds libc's __fxstat.
+    unsafe {
+        original::<unsafe extern "C" fn(c_int, c_int, *mut libc::stat) -> c_int>(&FXSTAT)(
+            ver, fd, buf,
+        )
+    }
+}
+
+/// Hook for `__fxstatat(ver, dirfd, path, buf, flags)`: `fstatat` behind glibc's pre-2.33 ABI.
+#[cfg(target_os = "linux")]
+unsafe extern "C" fn fxstatat(
+    ver: c_int,
+    dirfd: c_int,
+    path: *const c_char,
+    buf: *mut libc::stat,
+    flags: c_int,
+) -> c_int {
+    if ver == STAT_VER {
+        // SAFETY: the caller's `fstatat` arguments, passed on.
+        return unsafe { fstatat(dirfd, path, buf, flags) };
+    }
+    // SAFETY: FXSTATAT holds libc's __fxstatat.
+    unsafe {
+        original::<unsafe extern "C" fn(c_int, c_int, *const c_char, *mut libc::stat, c_int) -> c_int>(
+            &FXSTATAT,
+        )(ver, dirfd, path, buf, flags)
+    }
 }
 
 /// Hook for `statx(2)` (Linux), which Rust's `std::fs::metadata` tries first on Linux.

@@ -960,7 +960,7 @@ impl SimBuilder {
     /// socket's [`SocketEntry::unmodelled_options`](crate::SocketEntry::unmodelled_options) and
     /// logged as [`RecordedEvent::UnmodelledOption`](crate::RecordedEvent::UnmodelledOption).
     /// The options the sim ignores on purpose, as harmless to what a test can observe, are not
-    /// refused; the README lists them.
+    /// refused; `docs/sockets.md` lists them.
     pub fn strict_sockopts(mut self) -> Self {
         self.strict_sockopts = true;
         self

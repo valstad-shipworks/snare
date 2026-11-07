@@ -2,8 +2,8 @@
 
 How the integration tests of `crates/snare` (and the engine tests of `crates/snare-interpose`) are
 organised, how to run them on each platform, which feature areas each platform covers, and what
-a Windows run is expected to skip. For maintainers; the user-facing feature description is the
-top-level `README.md`.
+a Windows run is expected to skip. For maintainers; the user-facing feature description is in the
+top-level `docs/`.
 
 ## Layout
 

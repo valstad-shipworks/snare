@@ -182,12 +182,13 @@ fn proc_net_snmp_renders_every_line() {
     Sim::new().run(|| {
         let text = std::fs::read_to_string("/proc/net/snmp").unwrap();
         let names: Vec<&str> = text.lines().map(|l| l.split(':').next().unwrap()).collect();
-        assert_eq!(
-            names,
-            [
-                "Ip", "Ip", "Icmp", "Icmp", "Tcp", "Tcp", "Udp", "Udp", "UdpLite", "UdpLite"
-            ]
-        );
+        let mut want = vec!["Ip", "Ip", "Icmp", "Icmp", "Tcp", "Tcp", "Udp", "Udp"];
+        // Linux 7.1 removed UDP-Lite and its rows with it; a plain sim presents this machine's
+        // kernel.
+        if kernel_before(7, 1) {
+            want.extend(["UdpLite", "UdpLite"]);
+        }
+        assert_eq!(names, want);
         let tcp = counters::proc_line("/proc/net/snmp", "Tcp");
         assert_eq!(tcp["MaxConn"], u64::MAX, "printed as -1");
         assert_eq!(tcp["RtoMin"], 200);
@@ -356,4 +357,17 @@ fn a_stations_datagrams_are_not_the_simhosts() {
         .host(snare::HostProfile::new().nic(nic).build())
         .build()
         .run(station_traffic);
+}
+
+/// Whether the machine's kernel is older than `major.minor`.
+#[cfg(target_os = "linux")]
+fn kernel_before(major: u32, minor: u32) -> bool {
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::uname(&mut uts) }, 0);
+    let release = unsafe { std::ffi::CStr::from_ptr(uts.release.as_ptr()) }.to_string_lossy();
+    let mut parts = release
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse::<u32>().unwrap_or(0));
+    (parts.next().unwrap_or(0), parts.next().unwrap_or(0)) < (major, minor)
 }

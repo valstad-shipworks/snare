@@ -72,17 +72,35 @@ impl ProcNetFs {
 
     /// The text of `path`, or `None` for a path this plane does not serve.
     fn render(&self, path: &Path) -> Option<Vec<u8>> {
-        let counters = |shared: Arc<SimShared>| shared.proto_counters();
+        let shared = self.shared.upgrade()?;
+        let counters = shared.proto_counters();
+        let udplite = crate::netstats::linux::has_udplite(&kernel_release(&shared));
         match path.to_str()? {
-            "/proc/net/snmp" | "/proc/self/net/snmp" => Some(crate::netstats::linux::snmp(
-                &counters(self.shared.upgrade()?),
-            )),
-            "/proc/net/snmp6" | "/proc/self/net/snmp6" => Some(crate::netstats::linux::snmp6(
-                &counters(self.shared.upgrade()?),
-            )),
+            "/proc/net/snmp" | "/proc/self/net/snmp" => {
+                Some(crate::netstats::linux::snmp(&counters, udplite))
+            }
+            "/proc/net/snmp6" | "/proc/self/net/snmp6" => {
+                Some(crate::netstats::linux::snmp6(&counters, udplite))
+            }
             _ => None,
         }
     }
+}
+
+/// The kernel release the sim presents: its `SimHost`'s, else the machine's.
+fn kernel_release(shared: &SimShared) -> String {
+    if let Some(release) = shared.kernel_release.get() {
+        return release.clone();
+    }
+    snare_interpose::real(|| {
+        let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+        if unsafe { libc::uname(&mut uts) } != 0 {
+            return String::new();
+        }
+        unsafe { std::ffi::CStr::from_ptr(uts.release.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    })
 }
 
 /// Ok with a value.

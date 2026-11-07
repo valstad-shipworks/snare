@@ -285,6 +285,15 @@ impl NicSpec {
         self
     }
 
+    /// Sets the hardware address when `mac` is `Some`, else leaves it as it is.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) fn mac_opt(mut self, mac: Option<[u8; 6]>) -> Self {
+        if mac.is_some() {
+            self.mac = mac;
+        }
+        self
+    }
+
     /// Whether the link has carrier.
     pub fn link(mut self, carrier: bool) -> Self {
         self.carrier = carrier;
